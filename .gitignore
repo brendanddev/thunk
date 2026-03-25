@@ -1,0 +1,17 @@
+
+## Environment variables
+.env
+
+## Models
+*.gguf
+*.ggml
+*.bin
+
+## Build output
+/target
+
+## Context and plans
+CLAUDE.md
+PLANS.md
+
+
