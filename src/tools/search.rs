@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::error::{ParamsError, Result};
-use super::Tool;
+use super::{Tool, ToolRunResult};
 
 // File extensions we'll search — avoids binary files and build artifacts
 const SEARCHABLE_EXTENSIONS: &[&str] = &[
@@ -34,7 +34,7 @@ impl Tool for SearchCode {
          Returns matching lines with file names and line numbers."
     }
 
-    fn run(&self, arg: &str) -> Result<String> {
+    fn run(&self, arg: &str) -> Result<ToolRunResult> {
         info!(tool = "search", "tool called");
         let query = arg.trim();
 
@@ -49,7 +49,7 @@ impl Tool for SearchCode {
         walk_and_search(current_dir, query, &mut matches)?;
 
         if matches.is_empty() {
-            return Ok(format!("No results found for: {query}"));
+            return Ok(ToolRunResult::Immediate(format!("No results found for: {query}")));
         }
 
         // Cap results to avoid flooding context
@@ -74,7 +74,7 @@ impl Tool for SearchCode {
             output.push_str(&format!("  {:4}: {}\n", m.line_number, m.line_content.trim()));
         }
 
-        Ok(output)
+        Ok(ToolRunResult::Immediate(output))
     }
 }
 

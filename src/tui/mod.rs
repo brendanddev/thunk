@@ -25,7 +25,7 @@ use ratatui::{
 };
 
 use crate::error::Result;
-use crate::events::InferenceEvent;
+use crate::events::{InferenceEvent, PendingActionKind};
 use crate::inference::SessionCommand;
 use state::{AppState, Role};
 
@@ -131,13 +131,27 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     state.append_token(&token);
                 }
                 InferenceEvent::ToolCall(call) => {
+                    state.clear_pending_action();
                     state.last_tool_call = Some(call);
                     state.status = "running tool...".to_string();
                 }
+                InferenceEvent::PendingAction(action) => {
+                    let title = action.title.clone();
+                    let preview = action.preview.clone();
+                    let kind = match action.kind {
+                        PendingActionKind::ShellCommand => "shell command",
+                    };
+                    state.set_pending_action(action);
+                    state.add_system_message(&format!(
+                        "{title} ({kind}):\n{preview}\nUse /approve or /reject."
+                    ));
+                }
                 InferenceEvent::Done => {
+                    state.clear_pending_action();
                     state.finish_response();
                 }
                 InferenceEvent::Error(e) => {
+                    state.clear_pending_action();
                     state.add_error(&e);
                 }
             }
@@ -162,6 +176,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         (KeyCode::Enter, _) => {
                             if !state.input.is_empty() && !state.is_generating && state.is_ready() {
                                 let prompt = state.submit_input();
+
+                                if state.pending_action.is_some()
+                                    && !matches!(
+                                        prompt.as_str(),
+                                        "/approve" | "/reject"
+                                    )
+                                    && !prompt.starts_with("/approve ")
+                                    && !prompt.starts_with("/reject ")
+                                {
+                                    state.add_system_message(
+                                        "An action is awaiting approval. Use /approve or /reject first.",
+                                    );
+                                    continue;
+                                }
 
                                 // Check for slash commands before sending to inference.
                                 // These run tools directly and inject results into context
@@ -221,6 +249,24 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         // Ctrl+W — delete word before cursor
                         (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
                             state.delete_word_before();
+                        }
+
+                        // Ctrl+Y — approve pending action
+                        (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+                            if let Some(id) = state.pending_action_id() {
+                                let _ = prompt_tx.send(SessionCommand::ApproveAction(id));
+                                state.add_system_message("approved pending action");
+                                state.clear_pending_action();
+                            }
+                        }
+
+                        // Ctrl+N — reject pending action
+                        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                            if let Some(id) = state.pending_action_id() {
+                                let _ = prompt_tx.send(SessionCommand::RejectAction(id));
+                                state.add_system_message("rejected pending action");
+                                state.clear_pending_action();
+                            }
                         }
 
                         // Scroll
@@ -366,6 +412,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("clear", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
+            Span::styled("^y/^n  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("approve/reject", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
             Span::styled("^q     ", Style::default().fg(Color::DarkGray)),
             Span::styled("quit", Style::default().fg(Color::DarkGray)),
         ])),
@@ -390,6 +440,14 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled("/git   ", Style::default().fg(Color::DarkGray)),
             Span::styled(" <cmd>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/run   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <cmd>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/approve", Style::default().fg(Color::DarkGray)),
+            Span::styled(" /reject", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
             Span::styled("/clear ", Style::default().fg(Color::DarkGray)),
@@ -640,12 +698,15 @@ fn handle_slash_command(
             }
             let tool = crate::tools::ReadFile;
             match crate::tools::Tool::run(&tool, arg) {
-                Ok(output) => {
+                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
                     state.add_system_message(&format!("loaded: {arg}"));
                     let safe = sanitize_for_display(&output);
                     let context = format!("I've loaded this file for context:\n\n{safe}");
                     state.add_user_message(&context);
                     let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                }
+                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
+                    state.add_system_message("read requested approval unexpectedly");
                 }
                 Err(e) => {
                     state.add_system_message(&format!("error reading {arg}: {e}"));
@@ -657,12 +718,15 @@ fn handle_slash_command(
             let path = if arg.is_empty() { "." } else { arg };
             let tool = crate::tools::ListDir;
             match crate::tools::Tool::run(&tool, path) {
-                Ok(output) => {
+                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
                     state.add_system_message(&format!("listed: {path}"));
                     let safe = sanitize_for_display(&output);
                     let context = format!("Directory listing:\n\n{safe}");
                     state.add_user_message(&context);
                     let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                }
+                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
+                    state.add_system_message("list requested approval unexpectedly");
                 }
                 Err(e) => {
                     state.add_system_message(&format!("error listing {path}: {e}"));
@@ -677,12 +741,15 @@ fn handle_slash_command(
             }
             let tool = crate::tools::SearchCode;
             match crate::tools::Tool::run(&tool, arg) {
-                Ok(output) => {
+                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
                     state.add_system_message(&format!("searched: {arg}"));
                     let safe = sanitize_for_display(&output);
                     let context = format!("Search results:\n\n{safe}");
                     state.add_user_message(&context);
                     let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                }
+                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
+                    state.add_system_message("search requested approval unexpectedly");
                 }
                 Err(e) => {
                     state.add_system_message(&format!("error searching: {e}"));
@@ -694,16 +761,49 @@ fn handle_slash_command(
             let git_arg = if arg.is_empty() { "status" } else { arg };
             let tool = crate::tools::GitTool;
             match crate::tools::Tool::run(&tool, git_arg) {
-                Ok(output) => {
+                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
                     state.add_system_message(&format!("git: {git_arg}"));
                     let safe = sanitize_for_display(&output);
                     let context = format!("Git context ({git_arg}):\n\n{safe}");
                     state.add_user_message(&context);
                     let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
                 }
+                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
+                    state.add_system_message("git requested approval unexpectedly");
+                }
                 Err(e) => {
                     state.add_system_message(&format!("git error: {e}"));
                 }
+            }
+        }
+
+        "/run" | "/bash" => {
+            if arg.is_empty() {
+                state.add_system_message("Usage: /run <command>");
+                return;
+            }
+            let _ = prompt_tx.send(SessionCommand::RequestShellCommand(arg.to_string()));
+        }
+
+        "/approve" => {
+            match state.pending_action_id() {
+                Some(id) => {
+                    let _ = prompt_tx.send(SessionCommand::ApproveAction(id));
+                    state.add_system_message("approved pending action");
+                    state.clear_pending_action();
+                }
+                None => state.add_system_message("No pending action to approve."),
+            }
+        }
+
+        "/reject" => {
+            match state.pending_action_id() {
+                Some(id) => {
+                    let _ = prompt_tx.send(SessionCommand::RejectAction(id));
+                    state.add_system_message("rejected pending action");
+                    state.clear_pending_action();
+                }
+                None => state.add_system_message("No pending action to reject."),
             }
         }
 
@@ -719,6 +819,9 @@ fn handle_slash_command(
                  /ls [path]      — list directory (default: current)\n  \
                  /search <query> — search source files\n  \
                  /git [command]  — git status, diff, log\n  \
+                 /run <command>  — propose a shell command\n  \
+                 /approve        — approve pending action\n  \
+                 /reject         — reject pending action\n  \
                  /clear          — clear conversation\n  \
                  /help           — show this message",
             );

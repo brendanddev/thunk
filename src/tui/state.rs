@@ -1,5 +1,7 @@
 // src/tui/state.rs
 
+use crate::events::PendingAction;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Role {
     System,
@@ -46,6 +48,9 @@ pub struct AppState {
 
     /// Last tool call being executed, shown in sidebar
     pub last_tool_call: Option<String>,
+
+    /// Action currently awaiting approval
+    pub pending_action: Option<PendingAction>,
 }
 
 impl AppState {
@@ -62,6 +67,7 @@ impl AppState {
             backend_name: "...".to_string(),
             tick: 0,
             last_tool_call: None,
+            pending_action: None,
         }
     }
 
@@ -214,6 +220,23 @@ impl AppState {
         if status == "ready" {
             self.model_ready = true;
         }
+    }
+
+    pub fn set_pending_action(&mut self, action: PendingAction) {
+        self.pending_action = Some(action);
+        self.is_generating = false;
+        self.status = "awaiting approval".to_string();
+    }
+
+    pub fn clear_pending_action(&mut self) {
+        self.pending_action = None;
+        if !self.is_generating {
+            self.status = "ready".to_string();
+        }
+    }
+
+    pub fn pending_action_id(&self) -> Option<u64> {
+        self.pending_action.as_ref().map(|action| action.id)
     }
 
     pub fn is_ready(&self) -> bool {

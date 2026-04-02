@@ -12,7 +12,7 @@ use std::fs;
 use tracing::info;
 
 use crate::error::{ParamsError, Result};
-use super::Tool;
+use super::{Tool, ToolRunResult};
 
 /// Reads the contents of a file and returns them as a string.
 ///
@@ -28,7 +28,7 @@ impl Tool for ReadFile {
         "Read the contents of a file. Provide a relative or absolute path."
     }
 
-    fn run(&self, arg: &str) -> Result<String> {
+    fn run(&self, arg: &str) -> Result<ToolRunResult> {
         info!(tool = "read_file", arg = arg.trim(), "tool called");
         let path = Path::new(arg.trim());
 
@@ -60,10 +60,10 @@ impl Tool for ReadFile {
         let line_count = content.lines().count();
 
         // Include the path and line count as a header so the model has context
-        Ok(format!(
+        Ok(ToolRunResult::Immediate(format!(
             "File: {}\nLines: {line_count}\n\n```\n{content}\n```",
             path.display()
-        ))
+        )))
     }
 }
 
@@ -81,7 +81,7 @@ impl Tool for ListDir {
         "List files and directories at a path. Use '.' for current directory."
     }
 
-    fn run(&self, arg: &str) -> Result<String> {
+    fn run(&self, arg: &str) -> Result<ToolRunResult> {
         info!(tool = "list_dir", arg = arg.trim(), "tool called");
         let path = Path::new(arg.trim());
 
@@ -137,13 +137,16 @@ impl Tool for ListDir {
         entries.extend(files);
 
         if entries.is_empty() {
-            return Ok(format!("Directory {} is empty.", path.display()));
+            return Ok(ToolRunResult::Immediate(format!(
+                "Directory {} is empty.",
+                path.display()
+            )));
         }
 
-        Ok(format!(
+        Ok(ToolRunResult::Immediate(format!(
             "Directory: {}\n\n{}",
             path.display(),
             entries.join("\n")
-        ))
+        )))
     }
 }

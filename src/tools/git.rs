@@ -5,7 +5,7 @@
 use std::process::Command;
 
 use crate::error::{ParamsError, Result};
-use super::Tool;
+use super::{Tool, ToolRunResult};
 
 pub struct GitTool;
 
@@ -18,7 +18,7 @@ impl Tool for GitTool {
         "Read git repo context. Usage examples: [git: status], [git: diff], [git: log 5]"
     }
 
-    fn run(&self, arg: &str) -> Result<String> {
+    fn run(&self, arg: &str) -> Result<ToolRunResult> {
         let trimmed = arg.trim();
         let subcommand = if trimmed.is_empty() { "status" } else { trimmed };
         let mut parts = subcommand.split_whitespace();
@@ -42,7 +42,7 @@ impl Tool for GitTool {
     }
 }
 
-fn run_git(args: &[&str]) -> Result<String> {
+fn run_git(args: &[&str]) -> Result<ToolRunResult> {
     let output = Command::new("git")
         .args(args)
         .output()?;
@@ -57,7 +57,7 @@ fn run_git(args: &[&str]) -> Result<String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok(truncate_output(&stdout, 16_000))
+    Ok(ToolRunResult::Immediate(truncate_output(&stdout, 16_000)))
 }
 
 fn truncate_output(output: &str, max_chars: usize) -> String {

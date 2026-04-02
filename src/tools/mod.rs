@@ -14,15 +14,17 @@
 // runs the tools, and injects the results back as a new user message so
 // the model can reason about the actual file contents.
 
+mod bash;
 mod fs;
 mod git;
 mod search;
 
+pub use bash::BashTool;
 pub use fs::{ListDir, ReadFile};
 pub use git::GitTool;
 pub use search::SearchCode;
 
-use crate::error::Result;
+use crate::error::{ParamsError, Result};
 
 /// The contract every tool must fulfill.
 /// Tools are simple — they take a string argument and return a string result.
@@ -36,7 +38,15 @@ pub trait Tool: Send + Sync {
 
     /// Run the tool with the given argument string.
     /// Returns the result as a string to be injected back into the conversation.
-    fn run(&self, arg: &str) -> Result<String>;
+    fn run(&self, arg: &str) -> Result<ToolRunResult>;
+
+    /// Run the tool after the user has approved it.
+    fn run_approved(&self, _arg: &str) -> Result<String> {
+        Err(ParamsError::Config(format!(
+            "Tool {} does not support approval-based execution",
+            self.name()
+        )))
+    }
 }
 
 /// The global tool registry — holds all available tools.
@@ -53,6 +63,7 @@ impl ToolRegistry {
                 Box::new(ListDir),
                 Box::new(SearchCode),
                 Box::new(GitTool),
+                Box::new(BashTool),
             ],
         }
     }
@@ -82,8 +93,8 @@ impl ToolRegistry {
     }
 
     /// Scan a response string for tool calls and execute them all.
-    /// Returns a list of (tool_name, argument, result) tuples.
-    pub fn execute_tool_calls(&self, response: &str) -> Vec<ToolResult> {
+    /// Stops early if a tool requires approval.
+    pub fn execute_tool_calls(&self, response: &str) -> ToolExecution {
         let mut results = Vec::new();
 
         for tool in &self.tools {
@@ -98,16 +109,26 @@ impl ToolRegistry {
                 if let Some(end_offset) = response[after_tag..].find(']') {
                     let arg = response[after_tag..after_tag + end_offset].trim().to_string();
 
-                    let result = match tool.run(&arg) {
+                    let tool_run = match tool.run(&arg) {
                         Ok(output) => output,
-                        Err(e) => format!("Error: {e}"),
+                        Err(e) => ToolRunResult::Immediate(format!("Error: {e}")),
                     };
 
-                    results.push(ToolResult {
-                        tool_name: tool.name().to_string(),
-                        argument: arg,
-                        output: result,
-                    });
+                    match tool_run {
+                        ToolRunResult::Immediate(output) => {
+                            results.push(ToolResult {
+                                tool_name: tool.name().to_string(),
+                                argument: arg,
+                                output,
+                            });
+                        }
+                        ToolRunResult::RequiresApproval(pending) => {
+                            return ToolExecution {
+                                results,
+                                pending: Some(pending),
+                            };
+                        }
+                    }
 
                     search_from = after_tag + end_offset + 1;
                 } else {
@@ -116,7 +137,10 @@ impl ToolRegistry {
             }
         }
 
-        results
+        ToolExecution {
+            results,
+            pending: None,
+        }
     }
 
     /// Format tool results into a message to inject back into the conversation.
@@ -136,6 +160,29 @@ impl ToolRegistry {
 
         Some(msg)
     }
+
+    pub fn execute_pending_action(&self, pending: &PendingToolAction) -> ToolResult {
+        let output = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == pending.tool_name)
+            .map(|tool| tool.run_approved(&pending.argument))
+            .unwrap_or_else(|| {
+                Err(ParamsError::Config(format!(
+                    "Unknown pending tool: {}",
+                    pending.tool_name
+                )))
+            });
+
+        ToolResult {
+            tool_name: pending.tool_name.clone(),
+            argument: pending.argument.clone(),
+            output: match output {
+                Ok(output) => output,
+                Err(e) => format!("Error: {e}"),
+            },
+        }
+    }
 }
 
 /// The result of running a single tool call.
@@ -143,4 +190,22 @@ pub struct ToolResult {
     pub tool_name: String,
     pub argument: String,
     pub output: String,
+}
+
+pub enum ToolRunResult {
+    Immediate(String),
+    RequiresApproval(PendingToolAction),
+}
+
+pub struct ToolExecution {
+    pub results: Vec<ToolResult>,
+    pub pending: Option<PendingToolAction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingToolAction {
+    pub tool_name: String,
+    pub argument: String,
+    pub title: String,
+    pub preview: String,
 }

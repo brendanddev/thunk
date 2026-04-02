@@ -18,15 +18,18 @@ pub use openai_compat::OpenAICompatBackend;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
-use crate::events::InferenceEvent;
+use crate::events::{InferenceEvent, PendingAction, PendingActionKind};
 use crate::config;
 use crate::error::{ParamsError, Result};
 use crate::memory::{compression, facts::FactStore, index::ProjectIndex};
-use crate::tools::ToolRegistry;
+use crate::tools::{PendingToolAction, ToolRegistry};
 
 pub enum SessionCommand {
     SubmitUser(String),
     InjectUserContext(String),
+    RequestShellCommand(String),
+    ApproveAction(u64),
+    RejectAction(u64),
     ClearSession,
 }
 
@@ -68,6 +71,7 @@ pub fn model_thread(
     let mut session_messages = vec![Message::system(
         &build_system_prompt(&tools, &session_facts, &[]),
     )];
+    let mut next_action_id = 1u64;
 
     while let Ok(command) = prompt_rx.recv() {
         match command {
@@ -80,6 +84,35 @@ pub fn model_thread(
             }
             SessionCommand::InjectUserContext(content) => {
                 session_messages.push(Message::user(&content));
+                continue;
+            }
+            SessionCommand::RequestShellCommand(command) => {
+                let pending = PendingToolAction {
+                    tool_name: "bash".to_string(),
+                    argument: command.clone(),
+                    title: "Approve shell command".to_string(),
+                    preview: command,
+                };
+                if let Err(e) = handle_pending_action(
+                    &prompt_rx,
+                    &token_tx,
+                    &*backend,
+                    &tools,
+                    &mut session_messages,
+                    next_action_id,
+                    pending,
+                    false,
+                ) {
+                    let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                }
+                let _ = token_tx.send(InferenceEvent::Done);
+                next_action_id = next_action_id.saturating_add(1);
+                continue;
+            }
+            SessionCommand::ApproveAction(_) | SessionCommand::RejectAction(_) => {
+                let _ = token_tx.send(InferenceEvent::Error(
+                    "No action is currently awaiting approval".to_string()
+                ));
                 continue;
             }
             SessionCommand::SubmitUser(prompt) => {
@@ -107,9 +140,28 @@ pub fn model_thread(
                     }
                     Ok(full_response) => {
                         // Check if the model used any tools
-                        let tool_results = tools.execute_tool_calls(&full_response);
+                        let tool_execution = tools.execute_tool_calls(&full_response);
+                        let tool_results = tool_execution.results;
 
-                        if let Some(result_msg) = ToolRegistry::format_results(&tool_results) {
+                        if let Some(pending) = tool_execution.pending {
+                            session_messages.push(Message::assistant(&full_response));
+                            if let Some(result_msg) = ToolRegistry::format_results(&tool_results) {
+                                session_messages.push(Message::user(&result_msg));
+                            }
+                            if let Err(e) = handle_pending_action(
+                                &prompt_rx,
+                                &token_tx,
+                                &*backend,
+                                &tools,
+                                &mut session_messages,
+                                next_action_id,
+                                pending,
+                                true,
+                            ) {
+                                let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                            }
+                            next_action_id = next_action_id.saturating_add(1);
+                        } else if let Some(result_msg) = ToolRegistry::format_results(&tool_results) {
                             // Notify the UI that tool calls are being processed
                             let _ = token_tx.send(InferenceEvent::ToolCall(
                                 tool_results.iter()
@@ -144,6 +196,77 @@ pub fn model_thread(
 
     if let Some(store) = fact_store.as_ref() {
         store.extract_and_store(&session_messages, &project_name, &*backend);
+    }
+}
+
+fn handle_pending_action(
+    prompt_rx: &Receiver<SessionCommand>,
+    token_tx: &Sender<InferenceEvent>,
+    backend: &dyn InferenceBackend,
+    tools: &ToolRegistry,
+    session_messages: &mut Vec<Message>,
+    action_id: u64,
+    mut pending: PendingToolAction,
+    run_follow_up: bool,
+) -> Result<()> {
+    if pending.preview.is_empty() {
+        pending.preview = pending.argument.clone();
+    }
+
+    let event = PendingAction {
+        id: action_id,
+        kind: PendingActionKind::ShellCommand,
+        title: pending.title.clone(),
+        preview: pending.preview.clone(),
+    };
+    let _ = token_tx.send(InferenceEvent::PendingAction(event));
+
+    loop {
+        match prompt_rx.recv() {
+            Ok(SessionCommand::ApproveAction(id)) if id == action_id => {
+                let result = tools.execute_pending_action(&pending);
+                let _ = token_tx.send(InferenceEvent::ToolCall(format!(
+                    "{}({})",
+                    result.tool_name, result.argument
+                )));
+                let result_msg = ToolRegistry::format_results(&[result]);
+                if let Some(result_msg) = result_msg {
+                    session_messages.push(Message::user(&result_msg));
+                }
+                if run_follow_up {
+                    let follow_up = run_and_collect(backend, session_messages, token_tx.clone())?;
+                    if !follow_up.trim().is_empty() {
+                        session_messages.push(Message::assistant(&follow_up));
+                    }
+                }
+                return Ok(());
+            }
+            Ok(SessionCommand::RejectAction(id)) if id == action_id => {
+                let rejection = format!(
+                    "User rejected proposed action: {}",
+                    pending.argument
+                );
+                session_messages.push(Message::user(&rejection));
+                if run_follow_up {
+                    let follow_up = run_and_collect(backend, session_messages, token_tx.clone())?;
+                    if !follow_up.trim().is_empty() {
+                        session_messages.push(Message::assistant(&follow_up));
+                    }
+                }
+                return Ok(());
+            }
+            Ok(SessionCommand::ClearSession) => {
+                return Err(ParamsError::Config(
+                    "Cannot clear session while an action is awaiting approval".to_string()
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return Err(ParamsError::Inference(
+                    "Approval channel closed while waiting for user decision".to_string()
+                ));
+            }
+        }
     }
 }
 
