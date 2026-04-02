@@ -161,7 +161,7 @@ fn default_openai_url() -> String { "https://api.groq.com/openai/v1".to_string()
 fn default_openai_model() -> String { "llama-3.3-70b-versatile".to_string() }
 fn default_max_tokens() -> i32 { 512 }
 fn default_temperature() -> f32 { 0.8 }
-fn default_lsp_timeout_ms() -> u64 { 3000 }
+fn default_lsp_timeout_ms() -> u64 { 15000 }
 
 impl OpenAICompatConfig {
     /// Infer a human-readable provider name from the URL if not set in config.
@@ -383,7 +383,7 @@ pub fn load() -> Result<Config> {
              # LSP diagnostics (Rust-first initial slice):\n\
              #   [lsp]\n\
              #   rust_analyzer_path = \"/absolute/path/to/rust-analyzer\"\n\
-             #   timeout_ms = 3000\n\
+             #   timeout_ms = 15000\n\
              #\n\
              # Reflection pass:\n\
              #   [reflection]\n\

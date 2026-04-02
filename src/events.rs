@@ -37,6 +37,11 @@ pub enum InferenceEvent {
     Ready,
     /// Active backend name for the sidebar.
     BackendName(String),
+    /// A generation phase started.
+    GenerationStarted {
+        label: String,
+        show_placeholder: bool,
+    },
     /// A generated token — append to current response.
     Token(String),
     /// Tool calls being executed — shown in sidebar.

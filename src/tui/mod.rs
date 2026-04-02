@@ -36,6 +36,14 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 // How often to advance the spinner (every N ticks at ~60fps = ~100ms per frame)
 const SPINNER_SPEED: u64 = 6;
 
+enum SlashJobOutcome {
+    Context {
+        status_message: String,
+        context: String,
+    },
+    Error(String),
+}
+
 fn truncate_for_width(value: &str, max_chars: usize) -> String {
     let len = value.chars().count();
     if len <= max_chars {
@@ -130,6 +138,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
     let (token_tx, token_rx) = mpsc::channel::<InferenceEvent>();
     let (prompt_tx, prompt_rx) = mpsc::channel::<SessionCommand>();
+    let (slash_tx, slash_rx) = mpsc::channel::<SlashJobOutcome>();
 
     let token_tx_clone = token_tx.clone();
     thread::spawn(move || {
@@ -156,6 +165,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 }
                 InferenceEvent::BackendName(name) => {
                     state.set_backend_name(name);
+                }
+                InferenceEvent::GenerationStarted {
+                    label,
+                    show_placeholder,
+                } => {
+                    state.start_generation(&label, show_placeholder);
                 }
                 InferenceEvent::Token(token) => {
                     state.append_token(&token);
@@ -216,6 +231,24 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             }
         }
 
+        while let Ok(outcome) = slash_rx.try_recv() {
+            match outcome {
+                SlashJobOutcome::Context {
+                    status_message,
+                    context,
+                } => {
+                    state.add_system_message(&status_message);
+                    state.add_user_message(&context);
+                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    state.finish_response();
+                }
+                SlashJobOutcome::Error(message) => {
+                    state.add_system_message(&message);
+                    state.finish_response();
+                }
+            }
+        }
+
         // Calculate remaining time in frame budget
         let elapsed = frame_start.elapsed();
         let remaining = frame_duration.saturating_sub(elapsed);
@@ -254,13 +287,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                                 // These run tools directly and inject results into context
                                 // without requiring the model to format a tool call tag.
                                 if prompt.starts_with('/') {
-                                    handle_slash_command(&prompt, &mut state, &prompt_tx);
+                                    handle_slash_command(&prompt, &mut state, &prompt_tx, &slash_tx);
                                 } else {
                                     state.add_user_message(&prompt);
                                     let _ = prompt_tx.send(SessionCommand::SubmitUser(prompt.clone()));
-                                    state.is_generating = true;
-                                    state.status = "generating...".to_string();
-                                    state.start_assistant_message();
+                                    state.start_generation("generating...", true);
                                 }
                             }
                         }
@@ -580,6 +611,14 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(" <file>", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
+            Span::styled("/hover ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <f:l:c>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/def   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <f:l:c>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
             Span::styled("/lcheck", Style::default().fg(Color::DarkGray)),
             Span::styled(" status", Style::default().fg(Color::DarkGray)),
         ])),
@@ -850,10 +889,49 @@ fn sanitize_for_display(s: &str) -> String {
     result
 }
 
+fn run_tool_immediate<T: crate::tools::Tool>(tool: T, arg: &str) -> std::result::Result<String, String> {
+    match crate::tools::Tool::run(&tool, arg) {
+        Ok(crate::tools::ToolRunResult::Immediate(output)) => Ok(output),
+        Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
+            Err("requested approval unexpectedly".to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn spawn_slash_context_job<F>(
+    state: &mut AppState,
+    slash_tx: &mpsc::Sender<SlashJobOutcome>,
+    running_status: &str,
+    status_message: String,
+    context_prefix: String,
+    work: F,
+) where
+    F: FnOnce() -> std::result::Result<String, String> + Send + 'static,
+{
+    state.start_generation(running_status, false);
+    let tx = slash_tx.clone();
+    thread::spawn(move || {
+        let outcome = match work() {
+            Ok(output) => {
+                let safe = sanitize_for_display(&output);
+                let context = format!("{context_prefix}\n\n{safe}");
+                SlashJobOutcome::Context {
+                    status_message,
+                    context,
+                }
+            }
+            Err(error) => SlashJobOutcome::Error(error),
+        };
+        let _ = tx.send(outcome);
+    });
+}
+
 fn handle_slash_command(
     input: &str,
     state: &mut AppState,
     prompt_tx: &mpsc::Sender<SessionCommand>,
+    slash_tx: &mpsc::Sender<SlashJobOutcome>,
 ) {
     // Parse command and argument
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
@@ -867,42 +945,30 @@ fn handle_slash_command(
                 state.add_system_message("Usage: /read <file_path>");
                 return;
             }
-            let tool = crate::tools::ReadFile;
-            match crate::tools::Tool::run(&tool, arg) {
-                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
-                    state.add_system_message(&format!("loaded: {arg}"));
-                    let safe = sanitize_for_display(&output);
-                    let context = format!("I've loaded this file for context:\n\n{safe}");
-                    state.add_user_message(&context);
-                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
-                }
-                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
-                    state.add_system_message("read requested approval unexpectedly");
-                }
-                Err(e) => {
-                    state.add_system_message(&format!("error reading {arg}: {e}"));
-                }
-            }
+            let arg_owned = arg.to_string();
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "reading file...",
+                format!("loaded: {arg}"),
+                "I've loaded this file for context:".to_string(),
+                move || run_tool_immediate(crate::tools::ReadFile, &arg_owned)
+                    .map_err(|e| format!("error reading {arg_owned}: {e}")),
+            );
         }
 
         "/ls" | "/list" => {
             let path = if arg.is_empty() { "." } else { arg };
-            let tool = crate::tools::ListDir;
-            match crate::tools::Tool::run(&tool, path) {
-                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
-                    state.add_system_message(&format!("listed: {path}"));
-                    let safe = sanitize_for_display(&output);
-                    let context = format!("Directory listing:\n\n{safe}");
-                    state.add_user_message(&context);
-                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
-                }
-                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
-                    state.add_system_message("list requested approval unexpectedly");
-                }
-                Err(e) => {
-                    state.add_system_message(&format!("error listing {path}: {e}"));
-                }
-            }
+            let path_owned = path.to_string();
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "listing directory...",
+                format!("listed: {path}"),
+                "Directory listing:".to_string(),
+                move || run_tool_immediate(crate::tools::ListDir, &path_owned)
+                    .map_err(|e| format!("error listing {path_owned}: {e}")),
+            );
         }
 
         "/search" | "/s" | "/grep" => {
@@ -910,42 +976,32 @@ fn handle_slash_command(
                 state.add_system_message("Usage: /search <query>");
                 return;
             }
-            let tool = crate::tools::SearchCode;
-            match crate::tools::Tool::run(&tool, arg) {
-                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
-                    state.add_system_message(&format!("searched: {arg}"));
-                    let safe = sanitize_for_display(&output);
-                    let context = format!("Search results:\n\n{safe}");
-                    state.add_user_message(&context);
-                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
-                }
-                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
-                    state.add_system_message("search requested approval unexpectedly");
-                }
-                Err(e) => {
-                    state.add_system_message(&format!("error searching: {e}"));
-                }
-            }
+            let arg_owned = arg.to_string();
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "searching code...",
+                format!("searched: {arg}"),
+                "Search results:".to_string(),
+                move || run_tool_immediate(crate::tools::SearchCode, &arg_owned)
+                    .map_err(|e| format!("error searching: {e}")),
+            );
         }
 
         "/git" => {
             let git_arg = if arg.is_empty() { "status" } else { arg };
-            let tool = crate::tools::GitTool;
-            match crate::tools::Tool::run(&tool, git_arg) {
-                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
-                    state.add_system_message(&format!("git: {git_arg}"));
-                    let safe = sanitize_for_display(&output);
-                    let context = format!("Git context ({git_arg}):\n\n{safe}");
-                    state.add_user_message(&context);
-                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
-                }
-                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
-                    state.add_system_message("git requested approval unexpectedly");
-                }
-                Err(e) => {
-                    state.add_system_message(&format!("git error: {e}"));
-                }
-            }
+            let git_arg_owned = git_arg.to_string();
+            let status_message = format!("git: {git_arg}");
+            let context_prefix = format!("Git context ({git_arg}):");
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "running git...",
+                status_message,
+                context_prefix,
+                move || run_tool_immediate(crate::tools::GitTool, &git_arg_owned)
+                    .map_err(|e| format!("git error: {e}")),
+            );
         }
 
         "/diag" | "/lsp" => {
@@ -953,31 +1009,61 @@ fn handle_slash_command(
                 state.add_system_message("Usage: /diag <rust_file>");
                 return;
             }
-            let tool = crate::tools::LspDiagnosticsTool;
-            match crate::tools::Tool::run(&tool, arg) {
-                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
-                    state.add_system_message(&format!("diagnostics: {arg}"));
-                    let safe = sanitize_for_display(&output);
-                    let context = format!("LSP diagnostics:\n\n{safe}");
-                    state.add_user_message(&context);
-                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
-                }
-                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
-                    state.add_system_message("diagnostics requested approval unexpectedly");
-                }
-                Err(e) => {
-                    state.add_system_message(&format!("diagnostics error: {e}"));
-                }
+            let arg_owned = arg.to_string();
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "running diagnostics...",
+                format!("diagnostics: {arg}"),
+                "LSP diagnostics:".to_string(),
+                move || run_tool_immediate(crate::tools::LspDiagnosticsTool, &arg_owned)
+                    .map_err(|e| format!("diagnostics error: {e}")),
+            );
+        }
+
+        "/hover" => {
+            if arg.is_empty() {
+                state.add_system_message("Usage: /hover <file>:<line>:<col>");
+                return;
             }
+            let arg_owned = arg.to_string();
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "loading hover info...",
+                format!("hover: {arg}"),
+                "LSP hover:".to_string(),
+                move || run_tool_immediate(crate::tools::LspHoverTool, &arg_owned)
+                    .map_err(|e| format!("hover error: {e}")),
+            );
+        }
+
+        "/def" | "/definition" => {
+            if arg.is_empty() {
+                state.add_system_message("Usage: /def <file>:<line>:<col>");
+                return;
+            }
+            let arg_owned = arg.to_string();
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "resolving definition...",
+                format!("definition: {arg}"),
+                "LSP definition:".to_string(),
+                move || run_tool_immediate(crate::tools::LspDefinitionTool, &arg_owned)
+                    .map_err(|e| format!("definition error: {e}")),
+            );
         }
 
         "/lcheck" | "/lsp-check" => {
-            let report = crate::tools::rust_lsp_health_report();
-            state.add_system_message("lsp check");
-            let safe = sanitize_for_display(&report);
-            let context = format!("LSP check:\n\n{safe}");
-            state.add_user_message(&context);
-            let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "checking rust lsp...",
+                "lsp check".to_string(),
+                "LSP check:".to_string(),
+                move || Ok(crate::tools::rust_lsp_health_report()),
+            );
         }
 
         "/run" | "/bash" => {
@@ -1075,22 +1161,16 @@ fn handle_slash_command(
                 state.add_system_message("Usage: /fetch <url>");
                 return;
             }
-            let tool = crate::tools::FetchUrlTool;
-            match crate::tools::Tool::run(&tool, arg) {
-                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
-                    state.add_system_message(&format!("fetched: {arg}"));
-                    let safe = sanitize_for_display(&output);
-                    let context = format!("Fetched web context:\n\n{safe}");
-                    state.add_user_message(&context);
-                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
-                }
-                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
-                    state.add_system_message("fetch requested approval unexpectedly");
-                }
-                Err(e) => {
-                    state.add_system_message(&format!("fetch error: {e}"));
-                }
-            }
+            let arg_owned = arg.to_string();
+            spawn_slash_context_job(
+                state,
+                slash_tx,
+                "fetching webpage...",
+                format!("fetched: {arg}"),
+                "Fetched web context:".to_string(),
+                move || run_tool_immediate(crate::tools::FetchUrlTool, &arg_owned)
+                    .map_err(|e| format!("fetch error: {e}")),
+            );
         }
 
         "/approve" => {
@@ -1136,6 +1216,8 @@ fn handle_slash_command(
                  /search <query> — search source files\n  \
                  /git [command]  — git status, diff, log\n  \
                  /diag <file>    — Rust LSP diagnostics for a file\n  \
+                 /hover <f:l:c>  — Rust LSP hover at file:line:col\n  \
+                 /def <f:l:c>    — Rust LSP definition at file:line:col\n  \
                  /lcheck         — Rust LSP setup check\n  \
                  /fetch <url>    — fetch a webpage into context\n  \
                  /run <command>  — propose a shell command\n  \

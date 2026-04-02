@@ -204,7 +204,28 @@ impl AppState {
         self.scroll_offset = 0;
     }
 
+    fn ensure_open_assistant_message(&mut self) {
+        let has_open_assistant = self
+            .messages
+            .last()
+            .map(|msg| msg.role == Role::Assistant)
+            .unwrap_or(false);
+        if !has_open_assistant {
+            self.start_assistant_message();
+        }
+    }
+
+    pub fn start_generation(&mut self, label: &str, show_placeholder: bool) {
+        self.is_generating = true;
+        self.status = label.to_string();
+        if show_placeholder {
+            self.ensure_open_assistant_message();
+        }
+        self.scroll_offset = 0;
+    }
+
     pub fn append_token(&mut self, token: &str) {
+        self.ensure_open_assistant_message();
         if let Some(last) = self.messages.last_mut() {
             if last.role == Role::Assistant {
                 last.content.push_str(token);

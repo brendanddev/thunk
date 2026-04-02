@@ -243,7 +243,10 @@ fn main() -> Result<()> {
                 }
                 println!();
                 if cfg.debug_logging.content && !collected.trim().is_empty() {
-                    debug_log::append_assistant_response(&collected)?;
+                    debug_log::append_assistant_response(
+                        &collected,
+                        debug_log::ResponseSource::Live,
+                    )?;
                 }
                 match handle.join() {
                     Ok(result) => result?,

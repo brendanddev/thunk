@@ -231,7 +231,7 @@ fn normalize_prompt(prompt: &str) -> String {
     let stopwords = [
         "a", "an", "the", "what", "is", "are", "was", "were", "do", "does", "did", "can",
         "could", "would", "should", "please", "tell", "me", "about", "explain", "define",
-        "in", "programming", "code", "for", "to", "of", "and", "or", "how",
+        "in", "programming", "code", "for", "to", "of", "and", "or", "how", "whats", "s",
     ];
 
     cleaned
@@ -312,6 +312,7 @@ mod tests {
     fn normalize_prompt_strips_wrapper_words() {
         assert_eq!(normalize_prompt("What is a pointer?"), "point");
         assert_eq!(normalize_prompt("Explain pointers"), "point");
+        assert_eq!(normalize_prompt("Whats a pointer"), "point");
     }
 
     #[test]

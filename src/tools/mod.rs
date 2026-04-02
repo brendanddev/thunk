@@ -25,7 +25,7 @@ mod write;
 pub use bash::BashTool;
 pub use fs::{ListDir, ReadFile};
 pub use git::GitTool;
-pub use lsp::{LspDiagnosticsTool, rust_lsp_health_report};
+pub use lsp::{LspDefinitionTool, LspDiagnosticsTool, LspHoverTool, rust_lsp_health_report};
 pub use search::SearchCode;
 pub use web::FetchUrlTool;
 pub use write::WriteFileTool;
@@ -76,6 +76,8 @@ impl ToolRegistry {
                 Box::new(SearchCode),
                 Box::new(GitTool),
                 Box::new(LspDiagnosticsTool),
+                Box::new(LspHoverTool),
+                Box::new(LspDefinitionTool),
                 Box::new(FetchUrlTool),
                 Box::new(BashTool),
                 Box::new(WriteFileTool),

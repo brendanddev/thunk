@@ -62,6 +62,23 @@ enum CacheMode {
     PreferPromptLevel,
 }
 
+struct CacheLookup {
+    text: String,
+    hit: bool,
+    source: debug_log::ResponseSource,
+}
+
+fn emit_generation_started(
+    token_tx: &Sender<InferenceEvent>,
+    label: &str,
+    show_placeholder: bool,
+) {
+    let _ = token_tx.send(InferenceEvent::GenerationStarted {
+        label: label.to_string(),
+        show_placeholder,
+    });
+}
+
 /// Persistent model thread — loads the backend once, handles prompts in a loop.
 /// After each response it checks for tool calls and runs a follow-up if needed.
 pub fn model_thread(
@@ -276,6 +293,7 @@ pub fn model_thread(
                 compression::compress_history(&mut session_messages, &*backend, eco_enabled);
 
                 // Run generation — collect full response for tool call detection
+                emit_generation_started(&token_tx, "generating...", false);
                 let response = generate_with_cache(
                     &*backend,
                     &session_messages,
@@ -296,19 +314,23 @@ pub fn model_thread(
                     Err(e) => {
                         let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                     }
-                    Ok(full_response) => {
+                    Ok(response) => {
+                        let response_source = response.source;
+                        let full_response = response.text;
                         info!(
                             response_chars = full_response.chars().count(),
                             reflection_enabled,
                             "generation completed"
                         );
-                        record_generation_budget(
-                            &cfg,
-                            &mut budget,
-                            &token_tx,
-                            prompt_tokens,
-                            &full_response,
-                        );
+                        if !response.hit {
+                            record_generation_budget(
+                                &cfg,
+                                &mut budget,
+                                &token_tx,
+                                prompt_tokens,
+                                &full_response,
+                            );
+                        }
 
                         // Check if the model used any tools
                         let tool_execution = tools.execute_tool_calls(&full_response);
@@ -372,14 +394,18 @@ pub fn model_thread(
                                 CacheMode::PreferPromptLevel,
                             ) {
                                 Ok(follow_up) => {
+                                    let follow_up_source = follow_up.source;
+                                    let follow_up_text = follow_up.text;
                                     let prompt_tokens = estimate_message_tokens(&session_messages);
-                                    record_generation_budget(
-                                        &cfg,
-                                        &mut budget,
-                                        &token_tx,
-                                        prompt_tokens,
-                                        &follow_up,
-                                    );
+                                    if !follow_up.hit {
+                                        record_generation_budget(
+                                            &cfg,
+                                            &mut budget,
+                                            &token_tx,
+                                            prompt_tokens,
+                                            &follow_up_text,
+                                        );
+                                    }
                                     let final_response = if reflection_enabled {
                                         reflect_response(
                                             &*backend,
@@ -389,16 +415,30 @@ pub fn model_thread(
                                             exact_cache.as_ref(),
                                             &mut cache_stats,
                                             &session_messages,
-                                            &follow_up,
+                                            &follow_up_text,
                                         )
                                     } else {
-                                        Ok(follow_up)
+                                        Ok(follow_up_text)
                                     };
 
                                     match final_response {
                                         Ok(final_response) => {
                                             if !final_response.trim().is_empty() {
-                                                log_debug_response(debug_logging_enabled, &final_response);
+                                                log_debug_response(
+                                                    debug_logging_enabled,
+                                                    &final_response,
+                                                    if reflection_enabled {
+                                                        debug_log::ResponseSource::Live
+                                                    } else {
+                                                        follow_up_source
+                                                    },
+                                                );
+                                                store_exact_cache(
+                                                    exact_cache.as_ref(),
+                                                    &backend.name(),
+                                                    &session_messages,
+                                                    &final_response,
+                                                );
                                                 session_messages.push(Message::assistant(&final_response));
                                             }
                                         }
@@ -432,7 +472,21 @@ pub fn model_thread(
                             match final_response {
                                 Ok(final_response) => {
                                     if !final_response.trim().is_empty() {
-                                        log_debug_response(debug_logging_enabled, &final_response);
+                                        log_debug_response(
+                                            debug_logging_enabled,
+                                            &final_response,
+                                            if reflection_enabled {
+                                                debug_log::ResponseSource::Live
+                                            } else {
+                                                response_source
+                                            },
+                                        );
+                                        store_exact_cache(
+                                            exact_cache.as_ref(),
+                                            &backend.name(),
+                                            &session_messages,
+                                            &final_response,
+                                        );
                                         store_prompt_level_cache(
                                             exact_cache.as_ref(),
                                             &backend.name(),
@@ -518,6 +572,7 @@ fn handle_pending_action(
                     }
                 }
                 if run_follow_up {
+                    emit_generation_started(token_tx, "generating...", true);
                     let prompt_tokens = estimate_message_tokens(session_messages);
                     let follow_up = generate_with_cache(
                         backend,
@@ -528,13 +583,17 @@ fn handle_pending_action(
                         cache_stats,
                         CacheMode::PreferPromptLevel,
                     )?;
-                    record_generation_budget(
-                        cfg,
-                        budget,
-                        token_tx,
-                        prompt_tokens,
-                        &follow_up,
-                    );
+                    let follow_up_source = follow_up.source;
+                    let follow_up_text = follow_up.text;
+                    if !follow_up.hit {
+                        record_generation_budget(
+                            cfg,
+                            budget,
+                            token_tx,
+                            prompt_tokens,
+                            &follow_up_text,
+                        );
+                    }
                     let final_response = if reflection_enabled {
                         reflect_response(
                             backend,
@@ -544,13 +603,27 @@ fn handle_pending_action(
                             exact_cache,
                             cache_stats,
                             session_messages,
-                            &follow_up,
+                            &follow_up_text,
                         )?
                     } else {
-                        follow_up
+                        follow_up_text
                     };
                     if !final_response.trim().is_empty() {
-                        log_debug_response(debug_logging_enabled, &final_response);
+                        log_debug_response(
+                            debug_logging_enabled,
+                            &final_response,
+                            if reflection_enabled {
+                                debug_log::ResponseSource::Live
+                            } else {
+                                follow_up_source
+                            },
+                        );
+                        store_exact_cache(
+                            exact_cache,
+                            &backend.name(),
+                            session_messages,
+                            &final_response,
+                        );
                         session_messages.push(Message::assistant(&final_response));
                     }
                 }
@@ -567,6 +640,7 @@ fn handle_pending_action(
                     let _ = token_tx.send(InferenceEvent::ContextMessage(rejection));
                 }
                 if run_follow_up {
+                    emit_generation_started(token_tx, "generating...", true);
                     let follow_up = generate_with_cache(
                         backend,
                         session_messages,
@@ -576,14 +650,18 @@ fn handle_pending_action(
                         cache_stats,
                         CacheMode::PreferPromptLevel,
                     )?;
+                    let follow_up_source = follow_up.source;
+                    let follow_up_text = follow_up.text;
                     let prompt_tokens = estimate_message_tokens(session_messages);
-                    record_generation_budget(
-                        cfg,
-                        budget,
-                        token_tx,
-                        prompt_tokens,
-                        &follow_up,
-                    );
+                    if !follow_up.hit {
+                        record_generation_budget(
+                            cfg,
+                            budget,
+                            token_tx,
+                            prompt_tokens,
+                            &follow_up_text,
+                        );
+                    }
                     let final_response = if reflection_enabled {
                         reflect_response(
                             backend,
@@ -593,13 +671,27 @@ fn handle_pending_action(
                             exact_cache,
                             cache_stats,
                             session_messages,
-                            &follow_up,
+                            &follow_up_text,
                         )?
                     } else {
-                        follow_up
+                        follow_up_text
                     };
                     if !final_response.trim().is_empty() {
-                        log_debug_response(debug_logging_enabled, &final_response);
+                        log_debug_response(
+                            debug_logging_enabled,
+                            &final_response,
+                            if reflection_enabled {
+                                debug_log::ResponseSource::Live
+                            } else {
+                                follow_up_source
+                            },
+                        );
+                        store_exact_cache(
+                            exact_cache,
+                            &backend.name(),
+                            session_messages,
+                            &final_response,
+                        );
                         session_messages.push(Message::assistant(&final_response));
                     }
                 }
@@ -721,12 +813,12 @@ fn emit_cache_update(
     }));
 }
 
-fn log_debug_response(enabled: bool, text: &str) {
+fn log_debug_response(enabled: bool, text: &str, source: debug_log::ResponseSource) {
     if !enabled || text.trim().is_empty() {
         return;
     }
 
-    if let Err(e) = debug_log::append_assistant_response(text) {
+    if let Err(e) = debug_log::append_assistant_response(text, source) {
         warn!(error = %e, "debug assistant response logging failed");
     }
 }
@@ -737,7 +829,7 @@ fn prompt_level_cache_key<'a>(messages: &'a [Message]) -> Option<(&'a str, &'a s
     }
 
     let non_system = messages.iter().filter(|m| m.role != "system").count();
-    if non_system == 0 || non_system > 4 {
+    if non_system == 0 || non_system > 12 {
         return None;
     }
 
@@ -790,6 +882,21 @@ fn store_prompt_level_cache(
     }
 }
 
+fn store_exact_cache(
+    exact_cache: Option<&ExactCache>,
+    backend_name: &str,
+    messages: &[Message],
+    response: &str,
+) {
+    let Some(cache) = exact_cache else {
+        return;
+    };
+
+    if let Err(e) = cache.put(backend_name, messages, response) {
+        warn!(error = %e, "exact cache store failed");
+    }
+}
+
 fn generate_with_cache(
     backend: &dyn InferenceBackend,
     messages: &[Message],
@@ -798,7 +905,7 @@ fn generate_with_cache(
     exact_cache: Option<&ExactCache>,
     cache_stats: &mut SessionCacheStats,
     cache_mode: CacheMode,
-) -> Result<String> {
+) -> Result<CacheLookup> {
     if let Some(cache) = exact_cache {
         match cache.get(&backend.name(), messages) {
             Ok(Some(cached)) => {
@@ -811,7 +918,11 @@ fn generate_with_cache(
                 if stream_tokens {
                     let _ = token_tx.send(InferenceEvent::Token(cached.clone()));
                 }
-                return Ok(cached);
+                return Ok(CacheLookup {
+                    text: cached,
+                    hit: true,
+                    source: debug_log::ResponseSource::ExactCache,
+                });
             }
             Ok(None) => {}
             Err(e) => {
@@ -832,7 +943,11 @@ fn generate_with_cache(
                         if stream_tokens {
                             let _ = token_tx.send(InferenceEvent::Token(cached.clone()));
                         }
-                        return Ok(cached);
+                        return Ok(CacheLookup {
+                            text: cached,
+                            hit: true,
+                            source: debug_log::ResponseSource::PromptCache,
+                        });
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -851,7 +966,11 @@ fn generate_with_cache(
                         if stream_tokens {
                             let _ = token_tx.send(InferenceEvent::Token(cached.clone()));
                         }
-                        return Ok(cached);
+                        return Ok(CacheLookup {
+                            text: cached,
+                            hit: true,
+                            source: debug_log::ResponseSource::SemanticCache,
+                        });
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -866,12 +985,11 @@ fn generate_with_cache(
     emit_cache_update(cache_stats, false, &token_tx);
 
     let response = run_and_collect(backend, messages, token_tx.clone(), stream_tokens)?;
-    if let Some(cache) = exact_cache {
-        if let Err(e) = cache.put(&backend.name(), messages, &response) {
-            warn!(error = %e, "exact cache store failed");
-        }
-    }
-    Ok(response)
+    Ok(CacheLookup {
+        text: response,
+        hit: false,
+        source: debug_log::ResponseSource::Live,
+    })
 }
 
 /// Run generation and collect the full response as a String,
@@ -949,6 +1067,7 @@ fn reflect_response(
     info!(draft_chars = draft.chars().count(), "reflection pass started");
     let reflection_messages = build_reflection_messages(session_messages, draft);
     let prompt_tokens = estimate_message_tokens(&reflection_messages);
+    emit_generation_started(token_tx, "reflecting...", false);
     let reflected = generate_with_cache(
         backend,
         &reflection_messages,
@@ -958,14 +1077,16 @@ fn reflect_response(
         cache_stats,
         CacheMode::ExactOnly,
     )?;
-    record_generation_budget(cfg, budget, token_tx, prompt_tokens, &reflected);
+    if !reflected.hit {
+        record_generation_budget(cfg, budget, token_tx, prompt_tokens, &reflected.text);
+    }
 
-    if reflected.trim().is_empty() || looks_like_reflection_meta(&reflected) {
+    if reflected.text.trim().is_empty() || looks_like_reflection_meta(&reflected.text) {
         warn!("reflection returned empty or meta response, falling back to draft");
         Ok(draft.to_string())
     } else {
-        info!(chars = reflected.chars().count(), "reflection pass completed");
-        Ok(reflected)
+        info!(chars = reflected.text.chars().count(), "reflection pass completed");
+        Ok(reflected.text)
     }
 }
 
@@ -1098,6 +1219,22 @@ mod tests {
         ];
 
         assert!(prompt_level_cache_key(&messages).is_none());
+    }
+
+    #[test]
+    fn prompt_level_cache_key_allows_longer_plain_chat() {
+        let messages = vec![
+            Message::system("system"),
+            Message::user("What is a pointer?"),
+            Message::assistant("A pointer stores an address."),
+            Message::user("Explain ownership."),
+            Message::assistant("Ownership controls cleanup."),
+            Message::user("Whats a pointer?"),
+        ];
+
+        let key = prompt_level_cache_key(&messages);
+
+        assert_eq!(key, Some(("system", "Whats a pointer?")));
     }
 }
 
