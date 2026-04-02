@@ -5,6 +5,7 @@
 use std::process::Command;
 
 use crate::error::{ParamsError, Result};
+use crate::events::PendingActionKind;
 use super::{PendingToolAction, Tool, ToolRunResult};
 
 pub struct BashTool;
@@ -30,8 +31,10 @@ impl Tool for BashTool {
         }
 
         Ok(ToolRunResult::RequiresApproval(PendingToolAction {
+            kind: PendingActionKind::ShellCommand,
             tool_name: self.name().to_string(),
             argument: command.to_string(),
+            display_argument: command.to_string(),
             title: "Approve shell command".to_string(),
             preview: command.to_string(),
         }))
