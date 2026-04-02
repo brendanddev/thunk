@@ -1,21 +1,7 @@
 // main.rs
 //
-// Entry point for params-cli. This file does two things:
-//
-//   1. Declares the modules that make up the project (mod error, mod inference, etc.)
-//      Rust requires you to explicitly declare every module in the tree. Think of
-//      these `mod` statements as telling the compiler "this file exists and is part
-//      of the project". The actual code lives in src/error.rs, src/inference/mod.rs etc.
-//
-//   2. Defines the CLI interface using Clap, then routes each command to the right module.
-//
-// Clap works via derive macros — you describe your CLI as Rust structs and enums,
-// and Clap generates all the argument parsing, help text, and error messages for you.
-// The doc comments (///) on each field and variant become the help text you see
-// when running `params --help`.
+// Entry point.
 
-// Declare modules. Each of these corresponds to a file or folder in src/.
-// We'll add more here (inference, tui, memory, etc.) as we build them out.
 mod error;
 mod config;
 mod events;
@@ -38,7 +24,7 @@ use error::Result;
 #[derive(Parser)]
 #[command(name = "params")]
 #[command(about = "Local-first AI coding assistant")]
-#[command(version)] // reads version from Cargo.toml automatically
+#[command(version)]
 struct Cli {
     /// An optional one-shot prompt. If provided without a subcommand,
     /// params runs the prompt through the local model and prints the response.
@@ -161,27 +147,22 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Pull { model }) => {
             println!("Pulling model: {model}");
-            // TODO: src/commands/pull.rs — download .gguf to ~/.params/models/
         }
 
         Some(Command::Index { path }) => {
             println!("Indexing: {path}");
-            // TODO: src/memory/mod.rs — walk repo, chunk files, store in SQLite
         }
 
         Some(Command::Compare { prompt }) => {
             println!("Comparing: {prompt}");
-            // TODO: src/compare/mod.rs — run prompt on local + Anthropic, show side by side
         }
 
         Some(Command::Bench { last }) => {
             println!("Benchmark (last {last} ratings)");
-            // TODO: src/bench/mod.rs — query SQLite ratings, print summary
         }
 
         Some(Command::Train { project }) => {
             println!("Training on: {project}");
-            // TODO: src/commands/train.rs — generate data, run LoRA fine-tune
         }
 
         // No subcommand was given — check if there's a one-shot prompt,

@@ -21,8 +21,6 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use tracing::info;
-
 use crate::error::Result;
 use crate::inference::Message;
 use crate::events::InferenceEvent;
@@ -35,7 +33,6 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 const SPINNER_SPEED: u64 = 6;
 
 pub fn run() -> Result<()> {
-    info!("TUI starting");
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
@@ -45,7 +42,6 @@ pub fn run() -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     terminal.show_cursor()?;
-    info!("TUI exiting");
     result
 }
 
@@ -116,12 +112,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         (KeyCode::Enter, _) => {
                             if !state.input.is_empty() && !state.is_generating && state.is_ready() {
                                 let prompt = state.submit_input();
-                                state.add_user_message(&prompt);
-                                let messages = state.build_messages();
-                                let _ = prompt_tx.send(messages);
-                                state.is_generating = true;
-                                state.status = "generating...".to_string();
-                                state.start_assistant_message();
+
+                                // Check for slash commands before sending to inference.
+                                // These run tools directly and inject results into context
+                                // without requiring the model to format a tool call tag.
+                                if prompt.starts_with('/') {
+                                    handle_slash_command(&prompt, &mut state);
+                                } else {
+                                    state.add_user_message(&prompt);
+                                    let messages = state.build_messages();
+                                    let _ = prompt_tx.send(messages);
+                                    state.is_generating = true;
+                                    state.status = "generating...".to_string();
+                                    state.start_assistant_message();
+                                }
                             }
                         }
 
@@ -310,6 +314,27 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("^q     ", Style::default().fg(Color::DarkGray)),
             Span::styled("quit", Style::default().fg(Color::DarkGray)),
         ])),
+        ListItem::new(Line::from("")),
+        ListItem::new(Line::from(vec![
+            Span::styled("─────────────────────", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from("")),
+        ListItem::new(Line::from(vec![
+            Span::styled("/read  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("<path>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/ls    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[path]", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/search", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <q>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/clear ", Style::default().fg(Color::DarkGray)),
+            Span::styled("history", Style::default().fg(Color::DarkGray)),
+        ])),
     ];
 
     frame.render_widget(List::new(items).block(block), area);
@@ -400,7 +425,20 @@ fn draw_chat(frame: &mut Frame, state: &AppState, area: Rect) {
                 }
                 lines.push(Line::from(""));
             }
-            Role::System => {}
+            Role::System => {
+                // System messages are shown as subtle info lines
+                // They are NOT sent to the model — just UI feedback
+                for line in msg.content.lines() {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("● {line}"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
         }
     }
 
@@ -477,4 +515,123 @@ fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let paragraph = Paragraph::new(Line::from(input_spans)).block(block);
     frame.render_widget(paragraph, area);
+}
+
+/// Handles slash commands typed by the user.
+///
+/// Slash commands run tools directly without going through the model.
+/// The result is injected into the conversation as a user message so
+/// the model can reason about the actual content on the next message.
+///
+/// Available commands:
+///   /read <path>     — read a file into context
+///   /ls [path]       — list directory contents
+///   /search <query>  — search across source files
+///   /help            — show available commands
+///   /clear           — clear the conversation history
+/// Strip ANSI escape codes and non-printable characters from a string.
+/// Prevents terminal corruption when file contents are rendered in the TUI.
+fn sanitize_for_display(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Skip ANSI escape sequences (ESC [ ... m)
+            '' => {
+                // Skip everything until we hit a letter (end of escape sequence)
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            // Keep newlines, tabs, and printable chars
+            '\n' | '\t' => result.push(c),
+            c if c.is_control() => {} // skip other control chars
+            c => result.push(c),
+        }
+    }
+    result
+}
+
+fn handle_slash_command(input: &str, state: &mut AppState) {
+    // Parse command and argument
+    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+    let cmd = parts[0].to_lowercase();
+    let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+    match cmd.as_str() {
+        "/read" | "/r" => {
+            if arg.is_empty() {
+                state.add_system_message("Usage: /read <file_path>");
+                return;
+            }
+            let tool = crate::tools::ReadFile;
+            match crate::tools::Tool::run(&tool, arg) {
+                Ok(output) => {
+                    state.add_system_message(&format!("loaded: {arg}"));
+                    let safe = sanitize_for_display(&output);
+                    state.add_user_message(&format!("I've loaded this file for context:\n\n{safe}"));
+                }
+                Err(e) => {
+                    state.add_system_message(&format!("error reading {arg}: {e}"));
+                }
+            }
+        }
+
+        "/ls" | "/list" => {
+            let path = if arg.is_empty() { "." } else { arg };
+            let tool = crate::tools::ListDir;
+            match crate::tools::Tool::run(&tool, path) {
+                Ok(output) => {
+                    state.add_system_message(&format!("listed: {path}"));
+                    let safe = sanitize_for_display(&output);
+                    state.add_user_message(&format!("Directory listing:\n\n{safe}"));
+                }
+                Err(e) => {
+                    state.add_system_message(&format!("error listing {path}: {e}"));
+                }
+            }
+        }
+
+        "/search" | "/s" | "/grep" => {
+            if arg.is_empty() {
+                state.add_system_message("Usage: /search <query>");
+                return;
+            }
+            let tool = crate::tools::SearchCode;
+            match crate::tools::Tool::run(&tool, arg) {
+                Ok(output) => {
+                    state.add_system_message(&format!("searched: {arg}"));
+                    let safe = sanitize_for_display(&output);
+                    state.add_user_message(&format!("Search results:\n\n{safe}"));
+                }
+                Err(e) => {
+                    state.add_system_message(&format!("error searching: {e}"));
+                }
+            }
+        }
+
+        "/clear" | "/c" => {
+            state.clear_messages();
+            state.add_system_message("conversation cleared");
+        }
+
+        "/help" | "/h" | "/?" => {
+            state.add_system_message(
+                "/read <path>    — load a file into context\n  \
+                 /ls [path]      — list directory (default: current)\n  \
+                 /search <query> — search source files\n  \
+                 /clear          — clear conversation\n  \
+                 /help           — show this message"
+            );
+        }
+
+        _ => {
+            state.add_system_message(&format!(
+                "unknown command: {cmd}. Type /help for available commands."
+            ));
+        }
+    }
 }
