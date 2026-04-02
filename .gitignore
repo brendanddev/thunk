@@ -2,10 +2,14 @@
 ## Environment variables
 .env
 
+## Build output
+/target
+
 ## Documentation
-CLAUDE.md
-PLANS.md
-NOTES.md
+docs/
 
-
-
+## Models
+models/
+*.gguf
+*.ggml
+*.bin

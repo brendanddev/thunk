@@ -1,0 +1,49 @@
+// src/inference/backend.rs
+
+use std::sync::mpsc::Sender;
+use crate::events::InferenceEvent;
+use crate::error::Result;
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+impl Message {
+    pub fn system(content: &str) -> Self {
+        Self { role: "system".to_string(), content: content.to_string() }
+    }
+    pub fn user(content: &str) -> Self {
+        Self { role: "user".to_string(), content: content.to_string() }
+    }
+    pub fn assistant(content: &str) -> Self {
+        Self { role: "assistant".to_string(), content: content.to_string() }
+    }
+}
+
+/// The base system prompt — tool descriptions get appended to this at runtime.
+pub const SYSTEM_PROMPT_BASE: &str = "\
+You are params, a local AI coding assistant. \
+Be concise and precise. \
+Prefer code over lengthy explanation. \
+When showing code, use markdown code blocks with the language specified. \
+If you are unsure about something, say so.";
+
+/// Returns the full system prompt with tool descriptions appended.
+pub fn system_prompt_with_tools(tool_descriptions: &str) -> String {
+    format!("{}\n\n{}", SYSTEM_PROMPT_BASE, tool_descriptions)
+}
+
+/// For backward compatibility — used where tools aren't set up yet
+pub const SYSTEM_PROMPT: &str = SYSTEM_PROMPT_BASE;
+
+pub trait InferenceBackend: Send {
+    fn generate(
+        &self,
+        messages: &[Message],
+        tx: Sender<InferenceEvent>,
+    ) -> Result<()>;
+
+    fn name(&self) -> String;
+}
