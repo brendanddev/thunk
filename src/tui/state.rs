@@ -31,6 +31,9 @@ pub struct AppState {
     /// Lines scrolled up from bottom (0 = pinned to bottom)
     pub scroll_offset: usize,
 
+    /// Maximum scroll value (updated each frame based on content size)
+    pub max_scroll: usize,
+
     /// Sidebar status string
     pub status: String,
 
@@ -55,6 +58,7 @@ impl AppState {
             messages: Vec::new(),
             is_generating: false,
             scroll_offset: 0,
+            max_scroll: 0,
             status: "loading...".to_string(),
             model_ready: false,
             backend_name: "...".to_string(),
@@ -71,6 +75,7 @@ impl AppState {
     /// Submit input and clear it, returning the text
     pub fn submit_input(&mut self) -> String {
         self.cursor = 0;
+        self.scroll_offset = 0;
         std::mem::take(&mut self.input)
     }
 
@@ -108,10 +113,7 @@ impl AppState {
         let before = &self.input[..self.cursor];
         // Skip trailing spaces then find start of word
         let trim_end = before.trim_end_matches(' ').len();
-        let word_start = before[..trim_end]
-            .rfind(' ')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let word_start = before[..trim_end].rfind(' ').map(|i| i + 1).unwrap_or(0);
         self.input.drain(word_start..self.cursor);
         self.cursor = word_start;
     }
@@ -196,7 +198,10 @@ impl AppState {
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_add(lines);
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(lines)
+            .min(self.max_scroll);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
@@ -240,7 +245,7 @@ impl AppState {
             format!("{before}\x1b[7m{at_cursor}\x1b[0m{rest}")
         }
     }
-    
+
     pub fn add_system_message(&mut self, content: &str) {
         self.messages.push(ChatMessage {
             role: Role::System,
@@ -252,6 +257,4 @@ impl AppState {
         self.messages.clear();
         self.scroll_offset = 0;
     }
-
-
 }

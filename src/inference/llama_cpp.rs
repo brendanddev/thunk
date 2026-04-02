@@ -14,9 +14,9 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
 };
 
+use super::backend::{InferenceBackend, Message};
 use crate::error::{ParamsError, Result};
 use crate::events::InferenceEvent;
-use super::backend::{InferenceBackend, Message};
 
 /// Formats a conversation into a ChatML prompt string.
 /// Qwen uses ChatML format — we build it manually.
@@ -47,8 +47,8 @@ impl LlamaCppBackend {
     /// Load a model from a .gguf file path. This is the slow step — it reads
     /// the weights from disk and uploads them to GPU memory.
     pub fn load(model_path: PathBuf, max_tokens: i32, temperature: f32) -> Result<Self> {
-        let mut backend = LlamaBackend::init()
-            .map_err(|e| ParamsError::Inference(e.to_string()))?;
+        let mut backend =
+            LlamaBackend::init().map_err(|e| ParamsError::Inference(e.to_string()))?;
         backend.void_logs();
 
         let model_params = LlamaModelParams::default();
@@ -82,22 +82,26 @@ impl InferenceBackend for LlamaCppBackend {
         // The model weights stay loaded — only the KV cache is reset.
         // This is much cheaper than reloading the model.
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(8192));
+            .with_n_ctx(NonZeroU32::new(8192))
+            .with_n_batch(8192);
 
-        let mut ctx = self.model
+        let mut ctx = self
+            .model
             .new_context(&self._backend, ctx_params)
             .map_err(|e| ParamsError::Inference(e.to_string()))?;
 
         let prompt = format_messages(messages);
 
-        let tokens = self.model
+        let tokens = self
+            .model
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| ParamsError::Inference(e.to_string()))?;
 
         let mut batch = LlamaBatch::new(tokens.len().max(2048), 1);
         let last_idx = (tokens.len() - 1) as i32;
         for (i, token) in tokens.iter().enumerate() {
-            batch.add(*token, i as i32, &[0], i as i32 == last_idx)
+            batch
+                .add(*token, i as i32, &[0], i as i32 == last_idx)
                 .map_err(|e| ParamsError::Inference(e.to_string()))?;
         }
 
@@ -120,7 +124,8 @@ impl InferenceBackend for LlamaCppBackend {
             }
 
             #[allow(deprecated)]
-            let token_bytes = self.model
+            let token_bytes = self
+                .model
                 .token_to_bytes(next_token, Special::Plaintext)
                 .map_err(|e| ParamsError::Inference(e.to_string()))?;
 
@@ -137,7 +142,8 @@ impl InferenceBackend for LlamaCppBackend {
             }
 
             batch.clear();
-            batch.add(next_token, current_pos, &[0], true)
+            batch
+                .add(next_token, current_pos, &[0], true)
                 .map_err(|e| ParamsError::Inference(e.to_string()))?;
             current_pos += 1;
 

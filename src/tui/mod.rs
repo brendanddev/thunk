@@ -8,7 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -22,8 +25,8 @@ use ratatui::{
 };
 
 use crate::error::Result;
-use crate::inference::Message;
 use crate::events::InferenceEvent;
+use crate::inference::Message;
 use state::{AppState, Role};
 
 // Spinner frames — braille dots give a smooth animation
@@ -35,12 +38,22 @@ const SPINNER_SPEED: u64 = 6;
 pub fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_app(&mut terminal);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -66,7 +79,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         state.tick();
 
         // Draw current frame
-        terminal.draw(|frame| draw(frame, &state))?;
+        terminal.draw(|frame| draw(frame, &mut state))?;
 
         // Drain all pending inference events
         while let Ok(event) = token_rx.try_recv() {
@@ -140,10 +153,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         }
 
                         // Cursor movement
-                        (KeyCode::Left, _) => { state.cursor_left(); }
-                        (KeyCode::Right, _) => { state.cursor_right(); }
-                        (KeyCode::Home, _) => { state.cursor_home(); }
-                        (KeyCode::End, _) => { state.cursor_end(); }
+                        (KeyCode::Left, _) => {
+                            state.cursor_left();
+                        }
+                        (KeyCode::Right, _) => {
+                            state.cursor_right();
+                        }
+                        (KeyCode::Home, _) => {
+                            state.cursor_home();
+                        }
+                        (KeyCode::End, _) => {
+                            state.cursor_end();
+                        }
 
                         // Ctrl+A — go to start
                         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
@@ -167,10 +188,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         }
 
                         // Scroll
-                        (KeyCode::Up, _) => { state.scroll_up(1); }
-                        (KeyCode::Down, _) => { state.scroll_down(1); }
-                        (KeyCode::PageUp, _) => { state.scroll_up(10); }
-                        (KeyCode::PageDown, _) => { state.scroll_down(10); }
+                        (KeyCode::Up, _) => {
+                            state.scroll_up(1);
+                        }
+                        (KeyCode::Down, _) => {
+                            state.scroll_down(1);
+                        }
+                        (KeyCode::PageUp, _) => {
+                            state.scroll_up(10);
+                        }
+                        (KeyCode::PageDown, _) => {
+                            state.scroll_down(10);
+                        }
 
                         // Regular character input
                         (KeyCode::Char(c), KeyModifiers::NONE)
@@ -185,9 +214,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 // Handle paste events
                 Event::Paste(text) => {
                     // Strip newlines from paste — treat as single line
-                    let clean: String = text.chars()
-                        .filter(|&c| c != '\n' && c != '\r')
-                        .collect();
+                    let clean: String = text.chars().filter(|&c| c != '\n' && c != '\r').collect();
                     state.insert_str(&clean);
                 }
 
@@ -197,7 +224,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     }
 }
 
-fn draw(frame: &mut Frame, state: &AppState) {
+fn draw(frame: &mut Frame, state: &mut AppState) {
     let size = frame.area();
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
@@ -256,15 +283,14 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(&status_line, Style::default().fg(status_color)),
         ])),
         ListItem::new(Line::from("")),
-        ListItem::new(Line::from(vec![
-            Span::styled("backend", Style::default().fg(Color::DarkGray)),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                format!("  {backend_display}"),
-                Style::default().fg(Color::Cyan),
-            ),
-        ])),
+        ListItem::new(Line::from(vec![Span::styled(
+            "backend",
+            Style::default().fg(Color::DarkGray),
+        )])),
+        ListItem::new(Line::from(vec![Span::styled(
+            format!("  {backend_display}"),
+            Style::default().fg(Color::Cyan),
+        )])),
         ListItem::new(Line::from("")),
         ListItem::new(Line::from(vec![
             Span::styled("msgs  ", Style::default().fg(Color::DarkGray)),
@@ -290,9 +316,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             }
         },
         ListItem::new(Line::from("")),
-        ListItem::new(Line::from(vec![
-            Span::styled("─────────────────────", Style::default().fg(Color::DarkGray)),
-        ])),
+        ListItem::new(Line::from(vec![Span::styled(
+            "─────────────────────",
+            Style::default().fg(Color::DarkGray),
+        )])),
         ListItem::new(Line::from("")),
         ListItem::new(Line::from(vec![
             Span::styled("enter  ", Style::default().fg(Color::DarkGray)),
@@ -315,9 +342,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("quit", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from("")),
-        ListItem::new(Line::from(vec![
-            Span::styled("─────────────────────", Style::default().fg(Color::DarkGray)),
-        ])),
+        ListItem::new(Line::from(vec![Span::styled(
+            "─────────────────────",
+            Style::default().fg(Color::DarkGray),
+        )])),
         ListItem::new(Line::from("")),
         ListItem::new(Line::from(vec![
             Span::styled("/read  ", Style::default().fg(Color::DarkGray)),
@@ -340,7 +368,7 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
-fn draw_main(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_main(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
@@ -349,7 +377,7 @@ fn draw_main(frame: &mut Frame, state: &AppState, area: Rect) {
     draw_input(frame, state, vertical[1]);
 }
 
-fn draw_chat(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_chat(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -383,10 +411,13 @@ fn draw_chat(frame: &mut Frame, state: &AppState, area: Rect) {
                 // User badge
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(" you ", Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        " you ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]));
                 // User message content
                 for line in msg.content.lines() {
@@ -404,10 +435,13 @@ fn draw_chat(frame: &mut Frame, state: &AppState, area: Rect) {
                 // Assistant badge
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(" params ", Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        " params ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]));
                 // Assistant message content
                 for line in msg.content.lines() {
@@ -431,10 +465,7 @@ fn draw_chat(frame: &mut Frame, state: &AppState, area: Rect) {
                 for line in msg.content.lines() {
                     lines.push(Line::from(vec![
                         Span::raw("  "),
-                        Span::styled(
-                            format!("● {line}"),
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled(format!("● {line}"), Style::default().fg(Color::DarkGray)),
                     ]));
                 }
                 lines.push(Line::from(""));
@@ -445,25 +476,25 @@ fn draw_chat(frame: &mut Frame, state: &AppState, area: Rect) {
     let visible_width = area.width.saturating_sub(2) as usize;
     let visible_height = area.height.saturating_sub(2) as usize;
 
-    let total_display_lines: usize = lines.iter().map(|line| {
-        let char_len: usize = line.spans.iter()
-            .map(|s| s.content.chars().count())
-            .sum();
-        if char_len == 0 || visible_width == 0 {
-            1
-        } else {
-            (char_len + visible_width - 1) / visible_width
-        }
-    }).sum();
+    let total_display_lines: usize = lines
+        .iter()
+        .map(|line| {
+            let char_len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            if char_len == 0 || visible_width == 0 {
+                1
+            } else {
+                (char_len + visible_width - 1) / visible_width
+            }
+        })
+        .sum();
 
     let total_with_buffer = total_display_lines + 2;
     let max_scroll = total_with_buffer.saturating_sub(visible_height);
 
-    let scroll = if state.scroll_offset == 0 {
-        max_scroll
-    } else {
-        max_scroll.saturating_sub(state.scroll_offset)
-    };
+    state.max_scroll = max_scroll;
+    state.scroll_offset = state.scroll_offset.min(max_scroll);
+
+    let scroll = max_scroll.saturating_sub(state.scroll_offset);
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -500,7 +531,12 @@ fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
     } else if after_cursor.is_empty() {
         vec![
             Span::styled(before_cursor.to_string(), Style::default().fg(Color::White)),
-            Span::styled("█", Style::default().fg(Color::White).add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "█",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
         ]
     } else {
         let mut chars = after_cursor.chars();
@@ -508,7 +544,10 @@ fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
         let rest: String = chars.collect();
         vec![
             Span::styled(before_cursor.to_string(), Style::default().fg(Color::White)),
-            Span::styled(at_cursor, Style::default().fg(Color::Black).bg(Color::White)),
+            Span::styled(
+                at_cursor,
+                Style::default().fg(Color::Black).bg(Color::White),
+            ),
             Span::styled(rest, Style::default().fg(Color::White)),
         ]
     };
@@ -572,7 +611,8 @@ fn handle_slash_command(input: &str, state: &mut AppState) {
                 Ok(output) => {
                     state.add_system_message(&format!("loaded: {arg}"));
                     let safe = sanitize_for_display(&output);
-                    state.add_user_message(&format!("I've loaded this file for context:\n\n{safe}"));
+                    state
+                        .add_user_message(&format!("I've loaded this file for context:\n\n{safe}"));
                 }
                 Err(e) => {
                     state.add_system_message(&format!("error reading {arg}: {e}"));
@@ -624,7 +664,7 @@ fn handle_slash_command(input: &str, state: &mut AppState) {
                  /ls [path]      — list directory (default: current)\n  \
                  /search <query> — search source files\n  \
                  /clear          — clear conversation\n  \
-                 /help           — show this message"
+                 /help           — show this message",
             );
         }
 
