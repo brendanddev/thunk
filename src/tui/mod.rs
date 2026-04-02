@@ -26,7 +26,7 @@ use ratatui::{
 use tracing::info;
 
 use crate::error::Result;
-use crate::events::{InferenceEvent, PendingActionKind};
+use crate::events::{InferenceEvent, PendingActionKind, ProgressStatus, ProgressTrace};
 use crate::inference::SessionCommand;
 use state::{AppState, Role};
 
@@ -38,10 +38,13 @@ const SPINNER_SPEED: u64 = 6;
 
 enum SlashJobOutcome {
     Context {
-        status_message: String,
+        finished_trace: String,
         context: String,
     },
-    Error(String),
+    Error {
+        failed_trace: String,
+        message: String,
+    },
 }
 
 fn truncate_for_width(value: &str, max_chars: usize) -> String {
@@ -172,6 +175,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 } => {
                     state.start_generation(&label, show_placeholder);
                 }
+                InferenceEvent::Trace(trace) => {
+                    state.apply_trace(trace);
+                }
                 InferenceEvent::Token(token) => {
                     state.append_token(&token);
                 }
@@ -234,15 +240,27 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         while let Ok(outcome) = slash_rx.try_recv() {
             match outcome {
                 SlashJobOutcome::Context {
-                    status_message,
+                    finished_trace,
                     context,
                 } => {
-                    state.add_system_message(&status_message);
+                    state.apply_trace(ProgressTrace {
+                        status: ProgressStatus::Finished,
+                        label: finished_trace,
+                        persist: true,
+                    });
                     state.add_user_message(&context);
                     let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
                     state.finish_response();
                 }
-                SlashJobOutcome::Error(message) => {
+                SlashJobOutcome::Error {
+                    failed_trace,
+                    message,
+                } => {
+                    state.apply_trace(ProgressTrace {
+                        status: ProgressStatus::Failed,
+                        label: failed_trace,
+                        persist: true,
+                    });
                     state.add_system_message(&message);
                     state.finish_response();
                 }
@@ -428,6 +446,8 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let status_line = if !state.model_ready {
         format!("{spinner_frame} {}", state.status)
+    } else if let Some(ref trace) = state.current_trace {
+        format!("{spinner_frame} {}", truncate_for_width(trace, 18))
     } else if state.pending_action.is_some() {
         state.status.clone()
     } else if state.is_generating {
@@ -444,8 +464,7 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     // Truncate backend name to fit sidebar
     let backend_display = truncate_for_width(&state.backend_name, 18);
-
-    let items = vec![
+    let mut items = vec![
         ListItem::new(Line::from(vec![
             Span::styled("● ", Style::default().fg(status_color)),
             Span::styled(&status_line, Style::default().fg(status_color)),
@@ -528,32 +547,56 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             ),
         ])),
         ListItem::new(Line::from("")),
-        {
-            if let Some(ref call) = state.last_tool_call {
-                let truncated = truncate_for_width(call, 18);
-                ListItem::new(Line::from(vec![
-                    Span::styled("tool  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(truncated, Style::default().fg(Color::Yellow)),
-                ]))
-            } else {
-                ListItem::new(Line::from(""))
-            }
-        },
-        {
-            if let Some(ref pending) = state.pending_action {
-                let label = match pending.kind {
-                    PendingActionKind::ShellCommand => "pending",
-                    PendingActionKind::FileWrite => "pending",
-                };
-                let truncated = truncate_for_width(&pending.title, 18);
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{label:<6}"), Style::default().fg(Color::DarkGray)),
-                    Span::styled(truncated, Style::default().fg(Color::Yellow)),
-                ]))
-            } else {
-                ListItem::new(Line::from(""))
-            }
-        },
+        ListItem::new(Line::from(vec![Span::styled(
+            "activity",
+            Style::default().fg(Color::DarkGray),
+        )])),
+    ];
+
+    if let Some(ref trace) = state.current_trace {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("  now ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_for_width(trace, 14),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])));
+    } else {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("  now ", Style::default().fg(Color::DarkGray)),
+            Span::styled("idle", Style::default().fg(Color::DarkGray)),
+        ])));
+    }
+
+    if let Some(ref call) = state.last_tool_call {
+        let truncated = truncate_for_width(call, 14);
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("  tool", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {truncated}"), Style::default().fg(Color::Yellow)),
+        ])));
+    }
+
+    if let Some(ref pending) = state.pending_action {
+        let truncated = truncate_for_width(&pending.title, 14);
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("  wait", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {truncated}"), Style::default().fg(Color::Yellow)),
+        ])));
+    }
+
+    for trace in state.recent_traces.iter().take(3) {
+        let icon = if trace.success { "  ✓ " } else { "  ✕ " };
+        let color = if trace.success { Color::Green } else { Color::Red };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(icon, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_for_width(&trace.label, 14),
+                Style::default().fg(color),
+            ),
+        ])));
+    }
+
+    items.extend([
         ListItem::new(Line::from("")),
         ListItem::new(Line::from(vec![Span::styled(
             "─────────────────────",
@@ -662,7 +705,7 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("/clear-debug-log", Style::default().fg(Color::DarkGray)),
             Span::styled(" reset", Style::default().fg(Color::DarkGray)),
         ])),
-    ];
+    ]);
 
     frame.render_widget(List::new(items).block(block), area);
 }
@@ -903,13 +946,20 @@ fn spawn_slash_context_job<F>(
     state: &mut AppState,
     slash_tx: &mpsc::Sender<SlashJobOutcome>,
     running_status: &str,
-    status_message: String,
+    started_trace: String,
+    finished_trace: String,
+    failed_trace: String,
     context_prefix: String,
     work: F,
 ) where
     F: FnOnce() -> std::result::Result<String, String> + Send + 'static,
 {
     state.start_generation(running_status, false);
+    state.apply_trace(ProgressTrace {
+        status: ProgressStatus::Started,
+        label: started_trace,
+        persist: true,
+    });
     let tx = slash_tx.clone();
     thread::spawn(move || {
         let outcome = match work() {
@@ -917,11 +967,14 @@ fn spawn_slash_context_job<F>(
                 let safe = sanitize_for_display(&output);
                 let context = format!("{context_prefix}\n\n{safe}");
                 SlashJobOutcome::Context {
-                    status_message,
+                    finished_trace,
                     context,
                 }
             }
-            Err(error) => SlashJobOutcome::Error(error),
+            Err(error) => SlashJobOutcome::Error {
+                failed_trace,
+                message: error,
+            },
         };
         let _ = tx.send(outcome);
     });
@@ -950,7 +1003,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "reading file...",
-                format!("loaded: {arg}"),
+                format!("reading {arg}"),
+                format!("loaded {arg}"),
+                format!("read failed for {arg}"),
                 "I've loaded this file for context:".to_string(),
                 move || run_tool_immediate(crate::tools::ReadFile, &arg_owned)
                     .map_err(|e| format!("error reading {arg_owned}: {e}")),
@@ -964,7 +1019,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "listing directory...",
-                format!("listed: {path}"),
+                format!("listing {path}"),
+                format!("listed {path}"),
+                format!("list failed for {path}"),
                 "Directory listing:".to_string(),
                 move || run_tool_immediate(crate::tools::ListDir, &path_owned)
                     .map_err(|e| format!("error listing {path_owned}: {e}")),
@@ -981,7 +1038,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "searching code...",
-                format!("searched: {arg}"),
+                format!("searching for {arg}"),
+                format!("search complete for {arg}"),
+                format!("search failed for {arg}"),
                 "Search results:".to_string(),
                 move || run_tool_immediate(crate::tools::SearchCode, &arg_owned)
                     .map_err(|e| format!("error searching: {e}")),
@@ -997,7 +1056,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "running git...",
+                format!("running git {git_arg}"),
                 status_message,
+                format!("git failed for {git_arg}"),
                 context_prefix,
                 move || run_tool_immediate(crate::tools::GitTool, &git_arg_owned)
                     .map_err(|e| format!("git error: {e}")),
@@ -1014,7 +1075,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "running diagnostics...",
-                format!("diagnostics: {arg}"),
+                format!("running diagnostics for {arg}"),
+                format!("diagnostics ready for {arg}"),
+                format!("diagnostics failed for {arg}"),
                 "LSP diagnostics:".to_string(),
                 move || run_tool_immediate(crate::tools::LspDiagnosticsTool, &arg_owned)
                     .map_err(|e| format!("diagnostics error: {e}")),
@@ -1031,7 +1094,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "loading hover info...",
-                format!("hover: {arg}"),
+                format!("loading hover for {arg}"),
+                format!("hover ready for {arg}"),
+                format!("hover failed for {arg}"),
                 "LSP hover:".to_string(),
                 move || run_tool_immediate(crate::tools::LspHoverTool, &arg_owned)
                     .map_err(|e| format!("hover error: {e}")),
@@ -1048,7 +1113,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "resolving definition...",
-                format!("definition: {arg}"),
+                format!("resolving definition for {arg}"),
+                format!("definition ready for {arg}"),
+                format!("definition failed for {arg}"),
                 "LSP definition:".to_string(),
                 move || run_tool_immediate(crate::tools::LspDefinitionTool, &arg_owned)
                     .map_err(|e| format!("definition error: {e}")),
@@ -1060,7 +1127,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "checking rust lsp...",
-                "lsp check".to_string(),
+                "checking rust lsp".to_string(),
+                "rust lsp check complete".to_string(),
+                "rust lsp check failed".to_string(),
                 "LSP check:".to_string(),
                 move || Ok(crate::tools::rust_lsp_health_report()),
             );
@@ -1166,7 +1235,9 @@ fn handle_slash_command(
                 state,
                 slash_tx,
                 "fetching webpage...",
-                format!("fetched: {arg}"),
+                format!("fetching {arg}"),
+                format!("fetched {arg}"),
+                format!("fetch failed for {arg}"),
                 "Fetched web context:".to_string(),
                 move || run_tool_immediate(crate::tools::FetchUrlTool, &arg_owned)
                     .map_err(|e| format!("fetch error: {e}")),

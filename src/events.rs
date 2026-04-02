@@ -32,6 +32,21 @@ pub struct CacheUpdate {
     pub tokens_saved: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressStatus {
+    Started,
+    Updated,
+    Finished,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgressTrace {
+    pub status: ProgressStatus,
+    pub label: String,
+    pub persist: bool,
+}
+
 pub enum InferenceEvent {
     /// Model/backend loaded and ready.
     Ready,
@@ -42,6 +57,8 @@ pub enum InferenceEvent {
         label: String,
         show_placeholder: bool,
     },
+    /// A transient or durable progress-trace update.
+    Trace(ProgressTrace),
     /// A generated token — append to current response.
     Token(String),
     /// Tool calls being executed — shown in sidebar.

@@ -1,6 +1,8 @@
 // src/tui/state.rs
 
-use crate::events::PendingAction;
+use std::collections::VecDeque;
+
+use crate::events::{PendingAction, ProgressStatus, ProgressTrace};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Role {
@@ -13,6 +15,12 @@ pub enum Role {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceEntry {
+    pub label: String,
+    pub success: bool,
 }
 
 pub struct AppState {
@@ -48,6 +56,12 @@ pub struct AppState {
 
     /// Last tool call being executed, shown in sidebar
     pub last_tool_call: Option<String>,
+
+    /// Current transient progress trace shown in the sidebar
+    pub current_trace: Option<String>,
+
+    /// Recently completed progress traces shown under the current activity
+    pub recent_traces: VecDeque<TraceEntry>,
 
     /// Action currently awaiting approval
     pub pending_action: Option<PendingAction>,
@@ -88,6 +102,8 @@ impl AppState {
             backend_name: "...".to_string(),
             tick: 0,
             last_tool_call: None,
+            current_trace: None,
+            recent_traces: VecDeque::with_capacity(4),
             pending_action: None,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -238,11 +254,13 @@ impl AppState {
         self.is_generating = false;
         self.status = "ready".to_string();
         self.last_tool_call = None;
+        self.current_trace = None;
     }
 
     pub fn add_error(&mut self, error: &str) {
         self.is_generating = false;
         self.status = "ready".to_string();
+        self.current_trace = None;
         self.messages.push(ChatMessage {
             role: Role::Assistant,
             content: format!("error: {error}"),
@@ -353,9 +371,53 @@ impl AppState {
         self.scroll_offset = 0;
     }
 
+    fn push_recent_trace(&mut self, label: &str, success: bool) {
+        if label.trim().is_empty() {
+            return;
+        }
+        self.recent_traces.push_front(TraceEntry {
+            label: label.to_string(),
+            success,
+        });
+        while self.recent_traces.len() > 4 {
+            self.recent_traces.pop_back();
+        }
+    }
+
+    fn add_trace_chat_message(&mut self, prefix: &str, label: &str) {
+        self.add_system_message(&format!("{prefix} {label}"));
+    }
+
+    pub fn apply_trace(&mut self, trace: ProgressTrace) {
+        match trace.status {
+            ProgressStatus::Started | ProgressStatus::Updated => {
+                self.current_trace = Some(trace.label.clone());
+                if trace.persist && matches!(trace.status, ProgressStatus::Started) {
+                    self.add_trace_chat_message("→", &trace.label);
+                }
+            }
+            ProgressStatus::Finished => {
+                self.current_trace = None;
+                self.push_recent_trace(&trace.label, true);
+                if trace.persist {
+                    self.add_trace_chat_message("✓", &trace.label);
+                }
+            }
+            ProgressStatus::Failed => {
+                self.current_trace = None;
+                self.push_recent_trace(&trace.label, false);
+                if trace.persist {
+                    self.add_trace_chat_message("✕", &trace.label);
+                }
+            }
+        }
+    }
+
     pub fn clear_messages(&mut self) {
         self.messages.clear();
         self.scroll_offset = 0;
+        self.current_trace = None;
+        self.recent_traces.clear();
         self.prompt_tokens = 0;
         self.completion_tokens = 0;
         self.total_tokens = 0;

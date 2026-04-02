@@ -21,7 +21,10 @@ use std::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
 use crate::cache::ExactCache;
 use crate::debug_log;
-use crate::events::{BudgetUpdate, CacheUpdate, InferenceEvent, PendingAction, PendingActionKind};
+use crate::events::{
+    BudgetUpdate, CacheUpdate, InferenceEvent, PendingAction, PendingActionKind, ProgressStatus,
+    ProgressTrace,
+};
 use crate::config;
 use crate::error::{ParamsError, Result};
 use crate::memory::{compression, facts::FactStore, index::ProjectIndex};
@@ -77,6 +80,14 @@ fn emit_generation_started(
         label: label.to_string(),
         show_placeholder,
     });
+}
+
+fn emit_trace(token_tx: &Sender<InferenceEvent>, status: ProgressStatus, label: &str, persist: bool) {
+    let _ = token_tx.send(InferenceEvent::Trace(ProgressTrace {
+        status,
+        label: label.to_string(),
+        persist,
+    }));
 }
 
 /// Persistent model thread — loads the backend once, handles prompts in a loop.
@@ -294,6 +305,7 @@ pub fn model_thread(
 
                 // Run generation — collect full response for tool call detection
                 emit_generation_started(&token_tx, "generating...", false);
+                emit_trace(&token_tx, ProgressStatus::Started, "drafting answer...", false);
                 let response = generate_with_cache(
                     &*backend,
                     &session_messages,
@@ -312,6 +324,7 @@ pub fn model_thread(
 
                 match response {
                     Err(e) => {
+                        emit_trace(&token_tx, ProgressStatus::Failed, "generation failed", false);
                         let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                     }
                     Ok(response) => {
@@ -332,6 +345,7 @@ pub fn model_thread(
                             );
                         }
 
+                        emit_trace(&token_tx, ProgressStatus::Updated, "scanning tool calls...", false);
                         // Check if the model used any tools
                         let tool_execution = tools.execute_tool_calls(&full_response);
                         let tool_results = tool_execution.results;
@@ -342,6 +356,7 @@ pub fn model_thread(
                         );
 
                         if let Some(pending) = tool_execution.pending {
+                            emit_trace(&token_tx, ProgressStatus::Updated, "waiting for approval...", false);
                             session_messages.push(Message::assistant(&full_response));
                             if let Some(result_msg) = ToolRegistry::format_results_with_limit(
                                 &tool_results,
@@ -366,6 +381,7 @@ pub fn model_thread(
                                 pending,
                                 true,
                             ) {
+                                emit_trace(&token_tx, ProgressStatus::Failed, "approval flow failed", false);
                                 let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                             }
                             next_action_id = next_action_id.saturating_add(1);
@@ -373,6 +389,7 @@ pub fn model_thread(
                             &tool_results,
                             eco_tool_result_limit(eco_enabled),
                         ) {
+                            emit_trace(&token_tx, ProgressStatus::Updated, "running tool follow-up...", false);
                             // Notify the UI that tool calls are being processed
                             let _ = token_tx.send(InferenceEvent::ToolCall(
                                 tool_results.iter()
@@ -407,6 +424,12 @@ pub fn model_thread(
                                         );
                                     }
                                     let final_response = if reflection_enabled {
+                                        emit_trace(
+                                            &token_tx,
+                                            ProgressStatus::Updated,
+                                            "reflecting final answer...",
+                                            false,
+                                        );
                                         reflect_response(
                                             &*backend,
                                             &cfg,
@@ -441,20 +464,29 @@ pub fn model_thread(
                                                 );
                                                 session_messages.push(Message::assistant(&final_response));
                                             }
+                                            emit_trace(&token_tx, ProgressStatus::Finished, "answer ready", false);
                                         }
                                         Err(e) => {
                                             warn!(error = %e, "reflection after tool follow-up failed");
+                                            emit_trace(&token_tx, ProgressStatus::Failed, "follow-up failed", false);
                                             let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "tool follow-up generation failed");
+                                    emit_trace(&token_tx, ProgressStatus::Failed, "tool follow-up failed", false);
                                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                 }
                             }
                         } else {
                             let final_response = if reflection_enabled {
+                                emit_trace(
+                                    &token_tx,
+                                    ProgressStatus::Updated,
+                                    "reflecting final answer...",
+                                    false,
+                                );
                                 reflect_response(
                                     &*backend,
                                     &cfg,
@@ -495,9 +527,11 @@ pub fn model_thread(
                                         );
                                         session_messages.push(Message::assistant(&final_response));
                                     }
+                                    emit_trace(&token_tx, ProgressStatus::Finished, "answer ready", false);
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "final response post-processing failed");
+                                    emit_trace(&token_tx, ProgressStatus::Failed, "final answer failed", false);
                                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                 }
                             }
@@ -550,13 +584,22 @@ fn handle_pending_action(
         run_follow_up,
         "pending action proposed"
     );
+    emit_trace(token_tx, ProgressStatus::Started, "awaiting approval...", false);
     let _ = token_tx.send(InferenceEvent::PendingAction(event));
 
     loop {
         match prompt_rx.recv() {
             Ok(SessionCommand::ApproveAction(id)) if id == action_id => {
                 info!(action_id, tool = pending.tool_name.as_str(), "pending action approved");
+                emit_trace(token_tx, ProgressStatus::Finished, "approval received", false);
+                emit_trace(
+                    token_tx,
+                    ProgressStatus::Started,
+                    &format!("running {}", pending.tool_name),
+                    false,
+                );
                 let result = tools.execute_pending_action(&pending);
+                emit_trace(token_tx, ProgressStatus::Finished, "approved action complete", false);
                 let _ = token_tx.send(InferenceEvent::ToolCall(format!(
                     "{}({})",
                     result.tool_name, result.argument
@@ -573,6 +616,7 @@ fn handle_pending_action(
                 }
                 if run_follow_up {
                     emit_generation_started(token_tx, "generating...", true);
+                    emit_trace(token_tx, ProgressStatus::Started, "drafting follow-up...", false);
                     let prompt_tokens = estimate_message_tokens(session_messages);
                     let follow_up = generate_with_cache(
                         backend,
@@ -595,6 +639,7 @@ fn handle_pending_action(
                         );
                     }
                     let final_response = if reflection_enabled {
+                        emit_trace(token_tx, ProgressStatus::Updated, "reflecting final answer...", false);
                         reflect_response(
                             backend,
                             cfg,
@@ -626,11 +671,13 @@ fn handle_pending_action(
                         );
                         session_messages.push(Message::assistant(&final_response));
                     }
+                    emit_trace(token_tx, ProgressStatus::Finished, "follow-up ready", false);
                 }
                 return Ok(());
             }
             Ok(SessionCommand::RejectAction(id)) if id == action_id => {
                 info!(action_id, tool = pending.tool_name.as_str(), "pending action rejected");
+                emit_trace(token_tx, ProgressStatus::Failed, "action rejected", false);
                 let rejection = format!(
                     "User rejected proposed action: {}",
                     pending.display_argument
@@ -641,6 +688,7 @@ fn handle_pending_action(
                 }
                 if run_follow_up {
                     emit_generation_started(token_tx, "generating...", true);
+                    emit_trace(token_tx, ProgressStatus::Started, "drafting follow-up...", false);
                     let follow_up = generate_with_cache(
                         backend,
                         session_messages,
@@ -663,6 +711,7 @@ fn handle_pending_action(
                         );
                     }
                     let final_response = if reflection_enabled {
+                        emit_trace(token_tx, ProgressStatus::Updated, "reflecting final answer...", false);
                         reflect_response(
                             backend,
                             cfg,
@@ -694,17 +743,20 @@ fn handle_pending_action(
                         );
                         session_messages.push(Message::assistant(&final_response));
                     }
+                    emit_trace(token_tx, ProgressStatus::Finished, "follow-up ready", false);
                 }
                 return Ok(());
             }
             Ok(SessionCommand::ClearSession) => {
                 warn!(action_id, "clear requested while pending action active");
+                emit_trace(token_tx, ProgressStatus::Failed, "approval interrupted", false);
                 return Err(ParamsError::Config(
                     "Cannot clear session while an action is awaiting approval".to_string()
                 ));
             }
             Ok(_) => {}
             Err(_) => {
+                emit_trace(token_tx, ProgressStatus::Failed, "approval channel closed", false);
                 return Err(ParamsError::Inference(
                     "Approval channel closed while waiting for user decision".to_string()
                 ));
