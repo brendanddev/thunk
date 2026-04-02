@@ -19,6 +19,7 @@ pub use openai_compat::OpenAICompatBackend;
 use std::sync::mpsc::{Receiver, Sender};
 use crate::events::InferenceEvent;
 use crate::config;
+use crate::error::{ParamsError, Result};
 use crate::tools::ToolRegistry;
 
 /// Persistent model thread — loads the backend once, handles prompts in a loop.
@@ -35,48 +36,11 @@ pub fn model_thread(
         }
     };
 
-    let backend: Box<dyn InferenceBackend> = match cfg.backend.as_str() {
-        "ollama" => {
-            let b = OllamaBackend::new(&cfg.ollama.url, &cfg.ollama.model);
-            if let Err(e) = b.health_check() {
-                let _ = token_tx.send(InferenceEvent::Error(
-                    format!("Ollama failed: {e} — falling back to llama.cpp")
-                ));
-                match load_llama_cpp_backend(&cfg) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
-                        return;
-                    }
-                }
-            } else {
-                Box::new(b)
-            }
-        }
-        "openai_compat" => {
-            let provider_name = cfg.openai_compat.resolved_provider_name();
-            let b = OpenAICompatBackend::new(
-                &cfg.openai_compat.url,
-                &cfg.openai_compat.api_key,
-                &cfg.openai_compat.model,
-                &provider_name,
-            );
-            if let Err(e) = b.health_check() {
-                let _ = token_tx.send(InferenceEvent::Error(
-                    format!("{provider_name} failed: {e} — check your API key")
-                ));
-                return;
-            }
-            Box::new(b)
-        }
-        _ => {
-            match load_llama_cpp_backend(&cfg) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
-                    return;
-                }
-            }
+    let backend = match load_backend_with_fallback(&cfg, &token_tx) {
+        Ok(backend) => backend,
+        Err(e) => {
+            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+            return;
         }
     };
 
@@ -139,7 +103,7 @@ fn run_and_collect(
     backend: &dyn InferenceBackend,
     messages: &[Message],
     token_tx: Sender<InferenceEvent>,
-) -> crate::error::Result<String> {
+) -> Result<String> {
     use std::sync::{Arc, Mutex};
 
     // We need to both stream tokens to the UI and collect them locally.
@@ -150,9 +114,9 @@ fn run_and_collect(
     // Wrap the token_tx to also write to buffer
     let (intercept_tx, intercept_rx) = std::sync::mpsc::channel::<InferenceEvent>();
 
-    // Spawn a relay thread that forwards tokens to the UI and collects them
+    // Spawn a relay thread that forwards tokens to the UI and collects them.
     let relay_token_tx = token_tx.clone();
-    std::thread::spawn(move || {
+    let relay = std::thread::spawn(move || {
         while let Ok(event) = intercept_rx.recv() {
             match &event {
                 InferenceEvent::Token(t) => {
@@ -169,9 +133,9 @@ fn run_and_collect(
     });
 
     backend.generate(messages, intercept_tx)?;
-
-    // Give the relay thread a moment to finish flushing
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    relay.join().map_err(|_| {
+        ParamsError::Inference("token relay thread panicked".to_string())
+    })?;
 
     let result = buffer.lock()
         .map(|b| b.clone())
@@ -180,7 +144,52 @@ fn run_and_collect(
     Ok(result)
 }
 
-fn load_llama_cpp_backend(cfg: &config::Config) -> crate::error::Result<Box<dyn InferenceBackend>> {
+pub fn load_backend_from_config(cfg: &config::Config) -> Result<Box<dyn InferenceBackend>> {
+    match cfg.backend.as_str() {
+        "ollama" => {
+            let backend = OllamaBackend::new(&cfg.ollama.url, &cfg.ollama.model);
+            backend.health_check()?;
+            Ok(Box::new(backend))
+        }
+        "openai_compat" => {
+            let provider_name = cfg.openai_compat.resolved_provider_name();
+            let backend = OpenAICompatBackend::new(
+                &cfg.openai_compat.url,
+                &cfg.openai_compat.api_key,
+                &cfg.openai_compat.model,
+                &provider_name,
+            );
+            backend.health_check()?;
+            Ok(Box::new(backend))
+        }
+        "llama_cpp" => load_llama_cpp_backend(cfg),
+        other => Err(ParamsError::Config(format!(
+            "Unknown backend `{other}`. Expected llama_cpp, ollama, or openai_compat."
+        ))),
+    }
+}
+
+fn load_backend_with_fallback(
+    cfg: &config::Config,
+    token_tx: &Sender<InferenceEvent>,
+) -> Result<Box<dyn InferenceBackend>> {
+    match cfg.backend.as_str() {
+        "ollama" => {
+            let backend = OllamaBackend::new(&cfg.ollama.url, &cfg.ollama.model);
+            if let Err(e) = backend.health_check() {
+                let _ = token_tx.send(InferenceEvent::Error(
+                    format!("Ollama failed: {e} — falling back to llama.cpp")
+                ));
+                load_llama_cpp_backend(cfg)
+            } else {
+                Ok(Box::new(backend))
+            }
+        }
+        _ => load_backend_from_config(cfg),
+    }
+}
+
+fn load_llama_cpp_backend(cfg: &config::Config) -> Result<Box<dyn InferenceBackend>> {
     let model_path = match &cfg.llama_cpp.model_path {
         Some(p) => p.clone(),
         None => config::find_model()?,

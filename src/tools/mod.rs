@@ -17,10 +17,10 @@
 mod fs;
 mod search;
 
-pub use fs::{ReadFile, ListDir};
+pub use fs::{ListDir, ReadFile};
 pub use search::SearchCode;
 
-use crate::error::{ParamsError, Result};
+use crate::error::Result;
 
 /// The contract every tool must fulfill.
 /// Tools are simple — they take a string argument and return a string result.
@@ -58,20 +58,21 @@ impl ToolRegistry {
     /// system prompt so the model knows what it can use.
     pub fn tool_descriptions(&self) -> String {
         let mut desc = String::from(
-            "You have access to the following tools. Use them by including a tag \
-             in your response exactly as shown:\n\n"
+            "You have access to the following tools.\n\
+             When you need one, respond with only the tool call tags, one per line, \
+             using the exact syntax `[tool_name: argument]`.\n\
+             After tool results are returned, continue in a follow-up response.\n\n"
         );
         for tool in &self.tools {
             desc.push_str(&format!(
-                "  [{}]: {}\n  Usage: [{}]: <argument>\n\n",
+                "  {}: {}\n  Usage: [{}: <argument>]\n\n",
                 tool.name(),
                 tool.description(),
                 tool.name(),
             ));
         }
         desc.push_str(
-            "After using a tool, wait for the result before continuing your response.\n\
-             Only use tools when you actually need to read or search files.\n\
+            "Only use tools when you actually need to read or search files.\n\
              Do not use tools for questions that don't require file access."
         );
         desc

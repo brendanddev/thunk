@@ -11,12 +11,7 @@ use super::backend::{InferenceBackend, Message};
 
 /// The Ollama backend. Makes HTTP requests to an Ollama server.
 pub struct OllamaBackend {
-    /// Base URL of the Ollama server, e.g. "http://localhost:11434"
-    /// or "http://192.168.1.100:11434" for a remote machine.
     pub base_url: String,
-
-    /// The model to use, e.g. "qwen2.5-coder:14b" or "qwen2.5-coder:7b"
-    /// Must be pulled in Ollama first: `ollama pull qwen2.5-coder:14b`
     pub model: String,
 }
 

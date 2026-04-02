@@ -1,8 +1,6 @@
 # params-cli
 
-> Sounds good — I'll pick up right where we left off when you're ready. The memory module files are written (mod.rs, compression.rs, index.rs, facts.rs), but the wiring into inference/mod.rs and main.rs still needs to happen.  
-
----
+Personal AI coding assistant CLI focused on local-first workflows, modular backends, and privacy.
 
 ## Backends
 
@@ -10,8 +8,7 @@
 |---|---|---|---|
 | `llama_cpp` | Slow startup, then fast | Free | `.gguf` model file |
 | `ollama` | Fast (model stays loaded) | Free | Ollama installed |
-| `anthropic` | Fast | Per token | API key |
-| `openrouter` | Fast | Per token | API key |
+| `openai_compat` | Fast | Per token | OpenAI-compatible API key |
 
 Switch backends by editing `~/.params/config.toml`.
 
@@ -65,8 +62,8 @@ ollama pull qwen2.5-coder:7b
 ```
 Then set `backend = "ollama"` in `~/.params/config.toml`.
 
-**Option C — Anthropic API**
-Set `backend = "anthropic"` and add your API key to config or set `ANTHROPIC_API_KEY` env var.
+**Option C — OpenAI-compatible API**
+Set `backend = "openai_compat"` and configure `[openai_compat]` for Groq, OpenAI, OpenRouter, or xAI.
 
 **5. Run**
 ```bash
@@ -82,7 +79,7 @@ params
 `~/.params/config.toml` is created automatically on first run:
 
 ```toml
-# Backend options: "llama_cpp", "ollama", "anthropic", "openrouter"
+# Backend options: "llama_cpp", "ollama", "openai_compat"
 backend = "llama_cpp"
 
 [llama_cpp]
@@ -92,9 +89,10 @@ backend = "llama_cpp"
 url = "http://localhost:11434"  # or a LAN IP for a remote machine
 model = "qwen2.5-coder:7b"
 
-[anthropic]
-# api_key = "sk-ant-..."  # or set ANTHROPIC_API_KEY env var
-model = "claude-sonnet-4-5"
+[openai_compat]
+url = "https://api.groq.com/openai/v1"
+# api_key = ""  # or set GROQ_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / XAI_API_KEY
+model = "llama-3.3-70b-versatile"
 
 [generation]
 max_tokens = 512
@@ -134,7 +132,7 @@ src/
     backend.rs       — InferenceBackend trait
     llama_cpp.rs     — llama.cpp implementation
     ollama.rs        — Ollama HTTP implementation
-    anthropic.rs     — Anthropic API (planned)
+    openai_compat.rs — OpenAI-compatible API implementation
   tui/
     mod.rs           — Ratatui app, layout, event loop
     state.rs         — app state

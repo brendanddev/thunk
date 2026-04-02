@@ -39,12 +39,6 @@ pub enum ParamsError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Fired when an HTTP request fails.
-    /// Used by compare mode when calling the Anthropic API.
-    /// #[from] gives us automatic conversion from reqwest::Error via ?
-    #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
-
     /// Fired when something is misconfigured.
     /// e.g. ANTHROPIC_API_KEY not set, invalid config file, bad model path.
     #[error("Config error: {0}")]

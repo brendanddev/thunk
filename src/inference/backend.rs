@@ -22,7 +22,7 @@ impl Message {
     }
 }
 
-/// The base system prompt — tool descriptions get appended to this at runtime.
+/// Base system prompt
 pub const SYSTEM_PROMPT_BASE: &str = "\
 You are params, a local AI coding assistant. \
 Be concise and precise. \
@@ -35,7 +35,7 @@ pub fn system_prompt_with_tools(tool_descriptions: &str) -> String {
     format!("{}\n\n{}", SYSTEM_PROMPT_BASE, tool_descriptions)
 }
 
-/// For backward compatibility — used where tools aren't set up yet
+/// For backward compatibility
 pub const SYSTEM_PROMPT: &str = SYSTEM_PROMPT_BASE;
 
 pub trait InferenceBackend: Send {

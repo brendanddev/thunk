@@ -29,11 +29,21 @@ use crate::events::InferenceEvent;
 use crate::inference::Message;
 use state::{AppState, Role};
 
-// Spinner frames — braille dots give a smooth animation
+// Spinner frames
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // How often to advance the spinner (every N ticks at ~60fps = ~100ms per frame)
 const SPINNER_SPEED: u64 = 6;
+
+fn truncate_for_width(value: &str, max_chars: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let truncated: String = value.chars().take(keep).collect();
+    format!("{truncated}…")
+}
 
 pub fn run() -> Result<()> {
     enable_raw_mode()?;
@@ -271,11 +281,7 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     // Truncate backend name to fit sidebar
-    let backend_display = if state.backend_name.len() > 18 {
-        format!("{}…", &state.backend_name[..17])
-    } else {
-        state.backend_name.clone()
-    };
+    let backend_display = truncate_for_width(&state.backend_name, 18);
 
     let items = vec![
         ListItem::new(Line::from(vec![
@@ -302,11 +308,7 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         ListItem::new(Line::from("")),
         {
             if let Some(ref call) = state.last_tool_call {
-                let truncated = if call.len() > 18 {
-                    format!("{}…", &call[..17])
-                } else {
-                    call.clone()
-                };
+                let truncated = truncate_for_width(call, 18);
                 ListItem::new(Line::from(vec![
                     Span::styled("tool  ", Style::default().fg(Color::DarkGray)),
                     Span::styled(truncated, Style::default().fg(Color::Yellow)),

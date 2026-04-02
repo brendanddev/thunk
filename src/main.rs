@@ -6,6 +6,8 @@ mod error;
 mod config;
 mod events;
 mod inference;
+#[allow(dead_code)]
+mod memory;
 mod tools;
 mod tui;
 
@@ -14,7 +16,7 @@ use tracing::info;
 
 // Bring our Result type into scope so every function here can use `Result<T>`
 // instead of the full `std::result::Result<T, error::ParamsError>`.
-use error::Result;
+use error::{ParamsError, Result};
 
 /// The top-level CLI struct. Clap reads this to understand what arguments
 /// and subcommands the program accepts.
@@ -146,63 +148,74 @@ fn main() -> Result<()> {
     // every possible variant, so nothing can silently fall through.
     match cli.command {
         Some(Command::Pull { model }) => {
-            println!("Pulling model: {model}");
+            return Err(ParamsError::Config(format!(
+                "`params pull {model}` is not implemented yet."
+            )));
         }
 
         Some(Command::Index { path }) => {
-            println!("Indexing: {path}");
+            return Err(ParamsError::Config(format!(
+                "`params index {path}` is not implemented yet."
+            )));
         }
 
         Some(Command::Compare { prompt }) => {
-            println!("Comparing: {prompt}");
+            return Err(ParamsError::Config(format!(
+                "`params compare {prompt}` is not implemented yet."
+            )));
         }
 
         Some(Command::Bench { last }) => {
-            println!("Benchmark (last {last} ratings)");
+            return Err(ParamsError::Config(format!(
+                "`params bench --last {last}` is not implemented yet."
+            )));
         }
 
         Some(Command::Train { project }) => {
-            println!("Training on: {project}");
+            return Err(ParamsError::Config(format!(
+                "`params train --project {project}` is not implemented yet."
+            )));
         }
 
         // No subcommand was given — check if there's a one-shot prompt,
         // otherwise open the TUI.
         None => match cli.prompt {
             Some(prompt) => {
-                // One-shot mode — load config, build messages, run via ollama or llama.cpp
+                // One-shot mode — load config and run with the selected backend.
                 let cfg = config::load()?;
                 let messages = vec![
                     inference::Message::system(inference::SYSTEM_PROMPT),
                     inference::Message::user(&prompt),
                 ];
 
-                // Build the backend and generate directly to stdout
+                // Build the backend and generate directly to stdout.
                 let (tx, rx) = std::sync::mpsc::channel();
-                let backend: Box<dyn inference::InferenceBackend> = match cfg.backend.as_str() {
-                    "ollama" => Box::new(inference::OllamaBackend::new(&cfg.ollama.url, &cfg.ollama.model)),
-                    _ => {
-                        let model_path = cfg.llama_cpp.model_path
-                            .unwrap_or_else(|| config::find_model().unwrap());
-                        Box::new(inference::LlamaCppBackend::load(model_path, cfg.generation.max_tokens, cfg.generation.temperature)?)
-                    }
-                };
+                let backend = inference::load_backend_from_config(&cfg)?;
 
-                // Spawn generation on a thread, print tokens as they arrive
+                // Spawn generation on a thread, print tokens as they arrive.
                 let handle = std::thread::spawn(move || {
                     backend.generate(&messages, tx)
                 });
 
-                use events::InferenceEvent;
                 for event in rx {
                     match event {
-                        InferenceEvent::Token(t) => { print!("{t}"); use std::io::Write; std::io::stdout().flush().ok(); }
-                        InferenceEvent::Done => break,
-                        InferenceEvent::Error(e) => { eprintln!("Error: {e}"); break; }
+                        events::InferenceEvent::Token(t) => {
+                            print!("{t}");
+                            use std::io::Write;
+                            std::io::stdout().flush().ok();
+                        }
                         _ => {}
                     }
                 }
                 println!();
-                let _ = handle.join();
+                match handle.join() {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(ParamsError::Inference(
+                            "generation thread panicked".to_string()
+                        ));
+                    }
+                }
             }
             None => {
                 // Launch the full TUI app

@@ -231,21 +231,6 @@ impl AppState {
         messages
     }
 
-    /// Returns the display string for the input with a cursor indicator
-    pub fn input_display(&self) -> String {
-        let before = &self.input[..self.cursor];
-        let after = &self.input[self.cursor..];
-        // Use a block cursor character at the cursor position
-        if after.is_empty() {
-            format!("{before}█")
-        } else {
-            let mut chars = after.chars();
-            let at_cursor = chars.next().unwrap_or(' ');
-            let rest: String = chars.collect();
-            format!("{before}\x1b[7m{at_cursor}\x1b[0m{rest}")
-        }
-    }
-
     pub fn add_system_message(&mut self, content: &str) {
         self.messages.push(ChatMessage {
             role: Role::System,
