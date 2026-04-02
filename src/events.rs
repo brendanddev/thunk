@@ -24,6 +24,14 @@ pub struct BudgetUpdate {
     pub estimated_cost_usd: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CacheUpdate {
+    pub last_hit: bool,
+    pub hits: usize,
+    pub misses: usize,
+    pub tokens_saved: usize,
+}
+
 pub enum InferenceEvent {
     /// Model/backend loaded and ready.
     Ready,
@@ -37,8 +45,14 @@ pub enum InferenceEvent {
     ContextMessage(String),
     /// Reflection mode changed for the current session.
     ReflectionEnabled(bool),
+    /// Eco mode changed for the current session.
+    EcoEnabled(bool),
+    /// Separate content debug logging changed for the current session.
+    DebugLoggingEnabled(bool),
     /// Updated token/cost estimates for the current session.
     Budget(BudgetUpdate),
+    /// Updated cache stats for the current session.
+    Cache(CacheUpdate),
     /// A mutating action needs user approval before execution.
     PendingAction(PendingAction),
     /// Generation finished.

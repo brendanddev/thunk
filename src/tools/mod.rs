@@ -109,6 +109,22 @@ impl ToolRegistry {
         desc
     }
 
+    pub fn compact_tool_descriptions(&self) -> String {
+        let mut desc = String::from(
+            "You have tool access.\n\
+             Use only the tools you need.\n\
+             Use exact tags like `[tool_name: argument]`.\n\
+             For `write_file`, place `[write_file: path]` on its own line and follow it with a \
+             ```params-file block containing the full file contents.\n\
+             After tool results are returned, continue in a follow-up response.\n\n"
+        );
+        for tool in &self.tools {
+            desc.push_str(&format!("  {}: {}\n", tool.name(), tool.description()));
+        }
+        desc.push_str("\nKeep tool use minimal.");
+        desc
+    }
+
     /// Scan a response string for tool calls and execute them all.
     /// Stops early if a tool requires approval.
     pub fn execute_tool_calls(&self, response: &str) -> ToolExecution {
@@ -165,16 +181,20 @@ impl ToolRegistry {
 
     /// Format tool results into a message to inject back into the conversation.
     /// Returns None if there were no tool calls.
-    pub fn format_results(results: &[ToolResult]) -> Option<String> {
+    pub fn format_results_with_limit(
+        results: &[ToolResult],
+        max_chars_per_result: Option<usize>,
+    ) -> Option<String> {
         if results.is_empty() {
             return None;
         }
 
         let mut msg = String::from("Tool results:\n\n");
         for r in results {
+            let output = truncate_tool_output(&r.output, max_chars_per_result);
             msg.push_str(&format!(
                 "--- {}({}) ---\n{}\n\n",
-                r.tool_name, r.argument, r.output
+                r.tool_name, r.argument, output
             ));
         }
 
@@ -230,6 +250,24 @@ pub struct PendingToolAction {
     pub display_argument: String,
     pub title: String,
     pub preview: String,
+}
+
+fn truncate_tool_output(output: &str, max_chars: Option<usize>) -> String {
+    let Some(limit) = max_chars else {
+        return output.to_string();
+    };
+
+    let total = output.chars().count();
+    if total <= limit {
+        return output.to_string();
+    }
+
+    let keep = limit.saturating_sub(80);
+    let truncated: String = output.chars().take(keep).collect();
+    format!(
+        "{truncated}\n\n[truncated {} chars for eco mode]",
+        total.saturating_sub(keep)
+    )
 }
 
 #[cfg(test)]
@@ -318,6 +356,21 @@ mod tests {
             execution.results[0].output,
             "arg=src/main.rs;next=```params-file"
         );
+    }
+
+    #[test]
+    fn format_results_can_truncate_for_eco_mode() {
+        let results = vec![ToolResult {
+            tool_name: "search".to_string(),
+            argument: "foo".to_string(),
+            output: "a".repeat(200),
+        }];
+
+        let formatted = ToolRegistry::format_results_with_limit(&results, Some(80)).unwrap();
+
+        assert!(formatted.contains("[truncated"));
+        assert!(formatted.contains("--- search(foo) ---"));
+        assert!(formatted.len() < 220);
     }
 
     #[test]

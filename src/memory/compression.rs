@@ -23,9 +23,11 @@ use super::run_prompt_sync;
 
 /// Non-system messages above this count trigger compression (8 turns).
 const COMPRESSION_THRESHOLD: usize = 16;
+const ECO_COMPRESSION_THRESHOLD: usize = 10;
 
 /// Message pairs to preserve at the tail (user + assistant each).
 const KEEP_PAIRS: usize = 3;
+const ECO_KEEP_PAIRS: usize = 2;
 
 /// Compress `messages` in-place when history exceeds the threshold.
 ///
@@ -34,16 +36,26 @@ const KEEP_PAIRS: usize = 3;
 ///
 /// If there is no system prompt the function still works, treating index 0
 /// as the first history message.
-pub fn compress_history(messages: &mut Vec<Message>, backend: &dyn InferenceBackend) {
+pub fn compress_history(
+    messages: &mut Vec<Message>,
+    backend: &dyn InferenceBackend,
+    eco_enabled: bool,
+) {
     let non_system = messages.iter().filter(|m| m.role != "system").count();
+    let threshold = if eco_enabled {
+        ECO_COMPRESSION_THRESHOLD
+    } else {
+        COMPRESSION_THRESHOLD
+    };
 
-    if non_system <= COMPRESSION_THRESHOLD {
+    if non_system <= threshold {
         return;
     }
 
     debug!(
         messages = non_system,
-        threshold = COMPRESSION_THRESHOLD,
+        threshold,
+        eco_enabled,
         "history over threshold, compressing"
     );
 
@@ -54,7 +66,8 @@ pub fn compress_history(messages: &mut Vec<Message>, backend: &dyn InferenceBack
         0
     };
 
-    let keep_tail = KEEP_PAIRS * 2;
+    let keep_pairs = if eco_enabled { ECO_KEEP_PAIRS } else { KEEP_PAIRS };
+    let keep_tail = keep_pairs * 2;
 
     // Guard: nothing meaningful left to summarize.
     if messages.len() <= history_start + keep_tail {

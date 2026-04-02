@@ -64,6 +64,15 @@ fn format_cost(value: Option<f64>) -> String {
     }
 }
 
+fn format_hit_rate(hits: usize, misses: usize) -> String {
+    let total = hits.saturating_add(misses);
+    if total == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{:.0}%", (hits as f64 / total as f64) * 100.0)
+    }
+}
+
 fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -162,12 +171,26 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 InferenceEvent::ReflectionEnabled(enabled) => {
                     state.set_reflection_enabled(enabled);
                 }
+                InferenceEvent::EcoEnabled(enabled) => {
+                    state.set_eco_enabled(enabled);
+                }
+                InferenceEvent::DebugLoggingEnabled(enabled) => {
+                    state.set_debug_logging_enabled(enabled);
+                }
                 InferenceEvent::Budget(update) => {
                     state.update_budget(
                         update.prompt_tokens,
                         update.completion_tokens,
                         update.total_tokens,
                         update.estimated_cost_usd,
+                    );
+                }
+                InferenceEvent::Cache(update) => {
+                    state.update_cache(
+                        update.last_hit,
+                        update.hits,
+                        update.misses,
+                        update.tokens_saved,
                     );
                 }
                 InferenceEvent::PendingAction(action) => {
@@ -434,6 +457,45 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
                 Style::default().fg(Color::White),
             ),
         ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("eco   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if state.eco_enabled { "on" } else { "off" },
+                Style::default().fg(Color::White),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("dlog  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if state.debug_logging_enabled { "on" } else { "off" },
+                Style::default().fg(Color::White),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("cache ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                match state.last_cache_hit {
+                    Some(true) => "hit",
+                    Some(false) => "miss",
+                    None => "n/a",
+                },
+                Style::default().fg(Color::White),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("rate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_hit_rate(state.cache_hits, state.cache_misses),
+                Style::default().fg(Color::White),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("saved ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_compact_count(state.tokens_saved),
+                Style::default().fg(Color::White),
+            ),
+        ])),
         ListItem::new(Line::from("")),
         {
             if let Some(ref call) = state.last_tool_call {
@@ -534,6 +596,14 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(" on|off", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
+            Span::styled("/eco   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" on|off", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/debug-log", Style::default().fg(Color::DarkGray)),
+            Span::styled(" on|off", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
             Span::styled("write_file", Style::default().fg(Color::DarkGray)),
             Span::styled(" via model", Style::default().fg(Color::DarkGray)),
         ])),
@@ -544,6 +614,14 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled("/clear ", Style::default().fg(Color::DarkGray)),
             Span::styled("history", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/clear-cache", Style::default().fg(Color::DarkGray)),
+            Span::styled(" reset", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/clear-debug-log", Style::default().fg(Color::DarkGray)),
+            Span::styled(" reset", Style::default().fg(Color::DarkGray)),
         ])),
     ];
 
@@ -914,6 +992,12 @@ fn handle_slash_command(
             let mode = arg.to_ascii_lowercase();
             match mode.as_str() {
                 "on" => {
+                    if state.eco_enabled {
+                        state.add_system_message(
+                            "reflection stays off while eco mode is enabled. Use /eco off first."
+                        );
+                        return;
+                    }
                     state.set_reflection_enabled(true);
                     state.add_system_message("reflection enabled");
                     let _ = prompt_tx.send(SessionCommand::SetReflection(true));
@@ -931,6 +1015,57 @@ fn handle_slash_command(
                 }
                 _ => {
                     state.add_system_message("Usage: /reflect <on|off|status>");
+                }
+            }
+        }
+
+        "/eco" => {
+            let mode = arg.to_ascii_lowercase();
+            match mode.as_str() {
+                "on" => {
+                    state.set_eco_enabled(true);
+                    state.set_reflection_enabled(false);
+                    state.add_system_message("eco mode enabled");
+                    let _ = prompt_tx.send(SessionCommand::SetEco(true));
+                }
+                "off" => {
+                    state.set_eco_enabled(false);
+                    state.add_system_message("eco mode disabled");
+                    let _ = prompt_tx.send(SessionCommand::SetEco(false));
+                }
+                "" | "status" => {
+                    state.add_system_message(&format!(
+                        "eco mode is {}",
+                        if state.eco_enabled { "on" } else { "off" }
+                    ));
+                }
+                _ => {
+                    state.add_system_message("Usage: /eco <on|off|status>");
+                }
+            }
+        }
+
+        "/debug-log" => {
+            let mode = arg.to_ascii_lowercase();
+            match mode.as_str() {
+                "on" => {
+                    state.set_debug_logging_enabled(true);
+                    state.add_system_message("separate debug content logging enabled");
+                    let _ = prompt_tx.send(SessionCommand::SetDebugLogging(true));
+                }
+                "off" => {
+                    state.set_debug_logging_enabled(false);
+                    state.add_system_message("separate debug content logging disabled");
+                    let _ = prompt_tx.send(SessionCommand::SetDebugLogging(false));
+                }
+                "" | "status" => {
+                    state.add_system_message(&format!(
+                        "debug content logging is {}",
+                        if state.debug_logging_enabled { "on" } else { "off" }
+                    ));
+                }
+                _ => {
+                    state.add_system_message("Usage: /debug-log <on|off|status>");
                 }
             }
         }
@@ -984,6 +1119,16 @@ fn handle_slash_command(
             let _ = prompt_tx.send(SessionCommand::ClearSession);
         }
 
+        "/clear-cache" | "/cache-clear" => {
+            state.add_system_message("clearing exact cache...");
+            let _ = prompt_tx.send(SessionCommand::ClearCache);
+        }
+
+        "/clear-debug-log" => {
+            state.add_system_message("clearing separate debug content log...");
+            let _ = prompt_tx.send(SessionCommand::ClearDebugLog);
+        }
+
         "/help" | "/h" | "/?" => {
             state.add_system_message(
                 "/read <path>    — load a file into context\n  \
@@ -995,9 +1140,13 @@ fn handle_slash_command(
                  /fetch <url>    — fetch a webpage into context\n  \
                  /run <command>  — propose a shell command\n  \
                  /reflect on|off — toggle reflection pass\n  \
+                 /eco on|off     — toggle lower-token mode\n  \
+                 /debug-log on|off — toggle separate content debug log\n  \
                  /approve        — approve pending action\n  \
                  /reject         — reject pending action\n  \
                  /clear          — clear conversation\n  \
+                 /clear-cache    — clear exact response cache\n  \
+                 /clear-debug-log — clear separate debug content log\n  \
                  /help           — show this message",
             );
         }

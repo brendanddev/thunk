@@ -58,8 +58,20 @@ pub struct AppState {
     pub total_tokens: usize,
     pub estimated_cost_usd: Option<f64>,
 
+    /// Session cache tracking
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub tokens_saved: usize,
+    pub last_cache_hit: Option<bool>,
+
     /// Whether reflection is enabled for the current session
     pub reflection_enabled: bool,
+
+    /// Whether eco mode is enabled for the current session
+    pub eco_enabled: bool,
+
+    /// Whether separate content debug logging is enabled for the current session
+    pub debug_logging_enabled: bool,
 }
 
 impl AppState {
@@ -81,7 +93,13 @@ impl AppState {
             completion_tokens: 0,
             total_tokens: 0,
             estimated_cost_usd: None,
+            cache_hits: 0,
+            cache_misses: 0,
+            tokens_saved: 0,
+            last_cache_hit: None,
             reflection_enabled: false,
+            eco_enabled: false,
+            debug_logging_enabled: false,
         }
     }
 
@@ -287,6 +305,21 @@ impl AppState {
         self.reflection_enabled = enabled;
     }
 
+    pub fn set_eco_enabled(&mut self, enabled: bool) {
+        self.eco_enabled = enabled;
+    }
+
+    pub fn set_debug_logging_enabled(&mut self, enabled: bool) {
+        self.debug_logging_enabled = enabled;
+    }
+
+    pub fn update_cache(&mut self, last_hit: bool, hits: usize, misses: usize, tokens_saved: usize) {
+        self.cache_hits = hits;
+        self.cache_misses = misses;
+        self.tokens_saved = tokens_saved;
+        self.last_cache_hit = Some(last_hit);
+    }
+
     pub fn is_ready(&self) -> bool {
         self.model_ready
     }
@@ -312,5 +345,9 @@ impl AppState {
         } else {
             None
         };
+        self.cache_hits = 0;
+        self.cache_misses = 0;
+        self.tokens_saved = 0;
+        self.last_cache_hit = None;
     }
 }

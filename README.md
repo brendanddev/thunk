@@ -1,6 +1,6 @@
 # params-cli
 
-Personal AI coding assistant CLI focused on local-first workflows, modular backends, and privacy.
+Personal AI coding assistant CLI focused on local-first workflows, modular backends, privacy, and real coding actions.
 
 ## Backends
 
@@ -11,6 +11,17 @@ Personal AI coding assistant CLI focused on local-first workflows, modular backe
 | `openai_compat` | Fast | Per token | OpenAI-compatible API key |
 
 Switch backends by editing `.local/config.toml`.
+
+## What Works Today
+
+- Streaming Ratatui TUI with slash commands and approval flow
+- `llama_cpp`, `ollama`, and `openai_compat` backends
+- Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
+- Mutating tools with approval: shell commands and whole-file writes with diff preview
+- Three-level memory: session compression, project index, cross-session facts
+- Budget tracking, reflection toggle, and eco mode
+- Structured logging to `.local/params.log`
+- Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, plus `/clear-cache`
 
 ---
 
@@ -97,6 +108,12 @@ model = "llama-3.3-70b-versatile"
 [generation]
 max_tokens = 512
 temperature = 0.8
+
+[reflection]
+enabled = false
+
+[eco]
+enabled = false
 ```
 
 ---
@@ -117,6 +134,17 @@ params "explain what this function does"
 - `PageUp / PageDown` — scroll ten lines
 - `Ctrl+Q` — quit
 
+**Useful slash commands:**
+- `/read <path>`
+- `/ls [path]`
+- `/search <query>`
+- `/git [status|diff|log]`
+- `/fetch <url>`
+- `/run <command>`
+- `/reflect on|off|status`
+- `/eco on|off|status`
+- `/clear-cache`
+
 ---
 
 ## Project structure
@@ -124,6 +152,7 @@ params "explain what this function does"
 ```
 src/
   main.rs            — CLI entry point, argument routing
+  cache/             — exact response cache
   config.rs          — config loading, .local/config.toml
   error.rs           — unified error type
   events.rs          — shared channel event types
@@ -133,6 +162,8 @@ src/
     llama_cpp.rs     — llama.cpp implementation
     ollama.rs        — Ollama HTTP implementation
     openai_compat.rs — OpenAI-compatible API implementation
+  tools/             — tool registry and built-in tools
+  memory/            — compression, project index, cross-session facts
   tui/
     mod.rs           — Ratatui app, layout, event loop
     state.rs         — app state

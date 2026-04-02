@@ -19,7 +19,9 @@ pub use openai_compat::OpenAICompatBackend;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
-use crate::events::{BudgetUpdate, InferenceEvent, PendingAction, PendingActionKind};
+use crate::cache::ExactCache;
+use crate::debug_log;
+use crate::events::{BudgetUpdate, CacheUpdate, InferenceEvent, PendingAction, PendingActionKind};
 use crate::config;
 use crate::error::{ParamsError, Result};
 use crate::memory::{compression, facts::FactStore, index::ProjectIndex};
@@ -30,6 +32,10 @@ pub enum SessionCommand {
     InjectUserContext(String),
     RequestShellCommand(String),
     SetReflection(bool),
+    SetEco(bool),
+    SetDebugLogging(bool),
+    ClearDebugLog,
+    ClearCache,
     ApproveAction(u64),
     RejectAction(u64),
     ClearSession,
@@ -41,6 +47,19 @@ struct SessionBudget {
     completion_tokens: usize,
     estimated_cost_usd: f64,
     has_cost_estimate: bool,
+}
+
+#[derive(Default)]
+struct SessionCacheStats {
+    hits: usize,
+    misses: usize,
+    tokens_saved: usize,
+}
+
+#[derive(Clone, Copy)]
+enum CacheMode {
+    ExactOnly,
+    PreferPromptLevel,
 }
 
 /// Persistent model thread — loads the backend once, handles prompts in a loop.
@@ -68,14 +87,22 @@ pub fn model_thread(
 
     let _ = token_tx.send(InferenceEvent::Ready);
     let _ = token_tx.send(InferenceEvent::BackendName(backend.name()));
-    let mut reflection_enabled = cfg.reflection.enabled;
+    let mut eco_enabled = cfg.eco.enabled;
+    let mut reflection_requested = cfg.reflection.enabled;
+    let mut reflection_enabled = effective_reflection(reflection_requested, eco_enabled);
+    let mut debug_logging_enabled = cfg.debug_logging.content;
+    info!(enabled = eco_enabled, "eco initial state");
     info!(enabled = reflection_enabled, "reflection initial state");
+    info!(enabled = debug_logging_enabled, "debug logging initial state");
+    let _ = token_tx.send(InferenceEvent::EcoEnabled(eco_enabled));
     let _ = token_tx.send(InferenceEvent::ReflectionEnabled(reflection_enabled));
+    let _ = token_tx.send(InferenceEvent::DebugLoggingEnabled(debug_logging_enabled));
 
     // Build the tool registry — same instance reused across all prompts
     let tools = ToolRegistry::default();
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_name = project_root.to_string_lossy().to_string();
+    let exact_cache = ExactCache::open().ok();
     let fact_store = FactStore::open().ok();
     let project_index = ProjectIndex::open_for(&project_root).ok();
     let session_facts = fact_store
@@ -83,12 +110,14 @@ pub fn model_thread(
         .and_then(|store| store.get_relevant_facts(&project_name, "", 5).ok())
         .unwrap_or_default();
     let mut session_messages = vec![Message::system(
-        &build_system_prompt(&tools, &session_facts, &[]),
+        &build_system_prompt(&tools, &session_facts, &[], eco_enabled),
     )];
     let mut budget = SessionBudget {
         has_cost_estimate: cfg.backend == "llama_cpp" || cfg.backend == "ollama",
         ..SessionBudget::default()
     };
+    let mut cache_stats = SessionCacheStats::default();
+    emit_cache_update(&cache_stats, false, &token_tx);
     let mut next_action_id = 1u64;
 
     while let Ok(command) = prompt_rx.recv() {
@@ -97,13 +126,15 @@ pub fn model_thread(
                 info!("session cleared");
                 session_messages.clear();
                 session_messages.push(Message::system(
-                    &build_system_prompt(&tools, &session_facts, &[]),
+                    &build_system_prompt(&tools, &session_facts, &[], eco_enabled),
                 ));
                 budget = SessionBudget {
                     has_cost_estimate: cfg.backend == "llama_cpp" || cfg.backend == "ollama",
                     ..SessionBudget::default()
                 };
+                cache_stats = SessionCacheStats::default();
                 emit_budget_update(&budget, &token_tx);
+                emit_cache_update(&cache_stats, false, &token_tx);
                 continue;
             }
             SessionCommand::InjectUserContext(content) => {
@@ -126,10 +157,14 @@ pub fn model_thread(
                     &token_tx,
                     &*backend,
                     &tools,
+                    exact_cache.as_ref(),
                     &mut session_messages,
                     &cfg,
                     &mut budget,
+                    &mut cache_stats,
+                    debug_logging_enabled,
                     reflection_enabled,
+                    eco_enabled,
                     next_action_id,
                     pending,
                     false,
@@ -141,9 +176,65 @@ pub fn model_thread(
                 continue;
             }
             SessionCommand::SetReflection(enabled) => {
-                reflection_enabled = enabled;
-                info!(enabled, "reflection state updated");
-                let _ = token_tx.send(InferenceEvent::ReflectionEnabled(enabled));
+                reflection_requested = enabled;
+                reflection_enabled = effective_reflection(reflection_requested, eco_enabled);
+                info!(
+                    requested = enabled,
+                    effective = reflection_enabled,
+                    eco_enabled,
+                    "reflection state updated"
+                );
+                let _ = token_tx.send(InferenceEvent::ReflectionEnabled(reflection_enabled));
+                continue;
+            }
+            SessionCommand::SetEco(enabled) => {
+                eco_enabled = enabled;
+                reflection_enabled = effective_reflection(reflection_requested, eco_enabled);
+                info!(
+                    enabled = eco_enabled,
+                    reflection_enabled,
+                    "eco state updated"
+                );
+                if let Some(first) = session_messages.first_mut() {
+                    if first.role == "system" {
+                        first.content = build_system_prompt(&tools, &session_facts, &[], eco_enabled);
+                    }
+                }
+                let _ = token_tx.send(InferenceEvent::EcoEnabled(eco_enabled));
+                let _ = token_tx.send(InferenceEvent::ReflectionEnabled(reflection_enabled));
+                continue;
+            }
+            SessionCommand::SetDebugLogging(enabled) => {
+                debug_logging_enabled = enabled;
+                info!(enabled, "debug logging state updated");
+                let _ = token_tx.send(InferenceEvent::DebugLoggingEnabled(enabled));
+                continue;
+            }
+            SessionCommand::ClearDebugLog => {
+                match debug_log::clear() {
+                    Ok(()) => {
+                        info!("debug content log cleared");
+                    }
+                    Err(e) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                }
+                continue;
+            }
+            SessionCommand::ClearCache => {
+                match exact_cache.as_ref().map(|cache| cache.clear()) {
+                    Some(Ok(deleted)) => {
+                        info!(deleted, "exact cache cleared");
+                    }
+                    Some(Err(e)) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                    None => {
+                        let _ = token_tx.send(InferenceEvent::Error(
+                            "Cache is unavailable".to_string()
+                        ));
+                    }
+                }
                 continue;
             }
             SessionCommand::ApproveAction(_) | SessionCommand::RejectAction(_) => {
@@ -159,27 +250,40 @@ pub fn model_thread(
                     existing_messages = session_messages.len(),
                     "user turn submitted"
                 );
+                if debug_logging_enabled {
+                    if let Err(e) = debug_log::append_user_prompt(&prompt) {
+                        warn!(error = %e, "debug user prompt logging failed");
+                    }
+                }
                 session_messages.push(Message::user(&prompt));
 
                 let relevant_summaries = project_index
                     .as_ref()
-                    .and_then(|index| index.find_relevant(&prompt, 4).ok())
+                    .and_then(|index| index.find_relevant(&prompt, summary_limit(eco_enabled)).ok())
                     .unwrap_or_default();
 
                 if let Some(first) = session_messages.first_mut() {
                     if first.role == "system" {
-                        first.content = build_system_prompt(&tools, &session_facts, &relevant_summaries);
+                        first.content = build_system_prompt(
+                            &tools,
+                            &session_facts,
+                            &relevant_summaries,
+                            eco_enabled,
+                        );
                     }
                 }
 
-                compression::compress_history(&mut session_messages, &*backend);
+                compression::compress_history(&mut session_messages, &*backend, eco_enabled);
 
                 // Run generation — collect full response for tool call detection
-                let response = run_and_collect(
+                let response = generate_with_cache(
                     &*backend,
                     &session_messages,
                     token_tx.clone(),
                     !reflection_enabled,
+                    exact_cache.as_ref(),
+                    &mut cache_stats,
+                    CacheMode::PreferPromptLevel,
                 );
                 debug!(
                     reflection_enabled,
@@ -217,7 +321,10 @@ pub fn model_thread(
 
                         if let Some(pending) = tool_execution.pending {
                             session_messages.push(Message::assistant(&full_response));
-                            if let Some(result_msg) = ToolRegistry::format_results(&tool_results) {
+                            if let Some(result_msg) = ToolRegistry::format_results_with_limit(
+                                &tool_results,
+                                eco_tool_result_limit(eco_enabled),
+                            ) {
                                 session_messages.push(Message::user(&result_msg));
                             }
                             if let Err(e) = handle_pending_action(
@@ -225,10 +332,14 @@ pub fn model_thread(
                                 &token_tx,
                                 &*backend,
                                 &tools,
+                                exact_cache.as_ref(),
                                 &mut session_messages,
                                 &cfg,
                                 &mut budget,
+                                &mut cache_stats,
+                                debug_logging_enabled,
                                 reflection_enabled,
+                                eco_enabled,
                                 next_action_id,
                                 pending,
                                 true,
@@ -236,7 +347,10 @@ pub fn model_thread(
                                 let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                             }
                             next_action_id = next_action_id.saturating_add(1);
-                        } else if let Some(result_msg) = ToolRegistry::format_results(&tool_results) {
+                        } else if let Some(result_msg) = ToolRegistry::format_results_with_limit(
+                            &tool_results,
+                            eco_tool_result_limit(eco_enabled),
+                        ) {
                             // Notify the UI that tool calls are being processed
                             let _ = token_tx.send(InferenceEvent::ToolCall(
                                 tool_results.iter()
@@ -248,11 +362,14 @@ pub fn model_thread(
                             session_messages.push(Message::assistant(&full_response));
                             session_messages.push(Message::user(&result_msg));
 
-                            match run_and_collect(
+                            match generate_with_cache(
                                 &*backend,
                                 &session_messages,
                                 token_tx.clone(),
                                 !reflection_enabled,
+                                exact_cache.as_ref(),
+                                &mut cache_stats,
+                                CacheMode::PreferPromptLevel,
                             ) {
                                 Ok(follow_up) => {
                                     let prompt_tokens = estimate_message_tokens(&session_messages);
@@ -269,6 +386,8 @@ pub fn model_thread(
                                             &cfg,
                                             &mut budget,
                                             &token_tx,
+                                            exact_cache.as_ref(),
+                                            &mut cache_stats,
                                             &session_messages,
                                             &follow_up,
                                         )
@@ -279,6 +398,7 @@ pub fn model_thread(
                                     match final_response {
                                         Ok(final_response) => {
                                             if !final_response.trim().is_empty() {
+                                                log_debug_response(debug_logging_enabled, &final_response);
                                                 session_messages.push(Message::assistant(&final_response));
                                             }
                                         }
@@ -300,6 +420,8 @@ pub fn model_thread(
                                     &cfg,
                                     &mut budget,
                                     &token_tx,
+                                    exact_cache.as_ref(),
+                                    &mut cache_stats,
                                     &session_messages,
                                     &full_response,
                                 )
@@ -310,6 +432,13 @@ pub fn model_thread(
                             match final_response {
                                 Ok(final_response) => {
                                     if !final_response.trim().is_empty() {
+                                        log_debug_response(debug_logging_enabled, &final_response);
+                                        store_prompt_level_cache(
+                                            exact_cache.as_ref(),
+                                            &backend.name(),
+                                            &session_messages,
+                                            &final_response,
+                                        );
                                         session_messages.push(Message::assistant(&final_response));
                                     }
                                 }
@@ -338,10 +467,14 @@ fn handle_pending_action(
     token_tx: &Sender<InferenceEvent>,
     backend: &dyn InferenceBackend,
     tools: &ToolRegistry,
+    exact_cache: Option<&ExactCache>,
     session_messages: &mut Vec<Message>,
     cfg: &config::Config,
     budget: &mut SessionBudget,
+    cache_stats: &mut SessionCacheStats,
+    debug_logging_enabled: bool,
     reflection_enabled: bool,
+    eco_enabled: bool,
     action_id: u64,
     mut pending: PendingToolAction,
     run_follow_up: bool,
@@ -374,7 +507,10 @@ fn handle_pending_action(
                     "{}({})",
                     result.tool_name, result.argument
                 )));
-                let result_msg = ToolRegistry::format_results(&[result]);
+                let result_msg = ToolRegistry::format_results_with_limit(
+                    &[result],
+                    eco_tool_result_limit(eco_enabled),
+                );
                 if let Some(result_msg) = result_msg {
                     session_messages.push(Message::user(&result_msg));
                     if !run_follow_up {
@@ -383,11 +519,14 @@ fn handle_pending_action(
                 }
                 if run_follow_up {
                     let prompt_tokens = estimate_message_tokens(session_messages);
-                    let follow_up = run_and_collect(
+                    let follow_up = generate_with_cache(
                         backend,
                         session_messages,
                         token_tx.clone(),
                         !reflection_enabled,
+                        exact_cache,
+                        cache_stats,
+                        CacheMode::PreferPromptLevel,
                     )?;
                     record_generation_budget(
                         cfg,
@@ -402,6 +541,8 @@ fn handle_pending_action(
                             cfg,
                             budget,
                             token_tx,
+                            exact_cache,
+                            cache_stats,
                             session_messages,
                             &follow_up,
                         )?
@@ -409,6 +550,7 @@ fn handle_pending_action(
                         follow_up
                     };
                     if !final_response.trim().is_empty() {
+                        log_debug_response(debug_logging_enabled, &final_response);
                         session_messages.push(Message::assistant(&final_response));
                     }
                 }
@@ -425,11 +567,14 @@ fn handle_pending_action(
                     let _ = token_tx.send(InferenceEvent::ContextMessage(rejection));
                 }
                 if run_follow_up {
-                    let follow_up = run_and_collect(
+                    let follow_up = generate_with_cache(
                         backend,
                         session_messages,
                         token_tx.clone(),
                         !reflection_enabled,
+                        exact_cache,
+                        cache_stats,
+                        CacheMode::PreferPromptLevel,
                     )?;
                     let prompt_tokens = estimate_message_tokens(session_messages);
                     record_generation_budget(
@@ -445,6 +590,8 @@ fn handle_pending_action(
                             cfg,
                             budget,
                             token_tx,
+                            exact_cache,
+                            cache_stats,
                             session_messages,
                             &follow_up,
                         )?
@@ -452,6 +599,7 @@ fn handle_pending_action(
                         follow_up
                     };
                     if !final_response.trim().is_empty() {
+                        log_debug_response(debug_logging_enabled, &final_response);
                         session_messages.push(Message::assistant(&final_response));
                     }
                 }
@@ -491,6 +639,18 @@ fn estimate_text_tokens(text: &str) -> usize {
     } else {
         chars.div_ceil(4)
     }
+}
+
+fn effective_reflection(reflection_requested: bool, eco_enabled: bool) -> bool {
+    reflection_requested && !eco_enabled
+}
+
+fn summary_limit(eco_enabled: bool) -> usize {
+    if eco_enabled { 2 } else { 4 }
+}
+
+fn eco_tool_result_limit(eco_enabled: bool) -> Option<usize> {
+    if eco_enabled { Some(1200) } else { None }
 }
 
 fn estimate_generation_cost_usd(
@@ -546,6 +706,172 @@ fn emit_budget_update(budget: &SessionBudget, token_tx: &Sender<InferenceEvent>)
             None
         },
     }));
+}
+
+fn emit_cache_update(
+    stats: &SessionCacheStats,
+    last_hit: bool,
+    token_tx: &Sender<InferenceEvent>,
+) {
+    let _ = token_tx.send(InferenceEvent::Cache(CacheUpdate {
+        last_hit,
+        hits: stats.hits,
+        misses: stats.misses,
+        tokens_saved: stats.tokens_saved,
+    }));
+}
+
+fn log_debug_response(enabled: bool, text: &str) {
+    if !enabled || text.trim().is_empty() {
+        return;
+    }
+
+    if let Err(e) = debug_log::append_assistant_response(text) {
+        warn!(error = %e, "debug assistant response logging failed");
+    }
+}
+
+fn prompt_level_cache_key<'a>(messages: &'a [Message]) -> Option<(&'a str, &'a str)> {
+    if messages.last().map(|m| m.role.as_str()) != Some("user") {
+        return None;
+    }
+
+    let non_system = messages.iter().filter(|m| m.role != "system").count();
+    if non_system == 0 || non_system > 4 {
+        return None;
+    }
+
+    if messages.iter().any(|message| {
+        message.role == "user" && is_injected_context_message(&message.content)
+    }) {
+        return None;
+    }
+
+    let system_prompt = messages
+        .iter()
+        .find(|m| m.role == "system")
+        .map(|m| m.content.as_str())?;
+    let user_prompt = messages.last().map(|m| m.content.as_str())?;
+
+    Some((system_prompt, user_prompt))
+}
+
+fn is_injected_context_message(content: &str) -> bool {
+    let prefixes = [
+        "Tool results:\n",
+        "I've loaded this file for context:",
+        "Directory listing:\n",
+        "Search results:\n",
+        "Git context (",
+        "LSP diagnostics:\n",
+        "LSP check:\n",
+        "Fetched web context:\n",
+        "User rejected proposed action:",
+    ];
+
+    prefixes.iter().any(|prefix| content.starts_with(prefix))
+}
+
+fn store_prompt_level_cache(
+    exact_cache: Option<&ExactCache>,
+    backend_name: &str,
+    messages: &[Message],
+    response: &str,
+) {
+    let Some(cache) = exact_cache else {
+        return;
+    };
+    let Some((system_prompt, user_prompt)) = prompt_level_cache_key(messages) else {
+        return;
+    };
+
+    if let Err(e) = cache.put_prompt_level(backend_name, system_prompt, user_prompt, response) {
+        warn!(error = %e, "prompt-level cache store failed");
+    }
+}
+
+fn generate_with_cache(
+    backend: &dyn InferenceBackend,
+    messages: &[Message],
+    token_tx: Sender<InferenceEvent>,
+    stream_tokens: bool,
+    exact_cache: Option<&ExactCache>,
+    cache_stats: &mut SessionCacheStats,
+    cache_mode: CacheMode,
+) -> Result<String> {
+    if let Some(cache) = exact_cache {
+        match cache.get(&backend.name(), messages) {
+            Ok(Some(cached)) => {
+                let saved = estimate_message_tokens(messages)
+                    .saturating_add(estimate_text_tokens(&cached));
+                cache_stats.hits = cache_stats.hits.saturating_add(1);
+                cache_stats.tokens_saved = cache_stats.tokens_saved.saturating_add(saved);
+                info!(saved_tokens = saved, "exact cache hit");
+                emit_cache_update(cache_stats, true, &token_tx);
+                if stream_tokens {
+                    let _ = token_tx.send(InferenceEvent::Token(cached.clone()));
+                }
+                return Ok(cached);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "exact cache lookup failed");
+            }
+        }
+
+        if matches!(cache_mode, CacheMode::PreferPromptLevel) {
+            if let Some((system_prompt, user_prompt)) = prompt_level_cache_key(messages) {
+                match cache.get_prompt_level(&backend.name(), system_prompt, user_prompt) {
+                    Ok(Some(cached)) => {
+                        let saved = estimate_message_tokens(messages)
+                            .saturating_add(estimate_text_tokens(&cached));
+                        cache_stats.hits = cache_stats.hits.saturating_add(1);
+                        cache_stats.tokens_saved = cache_stats.tokens_saved.saturating_add(saved);
+                        info!(saved_tokens = saved, "prompt-level cache hit");
+                        emit_cache_update(cache_stats, true, &token_tx);
+                        if stream_tokens {
+                            let _ = token_tx.send(InferenceEvent::Token(cached.clone()));
+                        }
+                        return Ok(cached);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(error = %e, "prompt-level cache lookup failed");
+                    }
+                }
+
+                match cache.get_semantic_prompt_level(&backend.name(), system_prompt, user_prompt) {
+                    Ok(Some(cached)) => {
+                        let saved = estimate_message_tokens(messages)
+                            .saturating_add(estimate_text_tokens(&cached));
+                        cache_stats.hits = cache_stats.hits.saturating_add(1);
+                        cache_stats.tokens_saved = cache_stats.tokens_saved.saturating_add(saved);
+                        info!(saved_tokens = saved, "semantic prompt cache hit");
+                        emit_cache_update(cache_stats, true, &token_tx);
+                        if stream_tokens {
+                            let _ = token_tx.send(InferenceEvent::Token(cached.clone()));
+                        }
+                        return Ok(cached);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(error = %e, "semantic prompt cache lookup failed");
+                    }
+                }
+            }
+        }
+    }
+
+    cache_stats.misses = cache_stats.misses.saturating_add(1);
+    emit_cache_update(cache_stats, false, &token_tx);
+
+    let response = run_and_collect(backend, messages, token_tx.clone(), stream_tokens)?;
+    if let Some(cache) = exact_cache {
+        if let Err(e) = cache.put(&backend.name(), messages, &response) {
+            warn!(error = %e, "exact cache store failed");
+        }
+    }
+    Ok(response)
 }
 
 /// Run generation and collect the full response as a String,
@@ -611,6 +937,8 @@ fn reflect_response(
     cfg: &config::Config,
     budget: &mut SessionBudget,
     token_tx: &Sender<InferenceEvent>,
+    exact_cache: Option<&ExactCache>,
+    cache_stats: &mut SessionCacheStats,
     session_messages: &[Message],
     draft: &str,
 ) -> Result<String> {
@@ -621,11 +949,14 @@ fn reflect_response(
     info!(draft_chars = draft.chars().count(), "reflection pass started");
     let reflection_messages = build_reflection_messages(session_messages, draft);
     let prompt_tokens = estimate_message_tokens(&reflection_messages);
-    let reflected = run_and_collect(
+    let reflected = generate_with_cache(
         backend,
         &reflection_messages,
         token_tx.clone(),
         true,
+        exact_cache,
+        cache_stats,
+        CacheMode::ExactOnly,
     )?;
     record_generation_budget(cfg, budget, token_tx, prompt_tokens, &reflected);
 
@@ -710,6 +1041,64 @@ mod tests {
         assert!(looks_like_reflection_meta("No changes needed."));
         assert!(!looks_like_reflection_meta("A pointer stores the memory address of another value."));
     }
+
+    #[test]
+    fn eco_mode_disables_effective_reflection() {
+        assert!(effective_reflection(true, false));
+        assert!(!effective_reflection(true, true));
+        assert!(!effective_reflection(false, false));
+    }
+
+    #[test]
+    fn eco_prompt_is_compact_and_limited() {
+        let tools = ToolRegistry::default();
+        let facts = vec![
+            "fact one".to_string(),
+            "fact two".to_string(),
+            "fact three".to_string(),
+        ];
+        let summaries = vec![
+            ("a.rs".to_string(), "summary a".to_string()),
+            ("b.rs".to_string(), "summary b".to_string()),
+            ("c.rs".to_string(), "summary c".to_string()),
+        ];
+
+        let prompt = build_system_prompt(&tools, &facts, &summaries, true);
+
+        assert!(prompt.contains("Eco mode is active"));
+        assert!(prompt.contains("fact one"));
+        assert!(prompt.contains("fact two"));
+        assert!(!prompt.contains("fact three"));
+        assert!(prompt.contains("a.rs: summary a"));
+        assert!(prompt.contains("b.rs: summary b"));
+        assert!(!prompt.contains("c.rs: summary c"));
+    }
+
+    #[test]
+    fn prompt_level_cache_key_allows_short_plain_chat() {
+        let messages = vec![
+            Message::system("system"),
+            Message::user("What is a pointer?"),
+            Message::assistant("A pointer stores an address."),
+            Message::user("What is a pointer?"),
+        ];
+
+        let key = prompt_level_cache_key(&messages);
+
+        assert_eq!(key, Some(("system", "What is a pointer?")));
+    }
+
+    #[test]
+    fn prompt_level_cache_key_rejects_tool_context_sessions() {
+        let messages = vec![
+            Message::system("system"),
+            Message::user("I've loaded this file for context:\n\nfn main() {}"),
+            Message::assistant("Looks good."),
+            Message::user("What does it do?"),
+        ];
+
+        assert!(prompt_level_cache_key(&messages).is_none());
+    }
 }
 
 pub fn load_backend_from_config(cfg: &config::Config) -> Result<Box<dyn InferenceBackend>> {
@@ -774,12 +1163,22 @@ fn build_system_prompt(
     tools: &ToolRegistry,
     facts: &[String],
     summaries: &[(String, String)],
+    eco_enabled: bool,
 ) -> String {
-    let mut prompt = system_prompt_with_tools(&tools.tool_descriptions());
+    let mut prompt = if eco_enabled {
+        let mut compact = system_prompt_with_tools(&tools.compact_tool_descriptions());
+        compact.push_str("\n\nEco mode is active. Prefer concise answers and minimal tool use.");
+        compact
+    } else {
+        system_prompt_with_tools(&tools.tool_descriptions())
+    };
+
+    let fact_limit = if eco_enabled { 2 } else { 5 };
+    let summary_cap = summary_limit(eco_enabled);
 
     if !facts.is_empty() {
         prompt.push_str("\n\nRelevant prior project facts:\n");
-        for fact in facts {
+        for fact in facts.iter().take(fact_limit) {
             prompt.push_str("- ");
             prompt.push_str(fact);
             prompt.push('\n');
@@ -788,7 +1187,7 @@ fn build_system_prompt(
 
     if !summaries.is_empty() {
         prompt.push_str("\nRelevant indexed file summaries:\n");
-        for (path, summary) in summaries {
+        for (path, summary) in summaries.iter().take(summary_cap) {
             prompt.push_str("- ");
             prompt.push_str(path);
             prompt.push_str(": ");

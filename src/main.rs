@@ -3,7 +3,9 @@
 // Entry point.
 
 mod error;
+mod cache;
 mod config;
+mod debug_log;
 mod events;
 mod inference;
 #[allow(dead_code)]
@@ -202,14 +204,26 @@ fn main() -> Result<()> {
                 info!(mode = "one_shot", "starting one-shot generation");
                 // One-shot mode — load config and run with the selected backend.
                 let cfg = config::load()?;
+                if cfg.debug_logging.content {
+                    debug_log::append_user_prompt(&prompt)?;
+                }
+                let system_prompt = if cfg.eco.enabled {
+                    format!(
+                        "{}\n\nEco mode is active. Prefer concise answers.",
+                        inference::SYSTEM_PROMPT
+                    )
+                } else {
+                    inference::SYSTEM_PROMPT.to_string()
+                };
                 let messages = vec![
-                    inference::Message::system(inference::SYSTEM_PROMPT),
+                    inference::Message::system(&system_prompt),
                     inference::Message::user(&prompt),
                 ];
 
                 // Build the backend and generate directly to stdout.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let backend = inference::load_backend_from_config(&cfg)?;
+                let mut collected = String::new();
 
                 // Spawn generation on a thread, print tokens as they arrive.
                 let handle = std::thread::spawn(move || {
@@ -220,6 +234,7 @@ fn main() -> Result<()> {
                     match event {
                         events::InferenceEvent::Token(t) => {
                             print!("{t}");
+                            collected.push_str(&t);
                             use std::io::Write;
                             std::io::stdout().flush().ok();
                         }
@@ -227,6 +242,9 @@ fn main() -> Result<()> {
                     }
                 }
                 println!();
+                if cfg.debug_logging.content && !collected.trim().is_empty() {
+                    debug_log::append_assistant_response(&collected)?;
+                }
                 match handle.join() {
                     Ok(result) => result?,
                     Err(_) => {

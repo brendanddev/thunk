@@ -34,6 +34,12 @@ pub struct Config {
 
     #[serde(default)]
     pub reflection: ReflectionConfig,
+
+    #[serde(default)]
+    pub eco: EcoConfig,
+
+    #[serde(default)]
+    pub debug_logging: DebugLoggingConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -134,6 +140,20 @@ pub struct ReflectionConfig {
     pub enabled: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EcoConfig {
+    /// Whether to prefer lower-token prompts and context by default.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DebugLoggingConfig {
+    /// Whether to write user prompts and final assistant replies to a separate debug log.
+    #[serde(default)]
+    pub content: bool,
+}
+
 fn default_backend() -> String { "llama_cpp".to_string() }
 fn default_ollama_url() -> String { "http://localhost:11434".to_string() }
 fn default_ollama_model() -> String { "qwen2.5-coder:7b".to_string() }
@@ -219,7 +239,21 @@ impl Default for Config {
             budget: BudgetConfig::default(),
             lsp: LspConfig::default(),
             reflection: ReflectionConfig::default(),
+            eco: EcoConfig::default(),
+            debug_logging: DebugLoggingConfig::default(),
         }
+    }
+}
+
+impl Default for EcoConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+impl Default for DebugLoggingConfig {
+    fn default() -> Self {
+        Self { content: false }
     }
 }
 
@@ -247,6 +281,10 @@ pub fn log_dir() -> Result<PathBuf> {
 
 pub fn keys_env_path() -> Result<PathBuf> {
     Ok(local_dir()?.join("keys.env"))
+}
+
+pub fn debug_log_path() -> Result<PathBuf> {
+    Ok(local_dir()?.join("params-debug.log"))
 }
 
 pub fn local_dir() -> Result<PathBuf> {
@@ -349,7 +387,15 @@ pub fn load() -> Result<Config> {
              #\n\
              # Reflection pass:\n\
              #   [reflection]\n\
-             #   enabled = false\n\n\
+             #   enabled = false\n\
+             #\n\
+             # Eco mode:\n\
+             #   [eco]\n\
+             #   enabled = false\n\
+             #\n\
+             # Separate content debug logging (prompts/final answers only):\n\
+             #   [debug_logging]\n\
+             #   content = false\n\n\
              {toml}"
         );
 

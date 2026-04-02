@@ -1,10 +1,11 @@
 // src/inference/backend.rs
 
+use serde::Serialize;
 use std::sync::mpsc::Sender;
 use crate::events::InferenceEvent;
 use crate::error::Result;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
