@@ -5,6 +5,7 @@
 #[derive(Debug, Clone)]
 pub enum PendingActionKind {
     ShellCommand,
+    FileWrite,
 }
 
 #[derive(Debug, Clone)]
@@ -13,6 +14,14 @@ pub struct PendingAction {
     pub kind: PendingActionKind,
     pub title: String,
     pub preview: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BudgetUpdate {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub estimated_cost_usd: Option<f64>,
 }
 
 pub enum InferenceEvent {
@@ -24,6 +33,12 @@ pub enum InferenceEvent {
     Token(String),
     /// Tool calls being executed — shown in sidebar.
     ToolCall(String),
+    /// A local context/result message should be added to the chat.
+    ContextMessage(String),
+    /// Reflection mode changed for the current session.
+    ReflectionEnabled(bool),
+    /// Updated token/cost estimates for the current session.
+    Budget(BudgetUpdate),
     /// A mutating action needs user approval before execution.
     PendingAction(PendingAction),
     /// Generation finished.

@@ -104,6 +104,11 @@ enum Command {
         #[arg(long, default_value = ".")]
         project: String,
     },
+
+    /// Check local LSP setup for the first Rust diagnostics slice
+    ///
+    /// Reports how params resolves rust-analyzer and what to fix if it is not runnable.
+    LspCheck,
 }
 
 /// Initialises file-based logging to .local/params.log.
@@ -178,6 +183,10 @@ fn main() -> Result<()> {
             return Err(ParamsError::Config(format!(
                 "`params train --project {project}` is not implemented yet."
             )));
+        }
+
+        Some(Command::LspCheck) => {
+            println!("{}", tools::rust_lsp_health_report());
         }
 
         // No subcommand was given — check if there's a one-shot prompt,

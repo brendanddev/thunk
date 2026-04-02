@@ -25,6 +25,15 @@ pub struct Config {
 
     #[serde(default)]
     pub generation: GenerationConfig,
+
+    #[serde(default)]
+    pub budget: BudgetConfig,
+
+    #[serde(default)]
+    pub lsp: LspConfig,
+
+    #[serde(default)]
+    pub reflection: ReflectionConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,6 +106,34 @@ pub struct GenerationConfig {
     pub temperature: f32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    /// Optional estimated input pricing in USD per 1M tokens.
+    /// Leave unset for local backends or if you only want token estimates.
+    pub input_cost_per_million: Option<f64>,
+
+    /// Optional estimated output pricing in USD per 1M tokens.
+    /// If unset but input_cost_per_million is set, the input price is reused.
+    pub output_cost_per_million: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspConfig {
+    /// Optional explicit path to rust-analyzer for the first LSP slice.
+    pub rust_analyzer_path: Option<PathBuf>,
+
+    /// How long to wait for diagnostics from the language server.
+    #[serde(default = "default_lsp_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReflectionConfig {
+    /// Whether to run a hidden self-check pass before showing the final response.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 fn default_backend() -> String { "llama_cpp".to_string() }
 fn default_ollama_url() -> String { "http://localhost:11434".to_string() }
 fn default_ollama_model() -> String { "qwen2.5-coder:7b".to_string() }
@@ -104,6 +141,7 @@ fn default_openai_url() -> String { "https://api.groq.com/openai/v1".to_string()
 fn default_openai_model() -> String { "llama-3.3-70b-versatile".to_string() }
 fn default_max_tokens() -> i32 { 512 }
 fn default_temperature() -> f32 { 0.8 }
+fn default_lsp_timeout_ms() -> u64 { 3000 }
 
 impl OpenAICompatConfig {
     /// Infer a human-readable provider name from the URL if not set in config.
@@ -146,6 +184,30 @@ impl Default for GenerationConfig {
     }
 }
 
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            input_cost_per_million: None,
+            output_cost_per_million: None,
+        }
+    }
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            rust_analyzer_path: None,
+            timeout_ms: default_lsp_timeout_ms(),
+        }
+    }
+}
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -154,6 +216,9 @@ impl Default for Config {
             ollama: OllamaConfig::default(),
             openai_compat: OpenAICompatConfig::default(),
             generation: GenerationConfig::default(),
+            budget: BudgetConfig::default(),
+            lsp: LspConfig::default(),
+            reflection: ReflectionConfig::default(),
         }
     }
 }
@@ -269,7 +334,22 @@ pub fn load() -> Result<Config> {
              #   Grok:       url = \"https://api.x.ai/v1\"\n\
              #\n\
              # API keys: set in config, .local/keys.env, or env vars:\n\
-             #   GROQ_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, XAI_API_KEY\n\n\
+             #   GROQ_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, XAI_API_KEY\n\
+             #\n\
+             # Budget tracking uses token estimates for all backends.\n\
+             # For remote APIs, you can optionally set estimated USD pricing:\n\
+             #   [budget]\n\
+             #   input_cost_per_million = 0.0\n\
+             #   output_cost_per_million = 0.0\n\
+             #\n\
+             # LSP diagnostics (Rust-first initial slice):\n\
+             #   [lsp]\n\
+             #   rust_analyzer_path = \"/absolute/path/to/rust-analyzer\"\n\
+             #   timeout_ms = 3000\n\
+             #\n\
+             # Reflection pass:\n\
+             #   [reflection]\n\
+             #   enabled = false\n\n\
              {toml}"
         );
 

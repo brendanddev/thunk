@@ -45,6 +45,24 @@ fn truncate_for_width(value: &str, max_chars: usize) -> String {
     format!("{truncated}…")
 }
 
+fn format_compact_count(value: usize) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_cost(value: Option<f64>) -> String {
+    match value {
+        Some(v) if v >= 1.0 => format!("${v:.2}"),
+        Some(v) => format!("${v:.4}"),
+        None => "n/a".to_string(),
+    }
+}
+
 fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -125,7 +143,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     state.set_status("ready");
                 }
                 InferenceEvent::BackendName(name) => {
-                    state.backend_name = name;
+                    state.set_backend_name(name);
                 }
                 InferenceEvent::Token(token) => {
                     state.append_token(&token);
@@ -135,15 +153,30 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     state.last_tool_call = Some(call);
                     state.status = "running tool...".to_string();
                 }
+                InferenceEvent::ContextMessage(message) => {
+                    state.add_user_message(&message);
+                }
+                InferenceEvent::ReflectionEnabled(enabled) => {
+                    state.set_reflection_enabled(enabled);
+                }
+                InferenceEvent::Budget(update) => {
+                    state.update_budget(
+                        update.prompt_tokens,
+                        update.completion_tokens,
+                        update.total_tokens,
+                        update.estimated_cost_usd,
+                    );
+                }
                 InferenceEvent::PendingAction(action) => {
                     let title = action.title.clone();
                     let preview = action.preview.clone();
                     let kind = match action.kind {
                         PendingActionKind::ShellCommand => "shell command",
+                        PendingActionKind::FileWrite => "file write",
                     };
                     state.set_pending_action(action);
                     state.add_system_message(&format!(
-                        "{title} ({kind}):\n{preview}\nUse /approve or /reject."
+                        "Pending {kind}:\n{title}\nUse /approve or /reject.\n\n{preview}"
                     ));
                 }
                 InferenceEvent::Done => {
@@ -255,8 +288,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
                             if let Some(id) = state.pending_action_id() {
                                 let _ = prompt_tx.send(SessionCommand::ApproveAction(id));
-                                state.add_system_message("approved pending action");
-                                state.clear_pending_action();
+                                state.mark_pending_action_submitted("processing approval");
                             }
                         }
 
@@ -264,8 +296,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                             if let Some(id) = state.pending_action_id() {
                                 let _ = prompt_tx.send(SessionCommand::RejectAction(id));
-                                state.add_system_message("rejected pending action");
-                                state.clear_pending_action();
+                                state.mark_pending_action_submitted("processing rejection");
                             }
                         }
 
@@ -317,7 +348,7 @@ fn draw(frame: &mut Frame, state: &mut AppState) {
 }
 
 fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
-    let border_color = if state.is_generating {
+    let border_color = if state.pending_action.is_some() || state.is_generating {
         Color::Yellow
     } else if state.model_ready {
         Color::DarkGray
@@ -340,13 +371,15 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let status_line = if !state.model_ready {
         format!("{spinner_frame} {}", state.status)
+    } else if state.pending_action.is_some() {
+        state.status.clone()
     } else if state.is_generating {
         format!("{spinner_frame} generating")
     } else {
         state.status.clone()
     };
 
-    let status_color = if state.is_generating || !state.model_ready {
+    let status_color = if state.pending_action.is_some() || state.is_generating || !state.model_ready {
         Color::Yellow
     } else {
         Color::Green
@@ -377,12 +410,48 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
                 Style::default().fg(Color::White),
             ),
         ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("tok   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_compact_count(state.total_tokens),
+                Style::default().fg(Color::White),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("cost  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_cost(state.estimated_cost_usd),
+                Style::default().fg(Color::White),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("refl  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if state.reflection_enabled { "on" } else { "off" },
+                Style::default().fg(Color::White),
+            ),
+        ])),
         ListItem::new(Line::from("")),
         {
             if let Some(ref call) = state.last_tool_call {
                 let truncated = truncate_for_width(call, 18);
                 ListItem::new(Line::from(vec![
                     Span::styled("tool  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(truncated, Style::default().fg(Color::Yellow)),
+                ]))
+            } else {
+                ListItem::new(Line::from(""))
+            }
+        },
+        {
+            if let Some(ref pending) = state.pending_action {
+                let label = match pending.kind {
+                    PendingActionKind::ShellCommand => "pending",
+                    PendingActionKind::FileWrite => "pending",
+                };
+                let truncated = truncate_for_width(&pending.title, 18);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{label:<6}"), Style::default().fg(Color::DarkGray)),
                     Span::styled(truncated, Style::default().fg(Color::Yellow)),
                 ]))
             } else {
@@ -442,8 +511,28 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(" <cmd>", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
+            Span::styled("/diag  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <file>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/lcheck", Style::default().fg(Color::DarkGray)),
+            Span::styled(" status", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/fetch ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <url>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
             Span::styled("/run   ", Style::default().fg(Color::DarkGray)),
             Span::styled(" <cmd>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/reflect", Style::default().fg(Color::DarkGray)),
+            Span::styled(" on|off", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("write_file", Style::default().fg(Color::DarkGray)),
+            Span::styled(" via model", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
             Span::styled("/approve", Style::default().fg(Color::DarkGray)),
@@ -777,6 +866,38 @@ fn handle_slash_command(
             }
         }
 
+        "/diag" | "/lsp" => {
+            if arg.is_empty() {
+                state.add_system_message("Usage: /diag <rust_file>");
+                return;
+            }
+            let tool = crate::tools::LspDiagnosticsTool;
+            match crate::tools::Tool::run(&tool, arg) {
+                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
+                    state.add_system_message(&format!("diagnostics: {arg}"));
+                    let safe = sanitize_for_display(&output);
+                    let context = format!("LSP diagnostics:\n\n{safe}");
+                    state.add_user_message(&context);
+                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                }
+                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
+                    state.add_system_message("diagnostics requested approval unexpectedly");
+                }
+                Err(e) => {
+                    state.add_system_message(&format!("diagnostics error: {e}"));
+                }
+            }
+        }
+
+        "/lcheck" | "/lsp-check" => {
+            let report = crate::tools::rust_lsp_health_report();
+            state.add_system_message("lsp check");
+            let safe = sanitize_for_display(&report);
+            let context = format!("LSP check:\n\n{safe}");
+            state.add_user_message(&context);
+            let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+        }
+
         "/run" | "/bash" => {
             if arg.is_empty() {
                 state.add_system_message("Usage: /run <command>");
@@ -785,12 +906,59 @@ fn handle_slash_command(
             let _ = prompt_tx.send(SessionCommand::RequestShellCommand(arg.to_string()));
         }
 
+        "/reflect" => {
+            let mode = arg.to_ascii_lowercase();
+            match mode.as_str() {
+                "on" => {
+                    state.set_reflection_enabled(true);
+                    state.add_system_message("reflection enabled");
+                    let _ = prompt_tx.send(SessionCommand::SetReflection(true));
+                }
+                "off" => {
+                    state.set_reflection_enabled(false);
+                    state.add_system_message("reflection disabled");
+                    let _ = prompt_tx.send(SessionCommand::SetReflection(false));
+                }
+                "" | "status" => {
+                    state.add_system_message(&format!(
+                        "reflection is {}",
+                        if state.reflection_enabled { "on" } else { "off" }
+                    ));
+                }
+                _ => {
+                    state.add_system_message("Usage: /reflect <on|off|status>");
+                }
+            }
+        }
+
+        "/fetch" | "/web" => {
+            if arg.is_empty() {
+                state.add_system_message("Usage: /fetch <url>");
+                return;
+            }
+            let tool = crate::tools::FetchUrlTool;
+            match crate::tools::Tool::run(&tool, arg) {
+                Ok(crate::tools::ToolRunResult::Immediate(output)) => {
+                    state.add_system_message(&format!("fetched: {arg}"));
+                    let safe = sanitize_for_display(&output);
+                    let context = format!("Fetched web context:\n\n{safe}");
+                    state.add_user_message(&context);
+                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                }
+                Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
+                    state.add_system_message("fetch requested approval unexpectedly");
+                }
+                Err(e) => {
+                    state.add_system_message(&format!("fetch error: {e}"));
+                }
+            }
+        }
+
         "/approve" => {
             match state.pending_action_id() {
                 Some(id) => {
                     let _ = prompt_tx.send(SessionCommand::ApproveAction(id));
-                    state.add_system_message("approved pending action");
-                    state.clear_pending_action();
+                    state.mark_pending_action_submitted("processing approval");
                 }
                 None => state.add_system_message("No pending action to approve."),
             }
@@ -800,8 +968,7 @@ fn handle_slash_command(
             match state.pending_action_id() {
                 Some(id) => {
                     let _ = prompt_tx.send(SessionCommand::RejectAction(id));
-                    state.add_system_message("rejected pending action");
-                    state.clear_pending_action();
+                    state.mark_pending_action_submitted("processing rejection");
                 }
                 None => state.add_system_message("No pending action to reject."),
             }
@@ -819,7 +986,11 @@ fn handle_slash_command(
                  /ls [path]      — list directory (default: current)\n  \
                  /search <query> — search source files\n  \
                  /git [command]  — git status, diff, log\n  \
+                 /diag <file>    — Rust LSP diagnostics for a file\n  \
+                 /lcheck         — Rust LSP setup check\n  \
+                 /fetch <url>    — fetch a webpage into context\n  \
                  /run <command>  — propose a shell command\n  \
+                 /reflect on|off — toggle reflection pass\n  \
                  /approve        — approve pending action\n  \
                  /reject         — reject pending action\n  \
                  /clear          — clear conversation\n  \

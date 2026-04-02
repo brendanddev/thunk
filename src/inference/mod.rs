@@ -18,7 +18,7 @@ pub use openai_compat::OpenAICompatBackend;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
-use crate::events::{InferenceEvent, PendingAction, PendingActionKind};
+use crate::events::{BudgetUpdate, InferenceEvent, PendingAction, PendingActionKind};
 use crate::config;
 use crate::error::{ParamsError, Result};
 use crate::memory::{compression, facts::FactStore, index::ProjectIndex};
@@ -28,9 +28,18 @@ pub enum SessionCommand {
     SubmitUser(String),
     InjectUserContext(String),
     RequestShellCommand(String),
+    SetReflection(bool),
     ApproveAction(u64),
     RejectAction(u64),
     ClearSession,
+}
+
+#[derive(Default)]
+struct SessionBudget {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    estimated_cost_usd: f64,
+    has_cost_estimate: bool,
 }
 
 /// Persistent model thread — loads the backend once, handles prompts in a loop.
@@ -57,6 +66,8 @@ pub fn model_thread(
 
     let _ = token_tx.send(InferenceEvent::Ready);
     let _ = token_tx.send(InferenceEvent::BackendName(backend.name()));
+    let mut reflection_enabled = cfg.reflection.enabled;
+    let _ = token_tx.send(InferenceEvent::ReflectionEnabled(reflection_enabled));
 
     // Build the tool registry — same instance reused across all prompts
     let tools = ToolRegistry::default();
@@ -71,6 +82,10 @@ pub fn model_thread(
     let mut session_messages = vec![Message::system(
         &build_system_prompt(&tools, &session_facts, &[]),
     )];
+    let mut budget = SessionBudget {
+        has_cost_estimate: cfg.backend == "llama_cpp" || cfg.backend == "ollama",
+        ..SessionBudget::default()
+    };
     let mut next_action_id = 1u64;
 
     while let Ok(command) = prompt_rx.recv() {
@@ -80,6 +95,11 @@ pub fn model_thread(
                 session_messages.push(Message::system(
                     &build_system_prompt(&tools, &session_facts, &[]),
                 ));
+                budget = SessionBudget {
+                    has_cost_estimate: cfg.backend == "llama_cpp" || cfg.backend == "ollama",
+                    ..SessionBudget::default()
+                };
+                emit_budget_update(&budget, &token_tx);
                 continue;
             }
             SessionCommand::InjectUserContext(content) => {
@@ -88,8 +108,10 @@ pub fn model_thread(
             }
             SessionCommand::RequestShellCommand(command) => {
                 let pending = PendingToolAction {
+                    kind: PendingActionKind::ShellCommand,
                     tool_name: "bash".to_string(),
                     argument: command.clone(),
+                    display_argument: command.clone(),
                     title: "Approve shell command".to_string(),
                     preview: command,
                 };
@@ -99,6 +121,9 @@ pub fn model_thread(
                     &*backend,
                     &tools,
                     &mut session_messages,
+                    &cfg,
+                    &mut budget,
+                    reflection_enabled,
                     next_action_id,
                     pending,
                     false,
@@ -107,6 +132,11 @@ pub fn model_thread(
                 }
                 let _ = token_tx.send(InferenceEvent::Done);
                 next_action_id = next_action_id.saturating_add(1);
+                continue;
+            }
+            SessionCommand::SetReflection(enabled) => {
+                reflection_enabled = enabled;
+                let _ = token_tx.send(InferenceEvent::ReflectionEnabled(enabled));
                 continue;
             }
             SessionCommand::ApproveAction(_) | SessionCommand::RejectAction(_) => {
@@ -132,13 +162,27 @@ pub fn model_thread(
                 compression::compress_history(&mut session_messages, &*backend);
 
                 // Run generation — collect full response for tool call detection
-                let response = run_and_collect(&*backend, &session_messages, token_tx.clone());
+                let response = run_and_collect(
+                    &*backend,
+                    &session_messages,
+                    token_tx.clone(),
+                    !reflection_enabled,
+                );
+                let prompt_tokens = estimate_message_tokens(&session_messages);
 
                 match response {
                     Err(e) => {
                         let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                     }
                     Ok(full_response) => {
+                        record_generation_budget(
+                            &cfg,
+                            &mut budget,
+                            &token_tx,
+                            prompt_tokens,
+                            &full_response,
+                        );
+
                         // Check if the model used any tools
                         let tool_execution = tools.execute_tool_calls(&full_response);
                         let tool_results = tool_execution.results;
@@ -154,6 +198,9 @@ pub fn model_thread(
                                 &*backend,
                                 &tools,
                                 &mut session_messages,
+                                &cfg,
+                                &mut budget,
+                                reflection_enabled,
                                 next_action_id,
                                 pending,
                                 true,
@@ -173,18 +220,73 @@ pub fn model_thread(
                             session_messages.push(Message::assistant(&full_response));
                             session_messages.push(Message::user(&result_msg));
 
-                            match run_and_collect(&*backend, &session_messages, token_tx.clone()) {
+                            match run_and_collect(
+                                &*backend,
+                                &session_messages,
+                                token_tx.clone(),
+                                !reflection_enabled,
+                            ) {
                                 Ok(follow_up) => {
-                                    if !follow_up.trim().is_empty() {
-                                        session_messages.push(Message::assistant(&follow_up));
+                                    let prompt_tokens = estimate_message_tokens(&session_messages);
+                                    record_generation_budget(
+                                        &cfg,
+                                        &mut budget,
+                                        &token_tx,
+                                        prompt_tokens,
+                                        &follow_up,
+                                    );
+                                    let final_response = if reflection_enabled {
+                                        reflect_response(
+                                            &*backend,
+                                            &cfg,
+                                            &mut budget,
+                                            &token_tx,
+                                            &session_messages,
+                                            &follow_up,
+                                        )
+                                    } else {
+                                        Ok(follow_up)
+                                    };
+
+                                    match final_response {
+                                        Ok(final_response) => {
+                                            if !final_response.trim().is_empty() {
+                                                session_messages.push(Message::assistant(&final_response));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                                        }
                                     }
                                 }
                                 Err(e) => {
                                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                 }
                             }
-                        } else if !full_response.trim().is_empty() {
-                            session_messages.push(Message::assistant(&full_response));
+                        } else {
+                            let final_response = if reflection_enabled {
+                                reflect_response(
+                                    &*backend,
+                                    &cfg,
+                                    &mut budget,
+                                    &token_tx,
+                                    &session_messages,
+                                    &full_response,
+                                )
+                            } else {
+                                Ok(full_response)
+                            };
+
+                            match final_response {
+                                Ok(final_response) => {
+                                    if !final_response.trim().is_empty() {
+                                        session_messages.push(Message::assistant(&final_response));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                                }
+                            }
                         }
 
                         let _ = token_tx.send(InferenceEvent::Done);
@@ -205,6 +307,9 @@ fn handle_pending_action(
     backend: &dyn InferenceBackend,
     tools: &ToolRegistry,
     session_messages: &mut Vec<Message>,
+    cfg: &config::Config,
+    budget: &mut SessionBudget,
+    reflection_enabled: bool,
     action_id: u64,
     mut pending: PendingToolAction,
     run_follow_up: bool,
@@ -215,7 +320,7 @@ fn handle_pending_action(
 
     let event = PendingAction {
         id: action_id,
-        kind: PendingActionKind::ShellCommand,
+        kind: pending.kind.clone(),
         title: pending.title.clone(),
         preview: pending.preview.clone(),
     };
@@ -232,11 +337,39 @@ fn handle_pending_action(
                 let result_msg = ToolRegistry::format_results(&[result]);
                 if let Some(result_msg) = result_msg {
                     session_messages.push(Message::user(&result_msg));
+                    if !run_follow_up {
+                        let _ = token_tx.send(InferenceEvent::ContextMessage(result_msg));
+                    }
                 }
                 if run_follow_up {
-                    let follow_up = run_and_collect(backend, session_messages, token_tx.clone())?;
-                    if !follow_up.trim().is_empty() {
-                        session_messages.push(Message::assistant(&follow_up));
+                    let prompt_tokens = estimate_message_tokens(session_messages);
+                    let follow_up = run_and_collect(
+                        backend,
+                        session_messages,
+                        token_tx.clone(),
+                        !reflection_enabled,
+                    )?;
+                    record_generation_budget(
+                        cfg,
+                        budget,
+                        token_tx,
+                        prompt_tokens,
+                        &follow_up,
+                    );
+                    let final_response = if reflection_enabled {
+                        reflect_response(
+                            backend,
+                            cfg,
+                            budget,
+                            token_tx,
+                            session_messages,
+                            &follow_up,
+                        )?
+                    } else {
+                        follow_up
+                    };
+                    if !final_response.trim().is_empty() {
+                        session_messages.push(Message::assistant(&final_response));
                     }
                 }
                 return Ok(());
@@ -244,13 +377,41 @@ fn handle_pending_action(
             Ok(SessionCommand::RejectAction(id)) if id == action_id => {
                 let rejection = format!(
                     "User rejected proposed action: {}",
-                    pending.argument
+                    pending.display_argument
                 );
                 session_messages.push(Message::user(&rejection));
+                if !run_follow_up {
+                    let _ = token_tx.send(InferenceEvent::ContextMessage(rejection));
+                }
                 if run_follow_up {
-                    let follow_up = run_and_collect(backend, session_messages, token_tx.clone())?;
-                    if !follow_up.trim().is_empty() {
-                        session_messages.push(Message::assistant(&follow_up));
+                    let follow_up = run_and_collect(
+                        backend,
+                        session_messages,
+                        token_tx.clone(),
+                        !reflection_enabled,
+                    )?;
+                    let prompt_tokens = estimate_message_tokens(session_messages);
+                    record_generation_budget(
+                        cfg,
+                        budget,
+                        token_tx,
+                        prompt_tokens,
+                        &follow_up,
+                    );
+                    let final_response = if reflection_enabled {
+                        reflect_response(
+                            backend,
+                            cfg,
+                            budget,
+                            token_tx,
+                            session_messages,
+                            &follow_up,
+                        )?
+                    } else {
+                        follow_up
+                    };
+                    if !final_response.trim().is_empty() {
+                        session_messages.push(Message::assistant(&final_response));
                     }
                 }
                 return Ok(());
@@ -270,12 +431,88 @@ fn handle_pending_action(
     }
 }
 
+fn estimate_message_tokens(messages: &[Message]) -> usize {
+    let mut total = 0usize;
+    for message in messages {
+        total = total
+            .saturating_add(estimate_text_tokens(&message.role))
+            .saturating_add(estimate_text_tokens(&message.content))
+            .saturating_add(4);
+    }
+    total.saturating_add(2)
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    let chars = text.chars().count();
+    if chars == 0 {
+        0
+    } else {
+        chars.div_ceil(4)
+    }
+}
+
+fn estimate_generation_cost_usd(
+    cfg: &config::Config,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> Option<f64> {
+    match cfg.backend.as_str() {
+        "llama_cpp" | "ollama" => Some(0.0),
+        "openai_compat" => {
+            let input = cfg.budget.input_cost_per_million?;
+            let output = cfg
+                .budget
+                .output_cost_per_million
+                .unwrap_or(input);
+
+            Some(
+                (prompt_tokens as f64 / 1_000_000.0) * input
+                    + (completion_tokens as f64 / 1_000_000.0) * output,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn record_generation_budget(
+    cfg: &config::Config,
+    budget: &mut SessionBudget,
+    token_tx: &Sender<InferenceEvent>,
+    prompt_tokens: usize,
+    response: &str,
+) {
+    let completion_tokens = estimate_text_tokens(response);
+    budget.prompt_tokens = budget.prompt_tokens.saturating_add(prompt_tokens);
+    budget.completion_tokens = budget.completion_tokens.saturating_add(completion_tokens);
+
+    if let Some(cost) = estimate_generation_cost_usd(cfg, prompt_tokens, completion_tokens) {
+        budget.estimated_cost_usd += cost;
+        budget.has_cost_estimate = true;
+    }
+
+    emit_budget_update(budget, token_tx);
+}
+
+fn emit_budget_update(budget: &SessionBudget, token_tx: &Sender<InferenceEvent>) {
+    let _ = token_tx.send(InferenceEvent::Budget(BudgetUpdate {
+        prompt_tokens: budget.prompt_tokens,
+        completion_tokens: budget.completion_tokens,
+        total_tokens: budget.prompt_tokens.saturating_add(budget.completion_tokens),
+        estimated_cost_usd: if budget.has_cost_estimate {
+            Some(budget.estimated_cost_usd)
+        } else {
+            None
+        },
+    }));
+}
+
 /// Run generation and collect the full response as a String,
 /// while also streaming tokens to the UI via the channel.
 fn run_and_collect(
     backend: &dyn InferenceBackend,
     messages: &[Message],
     token_tx: Sender<InferenceEvent>,
+    stream_tokens: bool,
 ) -> Result<String> {
     use std::sync::{Arc, Mutex};
 
@@ -296,7 +533,9 @@ fn run_and_collect(
                     if let Ok(mut buf) = buffer_clone.lock() {
                         buf.push_str(t);
                     }
-                    let _ = relay_token_tx.send(event);
+                    if stream_tokens {
+                        let _ = relay_token_tx.send(event);
+                    }
                 }
                 _ => {
                     // Don't forward Done/Error — model_thread handles those
@@ -315,6 +554,79 @@ fn run_and_collect(
         .unwrap_or_default();
 
     Ok(result)
+}
+
+fn reflect_response(
+    backend: &dyn InferenceBackend,
+    cfg: &config::Config,
+    budget: &mut SessionBudget,
+    token_tx: &Sender<InferenceEvent>,
+    session_messages: &[Message],
+    draft: &str,
+) -> Result<String> {
+    if draft.trim().is_empty() {
+        return Ok(String::new());
+    }
+
+    let reflection_messages = build_reflection_messages(session_messages, draft);
+    let prompt_tokens = estimate_message_tokens(&reflection_messages);
+    let reflected = run_and_collect(
+        backend,
+        &reflection_messages,
+        token_tx.clone(),
+        true,
+    )?;
+    record_generation_budget(cfg, budget, token_tx, prompt_tokens, &reflected);
+
+    if reflected.trim().is_empty() {
+        Ok(draft.to_string())
+    } else {
+        Ok(reflected)
+    }
+}
+
+fn build_reflection_messages(session_messages: &[Message], draft: &str) -> Vec<Message> {
+    let mut messages = vec![Message::system(
+        "You are a reflection pass for params-cli. Review the assistant draft for correctness, safety, unnecessary claims, missed repo/tool context, and clarity. Return only the improved final answer. Do not mention reflection. Do not call tools. Keep good answers concise.",
+    )];
+
+    for message in session_messages {
+        if message.role != "system" {
+            messages.push(message.clone());
+        }
+    }
+
+    messages.push(Message::assistant(draft));
+    messages.push(Message::user(
+        "Review the assistant draft above. If it is already good, return it with only minimal edits. Return only the final answer text.",
+    ));
+    messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reflection_messages_exclude_original_system_prompt() {
+        let session_messages = vec![
+            Message::system("tool-heavy system prompt"),
+            Message::user("question"),
+            Message::assistant("draft context"),
+        ];
+
+        let reflection = build_reflection_messages(&session_messages, "final draft");
+
+        assert_eq!(reflection[0].role, "system");
+        assert!(!reflection.iter().skip(1).any(|m| m.content == "tool-heavy system prompt"));
+        assert_eq!(reflection[1].role, "user");
+        assert_eq!(reflection[1].content, "question");
+        assert_eq!(reflection[2].role, "assistant");
+        assert_eq!(reflection[2].content, "draft context");
+        assert_eq!(reflection[3].role, "assistant");
+        assert_eq!(reflection[3].content, "final draft");
+        assert_eq!(reflection[4].role, "user");
+    }
 }
 
 pub fn load_backend_from_config(cfg: &config::Config) -> Result<Box<dyn InferenceBackend>> {

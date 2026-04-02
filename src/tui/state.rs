@@ -51,6 +51,15 @@ pub struct AppState {
 
     /// Action currently awaiting approval
     pub pending_action: Option<PendingAction>,
+
+    /// Session budget tracking
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub estimated_cost_usd: Option<f64>,
+
+    /// Whether reflection is enabled for the current session
+    pub reflection_enabled: bool,
 }
 
 impl AppState {
@@ -68,6 +77,11 @@ impl AppState {
             tick: 0,
             last_tool_call: None,
             pending_action: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            estimated_cost_usd: None,
+            reflection_enabled: false,
         }
     }
 
@@ -222,10 +236,27 @@ impl AppState {
         }
     }
 
+    pub fn set_backend_name(&mut self, name: String) {
+        self.backend_name = name.clone();
+        if self.total_tokens == 0 {
+            self.estimated_cost_usd = if name.starts_with("llama.cpp") || name.starts_with("ollama") {
+                Some(0.0)
+            } else {
+                None
+            };
+        }
+    }
+
     pub fn set_pending_action(&mut self, action: PendingAction) {
         self.pending_action = Some(action);
         self.is_generating = false;
         self.status = "awaiting approval".to_string();
+    }
+
+    pub fn mark_pending_action_submitted(&mut self, decision: &str) {
+        if self.pending_action.is_some() {
+            self.status = format!("{decision}...");
+        }
     }
 
     pub fn clear_pending_action(&mut self) {
@@ -237,6 +268,23 @@ impl AppState {
 
     pub fn pending_action_id(&self) -> Option<u64> {
         self.pending_action.as_ref().map(|action| action.id)
+    }
+
+    pub fn update_budget(
+        &mut self,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        total_tokens: usize,
+        estimated_cost_usd: Option<f64>,
+    ) {
+        self.prompt_tokens = prompt_tokens;
+        self.completion_tokens = completion_tokens;
+        self.total_tokens = total_tokens;
+        self.estimated_cost_usd = estimated_cost_usd;
+    }
+
+    pub fn set_reflection_enabled(&mut self, enabled: bool) {
+        self.reflection_enabled = enabled;
     }
 
     pub fn is_ready(&self) -> bool {
@@ -254,5 +302,15 @@ impl AppState {
     pub fn clear_messages(&mut self) {
         self.messages.clear();
         self.scroll_offset = 0;
+        self.prompt_tokens = 0;
+        self.completion_tokens = 0;
+        self.total_tokens = 0;
+        self.estimated_cost_usd = if self.backend_name.starts_with("llama.cpp")
+            || self.backend_name.starts_with("ollama")
+        {
+            Some(0.0)
+        } else {
+            None
+        };
     }
 }
