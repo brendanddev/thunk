@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config;
 use crate::error::{ParamsError, Result};
@@ -72,7 +72,7 @@ impl Tool for LspDiagnosticsTool {
         let project_root = find_rust_project_root(&path)?;
         let source = fs::read_to_string(&path)?;
 
-        info!(tool = "lsp_diagnostics", path = display_path.as_str(), "tool called");
+        info!(tool = "lsp_diagnostics", "tool called");
 
         let diagnostics = collect_rust_diagnostics(&cfg, &project_root, &path, &source)?;
         let output = format_diagnostics(&display_path, &diagnostics);
@@ -219,6 +219,7 @@ fn collect_rust_diagnostics(
 }
 
 pub fn rust_lsp_health_report() -> String {
+    info!(tool = "lsp_health_check", "tool called");
     match config::load() {
         Ok(cfg) => format_lsp_health_report(&cfg),
         Err(e) => format!("LSP check failed to load config: {e}"),
@@ -254,6 +255,7 @@ fn format_lsp_health_report(cfg: &config::Config) -> String {
     }
 
     if !found_ready {
+        warn!("rust lsp health check found no runnable server");
         output.push_str("\nFix:\n");
         output.push_str("- Install the rust-analyzer component with `rustup component add rust-analyzer`\n");
         output.push_str("- Or set [lsp].rust_analyzer_path in .local/config.toml to a runnable binary\n");

@@ -158,34 +158,40 @@ fn main() -> Result<()> {
     // every possible variant, so nothing can silently fall through.
     match cli.command {
         Some(Command::Pull { model }) => {
+            info!(command = "pull", "cli command selected");
             return Err(ParamsError::Config(format!(
                 "`params pull {model}` is not implemented yet."
             )));
         }
 
         Some(Command::Index { path }) => {
+            info!(command = "index", "cli command selected");
             run_index_command(&path)?;
         }
 
         Some(Command::Compare { prompt }) => {
+            info!(command = "compare", "cli command selected");
             return Err(ParamsError::Config(format!(
                 "`params compare {prompt}` is not implemented yet."
             )));
         }
 
         Some(Command::Bench { last }) => {
+            info!(command = "bench", "cli command selected");
             return Err(ParamsError::Config(format!(
                 "`params bench --last {last}` is not implemented yet."
             )));
         }
 
         Some(Command::Train { project }) => {
+            info!(command = "train", "cli command selected");
             return Err(ParamsError::Config(format!(
                 "`params train --project {project}` is not implemented yet."
             )));
         }
 
         Some(Command::LspCheck) => {
+            info!(command = "lsp-check", "cli command selected");
             println!("{}", tools::rust_lsp_health_report());
         }
 
@@ -193,6 +199,7 @@ fn main() -> Result<()> {
         // otherwise open the TUI.
         None => match cli.prompt {
             Some(prompt) => {
+                info!(mode = "one_shot", "starting one-shot generation");
                 // One-shot mode — load config and run with the selected backend.
                 let cfg = config::load()?;
                 let messages = vec![
@@ -230,6 +237,7 @@ fn main() -> Result<()> {
                 }
             }
             None => {
+                info!(mode = "tui", "starting tui");
                 // Launch the full TUI app
                 tui::run()?;
             }
@@ -257,6 +265,7 @@ fn run_index_command(path: &str) -> Result<()> {
     }
 
     let root = std::fs::canonicalize(root)?;
+    info!(command = "index", "starting project index");
     let cfg = config::load()?;
     let backend = inference::load_backend_from_config(&cfg)?;
     let index = memory::index::ProjectIndex::open_for(&root)?;
@@ -295,6 +304,7 @@ fn run_index_command(path: &str) -> Result<()> {
         root.display(),
         skipped
     );
+    info!(indexed, skipped, "project index completed");
     Ok(())
 }
 

@@ -18,6 +18,7 @@ pub use openai_compat::OpenAICompatBackend;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
+use tracing::{debug, info, warn};
 use crate::events::{BudgetUpdate, InferenceEvent, PendingAction, PendingActionKind};
 use crate::config;
 use crate::error::{ParamsError, Result};
@@ -63,10 +64,12 @@ pub fn model_thread(
             return;
         }
     };
+    info!(backend = backend.name(), "model thread initialized");
 
     let _ = token_tx.send(InferenceEvent::Ready);
     let _ = token_tx.send(InferenceEvent::BackendName(backend.name()));
     let mut reflection_enabled = cfg.reflection.enabled;
+    info!(enabled = reflection_enabled, "reflection initial state");
     let _ = token_tx.send(InferenceEvent::ReflectionEnabled(reflection_enabled));
 
     // Build the tool registry — same instance reused across all prompts
@@ -91,6 +94,7 @@ pub fn model_thread(
     while let Ok(command) = prompt_rx.recv() {
         match command {
             SessionCommand::ClearSession => {
+                info!("session cleared");
                 session_messages.clear();
                 session_messages.push(Message::system(
                     &build_system_prompt(&tools, &session_facts, &[]),
@@ -103,10 +107,12 @@ pub fn model_thread(
                 continue;
             }
             SessionCommand::InjectUserContext(content) => {
+                info!(chars = content.chars().count(), "user context injected");
                 session_messages.push(Message::user(&content));
                 continue;
             }
             SessionCommand::RequestShellCommand(command) => {
+                info!("shell command approval requested");
                 let pending = PendingToolAction {
                     kind: PendingActionKind::ShellCommand,
                     tool_name: "bash".to_string(),
@@ -136,16 +142,23 @@ pub fn model_thread(
             }
             SessionCommand::SetReflection(enabled) => {
                 reflection_enabled = enabled;
+                info!(enabled, "reflection state updated");
                 let _ = token_tx.send(InferenceEvent::ReflectionEnabled(enabled));
                 continue;
             }
             SessionCommand::ApproveAction(_) | SessionCommand::RejectAction(_) => {
+                warn!("approval command received with no pending action");
                 let _ = token_tx.send(InferenceEvent::Error(
                     "No action is currently awaiting approval".to_string()
                 ));
                 continue;
             }
             SessionCommand::SubmitUser(prompt) => {
+                info!(
+                    reflection_enabled,
+                    existing_messages = session_messages.len(),
+                    "user turn submitted"
+                );
                 session_messages.push(Message::user(&prompt));
 
                 let relevant_summaries = project_index
@@ -168,6 +181,11 @@ pub fn model_thread(
                     token_tx.clone(),
                     !reflection_enabled,
                 );
+                debug!(
+                    reflection_enabled,
+                    message_count = session_messages.len(),
+                    "generation started"
+                );
                 let prompt_tokens = estimate_message_tokens(&session_messages);
 
                 match response {
@@ -175,6 +193,11 @@ pub fn model_thread(
                         let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                     }
                     Ok(full_response) => {
+                        info!(
+                            response_chars = full_response.chars().count(),
+                            reflection_enabled,
+                            "generation completed"
+                        );
                         record_generation_budget(
                             &cfg,
                             &mut budget,
@@ -186,6 +209,11 @@ pub fn model_thread(
                         // Check if the model used any tools
                         let tool_execution = tools.execute_tool_calls(&full_response);
                         let tool_results = tool_execution.results;
+                        info!(
+                            tool_results = tool_results.len(),
+                            pending = tool_execution.pending.is_some(),
+                            "tool scan completed"
+                        );
 
                         if let Some(pending) = tool_execution.pending {
                             session_messages.push(Message::assistant(&full_response));
@@ -255,11 +283,13 @@ pub fn model_thread(
                                             }
                                         }
                                         Err(e) => {
+                                            warn!(error = %e, "reflection after tool follow-up failed");
                                             let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                         }
                                     }
                                 }
                                 Err(e) => {
+                                    warn!(error = %e, "tool follow-up generation failed");
                                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                 }
                             }
@@ -284,6 +314,7 @@ pub fn model_thread(
                                     }
                                 }
                                 Err(e) => {
+                                    warn!(error = %e, "final response post-processing failed");
                                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                 }
                             }
@@ -297,6 +328,7 @@ pub fn model_thread(
     }
 
     if let Some(store) = fact_store.as_ref() {
+        info!("persisting session facts");
         store.extract_and_store(&session_messages, &project_name, &*backend);
     }
 }
@@ -324,11 +356,19 @@ fn handle_pending_action(
         title: pending.title.clone(),
         preview: pending.preview.clone(),
     };
+    info!(
+        action_id,
+        tool = pending.tool_name.as_str(),
+        kind = ?pending.kind,
+        run_follow_up,
+        "pending action proposed"
+    );
     let _ = token_tx.send(InferenceEvent::PendingAction(event));
 
     loop {
         match prompt_rx.recv() {
             Ok(SessionCommand::ApproveAction(id)) if id == action_id => {
+                info!(action_id, tool = pending.tool_name.as_str(), "pending action approved");
                 let result = tools.execute_pending_action(&pending);
                 let _ = token_tx.send(InferenceEvent::ToolCall(format!(
                     "{}({})",
@@ -375,6 +415,7 @@ fn handle_pending_action(
                 return Ok(());
             }
             Ok(SessionCommand::RejectAction(id)) if id == action_id => {
+                info!(action_id, tool = pending.tool_name.as_str(), "pending action rejected");
                 let rejection = format!(
                     "User rejected proposed action: {}",
                     pending.display_argument
@@ -417,6 +458,7 @@ fn handle_pending_action(
                 return Ok(());
             }
             Ok(SessionCommand::ClearSession) => {
+                warn!(action_id, "clear requested while pending action active");
                 return Err(ParamsError::Config(
                     "Cannot clear session while an action is awaiting approval".to_string()
                 ));
@@ -516,6 +558,12 @@ fn run_and_collect(
 ) -> Result<String> {
     use std::sync::{Arc, Mutex};
 
+    debug!(
+        stream_tokens,
+        message_count = messages.len(),
+        "run_and_collect started"
+    );
+
     // We need to both stream tokens to the UI and collect them locally.
     // Use a shared buffer that both the channel sender and collector write to.
     let buffer = Arc::new(Mutex::new(String::new()));
@@ -553,6 +601,8 @@ fn run_and_collect(
         .map(|b| b.clone())
         .unwrap_or_default();
 
+    debug!(chars = result.chars().count(), stream_tokens, "run_and_collect completed");
+
     Ok(result)
 }
 
@@ -568,6 +618,7 @@ fn reflect_response(
         return Ok(String::new());
     }
 
+    info!(draft_chars = draft.chars().count(), "reflection pass started");
     let reflection_messages = build_reflection_messages(session_messages, draft);
     let prompt_tokens = estimate_message_tokens(&reflection_messages);
     let reflected = run_and_collect(
@@ -578,16 +629,18 @@ fn reflect_response(
     )?;
     record_generation_budget(cfg, budget, token_tx, prompt_tokens, &reflected);
 
-    if reflected.trim().is_empty() {
+    if reflected.trim().is_empty() || looks_like_reflection_meta(&reflected) {
+        warn!("reflection returned empty or meta response, falling back to draft");
         Ok(draft.to_string())
     } else {
+        info!(chars = reflected.chars().count(), "reflection pass completed");
         Ok(reflected)
     }
 }
 
 fn build_reflection_messages(session_messages: &[Message], draft: &str) -> Vec<Message> {
     let mut messages = vec![Message::system(
-        "You are a reflection pass for params-cli. Review the assistant draft for correctness, safety, unnecessary claims, missed repo/tool context, and clarity. Return only the improved final answer. Do not mention reflection. Do not call tools. Keep good answers concise.",
+        "You are a reflection pass for params-cli. Rewrite the assistant draft into the final user-facing answer. Fix correctness, safety, unsupported claims, missed repo/tool context, and clarity issues. Return only the final answer itself. Never talk about the draft, reflection, review, edits, or whether the answer was already good. Do not call tools. Keep good answers concise.",
     )];
 
     for message in session_messages {
@@ -598,9 +651,30 @@ fn build_reflection_messages(session_messages: &[Message], draft: &str) -> Vec<M
 
     messages.push(Message::assistant(draft));
     messages.push(Message::user(
-        "Review the assistant draft above. If it is already good, return it with only minimal edits. Return only the final answer text.",
+        "Rewrite the assistant draft above as the final answer to the user. If the draft is already good, return the same answer text with only minimal edits. Do not add reviewer commentary. Return only the final answer text.",
     ));
     messages
+}
+
+fn looks_like_reflection_meta(text: &str) -> bool {
+    let trimmed = text.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let meta_markers = [
+        "the draft is already good",
+        "the draft is good",
+        "no further edits needed",
+        "no changes needed",
+        "no revisions needed",
+        "the answer is already good",
+        "minimal edits",
+        "review the assistant draft",
+        "reviewer commentary",
+    ];
+
+    meta_markers.iter().any(|marker| trimmed.contains(marker))
 }
 
 #[cfg(test)]
@@ -626,6 +700,15 @@ mod tests {
         assert_eq!(reflection[3].role, "assistant");
         assert_eq!(reflection[3].content, "final draft");
         assert_eq!(reflection[4].role, "user");
+    }
+
+    #[test]
+    fn reflection_meta_text_falls_back_to_draft() {
+        assert!(looks_like_reflection_meta(
+            "The draft is already good. No further edits needed."
+        ));
+        assert!(looks_like_reflection_meta("No changes needed."));
+        assert!(!looks_like_reflection_meta("A pointer stores the memory address of another value."));
     }
 }
 

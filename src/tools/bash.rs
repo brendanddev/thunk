@@ -3,6 +3,7 @@
 // Approval-driven shell execution tool.
 
 use std::process::Command;
+use tracing::info;
 
 use crate::error::{ParamsError, Result};
 use crate::events::PendingActionKind;
@@ -20,6 +21,7 @@ impl Tool for BashTool {
     }
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
+        info!(tool = "bash", phase = "proposal", "tool called");
         let command = arg.trim();
         if command.is_empty() {
             return Err(ParamsError::Config("Shell command cannot be empty".into()));
@@ -41,6 +43,7 @@ impl Tool for BashTool {
     }
 
     fn run_approved(&self, arg: &str) -> Result<String> {
+        info!(tool = "bash", phase = "execute", "approved tool executing");
         let output = Command::new("/bin/zsh")
             .arg("-lc")
             .arg(arg)
@@ -49,6 +52,7 @@ impl Tool for BashTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let status = output.status.code().unwrap_or(-1);
+        info!(tool = "bash", exit_code = status, "approved tool finished");
 
         let mut result = format!("Command: {arg}\nExit code: {status}\n");
         if !stdout.trim().is_empty() {

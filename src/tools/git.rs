@@ -3,6 +3,7 @@
 // Read-only git context tool.
 
 use std::process::Command;
+use tracing::info;
 
 use crate::error::{ParamsError, Result};
 use super::{Tool, ToolRunResult};
@@ -19,6 +20,7 @@ impl Tool for GitTool {
     }
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
+        info!(tool = "git", "tool called");
         let trimmed = arg.trim();
         let subcommand = if trimmed.is_empty() { "status" } else { trimmed };
         let mut parts = subcommand.split_whitespace();

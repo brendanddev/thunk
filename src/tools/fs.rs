@@ -29,7 +29,7 @@ impl Tool for ReadFile {
     }
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
-        info!(tool = "read_file", arg = arg.trim(), "tool called");
+        info!(tool = "read_file", "tool called");
         let path = Path::new(arg.trim());
 
         if !path.exists() {
@@ -82,7 +82,7 @@ impl Tool for ListDir {
     }
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
-        info!(tool = "list_dir", arg = arg.trim(), "tool called");
+        info!(tool = "list_dir", "tool called");
         let path = Path::new(arg.trim());
 
         // Default to current directory if empty

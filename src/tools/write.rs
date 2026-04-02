@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::error::{ParamsError, Result};
 use crate::events::PendingActionKind;
@@ -42,11 +43,13 @@ impl Tool for WriteFileTool {
     }
 
     fn run_with_context(&self, arg: &str, following_text: &str) -> Result<ToolRunResult> {
+        info!(tool = "write_file", phase = "proposal", "tool called");
         let root = std::env::current_dir()?;
         build_pending_write(&root, arg, following_text)
     }
 
     fn run_approved(&self, arg: &str) -> Result<String> {
+        info!(tool = "write_file", phase = "execute", "approved tool executing");
         let payload: WriteFilePayload = serde_json::from_str(arg)
             .map_err(|e| ParamsError::Config(format!("Invalid write payload: {e}")))?;
 
@@ -62,6 +65,7 @@ impl Tool for WriteFileTool {
         }
 
         fs::write(path, payload.content)?;
+        info!(tool = "write_file", phase = "execute", "approved tool finished");
         Ok(format!("Wrote file: {}", payload.display_path))
     }
 }

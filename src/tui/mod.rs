@@ -23,6 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
+use tracing::info;
 
 use crate::error::Result;
 use crate::events::{InferenceEvent, PendingActionKind};
@@ -91,6 +92,7 @@ fn push_wrapped_styled(lines: &mut Vec<Line>, text: &str, style: Style, width: u
 }
 
 pub fn run() -> Result<()> {
+    info!("tui starting");
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -110,6 +112,7 @@ pub fn run() -> Result<()> {
         DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
+    info!("tui exiting");
     result
 }
 
@@ -778,6 +781,7 @@ fn handle_slash_command(
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0].to_lowercase();
     let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    info!(command = cmd.as_str(), "slash command received");
 
     match cmd.as_str() {
         "/read" | "/r" => {

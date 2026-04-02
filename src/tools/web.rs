@@ -24,7 +24,7 @@ impl Tool for FetchUrlTool {
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
         let url = normalize_url(arg)?;
-        info!(tool = "fetch_url", url = url.as_str(), "tool called");
+        info!(tool = "fetch_url", "tool called");
 
         let response = ureq::get(&url)
             .set("User-Agent", "params-cli/0.2")
