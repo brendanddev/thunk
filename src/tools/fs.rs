@@ -6,9 +6,6 @@
 // the model can only work with code you paste directly into the chat.
 // With them, you can say "look at src/auth.rs and tell me what's wrong"
 // and the model will actually read the file.
-//
-// Safety: both tools are read-only. They cannot write, delete, or modify
-// anything. File writes are a separate concern and need explicit user approval.
 
 use std::path::Path;
 use std::fs;

@@ -1,12 +1,6 @@
 // src/config.rs
 //
 // App-wide configuration loaded from file
-//
-// Supported backends:
-//   "llama_cpp"     — local .gguf model via llama.cpp
-//   "ollama"        — Ollama server (local or remote LAN)
-//   "openai_compat" — any OpenAI-compatible API (OpenAI, Groq, OpenRouter, Grok)
-//
 
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};

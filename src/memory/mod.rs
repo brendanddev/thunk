@@ -1,6 +1,6 @@
 // src/memory/mod.rs
 //
-// Three-level memory system for params-cli.
+// Three-level memory system.
 //
 // Level 1 (compression.rs) — session compression: when the conversation
 //   grows past 8 turns, summarize old messages to stay within context limits.

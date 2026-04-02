@@ -1,16 +1,6 @@
 // src/inference/llama_cpp.rs
 //
 // The llama.cpp backend — runs a .gguf model directly in-process.
-//
-// Advantages:
-//   - No external dependencies, works offline
-//   - Single binary, zero setup for the user
-//   - Full control over sampling parameters
-//
-// Disadvantages:
-//   - Model loads from disk on startup (slow first run)
-//   - Limited by local RAM/VRAM
-//   - API changes frequently (llama-cpp-2 crate is a moving target)
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;

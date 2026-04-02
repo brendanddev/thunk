@@ -13,9 +13,6 @@
 // After generation completes, params scans the response for these tags,
 // runs the tools, and injects the results back as a new user message so
 // the model can reason about the actual file contents.
-//
-// This is simpler than true agentic tool use (no mid-generation interruption)
-// but works reliably without needing special model support.
 
 mod fs;
 mod search;

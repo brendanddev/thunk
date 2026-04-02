@@ -1,24 +1,6 @@
 // src/inference/ollama.rs
 //
 // The Ollama backend — talks to a running Ollama server via HTTP.
-//
-// Ollama is a tool that runs models as a persistent background server.
-// It keeps the model loaded in memory permanently, so there's no reload
-// cost between messages. It also supports running on a remote machine,
-// which means you can run a 14B model on your desktop and connect from
-// your M2 Air or ThinkPad over your local network.
-//
-// Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md
-//
-// Advantages:
-//   - Model stays loaded permanently — no startup freeze per session
-//   - Can point at a remote machine (e.g. desktop with better GPU)
-//   - Simple HTTP API, no C++ compilation required
-//   - Easy to switch models via config
-//
-// Disadvantages:
-//   - Requires Ollama to be installed and running separately
-//   - Needs network access (even if just localhost)
 
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::Sender;

@@ -6,24 +6,6 @@
 // The request body, streaming format, and authentication are identical — the only
 // differences are the base URL, the API key, and available model names.
 //
-// Provider URLs:
-//   OpenAI:     https://api.openai.com/v1
-//   Groq:       https://api.groq.com/openai/v1
-//   OpenRouter: https://openrouter.ai/api/v1
-//   Grok (xAI): https://api.x.ai/v1
-//
-// Streaming format (Server-Sent Events):
-//   Each chunk is a "data: {...}" line.
-//   The stream ends with "data: [DONE]".
-//   Each JSON chunk has: choices[0].delta.content
-//
-// Config example:
-//   backend = "openai_compat"
-//   [openai_compat]
-//   url = "https://api.groq.com/openai/v1"
-//   api_key = "gsk_..."         # or leave empty to use GROQ_API_KEY env var
-//   model = "llama-3.3-70b-versatile"
-//
 
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::Sender;
