@@ -82,7 +82,7 @@ impl InferenceBackend for LlamaCppBackend {
         // The model weights stay loaded — only the KV cache is reset.
         // This is much cheaper than reloading the model.
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(4096));
+            .with_n_ctx(NonZeroU32::new(8192));
 
         let mut ctx = self.model
             .new_context(&self._backend, ctx_params)
@@ -94,7 +94,7 @@ impl InferenceBackend for LlamaCppBackend {
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| ParamsError::Inference(e.to_string()))?;
 
-        let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
+        let mut batch = LlamaBatch::new(tokens.len().max(2048), 1);
         let last_idx = (tokens.len() - 1) as i32;
         for (i, token) in tokens.iter().enumerate() {
             batch.add(*token, i as i32, &[0], i as i32 == last_idx)
