@@ -1,7 +1,5 @@
 // src/tui/state.rs
 
-use crate::inference::{Message, SYSTEM_PROMPT};
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Role {
     System,
@@ -165,6 +163,7 @@ impl AppState {
             role: Role::Assistant,
             content: String::new(),
         });
+        self.scroll_offset = 0;
     }
 
     pub fn append_token(&mut self, token: &str) {
@@ -173,6 +172,7 @@ impl AppState {
                 last.content.push_str(token);
             }
         }
+        self.scroll_offset = 0;
     }
 
     pub fn finish_response(&mut self) {
@@ -188,6 +188,7 @@ impl AppState {
             role: Role::Assistant,
             content: format!("error: {error}"),
         });
+        self.scroll_offset = 0;
     }
 
     pub fn message_count(&self) -> usize {
@@ -219,23 +220,12 @@ impl AppState {
         self.model_ready
     }
 
-    pub fn build_messages(&self) -> Vec<Message> {
-        let mut messages = vec![Message::system(SYSTEM_PROMPT)];
-        for msg in &self.messages {
-            match msg.role {
-                Role::User => messages.push(Message::user(&msg.content)),
-                Role::Assistant => messages.push(Message::assistant(&msg.content)),
-                Role::System => {}
-            }
-        }
-        messages
-    }
-
     pub fn add_system_message(&mut self, content: &str) {
         self.messages.push(ChatMessage {
             role: Role::System,
             content: content.to_string(),
         });
+        self.scroll_offset = 0;
     }
 
     pub fn clear_messages(&mut self) {

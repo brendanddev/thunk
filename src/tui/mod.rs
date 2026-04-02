@@ -20,13 +20,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
 
 use crate::error::Result;
 use crate::events::InferenceEvent;
-use crate::inference::Message;
+use crate::inference::SessionCommand;
 use state::{AppState, Role};
 
 // Spinner frames
@@ -43,6 +43,33 @@ fn truncate_for_width(value: &str, max_chars: usize) -> String {
     let keep = max_chars.saturating_sub(1);
     let truncated: String = value.chars().take(keep).collect();
     format!("{truncated}…")
+}
+
+fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut wrapped = Vec::new();
+    let mut start = 0;
+
+    while start < chars.len() {
+        let end = (start + width).min(chars.len());
+        wrapped.push(chars[start..end].iter().collect());
+        start = end;
+    }
+
+    wrapped
+}
+
+fn push_wrapped_styled(lines: &mut Vec<Line>, text: &str, style: Style, width: usize) {
+    for part in wrap_plain_text(text, width) {
+        lines.push(Line::from(Span::styled(part, style)));
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -72,7 +99,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     let mut state = AppState::new();
 
     let (token_tx, token_rx) = mpsc::channel::<InferenceEvent>();
-    let (prompt_tx, prompt_rx) = mpsc::channel::<Vec<Message>>();
+    let (prompt_tx, prompt_rx) = mpsc::channel::<SessionCommand>();
 
     let token_tx_clone = token_tx.clone();
     thread::spawn(move || {
@@ -140,11 +167,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                                 // These run tools directly and inject results into context
                                 // without requiring the model to format a tool call tag.
                                 if prompt.starts_with('/') {
-                                    handle_slash_command(&prompt, &mut state);
+                                    handle_slash_command(&prompt, &mut state, &prompt_tx);
                                 } else {
                                     state.add_user_message(&prompt);
-                                    let messages = state.build_messages();
-                                    let _ = prompt_tx.send(messages);
+                                    let _ = prompt_tx.send(SessionCommand::SubmitUser(prompt.clone()));
                                     state.is_generating = true;
                                     state.status = "generating...".to_string();
                                     state.start_assistant_message();
@@ -362,6 +388,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(" <q>", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
+            Span::styled("/git   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <cmd>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
             Span::styled("/clear ", Style::default().fg(Color::DarkGray)),
             Span::styled("history", Style::default().fg(Color::DarkGray)),
         ])),
@@ -388,22 +418,28 @@ fn draw_chat(frame: &mut Frame, state: &mut AppState, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ));
 
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let visible_height = area.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
 
     // Welcome message when no messages yet
     if state.messages.is_empty() {
         if state.model_ready {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
+            push_wrapped_styled(
+                &mut lines,
                 "  ready. type a message below.",
                 Style::default().fg(Color::DarkGray),
-            )));
+                inner_width,
+            );
         } else {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
+            push_wrapped_styled(
+                &mut lines,
                 "  loading model...",
                 Style::default().fg(Color::DarkGray),
-            )));
+                inner_width,
+            );
         }
     }
 
@@ -423,10 +459,12 @@ fn draw_chat(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 ]));
                 // User message content
                 for line in msg.content.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {line}"),
+                    push_wrapped_styled(
+                        &mut lines,
+                        &format!("  {line}"),
                         Style::default().fg(Color::White),
-                    )));
+                        inner_width,
+                    );
                 }
                 if msg.content.is_empty() {
                     lines.push(Line::from(Span::raw("  ")));
@@ -447,10 +485,12 @@ fn draw_chat(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 ]));
                 // Assistant message content
                 for line in msg.content.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {line}"),
+                    push_wrapped_styled(
+                        &mut lines,
+                        &format!("  {line}"),
                         Style::default().fg(Color::Gray),
-                    )));
+                        inner_width,
+                    );
                 }
                 if msg.content.is_empty() {
                     // Show a subtle cursor while generating
@@ -465,44 +505,29 @@ fn draw_chat(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 // System messages are shown as subtle info lines
                 // They are NOT sent to the model — just UI feedback
                 for line in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(format!("● {line}"), Style::default().fg(Color::DarkGray)),
-                    ]));
+                    push_wrapped_styled(
+                        &mut lines,
+                        &format!("  ● {line}"),
+                        Style::default().fg(Color::DarkGray),
+                        inner_width,
+                    );
                 }
                 lines.push(Line::from(""));
             }
         }
     }
 
-    let visible_width = area.width.saturating_sub(2) as usize;
-    let visible_height = area.height.saturating_sub(2) as usize;
-
-    let total_display_lines: usize = lines
-        .iter()
-        .map(|line| {
-            let char_len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-            if char_len == 0 || visible_width == 0 {
-                1
-            } else {
-                (char_len + visible_width - 1) / visible_width
-            }
-        })
-        .sum();
-
-    let total_with_buffer = total_display_lines + 2;
-    let max_scroll = total_with_buffer.saturating_sub(visible_height);
+    let total_display_lines = lines.len();
+    let max_scroll = total_display_lines.saturating_sub(visible_height);
 
     state.max_scroll = max_scroll;
     state.scroll_offset = state.scroll_offset.min(max_scroll);
 
-    let scroll = max_scroll.saturating_sub(state.scroll_offset);
+    let end = total_display_lines.saturating_sub(state.scroll_offset);
+    let start = end.saturating_sub(visible_height);
+    let visible_lines = lines[start..end].to_vec();
 
-    let paragraph = Paragraph::new(Text::from(lines))
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll as u16, 0));
-
+    let paragraph = Paragraph::new(Text::from(visible_lines)).block(block);
     frame.render_widget(paragraph, area);
 }
 
@@ -568,6 +593,7 @@ fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
 ///   /read <path>     — read a file into context
 ///   /ls [path]       — list directory contents
 ///   /search <query>  — search across source files
+///   /git [command]   — git status/diff/log context
 ///   /help            — show available commands
 ///   /clear           — clear the conversation history
 /// Strip ANSI escape codes and non-printable characters from a string.
@@ -596,7 +622,11 @@ fn sanitize_for_display(s: &str) -> String {
     result
 }
 
-fn handle_slash_command(input: &str, state: &mut AppState) {
+fn handle_slash_command(
+    input: &str,
+    state: &mut AppState,
+    prompt_tx: &mpsc::Sender<SessionCommand>,
+) {
     // Parse command and argument
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0].to_lowercase();
@@ -613,8 +643,9 @@ fn handle_slash_command(input: &str, state: &mut AppState) {
                 Ok(output) => {
                     state.add_system_message(&format!("loaded: {arg}"));
                     let safe = sanitize_for_display(&output);
-                    state
-                        .add_user_message(&format!("I've loaded this file for context:\n\n{safe}"));
+                    let context = format!("I've loaded this file for context:\n\n{safe}");
+                    state.add_user_message(&context);
+                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
                 }
                 Err(e) => {
                     state.add_system_message(&format!("error reading {arg}: {e}"));
@@ -629,7 +660,9 @@ fn handle_slash_command(input: &str, state: &mut AppState) {
                 Ok(output) => {
                     state.add_system_message(&format!("listed: {path}"));
                     let safe = sanitize_for_display(&output);
-                    state.add_user_message(&format!("Directory listing:\n\n{safe}"));
+                    let context = format!("Directory listing:\n\n{safe}");
+                    state.add_user_message(&context);
+                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
                 }
                 Err(e) => {
                     state.add_system_message(&format!("error listing {path}: {e}"));
@@ -647,7 +680,9 @@ fn handle_slash_command(input: &str, state: &mut AppState) {
                 Ok(output) => {
                     state.add_system_message(&format!("searched: {arg}"));
                     let safe = sanitize_for_display(&output);
-                    state.add_user_message(&format!("Search results:\n\n{safe}"));
+                    let context = format!("Search results:\n\n{safe}");
+                    state.add_user_message(&context);
+                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
                 }
                 Err(e) => {
                     state.add_system_message(&format!("error searching: {e}"));
@@ -655,9 +690,27 @@ fn handle_slash_command(input: &str, state: &mut AppState) {
             }
         }
 
+        "/git" => {
+            let git_arg = if arg.is_empty() { "status" } else { arg };
+            let tool = crate::tools::GitTool;
+            match crate::tools::Tool::run(&tool, git_arg) {
+                Ok(output) => {
+                    state.add_system_message(&format!("git: {git_arg}"));
+                    let safe = sanitize_for_display(&output);
+                    let context = format!("Git context ({git_arg}):\n\n{safe}");
+                    state.add_user_message(&context);
+                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                }
+                Err(e) => {
+                    state.add_system_message(&format!("git error: {e}"));
+                }
+            }
+        }
+
         "/clear" | "/c" => {
             state.clear_messages();
             state.add_system_message("conversation cleared");
+            let _ = prompt_tx.send(SessionCommand::ClearSession);
         }
 
         "/help" | "/h" | "/?" => {
@@ -665,6 +718,7 @@ fn handle_slash_command(input: &str, state: &mut AppState) {
                 "/read <path>    — load a file into context\n  \
                  /ls [path]      — list directory (default: current)\n  \
                  /search <query> — search source files\n  \
+                 /git [command]  — git status, diff, log\n  \
                  /clear          — clear conversation\n  \
                  /help           — show this message",
             );

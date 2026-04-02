@@ -18,6 +18,11 @@ use tracing::info;
 // instead of the full `std::result::Result<T, error::ParamsError>`.
 use error::{ParamsError, Result};
 
+const INDEXABLE_EXTENSIONS: &[&str] = &[
+    "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift",
+    "rb", "php", "cs", "toml", "yaml", "yml", "json", "md", "txt", "sh", "sql",
+];
+
 /// The top-level CLI struct. Clap reads this to understand what arguments
 /// and subcommands the program accepts.
 ///
@@ -48,7 +53,7 @@ struct Cli {
 /// Doc comments (///) on variants become the help text for that subcommand.
 #[derive(Subcommand)]
 enum Command {
-    /// Download a model to ~/.params/models/
+    /// Download a model to .local/models/
     ///
     /// Example: params pull qwen2.5-coder-14b
     Pull {
@@ -92,7 +97,7 @@ enum Command {
     ///
     /// Generates instruction/response pairs from your indexed code,
     /// runs a LoRA fine-tune on the base model, and saves the result
-    /// to ~/.params/models/ as a new .gguf file.
+    /// to .local/models/ as a new .gguf file.
     /// Example: params train --project .
     Train {
         /// Path to the project to train on. Defaults to current directory.
@@ -101,16 +106,14 @@ enum Command {
     },
 }
 
-/// Initialises file-based logging to ~/.params/params.log.
+/// Initialises file-based logging to .local/params.log.
 ///
 /// Returns a WorkerGuard that must be kept alive for the duration of the
 /// program — dropping it flushes and closes the log file.  Returns None
 /// if the log directory cannot be created (the app still runs, just without
 /// file logging).
 fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let home = dirs::home_dir()?;
-    let log_dir = home.join(".params");
-    std::fs::create_dir_all(&log_dir).ok()?;
+    let log_dir = config::log_dir().ok()?;
 
     let level = if std::env::var("PARAMS_LOG").as_deref() == Ok("debug") {
         tracing::Level::DEBUG
@@ -134,6 +137,8 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 /// errors all the way up and have them printed cleanly on failure,
 /// instead of panicking or unwrapping.
 fn main() -> Result<()> {
+    config::load_local_env()?;
+
     // Hold the guard for the process lifetime so the log file stays open.
     let _log_guard = init_logging();
 
@@ -154,9 +159,7 @@ fn main() -> Result<()> {
         }
 
         Some(Command::Index { path }) => {
-            return Err(ParamsError::Config(format!(
-                "`params index {path}` is not implemented yet."
-            )));
+            run_index_command(&path)?;
         }
 
         Some(Command::Compare { prompt }) => {
@@ -227,4 +230,92 @@ fn main() -> Result<()> {
     // Returning Ok(()) signals success. If any TODO above returns an Err,
     // the ? operator will propagate it here and Rust will print the error message.
     Ok(())
+}
+
+fn run_index_command(path: &str) -> Result<()> {
+    let root = std::path::PathBuf::from(path);
+    if !root.exists() {
+        return Err(ParamsError::Config(format!(
+            "Index path does not exist: {}",
+            root.display()
+        )));
+    }
+    if !root.is_dir() {
+        return Err(ParamsError::Config(format!(
+            "Index path is not a directory: {}",
+            root.display()
+        )));
+    }
+
+    let root = std::fs::canonicalize(root)?;
+    let cfg = config::load()?;
+    let backend = inference::load_backend_from_config(&cfg)?;
+    let index = memory::index::ProjectIndex::open_for(&root)?;
+    let mut files = Vec::new();
+    collect_indexable_files(&root, &mut files)?;
+
+    let mut indexed = 0usize;
+    let mut skipped = 0usize;
+
+    for file in files {
+        if !index.needs_reindex(&file) {
+            skipped += 1;
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&file) {
+            Ok(content) => content,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        if content.len() > 100_000 {
+            skipped += 1;
+            continue;
+        }
+
+        index.index_file(&file, &content, &*backend)?;
+        indexed += 1;
+    }
+
+    println!(
+        "Indexed {} files in {} (skipped {}).",
+        indexed,
+        root.display(),
+        skipped
+    );
+    Ok(())
+}
+
+fn collect_indexable_files(root: &std::path::Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if name.starts_with('.') {
+            continue;
+        }
+        if matches!(name.as_ref(), "target" | "node_modules" | "__pycache__") {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_indexable_files(&path, files)?;
+        } else if is_indexable_file(&path) {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_indexable_file(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| INDEXABLE_EXTENSIONS.contains(&ext))
+        .unwrap_or(false)
 }

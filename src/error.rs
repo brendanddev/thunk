@@ -34,7 +34,7 @@ pub enum ParamsError {
     Database(#[from] rusqlite::Error),
 
     /// Fired when a file system operation fails.
-    /// e.g. can't read a source file, can't write to ~/.params/
+    /// e.g. can't read a source file, can't write to .local/
     /// #[from] gives us automatic conversion from std::io::Error via ?
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

@@ -2,6 +2,9 @@
 ## Environment variables
 .env
 
+## Local files
+.local/
+
 ## Build output
 /target
 

@@ -10,7 +10,7 @@ Personal AI coding assistant CLI focused on local-first workflows, modular backe
 | `ollama` | Fast (model stays loaded) | Free | Ollama installed |
 | `openai_compat` | Fast | Per token | OpenAI-compatible API key |
 
-Switch backends by editing `~/.params/config.toml`.
+Switch backends by editing `.local/config.toml`.
 
 ---
 
@@ -44,14 +44,14 @@ cargo build --release
 
 **4. Configure a backend**
 
-On first run, params creates `~/.params/config.toml`. Edit it to choose your backend.
+On first run, params creates `.local/config.toml`. Edit it to choose your backend.
 
 **Option A — llama.cpp (local, offline)**
 ```bash
-mkdir -p ~/.params/models
+mkdir -p .local/models
 # Download qwen2.5-coder-7b-instruct-q4_k_m.gguf from:
 # https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
-mv ~/Downloads/qwen2.5-coder-7b-instruct-q4_k_m.gguf ~/.params/models/
+mv ~/Downloads/qwen2.5-coder-7b-instruct-q4_k_m.gguf .local/models/
 ```
 
 **Option B — Ollama (recommended for speed)**
@@ -60,7 +60,7 @@ brew install ollama
 ollama serve &
 ollama pull qwen2.5-coder:7b
 ```
-Then set `backend = "ollama"` in `~/.params/config.toml`.
+Then set `backend = "ollama"` in `.local/config.toml`.
 
 **Option C — OpenAI-compatible API**
 Set `backend = "openai_compat"` and configure `[openai_compat]` for Groq, OpenAI, OpenRouter, or xAI.
@@ -76,14 +76,14 @@ params
 
 ## Configuration
 
-`~/.params/config.toml` is created automatically on first run:
+`.local/config.toml` is created automatically on first run:
 
 ```toml
 # Backend options: "llama_cpp", "ollama", "openai_compat"
 backend = "llama_cpp"
 
 [llama_cpp]
-# model_path = "/path/to/model.gguf"  # auto-detects from ~/.params/models/ if unset
+# model_path = "/path/to/model.gguf"  # auto-detects from .local/models/ if unset
 
 [ollama]
 url = "http://localhost:11434"  # or a LAN IP for a remote machine
@@ -91,7 +91,7 @@ model = "qwen2.5-coder:7b"
 
 [openai_compat]
 url = "https://api.groq.com/openai/v1"
-# api_key = ""  # or set GROQ_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / XAI_API_KEY
+# api_key = ""  # or set GROQ_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / XAI_API_KEY in .local/keys.env
 model = "llama-3.3-70b-versatile"
 
 [generation]
@@ -124,7 +124,7 @@ params "explain what this function does"
 ```
 src/
   main.rs            — CLI entry point, argument routing
-  config.rs          — config loading, ~/.params/config.toml
+  config.rs          — config loading, .local/config.toml
   error.rs           — unified error type
   events.rs          — shared channel event types
   inference/

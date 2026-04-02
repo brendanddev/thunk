@@ -74,7 +74,7 @@ pub struct OpenAICompatConfig {
     #[serde(default = "default_openai_url")]
     pub url: String,
 
-    /// API key. Leave empty and set env var instead for security:
+    /// API key. Leave empty and set env var or .local/keys.env instead:
     ///   GROQ_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or XAI_API_KEY
     #[serde(default)]
     pub api_key: String,
@@ -159,15 +159,71 @@ impl Default for Config {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| ParamsError::Config("Could not find home directory".into()))?;
-    Ok(home.join(".params").join("config.toml"))
+    Ok(local_dir()?.join("config.toml"))
 }
 
 pub fn models_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| ParamsError::Config("Could not find home directory".into()))?;
-    Ok(home.join(".params").join("models"))
+    let dir = local_dir()?.join("models");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn memory_dir() -> Result<PathBuf> {
+    let dir = local_dir()?.join("memory");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn log_dir() -> Result<PathBuf> {
+    let dir = local_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn keys_env_path() -> Result<PathBuf> {
+    Ok(local_dir()?.join("keys.env"))
+}
+
+pub fn local_dir() -> Result<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn load_local_env() -> Result<()> {
+    let path = keys_env_path()?;
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let contents = std::fs::read_to_string(&path)?;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        let key = key.trim();
+        if key.is_empty() || std::env::var_os(key).is_some() {
+            continue;
+        }
+
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+
+        std::env::set_var(key, value);
+    }
+
+    Ok(())
 }
 
 pub fn find_model() -> Result<PathBuf> {
@@ -204,6 +260,7 @@ pub fn load() -> Result<Config> {
         let with_comments = format!(
             "# params-cli configuration\n\
              # Backend options: \"llama_cpp\", \"ollama\", \"openai_compat\"\n\
+             # Stored locally in this repo under .local/\n\
              #\n\
              # OpenAI-compatible providers (set backend = \"openai_compat\"):\n\
              #   Groq:       url = \"https://api.groq.com/openai/v1\"\n\
@@ -211,7 +268,7 @@ pub fn load() -> Result<Config> {
              #   OpenAI:     url = \"https://api.openai.com/v1\"\n\
              #   Grok:       url = \"https://api.x.ai/v1\"\n\
              #\n\
-             # API keys: set in config OR use env vars:\n\
+             # API keys: set in config, .local/keys.env, or env vars:\n\
              #   GROQ_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, XAI_API_KEY\n\n\
              {toml}"
         );

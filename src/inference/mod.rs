@@ -16,16 +16,24 @@ pub use llama_cpp::LlamaCppBackend;
 pub use ollama::OllamaBackend;
 pub use openai_compat::OpenAICompatBackend;
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use crate::events::InferenceEvent;
 use crate::config;
 use crate::error::{ParamsError, Result};
+use crate::memory::{compression, facts::FactStore, index::ProjectIndex};
 use crate::tools::ToolRegistry;
+
+pub enum SessionCommand {
+    SubmitUser(String),
+    InjectUserContext(String),
+    ClearSession,
+}
 
 /// Persistent model thread — loads the backend once, handles prompts in a loop.
 /// After each response it checks for tool calls and runs a follow-up if needed.
 pub fn model_thread(
-    prompt_rx: Receiver<Vec<Message>>,
+    prompt_rx: Receiver<SessionCommand>,
     token_tx: Sender<InferenceEvent>,
 ) {
     let cfg = match config::load() {
@@ -49,51 +57,93 @@ pub fn model_thread(
 
     // Build the tool registry — same instance reused across all prompts
     let tools = ToolRegistry::default();
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_name = project_root.to_string_lossy().to_string();
+    let fact_store = FactStore::open().ok();
+    let project_index = ProjectIndex::open_for(&project_root).ok();
+    let session_facts = fact_store
+        .as_ref()
+        .and_then(|store| store.get_relevant_facts(&project_name, "", 5).ok())
+        .unwrap_or_default();
+    let mut session_messages = vec![Message::system(
+        &build_system_prompt(&tools, &session_facts, &[]),
+    )];
 
-    while let Ok(mut messages) = prompt_rx.recv() {
-        // Inject tool descriptions into the system prompt if present
-        if let Some(first) = messages.first_mut() {
-            if first.role == "system" {
-                first.content = system_prompt_with_tools(&tools.tool_descriptions());
+    while let Ok(command) = prompt_rx.recv() {
+        match command {
+            SessionCommand::ClearSession => {
+                session_messages.clear();
+                session_messages.push(Message::system(
+                    &build_system_prompt(&tools, &session_facts, &[]),
+                ));
+                continue;
             }
-        }
-
-        // Run generation — collect full response for tool call detection
-        let response = run_and_collect(&*backend, &messages, token_tx.clone());
-
-        match response {
-            Err(e) => {
-                let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+            SessionCommand::InjectUserContext(content) => {
+                session_messages.push(Message::user(&content));
+                continue;
             }
-            Ok(full_response) => {
-                // Check if the model used any tools
-                let tool_results = tools.execute_tool_calls(&full_response);
+            SessionCommand::SubmitUser(prompt) => {
+                session_messages.push(Message::user(&prompt));
 
-                if let Some(result_msg) = ToolRegistry::format_results(&tool_results) {
-                    // Notify the UI that tool calls are being processed
-                    let _ = token_tx.send(InferenceEvent::ToolCall(
-                        tool_results.iter()
-                            .map(|r| format!("{}({})", r.tool_name, r.argument))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
+                let relevant_summaries = project_index
+                    .as_ref()
+                    .and_then(|index| index.find_relevant(&prompt, 4).ok())
+                    .unwrap_or_default();
 
-                    // Add the assistant's response and tool results to history
-                    messages.push(Message::assistant(&full_response));
-                    messages.push(Message::user(&result_msg));
-
-                    // Run a follow-up generation with the tool results injected
-                    match run_and_collect(&*backend, &messages, token_tx.clone()) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
-                        }
+                if let Some(first) = session_messages.first_mut() {
+                    if first.role == "system" {
+                        first.content = build_system_prompt(&tools, &session_facts, &relevant_summaries);
                     }
                 }
 
-                let _ = token_tx.send(InferenceEvent::Done);
+                compression::compress_history(&mut session_messages, &*backend);
+
+                // Run generation — collect full response for tool call detection
+                let response = run_and_collect(&*backend, &session_messages, token_tx.clone());
+
+                match response {
+                    Err(e) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                    Ok(full_response) => {
+                        // Check if the model used any tools
+                        let tool_results = tools.execute_tool_calls(&full_response);
+
+                        if let Some(result_msg) = ToolRegistry::format_results(&tool_results) {
+                            // Notify the UI that tool calls are being processed
+                            let _ = token_tx.send(InferenceEvent::ToolCall(
+                                tool_results.iter()
+                                    .map(|r| format!("{}({})", r.tool_name, r.argument))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+
+                            session_messages.push(Message::assistant(&full_response));
+                            session_messages.push(Message::user(&result_msg));
+
+                            match run_and_collect(&*backend, &session_messages, token_tx.clone()) {
+                                Ok(follow_up) => {
+                                    if !follow_up.trim().is_empty() {
+                                        session_messages.push(Message::assistant(&follow_up));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                                }
+                            }
+                        } else if !full_response.trim().is_empty() {
+                            session_messages.push(Message::assistant(&full_response));
+                        }
+
+                        let _ = token_tx.send(InferenceEvent::Done);
+                    }
+                }
             }
         }
+    }
+
+    if let Some(store) = fact_store.as_ref() {
+        store.extract_and_store(&session_messages, &project_name, &*backend);
     }
 }
 
@@ -200,4 +250,34 @@ fn load_llama_cpp_backend(cfg: &config::Config) -> Result<Box<dyn InferenceBacke
         cfg.generation.temperature,
     )?;
     Ok(Box::new(backend))
+}
+
+fn build_system_prompt(
+    tools: &ToolRegistry,
+    facts: &[String],
+    summaries: &[(String, String)],
+) -> String {
+    let mut prompt = system_prompt_with_tools(&tools.tool_descriptions());
+
+    if !facts.is_empty() {
+        prompt.push_str("\n\nRelevant prior project facts:\n");
+        for fact in facts {
+            prompt.push_str("- ");
+            prompt.push_str(fact);
+            prompt.push('\n');
+        }
+    }
+
+    if !summaries.is_empty() {
+        prompt.push_str("\nRelevant indexed file summaries:\n");
+        for (path, summary) in summaries {
+            prompt.push_str("- ");
+            prompt.push_str(path);
+            prompt.push_str(": ");
+            prompt.push_str(summary);
+            prompt.push('\n');
+        }
+    }
+
+    prompt
 }

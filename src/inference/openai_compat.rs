@@ -44,7 +44,8 @@ impl OpenAICompatBackend {
     }
 
     /// Resolve the API key — use the configured value if set, otherwise
-    /// fall back to provider-specific environment variables.
+    /// fall back to provider-specific environment variables loaded from
+    /// the shell or .local/keys.env.
     ///
     /// This means you can leave api_key empty in config.toml and set the
     /// env var instead, which is safer (no plaintext key in config file).

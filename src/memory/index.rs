@@ -3,7 +3,7 @@
 // Level 2: project file index.
 //
 // Stores a 2-3 sentence summary for each source file in a SQLite database at
-// ~/.params/memory/{project_hash}.db. The hash is derived from the current
+// .local/memory/{project_hash}.db. The hash is derived from the current
 // working directory path so each project gets its own database.
 //
 // Summary generation calls the active backend, so indexing runs on the model
@@ -20,7 +20,8 @@ use std::time::UNIX_EPOCH;
 use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
-use crate::error::{ParamsError, Result};
+use crate::config;
+use crate::error::Result;
 use crate::inference::{InferenceBackend, Message};
 use super::run_prompt_sync;
 
@@ -32,7 +33,12 @@ impl ProjectIndex {
     /// Open or create the index database for the current working directory.
     pub fn open() -> Result<Self> {
         let cwd = std::env::current_dir()?;
-        let db_path = db_path_for(&cwd)?;
+        Self::open_for(&cwd)
+    }
+
+    /// Open or create the index database for a specific project root.
+    pub fn open_for(project_root: &Path) -> Result<Self> {
+        let db_path = db_path_for(project_root)?;
 
         let conn = Connection::open(&db_path)?;
 
@@ -152,13 +158,9 @@ impl ProjectIndex {
 }
 
 /// Build the path to the project index database.
-/// Creates `~/.params/memory/` if it doesn't exist.
+/// Creates `.local/memory/` if it doesn't exist.
 fn db_path_for(project_root: &Path) -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| ParamsError::Config("Could not find home directory".into()))?;
-    let memory_dir = home.join(".params").join("memory");
-    std::fs::create_dir_all(&memory_dir)?;
-
+    let memory_dir = config::memory_dir()?;
     let hash = path_hash(&project_root.to_string_lossy());
     Ok(memory_dir.join(format!("{hash}.db")))
 }

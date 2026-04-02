@@ -4,7 +4,7 @@
 //
 // At the end of each session, key facts (files examined, decisions made,
 // errors resolved) are extracted from the conversation via the backend and
-// stored in a shared SQLite database at ~/.params/memory/facts.db.
+// stored in a shared SQLite database at .local/memory/facts.db.
 //
 // Facts are scoped per project (current working directory path string).
 // At the start of a new session the top relevant facts are injected into
@@ -19,7 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
-use crate::error::{ParamsError, Result};
+use crate::config;
+use crate::error::Result;
 use crate::inference::{InferenceBackend, Message};
 use super::run_prompt_sync;
 
@@ -28,13 +29,9 @@ pub struct FactStore {
 }
 
 impl FactStore {
-    /// Open or create the shared fact database at ~/.params/memory/facts.db.
+    /// Open or create the shared fact database at .local/memory/facts.db.
     pub fn open() -> Result<Self> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| ParamsError::Config("Could not find home directory".into()))?;
-        let memory_dir = home.join(".params").join("memory");
-        std::fs::create_dir_all(&memory_dir)?;
-
+        let memory_dir = config::memory_dir()?;
         let db_path = memory_dir.join("facts.db");
         let conn = Connection::open(&db_path)?;
 

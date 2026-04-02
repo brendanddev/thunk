@@ -15,9 +15,11 @@
 // the model can reason about the actual file contents.
 
 mod fs;
+mod git;
 mod search;
 
 pub use fs::{ListDir, ReadFile};
+pub use git::GitTool;
 pub use search::SearchCode;
 
 use crate::error::Result;
@@ -50,6 +52,7 @@ impl ToolRegistry {
                 Box::new(ReadFile),
                 Box::new(ListDir),
                 Box::new(SearchCode),
+                Box::new(GitTool),
             ],
         }
     }
@@ -72,7 +75,7 @@ impl ToolRegistry {
             ));
         }
         desc.push_str(
-            "Only use tools when you actually need to read or search files.\n\
+            "Only use tools when you actually need repo or file context.\n\
              Do not use tools for questions that don't require file access."
         );
         desc
