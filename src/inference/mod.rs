@@ -25,6 +25,7 @@ use crate::events::{
     BudgetUpdate, CacheUpdate, InferenceEvent, PendingAction, PendingActionKind, ProgressStatus,
     ProgressTrace,
 };
+use crate::session::SessionStore;
 use crate::config;
 use crate::error::{ParamsError, Result};
 use crate::memory::{compression, facts::FactStore, index::ProjectIndex};
@@ -71,6 +72,14 @@ struct CacheLookup {
     source: debug_log::ResponseSource,
 }
 
+fn save_session(store: Option<&SessionStore>, messages: &[Message], backend_name: &str) {
+    if let Some(s) = store {
+        if let Err(e) = s.save(messages, backend_name) {
+            warn!(error = %e, "session save failed");
+        }
+    }
+}
+
 fn emit_generation_started(
     token_tx: &Sender<InferenceEvent>,
     label: &str,
@@ -83,6 +92,12 @@ fn emit_generation_started(
 }
 
 fn emit_trace(token_tx: &Sender<InferenceEvent>, status: ProgressStatus, label: &str, persist: bool) {
+    match status {
+        ProgressStatus::Started => info!(label, "trace.started"),
+        ProgressStatus::Updated => debug!(label, "trace.updated"),
+        ProgressStatus::Finished => info!(label, "trace.finished"),
+        ProgressStatus::Failed => warn!(label, "trace.failed"),
+    }
     let _ = token_tx.send(InferenceEvent::Trace(ProgressTrace {
         status,
         label: label.to_string(),
@@ -148,10 +163,38 @@ pub fn model_thread(
     emit_cache_update(&cache_stats, false, &token_tx);
     let mut next_action_id = 1u64;
 
+    // Restore previous session if one was saved.
+    let session_store = SessionStore::open().ok();
+    if let Some(ref store) = session_store {
+        match store.load() {
+            Ok(Some(saved)) => {
+                info!(msg_count = saved.messages.len(), saved_at = saved.saved_at, "restoring previous session");
+                let display_messages: Vec<(String, String)> = saved.messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect();
+                session_messages.extend(saved.messages);
+                let _ = token_tx.send(InferenceEvent::SessionRestored {
+                    display_messages,
+                    saved_at: saved.saved_at,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "session load failed — starting fresh");
+            }
+        }
+    }
+
     while let Ok(command) = prompt_rx.recv() {
         match command {
             SessionCommand::ClearSession => {
                 info!("session cleared");
+                if let Some(ref store) = session_store {
+                    if let Err(e) = store.clear() {
+                        warn!(error = %e, "session clear failed");
+                    }
+                }
                 session_messages.clear();
                 session_messages.push(Message::system(
                     &build_system_prompt(&tools, &session_facts, &[], eco_enabled),
@@ -198,6 +241,8 @@ pub fn model_thread(
                     false,
                 ) {
                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                } else {
+                    save_session(session_store.as_ref(), &session_messages, &backend.name());
                 }
                 let _ = token_tx.send(InferenceEvent::Done);
                 next_action_id = next_action_id.saturating_add(1);
@@ -537,6 +582,7 @@ pub fn model_thread(
                             }
                         }
 
+                        save_session(session_store.as_ref(), &session_messages, &backend.name());
                         let _ = token_tx.send(InferenceEvent::Done);
                     }
                 }

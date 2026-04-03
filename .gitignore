@@ -4,6 +4,7 @@
 
 ## Local files
 .local/
+.claude/
 
 ## Build output
 /target

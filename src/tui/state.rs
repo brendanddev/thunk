@@ -413,6 +413,38 @@ impl AppState {
         }
     }
 
+    /// Restore a previous session into the display. Called on startup when a saved session exists.
+    /// Injected context messages (tool results, slash-command output) are shown as muted system
+    /// lines rather than user messages to keep the display clean.
+    pub fn restore_session(&mut self, messages: Vec<(String, String)>, saved_at: u64) {
+        let age = describe_session_age(saved_at);
+        self.add_system_message(&format!("session resumed ({age})"));
+
+        for (role, content) in messages {
+            match role.as_str() {
+                "assistant" => {
+                    self.messages.push(ChatMessage {
+                        role: Role::Assistant,
+                        content,
+                    });
+                }
+                "user" => {
+                    let display_role = if is_injected_context(&content) {
+                        Role::System
+                    } else {
+                        Role::User
+                    };
+                    self.messages.push(ChatMessage {
+                        role: display_role,
+                        content,
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.scroll_offset = 0;
+    }
+
     pub fn clear_messages(&mut self) {
         self.messages.clear();
         self.scroll_offset = 0;
@@ -433,4 +465,44 @@ impl AppState {
         self.tokens_saved = 0;
         self.last_cache_hit = None;
     }
+}
+
+/// Returns a human-readable description of how long ago a session was saved.
+fn describe_session_age(saved_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.saturating_sub(saved_at);
+    if age < 120 {
+        "moments ago".to_string()
+    } else if age < 3600 {
+        let m = age / 60;
+        format!("{m}m ago")
+    } else if age < 86400 {
+        let h = age / 3600;
+        format!("{h}h ago")
+    } else {
+        let d = age / 86400;
+        format!("{d}d ago")
+    }
+}
+
+/// Returns true if a user-role message is an injected context payload (tool results,
+/// slash-command output, etc.) rather than a genuine user turn.
+fn is_injected_context(content: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "Tool results:\n",
+        "I've loaded this file for context:",
+        "Directory listing:",
+        "Search results:\n",
+        "Git context (",
+        "LSP diagnostics:\n",
+        "LSP check:\n",
+        "LSP hover:",
+        "LSP definition:",
+        "Fetched web context:\n",
+        "User rejected proposed action:",
+    ];
+    PREFIXES.iter().any(|p| content.starts_with(p))
 }

@@ -22,6 +22,7 @@ Switch backends by editing `.local/config.toml`.
 - Budget tracking, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, plus `/clear-cache`
+- Session persistence: conversation history auto-saved to `.local/sessions.db` and restored on the next startup; `/clear` starts a fresh session
 
 ---
 

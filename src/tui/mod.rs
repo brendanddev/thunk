@@ -23,7 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::Result;
 use crate::events::{InferenceEvent, PendingActionKind, ProgressStatus, ProgressTrace};
@@ -166,6 +166,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 InferenceEvent::Ready => {
                     state.set_status("ready");
                 }
+                InferenceEvent::SessionRestored { display_messages, saved_at } => {
+                    state.restore_session(display_messages, saved_at);
+                }
                 InferenceEvent::BackendName(name) => {
                     state.set_backend_name(name);
                 }
@@ -243,6 +246,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     finished_trace,
                     context,
                 } => {
+                    info!(label = finished_trace.as_str(), "trace.finished");
                     state.apply_trace(ProgressTrace {
                         status: ProgressStatus::Finished,
                         label: finished_trace,
@@ -256,6 +260,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     failed_trace,
                     message,
                 } => {
+                    warn!(label = failed_trace.as_str(), message = message.as_str(), "trace.failed");
                     state.apply_trace(ProgressTrace {
                         status: ProgressStatus::Failed,
                         label: failed_trace,
@@ -425,8 +430,6 @@ fn draw(frame: &mut Frame, state: &mut AppState) {
 fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
     let border_color = if state.pending_action.is_some() || state.is_generating {
         Color::Yellow
-    } else if state.model_ready {
-        Color::DarkGray
     } else {
         Color::DarkGray
     };
@@ -955,10 +958,11 @@ fn spawn_slash_context_job<F>(
     F: FnOnce() -> std::result::Result<String, String> + Send + 'static,
 {
     state.start_generation(running_status, false);
+    info!(label = started_trace.as_str(), "trace.started");
     state.apply_trace(ProgressTrace {
         status: ProgressStatus::Started,
         label: started_trace,
-        persist: true,
+        persist: false,
     });
     let tx = slash_tx.clone();
     thread::spawn(move || {

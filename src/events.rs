@@ -50,6 +50,12 @@ pub struct ProgressTrace {
 pub enum InferenceEvent {
     /// Model/backend loaded and ready.
     Ready,
+    /// A previous session was restored. Carries display-friendly (role, content) pairs
+    /// and the unix timestamp when the session was saved.
+    SessionRestored {
+        display_messages: Vec<(String, String)>,
+        saved_at: u64,
+    },
     /// Active backend name for the sidebar.
     BackendName(String),
     /// A generation phase started.

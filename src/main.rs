@@ -10,6 +10,7 @@ mod events;
 mod inference;
 #[allow(dead_code)]
 mod memory;
+mod session;
 mod tools;
 mod tui;
 
