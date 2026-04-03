@@ -19,7 +19,7 @@ Switch backends by editing `.local/config.toml`.
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands and whole-file writes with diff preview
 - Three-level memory: session compression, project index, cross-session facts with quality filtering, deduplication, TTL pruning, and per-project cap
-- Budget tracking, reflection toggle, and eco mode
+- Budget tracking, per-turn timing in the sidebar, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, with TTL + project-change invalidation and `/clear-cache`
 - Session persistence: conversation history auto-saved to `.local/sessions.db` and restored on the next startup; `/clear` starts a fresh session

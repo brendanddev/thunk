@@ -1,6 +1,7 @@
 // src/tui/state.rs
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::events::{PendingAction, ProgressStatus, ProgressTrace};
 
@@ -86,6 +87,15 @@ pub struct AppState {
 
     /// Whether separate content debug logging is enabled for the current session
     pub debug_logging_enabled: bool,
+
+    /// When the current active work slice started, if the assistant is actively working.
+    work_started_at: Option<Instant>,
+
+    /// Accumulated active time for the current turn, including resumed phases.
+    accumulated_work_duration: Duration,
+
+    /// Duration of the most recently completed turn or slash-command job.
+    last_work_duration: Option<Duration>,
 }
 
 impl AppState {
@@ -116,6 +126,9 @@ impl AppState {
             reflection_enabled: false,
             eco_enabled: false,
             debug_logging_enabled: false,
+            work_started_at: None,
+            accumulated_work_duration: Duration::ZERO,
+            last_work_duration: None,
         }
     }
 
@@ -232,6 +245,7 @@ impl AppState {
     }
 
     pub fn start_generation(&mut self, label: &str, show_placeholder: bool) {
+        self.resume_work_timer();
         self.is_generating = true;
         self.status = label.to_string();
         if show_placeholder {
@@ -251,6 +265,7 @@ impl AppState {
     }
 
     pub fn finish_response(&mut self) {
+        self.finish_work_timer();
         self.is_generating = false;
         self.status = "ready".to_string();
         self.last_tool_call = None;
@@ -258,6 +273,7 @@ impl AppState {
     }
 
     pub fn add_error(&mut self, error: &str) {
+        self.finish_work_timer();
         self.is_generating = false;
         self.status = "ready".to_string();
         self.current_trace = None;
@@ -305,6 +321,7 @@ impl AppState {
     }
 
     pub fn set_pending_action(&mut self, action: PendingAction) {
+        self.pause_work_timer();
         self.pending_action = Some(action);
         self.is_generating = false;
         self.status = "awaiting approval".to_string();
@@ -450,6 +467,9 @@ impl AppState {
         self.scroll_offset = 0;
         self.current_trace = None;
         self.recent_traces.clear();
+        self.work_started_at = None;
+        self.accumulated_work_duration = Duration::ZERO;
+        self.last_work_duration = None;
         self.prompt_tokens = 0;
         self.completion_tokens = 0;
         self.total_tokens = 0;
@@ -464,6 +484,45 @@ impl AppState {
         self.cache_misses = 0;
         self.tokens_saved = 0;
         self.last_cache_hit = None;
+    }
+
+    pub fn current_turn_duration(&self) -> Option<Duration> {
+        let mut total = self.accumulated_work_duration;
+        if let Some(started_at) = self.work_started_at {
+            total = total.saturating_add(started_at.elapsed());
+        }
+
+        if total.is_zero() {
+            None
+        } else {
+            Some(total)
+        }
+    }
+
+    pub fn last_work_duration(&self) -> Option<Duration> {
+        self.last_work_duration
+    }
+
+    fn resume_work_timer(&mut self) {
+        if self.work_started_at.is_none() {
+            self.work_started_at = Some(Instant::now());
+        }
+    }
+
+    fn pause_work_timer(&mut self) {
+        if let Some(started_at) = self.work_started_at.take() {
+            self.accumulated_work_duration = self
+                .accumulated_work_duration
+                .saturating_add(started_at.elapsed());
+        }
+    }
+
+    fn finish_work_timer(&mut self) {
+        self.pause_work_timer();
+        if !self.accumulated_work_duration.is_zero() {
+            self.last_work_duration = Some(self.accumulated_work_duration);
+        }
+        self.accumulated_work_duration = Duration::ZERO;
     }
 }
 
@@ -485,6 +544,33 @@ fn describe_session_age(saved_at: u64) -> String {
     } else {
         let d = age / 86400;
         format!("{d}d ago")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_timer_accumulates_and_finishes() {
+        let mut state = AppState::new();
+        state.start_generation("generating...", false);
+        std::thread::sleep(Duration::from_millis(5));
+        state.set_pending_action(PendingAction {
+            id: 1,
+            kind: crate::events::PendingActionKind::ShellCommand,
+            title: "Approve".to_string(),
+            preview: "echo hi".to_string(),
+        });
+        let paused = state.current_turn_duration().unwrap();
+        assert!(paused >= Duration::from_millis(1));
+
+        state.start_generation("generating...", false);
+        std::thread::sleep(Duration::from_millis(5));
+        state.finish_response();
+
+        assert!(state.current_turn_duration().is_none());
+        assert!(state.last_work_duration().unwrap() >= paused);
     }
 }
 

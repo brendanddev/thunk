@@ -84,6 +84,27 @@ fn format_hit_rate(hits: usize, misses: usize) -> String {
     }
 }
 
+fn format_duration(duration: Duration) -> String {
+    let total_ms = duration.as_millis();
+    if total_ms < 10_000 {
+        let secs = total_ms as f64 / 1000.0;
+        format!("{secs:.1}s")
+    } else {
+        let total_secs = duration.as_secs();
+        if total_secs < 60 {
+            format!("{total_secs}s")
+        } else if total_secs < 3600 {
+            let mins = total_secs / 60;
+            let secs = total_secs % 60;
+            format!("{mins}m {secs:02}s")
+        } else {
+            let hours = total_secs / 3600;
+            let mins = (total_secs % 3600) / 60;
+            format!("{hours}h {mins:02}m")
+        }
+    }
+}
+
 fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -467,6 +488,8 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     // Truncate backend name to fit sidebar
     let backend_display = truncate_for_width(&state.backend_name, 18);
+    let current_turn_duration = state.current_turn_duration();
+    let last_work_duration = state.last_work_duration();
     let mut items = vec![
         ListItem::new(Line::from(vec![
             Span::styled("● ", Style::default().fg(status_color)),
@@ -500,6 +523,28 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("cost  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format_cost(state.estimated_cost_usd),
+                Style::default().fg(Color::White),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("turn  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                current_turn_duration
+                    .map(format_duration)
+                    .unwrap_or_else(|| "n/a".to_string()),
+                Style::default().fg(if current_turn_duration.is_some() {
+                    Color::Yellow
+                } else {
+                    Color::White
+                }),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("last  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                last_work_duration
+                    .map(format_duration)
+                    .unwrap_or_else(|| "n/a".to_string()),
                 Style::default().fg(Color::White),
             ),
         ])),
