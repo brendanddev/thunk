@@ -111,7 +111,7 @@ pub fn model_thread(
     prompt_rx: Receiver<SessionCommand>,
     token_tx: Sender<InferenceEvent>,
 ) {
-    let cfg = match config::load() {
+    let cfg = match config::load_with_profile() {
         Ok(c) => c,
         Err(e) => {
             let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
@@ -140,6 +140,17 @@ pub fn model_thread(
     let _ = token_tx.send(InferenceEvent::EcoEnabled(eco_enabled));
     let _ = token_tx.send(InferenceEvent::ReflectionEnabled(reflection_enabled));
     let _ = token_tx.send(InferenceEvent::DebugLoggingEnabled(debug_logging_enabled));
+
+    // If a project profile was loaded, emit a persistent trace so the user can
+    // see it in the chat as a startup milestone.
+    if let Some(ref profile_path) = cfg.active_profile {
+        let name = profile_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(config::PROJECT_PROFILE_FILE);
+        info!(profile = name, "project profile active");
+        emit_trace(&token_tx, ProgressStatus::Finished, &format!("profile: {name}"), true);
+    }
 
     // Build the tool registry — same instance reused across all prompts
     let tools = ToolRegistry::default();

@@ -204,7 +204,7 @@ fn main() -> Result<()> {
             Some(prompt) => {
                 info!(mode = "one_shot", "starting one-shot generation");
                 // One-shot mode — load config and run with the selected backend.
-                let cfg = config::load()?;
+                let cfg = config::load_with_profile()?;
                 if cfg.debug_logging.content {
                     debug_log::append_user_prompt(&prompt)?;
                 }
@@ -288,7 +288,7 @@ fn run_index_command(path: &str) -> Result<()> {
 
     let root = std::fs::canonicalize(root)?;
     info!(command = "index", "starting project index");
-    let cfg = config::load()?;
+    let cfg = config::load_with_profile()?;
     let backend = inference::load_backend_from_config(&cfg)?;
     let index = memory::index::ProjectIndex::open_for(&root)?;
     let mut files = Vec::new();

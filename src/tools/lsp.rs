@@ -66,7 +66,7 @@ impl Tool for LspDiagnosticsTool {
             ));
         }
 
-        let cfg = config::load()?;
+        let cfg = config::load_with_profile()?;
         let cwd = std::env::current_dir()?;
         let path = resolve_input_path(&cwd, requested)?;
         validate_rust_file(&path)?;
@@ -100,7 +100,7 @@ impl Tool for LspHoverTool {
             ));
         }
 
-        let cfg = config::load()?;
+        let cfg = config::load_with_profile()?;
         let cwd = std::env::current_dir()?;
         let hover_input = parse_hover_input(&cwd, requested)?;
         validate_rust_file(&hover_input.path)?;
@@ -141,7 +141,7 @@ impl Tool for LspDefinitionTool {
             ));
         }
 
-        let cfg = config::load()?;
+        let cfg = config::load_with_profile()?;
         let cwd = std::env::current_dir()?;
         let position_input = parse_hover_input(&cwd, requested)?;
         validate_rust_file(&position_input.path)?;
@@ -789,7 +789,7 @@ fn line_column_to_utf16(source: &str, line: usize, column: usize) -> Result<usiz
 
 pub fn rust_lsp_health_report() -> String {
     info!(tool = "lsp_health_check", "tool called");
-    match config::load() {
+    match config::load_with_profile() {
         Ok(cfg) => format_lsp_health_report(&cfg),
         Err(e) => format!("LSP check failed to load config: {e}"),
     }

@@ -23,6 +23,7 @@ Switch backends by editing `.local/config.toml`.
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, plus `/clear-cache`
 - Session persistence: conversation history auto-saved to `.local/sessions.db` and restored on the next startup; `/clear` starts a fresh session
+- Project profiles: add `.params.toml` to any project directory to override backend, model, reflection, eco, LSP, and budget settings for that project
 
 ---
 
@@ -88,7 +89,12 @@ params
 
 ## Configuration
 
-`.local/config.toml` is created automatically on first run:
+Config resolution order (highest precedence first):
+1. `.params.toml` in the current working directory (project-local profile)
+2. `.local/config.toml` (global config, created on first run)
+3. Compiled-in defaults
+
+### Global config — `.local/config.toml`
 
 ```toml
 # Backend options: "llama_cpp", "ollama", "openai_compat"
@@ -116,6 +122,27 @@ enabled = false
 [eco]
 enabled = false
 ```
+
+### Project profile — `.params.toml`
+
+Drop a `.params.toml` in any project root to override specific settings for that project. Only the fields you set are changed; everything else comes from the global config.
+
+```toml
+# Example: use a cloud model + higher token limit for a large project
+backend = "openai_compat"
+
+[openai_compat]
+model = "gpt-4o"
+
+[generation]
+max_tokens = 2048
+
+[reflection]
+enabled = true
+```
+
+When a profile is active, params shows `● ✓ profile: .params.toml` in the chat at startup.
+You can commit `.params.toml` to share project settings with collaborators, or add it to `.gitignore` for personal overrides.
 
 ---
 
