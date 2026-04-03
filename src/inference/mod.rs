@@ -25,6 +25,7 @@ use crate::events::{
     BudgetUpdate, CacheUpdate, InferenceEvent, PendingAction, PendingActionKind, ProgressStatus,
     ProgressTrace,
 };
+use crate::hooks::{HookEvent, Hooks};
 use crate::session::SessionStore;
 use crate::config;
 use crate::error::{ParamsError, Result};
@@ -70,6 +71,9 @@ struct CacheLookup {
     text: String,
     hit: bool,
     source: debug_log::ResponseSource,
+    /// Wall-clock milliseconds spent on live generation.
+    /// Zero for cache hits — no model work was done.
+    elapsed_ms: u64,
 }
 
 fn save_session(store: Option<&SessionStore>, messages: &[Message], backend_name: &str) {
@@ -127,6 +131,7 @@ pub fn model_thread(
         }
     };
     info!(backend = backend.name(), "model thread initialized");
+    let hooks = Hooks::default();
 
     let _ = token_tx.send(InferenceEvent::Ready);
     let _ = token_tx.send(InferenceEvent::BackendName(backend.name()));
@@ -179,7 +184,8 @@ pub fn model_thread(
     if let Some(ref store) = session_store {
         match store.load() {
             Ok(Some(saved)) => {
-                info!(msg_count = saved.messages.len(), saved_at = saved.saved_at, "restoring previous session");
+                let restored_count = saved.messages.len();
+                info!(msg_count = restored_count, saved_at = saved.saved_at, "restoring previous session");
                 let display_messages: Vec<(String, String)> = saved.messages
                     .iter()
                     .map(|m| (m.role.clone(), m.content.clone()))
@@ -187,6 +193,10 @@ pub fn model_thread(
                 session_messages.extend(saved.messages);
                 let _ = token_tx.send(InferenceEvent::SessionRestored {
                     display_messages,
+                    saved_at: saved.saved_at,
+                });
+                hooks.dispatch(HookEvent::SessionRestored {
+                    message_count: restored_count,
                     saved_at: saved.saved_at,
                 });
             }
@@ -251,6 +261,7 @@ pub fn model_thread(
                     next_action_id,
                     pending,
                     false,
+                    &hooks,
                 ) {
                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                 } else {
@@ -363,6 +374,12 @@ pub fn model_thread(
                 // Run generation — collect full response for tool call detection
                 emit_generation_started(&token_tx, "generating...", false);
                 emit_trace(&token_tx, ProgressStatus::Started, "drafting answer...", false);
+                hooks.dispatch(HookEvent::BeforeGeneration {
+                    backend: backend.name(),
+                    message_count: session_messages.len(),
+                    eco: eco_enabled,
+                    reflection: reflection_enabled,
+                });
                 let response = generate_with_cache(
                     &*backend,
                     &session_messages,
@@ -388,6 +405,12 @@ pub fn model_thread(
                     }
                     Ok(response) => {
                         let response_source = response.source;
+                        hooks.dispatch(HookEvent::AfterGeneration {
+                            backend: backend.name(),
+                            response_chars: response.text.chars().count(),
+                            from_cache: response.hit,
+                            elapsed_ms: response.elapsed_ms,
+                        });
                         let full_response = response.text;
                         info!(
                             response_chars = full_response.chars().count(),
@@ -413,6 +436,13 @@ pub fn model_thread(
                             pending = tool_execution.pending.is_some(),
                             "tool scan completed"
                         );
+                        for result in &tool_results {
+                            hooks.dispatch(HookEvent::ToolExecuted {
+                                tool_name: result.tool_name.clone(),
+                                argument_chars: result.argument.chars().count(),
+                                result_chars: result.output.chars().count(),
+                            });
+                        }
 
                         if let Some(pending) = tool_execution.pending {
                             emit_trace(&token_tx, ProgressStatus::Updated, "waiting for approval...", false);
@@ -440,6 +470,7 @@ pub fn model_thread(
                                 next_action_id,
                                 pending,
                                 true,
+                                &hooks,
                             ) {
                                 emit_trace(&token_tx, ProgressStatus::Failed, "approval flow failed", false);
                                 let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
@@ -615,6 +646,10 @@ pub fn model_thread(
         }
     }
 
+    hooks.dispatch(HookEvent::SessionEnding {
+        message_count: session_messages.len(),
+    });
+
     if let Some(store) = fact_store.as_ref() {
         info!("persisting session facts");
         store.extract_and_store(&session_messages, &project_name, &*backend);
@@ -629,6 +664,11 @@ pub fn model_thread(
                         "memory consolidated"
                     );
                 }
+                hooks.dispatch(HookEvent::MemoryConsolidated {
+                    facts_pruned: stats.ttl_pruned,
+                    facts_deduped: stats.dedup_removed,
+                    facts_capped: stats.cap_removed,
+                });
             }
             Err(e) => warn!(error = %e, "memory consolidation failed"),
         }
@@ -652,6 +692,7 @@ fn handle_pending_action(
     action_id: u64,
     mut pending: PendingToolAction,
     run_follow_up: bool,
+    hooks: &Hooks,
 ) -> Result<()> {
     if pending.preview.is_empty() {
         pending.preview = pending.argument.clone();
@@ -670,6 +711,10 @@ fn handle_pending_action(
         run_follow_up,
         "pending action proposed"
     );
+    hooks.dispatch(HookEvent::ApprovalRequested {
+        tool_name: pending.tool_name.clone(),
+        kind: format!("{:?}", pending.kind),
+    });
     emit_trace(token_tx, ProgressStatus::Started, "awaiting approval...", false);
     let _ = token_tx.send(InferenceEvent::PendingAction(event));
 
@@ -677,6 +722,10 @@ fn handle_pending_action(
         match prompt_rx.recv() {
             Ok(SessionCommand::ApproveAction(id)) if id == action_id => {
                 info!(action_id, tool = pending.tool_name.as_str(), "pending action approved");
+                hooks.dispatch(HookEvent::ApprovalResolved {
+                    tool_name: pending.tool_name.clone(),
+                    approved: true,
+                });
                 emit_trace(token_tx, ProgressStatus::Finished, "approval received", false);
                 emit_trace(
                     token_tx,
@@ -685,6 +734,11 @@ fn handle_pending_action(
                     false,
                 );
                 let result = tools.execute_pending_action(&pending);
+                hooks.dispatch(HookEvent::ToolExecuted {
+                    tool_name: result.tool_name.clone(),
+                    argument_chars: pending.argument.chars().count(),
+                    result_chars: result.output.chars().count(),
+                });
                 emit_trace(token_tx, ProgressStatus::Finished, "approved action complete", false);
                 let _ = token_tx.send(InferenceEvent::ToolCall(format!(
                     "{}({})",
@@ -768,6 +822,10 @@ fn handle_pending_action(
             }
             Ok(SessionCommand::RejectAction(id)) if id == action_id => {
                 info!(action_id, tool = pending.tool_name.as_str(), "pending action rejected");
+                hooks.dispatch(HookEvent::ApprovalResolved {
+                    tool_name: pending.tool_name.clone(),
+                    approved: false,
+                });
                 emit_trace(token_tx, ProgressStatus::Failed, "action rejected", false);
                 let rejection = format!(
                     "User rejected proposed action: {}",
@@ -1098,6 +1156,7 @@ fn generate_with_cache(
                     text: cached,
                     hit: true,
                     source: debug_log::ResponseSource::ExactCache,
+                    elapsed_ms: 0,
                 });
             }
             Ok(None) => {}
@@ -1123,6 +1182,7 @@ fn generate_with_cache(
                             text: cached,
                             hit: true,
                             source: debug_log::ResponseSource::PromptCache,
+                            elapsed_ms: 0,
                         });
                     }
                     Ok(None) => {}
@@ -1146,6 +1206,7 @@ fn generate_with_cache(
                             text: cached,
                             hit: true,
                             source: debug_log::ResponseSource::SemanticCache,
+                            elapsed_ms: 0,
                         });
                     }
                     Ok(None) => {}
@@ -1160,11 +1221,14 @@ fn generate_with_cache(
     cache_stats.misses = cache_stats.misses.saturating_add(1);
     emit_cache_update(cache_stats, false, &token_tx);
 
+    let gen_start = std::time::Instant::now();
     let response = run_and_collect(backend, messages, token_tx.clone(), stream_tokens)?;
+    let elapsed_ms = gen_start.elapsed().as_millis() as u64;
     Ok(CacheLookup {
         text: response,
         hit: false,
         source: debug_log::ResponseSource::Live,
+        elapsed_ms,
     })
 }
 

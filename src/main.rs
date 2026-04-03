@@ -7,6 +7,7 @@ mod cache;
 mod config;
 mod debug_log;
 mod events;
+mod hooks;
 mod inference;
 #[allow(dead_code)]
 mod memory;
