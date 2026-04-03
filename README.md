@@ -18,10 +18,10 @@ Switch backends by editing `.local/config.toml`.
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands and whole-file writes with diff preview
-- Three-level memory: session compression, project index, cross-session facts
+- Three-level memory: session compression, project index, cross-session facts with quality filtering, deduplication, TTL pruning, and per-project cap
 - Budget tracking, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
-- Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, plus `/clear-cache`
+- Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, with TTL + project-change invalidation and `/clear-cache`
 - Session persistence: conversation history auto-saved to `.local/sessions.db` and restored on the next startup; `/clear` starts a fresh session
 - Project profiles: add `.params.toml` to any project directory to override backend, model, reflection, eco, LSP, and budget settings for that project
 
@@ -116,11 +116,19 @@ model = "llama-3.3-70b-versatile"
 max_tokens = 512
 temperature = 0.8
 
+[cache]
+ttl_seconds = 21600
+# set to 0 to disable TTL expiration
+
 [reflection]
 enabled = false
 
 [eco]
 enabled = false
+
+[memory]
+fact_ttl_days = 90      # days before a cross-session fact is pruned; 0 disables TTL
+max_facts_per_project = 150  # per-project cap; oldest facts removed first when exceeded
 ```
 
 ### Project profile — `.params.toml`
@@ -136,6 +144,13 @@ model = "gpt-4o"
 
 [generation]
 max_tokens = 2048
+
+[cache]
+ttl_seconds = 3600
+
+[memory]
+fact_ttl_days = 30
+max_facts_per_project = 200
 
 [reflection]
 enabled = true

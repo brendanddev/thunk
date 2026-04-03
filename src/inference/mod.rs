@@ -19,7 +19,7 @@ pub use openai_compat::OpenAICompatBackend;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use tracing::{debug, info, warn};
-use crate::cache::ExactCache;
+use crate::cache::{build_cache_scope, ExactCache};
 use crate::debug_log;
 use crate::events::{
     BudgetUpdate, CacheUpdate, InferenceEvent, PendingAction, PendingActionKind, ProgressStatus,
@@ -242,6 +242,7 @@ pub fn model_thread(
                     exact_cache.as_ref(),
                     &mut session_messages,
                     &cfg,
+                    &project_root,
                     &mut budget,
                     &mut cache_stats,
                     debug_logging_enabled,
@@ -365,6 +366,8 @@ pub fn model_thread(
                 let response = generate_with_cache(
                     &*backend,
                     &session_messages,
+                    &cfg,
+                    &project_root,
                     token_tx.clone(),
                     !reflection_enabled,
                     exact_cache.as_ref(),
@@ -428,6 +431,7 @@ pub fn model_thread(
                                 exact_cache.as_ref(),
                                 &mut session_messages,
                                 &cfg,
+                                &project_root,
                                 &mut budget,
                                 &mut cache_stats,
                                 debug_logging_enabled,
@@ -460,6 +464,8 @@ pub fn model_thread(
                             match generate_with_cache(
                                 &*backend,
                                 &session_messages,
+                                &cfg,
+                                &project_root,
                                 token_tx.clone(),
                                 !reflection_enabled,
                                 exact_cache.as_ref(),
@@ -489,6 +495,7 @@ pub fn model_thread(
                                         reflect_response(
                                             &*backend,
                                             &cfg,
+                                            &project_root,
                                             &mut budget,
                                             &token_tx,
                                             exact_cache.as_ref(),
@@ -514,6 +521,8 @@ pub fn model_thread(
                                                 );
                                                 store_exact_cache(
                                                     exact_cache.as_ref(),
+                                                    &cfg,
+                                                    &project_root,
                                                     &backend.name(),
                                                     &session_messages,
                                                     &final_response,
@@ -546,6 +555,7 @@ pub fn model_thread(
                                 reflect_response(
                                     &*backend,
                                     &cfg,
+                                    &project_root,
                                     &mut budget,
                                     &token_tx,
                                     exact_cache.as_ref(),
@@ -571,12 +581,16 @@ pub fn model_thread(
                                         );
                                         store_exact_cache(
                                             exact_cache.as_ref(),
+                                            &cfg,
+                                            &project_root,
                                             &backend.name(),
                                             &session_messages,
                                             &final_response,
                                         );
                                         store_prompt_level_cache(
                                             exact_cache.as_ref(),
+                                            &cfg,
+                                            &project_root,
                                             &backend.name(),
                                             &session_messages,
                                             &final_response,
@@ -604,6 +618,20 @@ pub fn model_thread(
     if let Some(store) = fact_store.as_ref() {
         info!("persisting session facts");
         store.extract_and_store(&session_messages, &project_name, &*backend);
+        match store.consolidate(&project_name, &cfg.memory) {
+            Ok(stats) => {
+                if stats.ttl_pruned + stats.dedup_removed + stats.cap_removed > 0 {
+                    info!(
+                        project = project_name.as_str(),
+                        ttl_pruned = stats.ttl_pruned,
+                        dedup_removed = stats.dedup_removed,
+                        cap_removed = stats.cap_removed,
+                        "memory consolidated"
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "memory consolidation failed"),
+        }
     }
 }
 
@@ -615,6 +643,7 @@ fn handle_pending_action(
     exact_cache: Option<&ExactCache>,
     session_messages: &mut Vec<Message>,
     cfg: &config::Config,
+    project_root: &std::path::Path,
     budget: &mut SessionBudget,
     cache_stats: &mut SessionCacheStats,
     debug_logging_enabled: bool,
@@ -678,6 +707,8 @@ fn handle_pending_action(
                     let follow_up = generate_with_cache(
                         backend,
                         session_messages,
+                        cfg,
+                        project_root,
                         token_tx.clone(),
                         !reflection_enabled,
                         exact_cache,
@@ -700,6 +731,7 @@ fn handle_pending_action(
                         reflect_response(
                             backend,
                             cfg,
+                            project_root,
                             budget,
                             token_tx,
                             exact_cache,
@@ -722,6 +754,8 @@ fn handle_pending_action(
                         );
                         store_exact_cache(
                             exact_cache,
+                            cfg,
+                            project_root,
                             &backend.name(),
                             session_messages,
                             &final_response,
@@ -749,6 +783,8 @@ fn handle_pending_action(
                     let follow_up = generate_with_cache(
                         backend,
                         session_messages,
+                        cfg,
+                        project_root,
                         token_tx.clone(),
                         !reflection_enabled,
                         exact_cache,
@@ -772,6 +808,7 @@ fn handle_pending_action(
                         reflect_response(
                             backend,
                             cfg,
+                            project_root,
                             budget,
                             token_tx,
                             exact_cache,
@@ -794,6 +831,8 @@ fn handle_pending_action(
                         );
                         store_exact_cache(
                             exact_cache,
+                            cfg,
+                            project_root,
                             &backend.name(),
                             session_messages,
                             &final_response,
@@ -975,6 +1014,8 @@ fn is_injected_context_message(content: &str) -> bool {
 
 fn store_prompt_level_cache(
     exact_cache: Option<&ExactCache>,
+    cfg: &config::Config,
+    project_root: &std::path::Path,
     backend_name: &str,
     messages: &[Message],
     response: &str,
@@ -982,17 +1023,26 @@ fn store_prompt_level_cache(
     let Some(cache) = exact_cache else {
         return;
     };
+    let cache_scope = match build_cache_scope(project_root, cfg.cache.ttl_seconds) {
+        Ok(scope) => scope,
+        Err(e) => {
+            warn!(error = %e, "cache scope build failed; skipping prompt-level cache store");
+            return;
+        }
+    };
     let Some((system_prompt, user_prompt)) = prompt_level_cache_key(messages) else {
         return;
     };
 
-    if let Err(e) = cache.put_prompt_level(backend_name, system_prompt, user_prompt, response) {
+    if let Err(e) = cache.put_prompt_level(backend_name, system_prompt, user_prompt, response, &cache_scope) {
         warn!(error = %e, "prompt-level cache store failed");
     }
 }
 
 fn store_exact_cache(
     exact_cache: Option<&ExactCache>,
+    cfg: &config::Config,
+    project_root: &std::path::Path,
     backend_name: &str,
     messages: &[Message],
     response: &str,
@@ -1000,23 +1050,40 @@ fn store_exact_cache(
     let Some(cache) = exact_cache else {
         return;
     };
-
-    if let Err(e) = cache.put(backend_name, messages, response) {
+    let cache_scope = match build_cache_scope(project_root, cfg.cache.ttl_seconds) {
+        Ok(scope) => scope,
+        Err(e) => {
+            warn!(error = %e, "cache scope build failed; skipping exact cache store");
+            return;
+        }
+    };
+    if let Err(e) = cache.put(backend_name, messages, response, &cache_scope) {
         warn!(error = %e, "exact cache store failed");
+        return;
     }
 }
 
 fn generate_with_cache(
     backend: &dyn InferenceBackend,
     messages: &[Message],
+    cfg: &config::Config,
+    project_root: &std::path::Path,
     token_tx: Sender<InferenceEvent>,
     stream_tokens: bool,
     exact_cache: Option<&ExactCache>,
     cache_stats: &mut SessionCacheStats,
     cache_mode: CacheMode,
 ) -> Result<CacheLookup> {
-    if let Some(cache) = exact_cache {
-        match cache.get(&backend.name(), messages) {
+    let cache_scope = match build_cache_scope(project_root, cfg.cache.ttl_seconds) {
+        Ok(scope) => Some(scope),
+        Err(e) => {
+            warn!(error = %e, "cache scope build failed; bypassing cache");
+            None
+        }
+    };
+
+    if let (Some(cache), Some(cache_scope)) = (exact_cache, cache_scope.as_ref()) {
+        match cache.get(&backend.name(), messages, cache_scope) {
             Ok(Some(cached)) => {
                 let saved = estimate_message_tokens(messages)
                     .saturating_add(estimate_text_tokens(&cached));
@@ -1041,7 +1108,7 @@ fn generate_with_cache(
 
         if matches!(cache_mode, CacheMode::PreferPromptLevel) {
             if let Some((system_prompt, user_prompt)) = prompt_level_cache_key(messages) {
-                match cache.get_prompt_level(&backend.name(), system_prompt, user_prompt) {
+                match cache.get_prompt_level(&backend.name(), system_prompt, user_prompt, cache_scope) {
                     Ok(Some(cached)) => {
                         let saved = estimate_message_tokens(messages)
                             .saturating_add(estimate_text_tokens(&cached));
@@ -1064,7 +1131,7 @@ fn generate_with_cache(
                     }
                 }
 
-                match cache.get_semantic_prompt_level(&backend.name(), system_prompt, user_prompt) {
+                match cache.get_semantic_prompt_level(&backend.name(), system_prompt, user_prompt, cache_scope) {
                     Ok(Some(cached)) => {
                         let saved = estimate_message_tokens(messages)
                             .saturating_add(estimate_text_tokens(&cached));
@@ -1162,6 +1229,7 @@ fn run_and_collect(
 fn reflect_response(
     backend: &dyn InferenceBackend,
     cfg: &config::Config,
+    project_root: &std::path::Path,
     budget: &mut SessionBudget,
     token_tx: &Sender<InferenceEvent>,
     exact_cache: Option<&ExactCache>,
@@ -1180,6 +1248,8 @@ fn reflect_response(
     let reflected = generate_with_cache(
         backend,
         &reflection_messages,
+        cfg,
+        project_root,
         token_tx.clone(),
         true,
         exact_cache,

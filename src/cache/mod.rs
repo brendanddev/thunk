@@ -4,4 +4,4 @@
 
 mod exact;
 
-pub use exact::ExactCache;
+pub use exact::{build_cache_scope, ExactCache};

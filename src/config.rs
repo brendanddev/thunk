@@ -42,6 +42,9 @@ pub struct Config {
     pub budget: BudgetConfig,
 
     #[serde(default)]
+    pub cache: CacheConfig,
+
+    #[serde(default)]
     pub lsp: LspConfig,
 
     #[serde(default)]
@@ -52,6 +55,9 @@ pub struct Config {
 
     #[serde(default)]
     pub debug_logging: DebugLoggingConfig,
+
+    #[serde(default)]
+    pub memory: MemoryConfig,
 
     /// Path to the active project profile, if one was found.
     /// Set by load_with_profile() — never read from or written to the TOML file.
@@ -141,6 +147,14 @@ pub struct BudgetConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// How long cache entries remain valid before they are treated as stale.
+    /// Set to 0 to disable TTL-based expiration.
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LspConfig {
     /// Optional explicit path to rust-analyzer for the first LSP slice.
     pub rust_analyzer_path: Option<PathBuf>,
@@ -171,6 +185,22 @@ pub struct DebugLoggingConfig {
     pub content: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// How many days before a fact is considered stale and pruned.
+    /// Set to 0 to disable TTL-based pruning.
+    #[serde(default = "default_fact_ttl_days")]
+    pub fact_ttl_days: u64,
+
+    /// Maximum number of facts to keep per project.
+    /// When the cap is exceeded, the oldest (least recently seen) facts are removed.
+    #[serde(default = "default_max_facts_per_project")]
+    pub max_facts_per_project: usize,
+}
+
+fn default_fact_ttl_days() -> u64 { 90 }
+fn default_max_facts_per_project() -> usize { 150 }
+
 fn default_backend() -> String { "llama_cpp".to_string() }
 fn default_ollama_url() -> String { "http://localhost:11434".to_string() }
 fn default_ollama_model() -> String { "qwen2.5-coder:7b".to_string() }
@@ -178,6 +208,7 @@ fn default_openai_url() -> String { "https://api.groq.com/openai/v1".to_string()
 fn default_openai_model() -> String { "llama-3.3-70b-versatile".to_string() }
 fn default_max_tokens() -> i32 { 512 }
 fn default_temperature() -> f32 { 0.8 }
+fn default_cache_ttl_seconds() -> u64 { 21600 }
 fn default_lsp_timeout_ms() -> u64 { 15000 }
 
 impl OpenAICompatConfig {
@@ -230,6 +261,14 @@ impl Default for BudgetConfig {
     }
 }
 
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: default_cache_ttl_seconds(),
+        }
+    }
+}
+
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
@@ -254,10 +293,12 @@ impl Default for Config {
             openai_compat: OpenAICompatConfig::default(),
             generation: GenerationConfig::default(),
             budget: BudgetConfig::default(),
+            cache: CacheConfig::default(),
             lsp: LspConfig::default(),
             reflection: ReflectionConfig::default(),
             eco: EcoConfig::default(),
             debug_logging: DebugLoggingConfig::default(),
+            memory: MemoryConfig::default(),
             active_profile: None,
         }
     }
@@ -272,6 +313,15 @@ impl Default for EcoConfig {
 impl Default for DebugLoggingConfig {
     fn default() -> Self {
         Self { content: false }
+    }
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            fact_ttl_days: default_fact_ttl_days(),
+            max_facts_per_project: default_max_facts_per_project(),
+        }
     }
 }
 
@@ -398,6 +448,10 @@ pub fn load() -> Result<Config> {
              #   input_cost_per_million = 0.0\n\
              #   output_cost_per_million = 0.0\n\
              #\n\
+             # Response cache invalidation:\n\
+             #   [cache]\n\
+             #   ttl_seconds = 21600   # 6 hours, set 0 to disable TTL\n\
+             #\n\
              # LSP diagnostics (Rust-first initial slice):\n\
              #   [lsp]\n\
              #   rust_analyzer_path = \"/absolute/path/to/rust-analyzer\"\n\
@@ -471,6 +525,9 @@ pub struct ProjectProfile {
     pub budget: ProjectBudgetProfile,
 
     #[serde(default)]
+    pub cache: ProjectCacheProfile,
+
+    #[serde(default)]
     pub lsp: ProjectLspProfile,
 
     #[serde(default)]
@@ -478,6 +535,9 @@ pub struct ProjectProfile {
 
     #[serde(default)]
     pub eco: ProjectEcoProfile,
+
+    #[serde(default)]
+    pub memory: ProjectMemoryProfile,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -512,6 +572,11 @@ pub struct ProjectBudgetProfile {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct ProjectCacheProfile {
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct ProjectLspProfile {
     pub rust_analyzer_path: Option<PathBuf>,
     pub timeout_ms: Option<u64>,
@@ -525,6 +590,12 @@ pub struct ProjectReflectionProfile {
 #[derive(Debug, Deserialize, Default)]
 pub struct ProjectEcoProfile {
     pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ProjectMemoryProfile {
+    pub fact_ttl_days: Option<u64>,
+    pub max_facts_per_project: Option<usize>,
 }
 
 /// Apply a project profile on top of a base Config.
@@ -542,10 +613,13 @@ pub fn apply_profile(mut base: Config, profile: ProjectProfile) -> Config {
     if let Some(t) = profile.generation.temperature { base.generation.temperature = t; }
     if let Some(v) = profile.budget.input_cost_per_million { base.budget.input_cost_per_million = Some(v); }
     if let Some(v) = profile.budget.output_cost_per_million { base.budget.output_cost_per_million = Some(v); }
+    if let Some(v) = profile.cache.ttl_seconds { base.cache.ttl_seconds = v; }
     if let Some(p) = profile.lsp.rust_analyzer_path { base.lsp.rust_analyzer_path = Some(p); }
     if let Some(t) = profile.lsp.timeout_ms { base.lsp.timeout_ms = t; }
     if let Some(e) = profile.reflection.enabled { base.reflection.enabled = e; }
     if let Some(e) = profile.eco.enabled { base.eco.enabled = e; }
+    if let Some(v) = profile.memory.fact_ttl_days { base.memory.fact_ttl_days = v; }
+    if let Some(v) = profile.memory.max_facts_per_project { base.memory.max_facts_per_project = v; }
     base
 }
 
@@ -641,12 +715,16 @@ mod tests {
                 max_tokens: Some(2048),
                 ..ProjectGenerationProfile::default()
             },
+            cache: ProjectCacheProfile {
+                ttl_seconds: Some(3600),
+            },
             ..ProjectProfile::default()
         };
         let merged = apply_profile(base, profile);
         assert_eq!(merged.backend, "openai_compat");
         assert_eq!(merged.openai_compat.model, "gpt-4o");
         assert_eq!(merged.generation.max_tokens, 2048);
+        assert_eq!(merged.cache.ttl_seconds, 3600);
         // ollama settings unchanged
         assert_eq!(merged.ollama.model, "qwen2.5-coder:7b");
     }
