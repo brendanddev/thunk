@@ -12,7 +12,7 @@
 // find_relevant() does simple keyword scoring for now. Semantic search via
 // embeddings can be layered on top later without changing the schema.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -28,6 +28,19 @@ use super::run_prompt_sync;
 pub struct ProjectIndex {
     conn: Connection,
 }
+
+pub struct IndexDelta {
+    pub to_index: Vec<PathBuf>,
+    pub removed: usize,
+    pub unchanged: usize,
+    pub skipped_large: usize,
+}
+
+const INDEXABLE_EXTENSIONS: &[&str] = &[
+    "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift",
+    "rb", "php", "cs", "toml", "yaml", "yml", "json", "md", "txt", "sh", "sql",
+];
+const MAX_INDEXABLE_FILE_BYTES: u64 = 100_000;
 
 impl ProjectIndex {
     /// Open or create the index database for the current working directory.
@@ -155,6 +168,95 @@ impl ProjectIndex {
             Err(_) => true, // Not in the DB yet
         }
     }
+
+    /// Scan the project tree for changed/new/deleted indexable files.
+    ///
+    /// This is intentionally cheap: it uses file metadata and the existing DB
+    /// records to build a delta without reading file contents.
+    pub fn collect_delta(&self, root: &Path) -> Result<IndexDelta> {
+        let mut files = Vec::new();
+        collect_indexable_files(root, &mut files)?;
+
+        let mut current_paths = HashSet::with_capacity(files.len());
+        let mut to_index = Vec::new();
+        let mut unchanged = 0usize;
+        let mut skipped_large = 0usize;
+
+        for file in files {
+            current_paths.insert(file.to_string_lossy().to_string());
+
+            let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+            if size > MAX_INDEXABLE_FILE_BYTES {
+                skipped_large += 1;
+                continue;
+            }
+
+            if self.needs_reindex(&file) {
+                to_index.push(file);
+            } else {
+                unchanged += 1;
+            }
+        }
+
+        let indexed_paths = self.indexed_paths()?;
+        let mut removed = 0usize;
+        for path in indexed_paths {
+            if !current_paths.contains(&path) {
+                removed += self.remove_path_str(&path)?;
+            }
+        }
+
+        Ok(IndexDelta {
+            to_index,
+            removed,
+            unchanged,
+            skipped_large,
+        })
+    }
+
+    fn indexed_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn remove_path_str(&self, path: &str) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM files WHERE path = ?1", params![path])?)
+    }
+}
+
+/// Recursively collect indexable files from a project root.
+pub fn collect_indexable_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if name.starts_with('.') {
+            continue;
+        }
+        if matches!(name.as_ref(), "target" | "node_modules" | "__pycache__") {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_indexable_files(&path, files)?;
+        } else if is_indexable_file(&path) {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn is_indexable_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| INDEXABLE_EXTENSIONS.contains(&ext))
+        .unwrap_or(false)
 }
 
 /// Build the path to the project index database.
@@ -179,4 +281,99 @@ fn file_mtime(path: &Path) -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("params-index-test-{label}-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn test_index(root: &Path) -> ProjectIndex {
+        ProjectIndex::open_for(root).expect("open project index")
+    }
+
+    #[test]
+    fn collect_delta_detects_new_and_unchanged_files() {
+        let root = temp_project_dir("delta");
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n").expect("write source file");
+
+        let index = test_index(&root);
+        let first = index.collect_delta(&root).expect("collect first delta");
+        assert_eq!(first.to_index, vec![file.clone()]);
+        assert_eq!(first.unchanged, 0);
+
+        index.conn.execute(
+            "INSERT INTO files (path, summary, embedding_json, last_modified) VALUES (?1, ?2, NULL, ?3)",
+            params![
+                file.to_string_lossy().to_string(),
+                "summary",
+                file_mtime(&file).unwrap() as i64
+            ],
+        ).expect("seed index row");
+
+        let second = index.collect_delta(&root).expect("collect second delta");
+        assert!(second.to_index.is_empty());
+        assert_eq!(second.unchanged, 1);
+
+        let _ = fs::remove_file(file);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn collect_delta_removes_deleted_rows() {
+        let root = temp_project_dir("removed");
+        let file = root.join("lib.rs");
+        fs::write(&file, "pub fn value() {}\n").expect("write source file");
+
+        let index = test_index(&root);
+        index.conn.execute(
+            "INSERT INTO files (path, summary, embedding_json, last_modified) VALUES (?1, ?2, NULL, ?3)",
+            params![
+                file.to_string_lossy().to_string(),
+                "summary",
+                file_mtime(&file).unwrap() as i64
+            ],
+        ).expect("seed index row");
+
+        fs::remove_file(&file).expect("remove source file");
+        let delta = index.collect_delta(&root).expect("collect delta");
+        assert_eq!(delta.removed, 1);
+
+        let count: i64 = index.conn.query_row(
+            "SELECT COUNT(*) FROM files",
+            [],
+            |row| row.get(0),
+        ).expect("count files");
+        assert_eq!(count, 0);
+
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn collect_delta_skips_large_files() {
+        let root = temp_project_dir("large");
+        let file = root.join("big.rs");
+        fs::write(&file, "a".repeat((MAX_INDEXABLE_FILE_BYTES as usize) + 1))
+            .expect("write large file");
+
+        let index = test_index(&root);
+        let delta = index.collect_delta(&root).expect("collect delta");
+        assert!(delta.to_index.is_empty());
+        assert_eq!(delta.skipped_large, 1);
+
+        let _ = fs::remove_file(file);
+        let _ = fs::remove_dir(root);
+    }
 }

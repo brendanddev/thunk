@@ -17,7 +17,9 @@ pub use ollama::OllamaBackend;
 pub use openai_compat::OpenAICompatBackend;
 
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::collections::VecDeque;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use crate::cache::{build_cache_scope, ExactCache};
 use crate::debug_log;
@@ -76,11 +78,107 @@ struct CacheLookup {
     elapsed_ms: u64,
 }
 
+struct IncrementalIndexState {
+    pending_files: VecDeque<PathBuf>,
+    next_scan_at: Instant,
+    scan_interval: Duration,
+}
+
+impl IncrementalIndexState {
+    fn new() -> Self {
+        Self {
+            pending_files: VecDeque::new(),
+            next_scan_at: Instant::now(),
+            scan_interval: Duration::from_secs(20),
+        }
+    }
+
+    fn request_scan_soon(&mut self) {
+        self.next_scan_at = Instant::now();
+    }
+
+    fn should_scan(&self) -> bool {
+        self.pending_files.is_empty() || Instant::now() >= self.next_scan_at
+    }
+
+    fn schedule_next_scan(&mut self) {
+        self.next_scan_at = Instant::now() + self.scan_interval;
+    }
+
+    fn replace_queue(&mut self, files: Vec<PathBuf>) {
+        self.pending_files = files.into();
+    }
+}
+
+const IDLE_INDEX_POLL_INTERVAL: Duration = Duration::from_millis(350);
+
 fn save_session(store: Option<&SessionStore>, messages: &[Message], backend_name: &str) {
     if let Some(s) = store {
         if let Err(e) = s.save(messages, backend_name) {
             warn!(error = %e, "session save failed");
         }
+    }
+}
+
+fn refresh_incremental_index(
+    state: &mut IncrementalIndexState,
+    project_index: &ProjectIndex,
+    project_root: &std::path::Path,
+) {
+    match project_index.collect_delta(project_root) {
+        Ok(delta) => {
+            let queued = delta.to_index.len();
+            state.replace_queue(delta.to_index);
+            state.schedule_next_scan();
+            if queued > 0 || delta.removed > 0 {
+                info!(
+                    queued,
+                    removed = delta.removed,
+                    unchanged = delta.unchanged,
+                    skipped_large = delta.skipped_large,
+                    "incremental project index scan updated"
+                );
+            } else {
+                debug!(
+                    unchanged = delta.unchanged,
+                    skipped_large = delta.skipped_large,
+                    "incremental project index scan clean"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "incremental project index scan failed");
+            state.schedule_next_scan();
+        }
+    }
+}
+
+fn run_idle_index_step(
+    index_state: &mut IncrementalIndexState,
+    project_index: &ProjectIndex,
+    project_root: &std::path::Path,
+    backend: &dyn InferenceBackend,
+) {
+    if index_state.should_scan() {
+        refresh_incremental_index(index_state, project_index, project_root);
+    }
+
+    let Some(path) = index_state.pending_files.pop_front() else {
+        return;
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "idle index read failed");
+            return;
+        }
+    };
+
+    if let Err(e) = project_index.index_file(&path, &content, backend) {
+        warn!(path = %path.display(), error = %e, "idle index update failed");
+    } else {
+        debug!(path = %path.display(), remaining = index_state.pending_files.len(), "idle index updated file");
     }
 }
 
@@ -164,6 +262,12 @@ pub fn model_thread(
     let exact_cache = ExactCache::open().ok();
     let fact_store = FactStore::open().ok();
     let project_index = ProjectIndex::open_for(&project_root).ok();
+    let mut index_state = if cfg.backend == "llama_cpp" {
+        info!("idle incremental indexing disabled for llama_cpp backend");
+        None
+    } else {
+        project_index.as_ref().map(|_| IncrementalIndexState::new())
+    };
     let session_facts = fact_store
         .as_ref()
         .and_then(|store| store.get_relevant_facts(&project_name, "", 5).ok())
@@ -207,7 +311,17 @@ pub fn model_thread(
         }
     }
 
-    while let Ok(command) = prompt_rx.recv() {
+    loop {
+        if let (Some(index), Some(state)) = (project_index.as_ref(), index_state.as_mut()) {
+            run_idle_index_step(state, index, &project_root, &*backend);
+        }
+
+        let command = match prompt_rx.recv_timeout(IDLE_INDEX_POLL_INTERVAL) {
+            Ok(command) => command,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
         match command {
             SessionCommand::ClearSession => {
                 info!("session cleared");
@@ -262,6 +376,7 @@ pub fn model_thread(
                     pending,
                     false,
                     &hooks,
+                    index_state.as_mut(),
                 ) {
                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                 } else {
@@ -471,6 +586,7 @@ pub fn model_thread(
                                 pending,
                                 true,
                                 &hooks,
+                                index_state.as_mut(),
                             ) {
                                 emit_trace(&token_tx, ProgressStatus::Failed, "approval flow failed", false);
                                 let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
@@ -693,6 +809,7 @@ fn handle_pending_action(
     mut pending: PendingToolAction,
     run_follow_up: bool,
     hooks: &Hooks,
+    index_state: Option<&mut IncrementalIndexState>,
 ) -> Result<()> {
     if pending.preview.is_empty() {
         pending.preview = pending.argument.clone();
@@ -717,6 +834,7 @@ fn handle_pending_action(
     });
     emit_trace(token_tx, ProgressStatus::Started, "awaiting approval...", false);
     let _ = token_tx.send(InferenceEvent::PendingAction(event));
+    let mut index_state = index_state;
 
     loop {
         match prompt_rx.recv() {
@@ -734,6 +852,11 @@ fn handle_pending_action(
                     false,
                 );
                 let result = tools.execute_pending_action(&pending);
+                if matches!(pending.kind, PendingActionKind::FileWrite) {
+                    if let Some(state) = index_state.as_mut() {
+                        state.request_scan_soon();
+                    }
+                }
                 hooks.dispatch(HookEvent::ToolExecuted {
                     tool_name: result.tool_name.clone(),
                     argument_chars: pending.argument.chars().count(),

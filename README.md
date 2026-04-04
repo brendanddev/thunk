@@ -18,7 +18,7 @@ Switch backends by editing `.local/config.toml`.
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands and whole-file writes with diff preview
-- Three-level memory: session compression, project index, cross-session facts with quality filtering, deduplication, TTL pruning, and per-project cap
+- Three-level memory: session compression, incremental project index maintenance, cross-session facts with quality filtering, deduplication, TTL pruning, and per-project cap
 - Budget tracking, per-turn timing in the sidebar, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, with TTL + project-change invalidation and `/clear-cache`
@@ -158,6 +158,15 @@ enabled = true
 
 When a profile is active, params shows `● ✓ profile: .params.toml` in the chat at startup.
 You can commit `.params.toml` to share project settings with collaborators, or add it to `.gitignore` for personal overrides.
+
+### Project indexing
+
+`params index .` now works incrementally:
+- indexes only changed or new indexable files
+- removes stale rows for deleted files
+- skips oversized files
+
+During normal TUI use, params also maintains the project index in the background while idle, refreshing one stale file at a time with the active backend instead of forcing a full re-index on startup.
 
 ---
 

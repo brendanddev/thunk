@@ -96,6 +96,21 @@ pub struct AppState {
 
     /// Duration of the most recently completed turn or slash-command job.
     last_work_duration: Option<Duration>,
+
+    /// Completed trace labels collected for the current turn and collapsed when it ends.
+    grouped_trace_steps: Vec<String>,
+
+    /// Whether any completed trace in the current group failed.
+    grouped_trace_failed: bool,
+
+    /// Slash-command autocomplete candidates for the current input prefix.
+    autocomplete_matches: Vec<String>,
+
+    /// Index of the currently selected autocomplete suggestion.
+    autocomplete_index: usize,
+
+    /// Input prefix used to build the current autocomplete cycle.
+    autocomplete_prefix: Option<String>,
 }
 
 impl AppState {
@@ -129,6 +144,11 @@ impl AppState {
             work_started_at: None,
             accumulated_work_duration: Duration::ZERO,
             last_work_duration: None,
+            grouped_trace_steps: Vec::new(),
+            grouped_trace_failed: false,
+            autocomplete_matches: Vec::new(),
+            autocomplete_index: 0,
+            autocomplete_prefix: None,
         }
     }
 
@@ -141,6 +161,7 @@ impl AppState {
     pub fn submit_input(&mut self) -> String {
         self.cursor = 0;
         self.scroll_offset = 0;
+        self.clear_autocomplete();
         std::mem::take(&mut self.input)
     }
 
@@ -148,12 +169,14 @@ impl AppState {
     pub fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.clear_autocomplete();
     }
 
     /// Insert a string at cursor (for paste)
     pub fn insert_str(&mut self, s: &str) {
         self.input.insert_str(self.cursor, s);
         self.cursor += s.len();
+        self.clear_autocomplete();
     }
 
     /// Delete character before cursor (backspace)
@@ -168,6 +191,7 @@ impl AppState {
         }
         self.input.remove(prev);
         self.cursor = prev;
+        self.clear_autocomplete();
     }
 
     /// Delete word before cursor (Alt+Backspace)
@@ -181,6 +205,7 @@ impl AppState {
         let word_start = before[..trim_end].rfind(' ').map(|i| i + 1).unwrap_or(0);
         self.input.drain(word_start..self.cursor);
         self.cursor = word_start;
+        self.clear_autocomplete();
     }
 
     /// Move cursor left one character
@@ -245,6 +270,10 @@ impl AppState {
     }
 
     pub fn start_generation(&mut self, label: &str, show_placeholder: bool) {
+        if self.should_begin_new_trace_group() {
+            self.grouped_trace_steps.clear();
+            self.grouped_trace_failed = false;
+        }
         self.resume_work_timer();
         self.is_generating = true;
         self.status = label.to_string();
@@ -270,6 +299,7 @@ impl AppState {
         self.status = "ready".to_string();
         self.last_tool_call = None;
         self.current_trace = None;
+        self.flush_grouped_trace_summary();
     }
 
     pub fn add_error(&mut self, error: &str) {
@@ -277,6 +307,7 @@ impl AppState {
         self.is_generating = false;
         self.status = "ready".to_string();
         self.current_trace = None;
+        self.flush_grouped_trace_summary();
         self.messages.push(ChatMessage {
             role: Role::Assistant,
             content: format!("error: {error}"),
@@ -415,14 +446,22 @@ impl AppState {
             }
             ProgressStatus::Finished => {
                 self.current_trace = None;
-                self.push_recent_trace(&trace.label, true);
+                if self.is_grouping_turn_traces() {
+                    self.push_grouped_trace_step(&trace.label, true);
+                } else {
+                    self.push_recent_trace(&trace.label, true);
+                }
                 if trace.persist {
                     self.add_trace_chat_message("✓", &trace.label);
                 }
             }
             ProgressStatus::Failed => {
                 self.current_trace = None;
-                self.push_recent_trace(&trace.label, false);
+                if self.is_grouping_turn_traces() {
+                    self.push_grouped_trace_step(&trace.label, false);
+                } else {
+                    self.push_recent_trace(&trace.label, false);
+                }
                 if trace.persist {
                     self.add_trace_chat_message("✕", &trace.label);
                 }
@@ -470,6 +509,9 @@ impl AppState {
         self.work_started_at = None;
         self.accumulated_work_duration = Duration::ZERO;
         self.last_work_duration = None;
+        self.grouped_trace_steps.clear();
+        self.grouped_trace_failed = false;
+        self.clear_autocomplete();
         self.prompt_tokens = 0;
         self.completion_tokens = 0;
         self.total_tokens = 0;
@@ -503,6 +545,93 @@ impl AppState {
         self.last_work_duration
     }
 
+    pub fn autocomplete_hint(&self) -> Option<String> {
+        if self.autocomplete_matches.is_empty() {
+            return None;
+        }
+
+        let preview = self
+            .autocomplete_matches
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("  ");
+        let extra = self.autocomplete_matches.len().saturating_sub(4);
+        if extra > 0 {
+            Some(format!("{preview}  +{extra}"))
+        } else {
+            Some(preview)
+        }
+    }
+
+    pub fn autocomplete_command(&mut self, commands: &[&str], reverse: bool) -> bool {
+        let Some((start, end, typed_prefix)) = slash_prefix_range(&self.input, self.cursor) else {
+            self.clear_autocomplete();
+            return false;
+        };
+
+        let prefix = if !self.autocomplete_matches.is_empty()
+            && self.autocomplete_index < self.autocomplete_matches.len()
+            && self.autocomplete_matches[self.autocomplete_index] == self.input[..end]
+        {
+            self.autocomplete_prefix
+                .clone()
+                .unwrap_or(typed_prefix)
+        } else {
+            typed_prefix
+        };
+
+        let matches = commands
+            .iter()
+            .filter(|cmd| cmd.starts_with(prefix.as_str()))
+            .map(|cmd| (*cmd).to_string())
+            .collect::<Vec<_>>();
+
+        if matches.is_empty() {
+            self.clear_autocomplete();
+            return false;
+        }
+
+        let same_cycle = self
+            .autocomplete_prefix
+            .as_ref()
+            .map(|existing| existing == &prefix)
+            .unwrap_or(false)
+            && self.autocomplete_matches == matches;
+
+        if same_cycle {
+            if reverse {
+                if self.autocomplete_index == 0 {
+                    self.autocomplete_index = self.autocomplete_matches.len() - 1;
+                } else {
+                    self.autocomplete_index -= 1;
+                }
+            } else {
+                self.autocomplete_index = (self.autocomplete_index + 1) % self.autocomplete_matches.len();
+            }
+        } else {
+            self.autocomplete_matches = matches;
+            self.autocomplete_prefix = Some(prefix);
+            self.autocomplete_index = if reverse {
+                self.autocomplete_matches.len() - 1
+            } else {
+                0
+            };
+        }
+
+        let selected = &self.autocomplete_matches[self.autocomplete_index];
+        self.input.replace_range(start..end, selected);
+        self.cursor = start + selected.len();
+
+        if self.autocomplete_matches.len() == 1 && self.input[self.cursor..].is_empty() {
+            self.input.push(' ');
+            self.cursor += 1;
+        }
+
+        true
+    }
+
     fn resume_work_timer(&mut self) {
         if self.work_started_at.is_none() {
             self.work_started_at = Some(Instant::now());
@@ -524,6 +653,72 @@ impl AppState {
         }
         self.accumulated_work_duration = Duration::ZERO;
     }
+
+    fn should_begin_new_trace_group(&self) -> bool {
+        self.work_started_at.is_none()
+            && self.accumulated_work_duration.is_zero()
+            && self.grouped_trace_steps.is_empty()
+    }
+
+    fn is_grouping_turn_traces(&self) -> bool {
+        self.work_started_at.is_some()
+            || !self.accumulated_work_duration.is_zero()
+            || self.is_generating
+            || self.pending_action.is_some()
+    }
+
+    fn push_grouped_trace_step(&mut self, label: &str, success: bool) {
+        if label.trim().is_empty() {
+            return;
+        }
+        if self
+            .grouped_trace_steps
+            .last()
+            .map(|last| last == label)
+            .unwrap_or(false)
+        {
+            if !success {
+                self.grouped_trace_failed = true;
+            }
+            return;
+        }
+        self.grouped_trace_steps.push(label.to_string());
+        if !success {
+            self.grouped_trace_failed = true;
+        }
+    }
+
+    fn flush_grouped_trace_summary(&mut self) {
+        if self.grouped_trace_steps.is_empty() {
+            return;
+        }
+
+        let summary = summarize_trace_steps(&self.grouped_trace_steps);
+        self.push_recent_trace(&summary, !self.grouped_trace_failed);
+        self.grouped_trace_steps.clear();
+        self.grouped_trace_failed = false;
+    }
+
+    fn clear_autocomplete(&mut self) {
+        self.autocomplete_matches.clear();
+        self.autocomplete_index = 0;
+        self.autocomplete_prefix = None;
+    }
+}
+
+fn slash_prefix_range(input: &str, cursor: usize) -> Option<(usize, usize, String)> {
+    if !input.starts_with('/') {
+        return None;
+    }
+
+    let safe_cursor = cursor.min(input.len());
+    let active = &input[..safe_cursor];
+    let command_end = active.find(' ').unwrap_or(active.len());
+    if command_end == 0 || safe_cursor > command_end {
+        return None;
+    }
+
+    Some((0, command_end, input[..command_end].to_string()))
 }
 
 /// Returns a human-readable description of how long ago a session was saved.
@@ -544,6 +739,22 @@ fn describe_session_age(saved_at: u64) -> String {
     } else {
         let d = age / 86400;
         format!("{d}d ago")
+    }
+}
+
+fn summarize_trace_steps(steps: &[String]) -> String {
+    match steps {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} -> {second}"),
+        [first, second, third] => format!("{first} -> {second} -> {third}"),
+        _ => format!(
+            "{} -> {} -> {} (+{})",
+            steps[0],
+            steps[1],
+            steps[2],
+            steps.len() - 3
+        ),
     }
 }
 
@@ -571,6 +782,71 @@ mod tests {
 
         assert!(state.current_turn_duration().is_none());
         assert!(state.last_work_duration().unwrap() >= paused);
+    }
+
+    #[test]
+    fn grouped_traces_collapse_at_turn_end() {
+        let mut state = AppState::new();
+        state.start_generation("generating...", false);
+        state.apply_trace(ProgressTrace {
+            status: ProgressStatus::Finished,
+            label: "drafting answer...".to_string(),
+            persist: false,
+        });
+        state.apply_trace(ProgressTrace {
+            status: ProgressStatus::Finished,
+            label: "answer ready".to_string(),
+            persist: false,
+        });
+
+        assert!(state.recent_traces.is_empty());
+        state.finish_response();
+
+        assert_eq!(state.recent_traces.len(), 1);
+        assert_eq!(
+            state.recent_traces.front().unwrap().label,
+            "drafting answer... -> answer ready"
+        );
+        assert!(state.recent_traces.front().unwrap().success);
+    }
+
+    #[test]
+    fn standalone_traces_still_show_individually() {
+        let mut state = AppState::new();
+        state.apply_trace(ProgressTrace {
+            status: ProgressStatus::Finished,
+            label: "profile: .params.toml".to_string(),
+            persist: true,
+        });
+
+        assert_eq!(state.recent_traces.len(), 1);
+        assert_eq!(
+            state.recent_traces.front().unwrap().label,
+            "profile: .params.toml"
+        );
+    }
+
+    #[test]
+    fn command_autocomplete_cycles_matches() {
+        let mut state = AppState::new();
+        state.input = "/d".to_string();
+        state.cursor = 2;
+
+        assert!(state.autocomplete_command(&["/def", "/diag", "/debug-log"], false));
+        assert_eq!(state.input, "/def");
+
+        assert!(state.autocomplete_command(&["/def", "/diag", "/debug-log"], false));
+        assert_eq!(state.input, "/diag");
+    }
+
+    #[test]
+    fn command_autocomplete_adds_space_for_unique_match() {
+        let mut state = AppState::new();
+        state.input = "/reject".to_string();
+        state.cursor = state.input.len();
+
+        assert!(state.autocomplete_command(&["/reject"], false));
+        assert_eq!(state.input, "/reject ");
     }
 }
 

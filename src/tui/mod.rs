@@ -2,15 +2,14 @@
 
 mod state;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyModifiers,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -25,13 +24,47 @@ use ratatui::{
 };
 use tracing::{info, warn};
 
-use crate::error::Result;
+use crate::error::{ParamsError, Result};
 use crate::events::{InferenceEvent, PendingActionKind, ProgressStatus, ProgressTrace};
 use crate::inference::SessionCommand;
 use state::{AppState, Role};
 
 // Spinner frames
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SLASH_COMMANDS: &[&str] = &[
+    "/read",
+    "/r",
+    "/ls",
+    "/list",
+    "/search",
+    "/s",
+    "/grep",
+    "/git",
+    "/diag",
+    "/lsp",
+    "/hover",
+    "/def",
+    "/definition",
+    "/lcheck",
+    "/lsp-check",
+    "/run",
+    "/bash",
+    "/reflect",
+    "/eco",
+    "/debug-log",
+    "/fetch",
+    "/web",
+    "/approve",
+    "/reject",
+    "/clear",
+    "/c",
+    "/clear-cache",
+    "/cache-clear",
+    "/clear-debug-log",
+    "/help",
+    "/h",
+    "/?",
+];
 
 // How often to advance the spinner (every N ticks at ~60fps = ~100ms per frame)
 const SPINNER_SPEED: u64 = 6;
@@ -134,27 +167,34 @@ fn push_wrapped_styled(lines: &mut Vec<Line>, text: &str, style: Style, width: u
 
 pub fn run() -> Result<()> {
     info!("tui starting");
+    if !io::stdout().is_terminal() {
+        return Err(ParamsError::Config(
+            "The params TUI requires an interactive terminal (stdout is not a TTY).".to_string(),
+        ));
+    }
+
+    if std::env::var("TERM").as_deref() == Ok("dumb") {
+        return Err(ParamsError::Config(
+            "The params TUI cannot run with TERM=dumb. Launch it in a real terminal, or set TERM=xterm-256color before starting params.".to_string(),
+        ));
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_app(&mut terminal);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_app(&mut terminal)));
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
     info!("tui exiting");
-    result
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(ParamsError::Inference(
+            "The TUI panicked unexpectedly after startup. Terminal state was restored.".to_string(),
+        )),
+    }
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -413,6 +453,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         }
                         (KeyCode::PageDown, _) => {
                             state.scroll_down(10);
+                        }
+
+                        // Tab / Shift+Tab — autocomplete slash commands
+                        (KeyCode::Tab, KeyModifiers::NONE) => {
+                            if state.is_ready() && !state.is_generating {
+                                state.autocomplete_command(SLASH_COMMANDS, false);
+                            }
+                        }
+                        (KeyCode::BackTab, _) => {
+                            if state.is_ready() && !state.is_generating {
+                                state.autocomplete_command(SLASH_COMMANDS, true);
+                            }
                         }
 
                         // Regular character input
@@ -759,9 +811,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_main(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let input_height = if state.autocomplete_hint().is_some() { 4 } else { 3 };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .constraints([Constraint::Min(0), Constraint::Length(input_height)])
         .split(area);
     draw_chat(frame, state, vertical[0]);
     draw_input(frame, state, vertical[1]);
@@ -937,7 +990,15 @@ fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
         ]
     };
 
-    let paragraph = Paragraph::new(Line::from(input_spans)).block(block);
+    let mut lines = vec![Line::from(input_spans)];
+    if let Some(hint) = state.autocomplete_hint() {
+        lines.push(Line::from(Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(block);
     frame.render_widget(paragraph, area);
 }
 

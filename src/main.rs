@@ -22,11 +22,6 @@ use tracing::info;
 // instead of the full `std::result::Result<T, error::ParamsError>`.
 use error::{ParamsError, Result};
 
-const INDEXABLE_EXTENSIONS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift",
-    "rb", "php", "cs", "toml", "yaml", "yml", "json", "md", "txt", "sh", "sql",
-];
-
 /// The top-level CLI struct. Clap reads this to understand what arguments
 /// and subcommands the program accepts.
 ///
@@ -292,18 +287,12 @@ fn run_index_command(path: &str) -> Result<()> {
     let cfg = config::load_with_profile()?;
     let backend = inference::load_backend_from_config(&cfg)?;
     let index = memory::index::ProjectIndex::open_for(&root)?;
-    let mut files = Vec::new();
-    collect_indexable_files(&root, &mut files)?;
+    let delta = index.collect_delta(&root)?;
 
     let mut indexed = 0usize;
-    let mut skipped = 0usize;
+    let mut skipped = delta.unchanged.saturating_add(delta.skipped_large);
 
-    for file in files {
-        if !index.needs_reindex(&file) {
-            skipped += 1;
-            continue;
-        }
-
+    for file in delta.to_index {
         let content = match std::fs::read_to_string(&file) {
             Ok(content) => content,
             Err(_) => {
@@ -322,42 +311,12 @@ fn run_index_command(path: &str) -> Result<()> {
     }
 
     println!(
-        "Indexed {} files in {} (skipped {}).",
+        "Indexed {} files in {} (skipped {}, removed {}).",
         indexed,
         root.display(),
-        skipped
+        skipped,
+        delta.removed
     );
-    info!(indexed, skipped, "project index completed");
+    info!(indexed, skipped, removed = delta.removed, "project index completed");
     Ok(())
-}
-
-fn collect_indexable_files(root: &std::path::Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        if name.starts_with('.') {
-            continue;
-        }
-        if matches!(name.as_ref(), "target" | "node_modules" | "__pycache__") {
-            continue;
-        }
-
-        if path.is_dir() {
-            collect_indexable_files(&path, files)?;
-        } else if is_indexable_file(&path) {
-            files.push(path);
-        }
-    }
-
-    Ok(())
-}
-
-fn is_indexable_file(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| INDEXABLE_EXTENSIONS.contains(&ext))
-        .unwrap_or(false)
 }
