@@ -17,13 +17,13 @@ Switch backends by editing `.local/config.toml`.
 - Streaming Ratatui TUI with multiline input, slash commands, autocomplete, and a docked approval card
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
-- Mutating tools with approval: shell commands and whole-file writes with diff preview
+- Mutating tools with approval: shell commands, targeted file edits, and whole-file writes with diff preview
 - Policy sandbox and inspection: project-only read scope, richer approval previews, destructive shell blocking, and private-network fetch blocking
-- Three-level memory: session compression, incremental project index maintenance, cross-session facts with quality filtering, deduplication, TTL pruning, and per-project cap
+- Three-level memory: session compression, incremental project index maintenance, and cross-session facts with verified per-turn promotion, provenance tags, observability, deduplication, TTL pruning, and per-project cap
 - Budget tracking, per-turn timing in the sidebar, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, with TTL + project-change invalidation and `/clear-cache`
-- Session persistence: conversation history auto-saved to `.local/sessions.db` and restored on the next startup; `/clear` starts a fresh session
+- Session continuity: conversation history auto-saved to `.local/sessions.db`, the most recently opened session auto-restores on startup, `--no-resume` starts fresh, and `/sessions list|new|rename|resume|export` manages project-scoped saved sessions
 - Project profiles: add `.params.toml` to any project directory to override backend, model, reflection, eco, LSP, and budget settings for that project
 - Custom slash commands: load repo-local commands from `.local/commands.toml`
 
@@ -85,6 +85,9 @@ Set `backend = "openai_compat"` and configure `[openai_compat]` for Groq, OpenAI
 cargo run --release
 # or after installing:
 params
+
+# start fresh without restoring the most recent saved session
+params --no-resume
 ```
 
 ---
@@ -139,6 +142,10 @@ block_private_network = true
 inspect_network = true
 shell_mode = "approve_inspect"
 block_destructive_shell = true
+shell_allowlist = []
+shell_denylist = []
+network_allowlist = []
+inspect_cloud_requests = true
 ```
 
 ### Project profile — `.params.toml`
@@ -210,17 +217,38 @@ params "explain what this function does"
 - `/fetch <url>`
 - `/run <command>`
 - `/write <path> <content>` with `\n` escapes for line breaks
+- `/edit <path>` followed by a multiline `params-edit` fenced block
 - `/reflect on|off|status`
 - `/eco on|off|status`
 - `/commands list`
 - `/commands reload`
+- `/sessions list`
+- `/sessions new [name]`
+- `/sessions rename <name>`
+- `/sessions resume <name-or-id>`
+- `/sessions export <name-or-id> [markdown|json]`
+- `/memory [status|facts|last]`
 - `/clear-cache`
 
 Safety behavior:
 - `/read`, `/ls`, `/search`, and Rust LSP file lookups are restricted to the current project
 - `/fetch` only allows explicit public `http://` and `https://` URLs and blocks localhost/private-network targets
-- `/run`, `/write`, and model tool approvals use a docked approval card with policy/risk summary, preview, and approve/reject shortcuts
-- `/run` and model `[bash: ...]` calls remain approval-driven, but now show a policy summary and block clearly destructive commands
+- `/run`, `/write`, `/edit`, and model tool approvals use a docked approval card with policy/risk summary, preview, and approve/reject shortcuts
+- `/run` and model `[bash: ...]` calls remain approval-driven, show a policy summary, block clearly destructive commands, and can be further tightened with `shell_allowlist` / `shell_denylist`
+- `/edit` and model `[edit_file: ...]` calls use exact `SEARCH/REPLACE` blocks and reject stale approvals if the file changed after proposal
+- `network_allowlist` restricts `/fetch` and `openai_compat` provider destinations to exact hosts or subdomains you explicitly trust
+- `inspect_cloud_requests = true` adds endpoint/payload inspection before `openai_compat` requests leave the machine
+
+Session behavior:
+- params resumes the most recently opened session for the current project by default
+- `params --no-resume` starts a fresh unnamed session without deleting saved sessions
+- exported session transcripts are written under `.local/exports/sessions/`
+
+Memory behavior:
+- durable facts are promoted per turn from strict evidence instead of raw end-of-session transcript extraction
+- `/memory status` shows loaded fact count and the most recent summary paths used for retrieval
+- `/memory facts` lists the currently loaded durable facts with `legacy` vs `verified` tags
+- `/memory last` shows the latest accepted/skipped memory update plus the most recent consolidation stats
 
 ## Custom Slash Commands
 
@@ -267,8 +295,15 @@ steps = [
 
 Notes:
 - positional placeholders are `$1`, `$2`, and `$@`
-- workflow steps can use built-in context commands, and may end with a single final `/run` or `/write`
+- workflow steps can use built-in context commands, and may end with a single final `/run`, `/write`, or `/edit`
 - nested custom commands are intentionally not supported in v1
+
+## Current Stubs
+
+These CLI surfaces exist but are still scaffolding, not finished features:
+- `params compare`
+- `params bench`
+- `params train`
 
 ---
 

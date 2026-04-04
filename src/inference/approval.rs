@@ -9,6 +9,7 @@ use crate::debug_log;
 use crate::error::{ParamsError, Result};
 use crate::events::{InferenceEvent, PendingAction, PendingActionKind, ProgressStatus};
 use crate::hooks::{HookEvent, Hooks};
+use crate::memory::facts::TurnMemoryEvidence;
 use crate::safety::InspectionReport;
 use crate::tools::{PendingToolAction, ToolRegistry};
 
@@ -39,6 +40,7 @@ pub(super) struct ApprovalContext<'a> {
     pub eco_enabled: bool,
     pub hooks: &'a Hooks,
     pub index_state: Option<&'a mut IncrementalIndexState>,
+    pub turn_memory: Option<&'a mut TurnMemoryEvidence>,
 }
 
 pub(super) fn handle_pending_action(
@@ -78,6 +80,7 @@ pub(super) fn handle_pending_action(
     );
     let _ = ctx.token_tx.send(InferenceEvent::PendingAction(event));
     let mut index_state = ctx.index_state;
+    let mut turn_memory = ctx.turn_memory;
 
     loop {
         match ctx.prompt_rx.recv() {
@@ -104,7 +107,18 @@ pub(super) fn handle_pending_action(
                     false,
                 );
                 let result = ctx.tools.execute_pending_action(&pending);
-                if matches!(pending.kind, PendingActionKind::FileWrite) {
+                if let Some(memory) = turn_memory.as_deref_mut() {
+                    memory.record_tool_result(
+                        result.tool_name.clone(),
+                        result.argument.clone(),
+                        result.output.clone(),
+                        true,
+                    );
+                }
+                if matches!(
+                    pending.kind,
+                    PendingActionKind::FileWrite | PendingActionKind::FileEdit
+                ) {
                     if let Some(state) = index_state.as_mut() {
                         state.request_scan_soon();
                     }
@@ -189,6 +203,9 @@ pub(super) fn handle_pending_action(
                         follow_up_text
                     };
                     if !final_response.trim().is_empty() {
+                        if let Some(memory) = turn_memory.as_deref_mut() {
+                            memory.set_final_response(final_response.clone());
+                        }
                         log_debug_response(
                             ctx.debug_logging_enabled,
                             &final_response,
@@ -294,6 +311,9 @@ pub(super) fn handle_pending_action(
                     } else {
                         follow_up_text
                     };
+                    if let Some(memory) = turn_memory.as_deref_mut() {
+                        memory.set_final_response(final_response.clone());
+                    }
                     if !final_response.trim().is_empty() {
                         log_debug_response(
                             ctx.debug_logging_enabled,

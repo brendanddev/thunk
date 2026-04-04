@@ -22,7 +22,8 @@ pub use backend::{system_prompt_with_tools, InferenceBackend, Message, SYSTEM_PR
 pub use llama_cpp::LlamaCppBackend;
 pub use ollama::OllamaBackend;
 pub use openai_compat::OpenAICompatBackend;
-pub use session::model_thread;
+#[allow(unused_imports)]
+pub use session::{model_thread, model_thread_with_options, SessionRuntimeOptions};
 
 use std::sync::mpsc::Sender;
 
@@ -37,7 +38,22 @@ pub enum SessionCommand {
     SubmitUser(String),
     InjectUserContext(String),
     RequestShellCommand(String),
-    RequestFileWrite { path: String, content: String },
+    RequestFileWrite {
+        path: String,
+        content: String,
+    },
+    RequestFileEdit {
+        path: String,
+        edits: String,
+    },
+    ListSessions,
+    NewSession(Option<String>),
+    RenameSession(String),
+    ResumeSession(String),
+    ExportSession {
+        selector: String,
+        format: Option<String>,
+    },
     SetReflection(bool),
     SetEco(bool),
     SetDebugLogging(bool),

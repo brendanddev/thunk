@@ -9,6 +9,7 @@ use crate::commands::{
     builtin_command_specs, resolve_builtin_command, BuiltinKind, CommandRegistry, CustomCommand,
     CustomCommandBody, CustomCommandStep,
 };
+use crate::events::{FactProvenance, MemorySnapshot};
 use crate::events::{ProgressStatus, ProgressTrace};
 use crate::inference::SessionCommand;
 
@@ -37,6 +38,12 @@ pub(crate) enum SlashJobOutcome {
         contexts: Vec<String>,
         path: String,
         content: String,
+    },
+    WorkflowEdit {
+        finished_trace: ProgressTrace,
+        contexts: Vec<String>,
+        path: String,
+        edits: String,
     },
     Error {
         failed_trace: ProgressTrace,
@@ -101,6 +108,33 @@ pub(crate) fn decode_slash_write_content(raw: &str) -> String {
     }
 
     output
+}
+
+fn parse_slash_edit_body(arg: &str) -> Option<(String, String)> {
+    let normalized = arg.trim_start();
+    let first_newline = normalized.find('\n')?;
+    let path = normalized[..first_newline].trim();
+    let body = normalized[first_newline + 1..].trim_start_matches('\r');
+    if path.is_empty() || body.trim().is_empty() {
+        return None;
+    }
+    Some((path.to_string(), body.to_string()))
+}
+
+fn parse_sessions_export_args(arg: &str) -> Option<(String, Option<String>)> {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((selector, maybe_format)) = trimmed.rsplit_once(' ') {
+        let format = maybe_format.trim().to_ascii_lowercase();
+        if matches!(format.as_str(), "markdown" | "md" | "json") {
+            return Some((selector.trim().to_string(), Some(format)));
+        }
+    }
+
+    Some((trimmed.to_string(), None))
 }
 
 fn run_tool_immediate<T: crate::tools::Tool>(
@@ -340,6 +374,95 @@ fn format_custom_commands_list(registry: &CommandRegistry) -> String {
     lines.join("\n")
 }
 
+fn format_memory_status(snapshot: &MemorySnapshot) -> String {
+    let accepted = snapshot
+        .last_update
+        .as_ref()
+        .map(|update| update.accepted_facts.len())
+        .unwrap_or(0);
+    let skipped = snapshot
+        .last_update
+        .as_ref()
+        .map(|update| {
+            update
+                .skipped_reasons
+                .iter()
+                .map(|reason| reason.count)
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let mut lines = vec![
+        format!("loaded facts: {}", snapshot.loaded_facts.len()),
+        format!("last summaries: {}", snapshot.last_summary_paths.len()),
+        format!("last update: +{accepted} / -{skipped}"),
+    ];
+    if snapshot.last_summary_paths.is_empty() {
+        lines.push("recent summary paths: (none)".to_string());
+    } else {
+        lines.push("recent summary paths:".to_string());
+        for path in &snapshot.last_summary_paths {
+            lines.push(format!("  - {path}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_memory_facts(snapshot: &MemorySnapshot) -> String {
+    if snapshot.loaded_facts.is_empty() {
+        return "loaded memory facts:\n  (none)".to_string();
+    }
+
+    let mut lines = vec!["loaded memory facts:".to_string()];
+    for fact in &snapshot.loaded_facts {
+        let label = match fact.provenance {
+            FactProvenance::Legacy => "legacy",
+            FactProvenance::Verified => "verified",
+        };
+        lines.push(format!("  [{label}] {}", fact.content));
+    }
+    lines.join("\n")
+}
+
+fn format_memory_last(snapshot: &MemorySnapshot) -> String {
+    let mut lines = vec!["last memory update:".to_string()];
+    match &snapshot.last_update {
+        Some(update) => {
+            lines.push(format!("  accepted: {}", update.accepted_facts.len()));
+            lines.push(format!("  duplicates: {}", update.duplicate_count));
+            if update.accepted_facts.is_empty() {
+                lines.push("  accepted facts: (none)".to_string());
+            } else {
+                lines.push("  accepted facts:".to_string());
+                for fact in &update.accepted_facts {
+                    lines.push(format!("    - {}", fact.content));
+                }
+            }
+            if update.skipped_reasons.is_empty() {
+                lines.push("  skipped: (none)".to_string());
+            } else {
+                lines.push("  skipped:".to_string());
+                for reason in &update.skipped_reasons {
+                    lines.push(format!("    - {}: {}", reason.reason, reason.count));
+                }
+            }
+        }
+        None => lines.push("  (no verified update yet)".to_string()),
+    }
+
+    lines.push(String::new());
+    lines.push("last consolidation:".to_string());
+    match &snapshot.last_consolidation {
+        Some(consolidation) => {
+            lines.push(format!("  ttl pruned: {}", consolidation.ttl_pruned));
+            lines.push(format!("  dedup removed: {}", consolidation.dedup_removed));
+            lines.push(format!("  cap removed: {}", consolidation.cap_removed));
+        }
+        None => lines.push("  (no consolidation recorded yet)".to_string()),
+    }
+
+    lines.join("\n")
+}
+
 fn execute_custom_template(
     command: &CustomCommand,
     args: &[&str],
@@ -508,6 +631,25 @@ fn execute_custom_workflow(
                                         content: decode_slash_write_content(raw_content.trim()),
                                     });
                                 }
+                                "/edit" => {
+                                    let Some((path, edits)) = parse_slash_edit_body(arg) else {
+                                        let _ = tx.send(SlashJobOutcome::Error {
+                                            failed_trace: make_trace(
+                                                ProgressStatus::Failed,
+                                                format!("custom command failed: {workflow_name}"),
+                                                false,
+                                            ),
+                                            message: "workflow /edit step must use `/edit <path>` followed by a multiline ```params-edit block".to_string(),
+                                        });
+                                        return;
+                                    };
+                                    let _ = tx.send(SlashJobOutcome::WorkflowEdit {
+                                        finished_trace: final_trace,
+                                        contexts,
+                                        path,
+                                        edits,
+                                    });
+                                }
                                 _ => {}
                             }
                             return;
@@ -638,6 +780,15 @@ fn handle_builtin_slash_command(
                 content: decode_slash_write_content(raw_content.trim()),
             });
         }
+        "/edit" => {
+            let Some((path, edits)) = parse_slash_edit_body(arg) else {
+                state.add_system_message(
+                    "Usage: /edit <path> followed by a multiline ```params-edit block.",
+                );
+                return;
+            };
+            let _ = prompt_tx.send(SessionCommand::RequestFileEdit { path, edits });
+        }
         "/reflect" => {
             let mode = arg.to_ascii_lowercase();
             match mode.as_str() {
@@ -746,6 +897,65 @@ fn handle_builtin_slash_command(
             state.add_system_message("clearing separate debug content log...");
             let _ = prompt_tx.send(SessionCommand::ClearDebugLog);
         }
+        "/sessions" => {
+            let trimmed = arg.trim();
+            let (subcommand, rest) = if trimmed.is_empty() {
+                ("list", "")
+            } else if let Some((sub, remainder)) = trimmed.split_once(' ') {
+                (sub, remainder.trim())
+            } else {
+                (trimmed, "")
+            };
+
+            match subcommand {
+                "list" => {
+                    let _ = prompt_tx.send(SessionCommand::ListSessions);
+                }
+                "new" => {
+                    let name = if rest.is_empty() {
+                        None
+                    } else {
+                        Some(rest.to_string())
+                    };
+                    let _ = prompt_tx.send(SessionCommand::NewSession(name));
+                }
+                "rename" => {
+                    if rest.is_empty() {
+                        state.add_system_message("Usage: /sessions rename <name>");
+                        return;
+                    }
+                    let _ = prompt_tx.send(SessionCommand::RenameSession(rest.to_string()));
+                }
+                "resume" => {
+                    if rest.is_empty() {
+                        state.add_system_message("Usage: /sessions resume <name-or-id>");
+                        return;
+                    }
+                    let _ = prompt_tx.send(SessionCommand::ResumeSession(rest.to_string()));
+                }
+                "export" => {
+                    let Some((selector, format)) = parse_sessions_export_args(rest) else {
+                        state.add_system_message(
+                            "Usage: /sessions export <name-or-id> [markdown|json]",
+                        );
+                        return;
+                    };
+                    let _ = prompt_tx.send(SessionCommand::ExportSession { selector, format });
+                }
+                _ => {
+                    state.add_system_message("Usage: /sessions <list|new|rename|resume|export>");
+                }
+            }
+        }
+        "/memory" => {
+            let subcommand = if arg.is_empty() { "status" } else { arg.trim() };
+            match subcommand {
+                "status" => state.add_system_message(&format_memory_status(&state.memory_snapshot)),
+                "facts" => state.add_system_message(&format_memory_facts(&state.memory_snapshot)),
+                "last" => state.add_system_message(&format_memory_last(&state.memory_snapshot)),
+                _ => state.add_system_message("Usage: /memory [status|facts|last]"),
+            }
+        }
         "/help" => {
             state.add_system_message(&custom_help_text());
         }
@@ -778,11 +988,85 @@ fn handle_builtin_slash_command(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_slash_write_content;
+    use super::{
+        decode_slash_write_content, format_memory_facts, format_memory_last, format_memory_status,
+        parse_sessions_export_args, parse_slash_edit_body,
+    };
+    use crate::events::{
+        FactProvenance, MemoryConsolidationView, MemoryFactView, MemorySkippedReasonCount,
+        MemorySnapshot, MemoryUpdateReport,
+    };
 
     #[test]
     fn decode_slash_write_content_expands_common_escapes() {
         let decoded = decode_slash_write_content("hello\\nfrom\\tparams\\\\");
         assert_eq!(decoded, "hello\nfrom\tparams\\");
+    }
+
+    #[test]
+    fn parse_slash_edit_body_extracts_path_and_multiline_body() {
+        let parsed = parse_slash_edit_body(
+            "src/main.rs\n```params-edit\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n```",
+        )
+        .expect("parse edit body");
+
+        assert_eq!(parsed.0, "src/main.rs");
+        assert!(parsed.1.starts_with("```params-edit"));
+    }
+
+    #[test]
+    fn parse_sessions_export_args_supports_optional_format() {
+        assert_eq!(
+            parse_sessions_export_args("alpha markdown"),
+            Some(("alpha".to_string(), Some("markdown".to_string())))
+        );
+        assert_eq!(
+            parse_sessions_export_args("named session"),
+            Some(("named session".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn memory_formatters_include_counts_and_labels() {
+        let snapshot = MemorySnapshot {
+            loaded_facts: vec![
+                MemoryFactView {
+                    content: "src/main.rs updates cache stats".to_string(),
+                    provenance: FactProvenance::Verified,
+                },
+                MemoryFactView {
+                    content: "legacy session note".to_string(),
+                    provenance: FactProvenance::Legacy,
+                },
+            ],
+            last_summary_paths: vec!["src/main.rs".to_string()],
+            last_update: Some(MemoryUpdateReport {
+                accepted_facts: vec![MemoryFactView {
+                    content: "src/main.rs updates cache stats".to_string(),
+                    provenance: FactProvenance::Verified,
+                }],
+                skipped_reasons: vec![MemorySkippedReasonCount {
+                    reason: "missing evidence anchor".to_string(),
+                    count: 2,
+                }],
+                duplicate_count: 1,
+            }),
+            last_consolidation: Some(MemoryConsolidationView {
+                ttl_pruned: 1,
+                dedup_removed: 2,
+                cap_removed: 0,
+            }),
+        };
+
+        let status = format_memory_status(&snapshot);
+        let facts = format_memory_facts(&snapshot);
+        let last = format_memory_last(&snapshot);
+
+        assert!(status.contains("loaded facts: 2"));
+        assert!(status.contains("src/main.rs"));
+        assert!(facts.contains("[verified]"));
+        assert!(facts.contains("[legacy]"));
+        assert!(last.contains("duplicates: 1"));
+        assert!(last.contains("dedup removed: 2"));
     }
 }

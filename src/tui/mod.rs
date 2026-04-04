@@ -16,7 +16,17 @@ use tracing::info;
 
 use crate::error::{ParamsError, Result};
 
+#[derive(Clone, Copy, Default)]
+pub struct TuiOptions {
+    pub no_resume: bool,
+}
+
+#[allow(dead_code)]
 pub fn run() -> Result<()> {
+    run_with_options(TuiOptions::default())
+}
+
+pub fn run_with_options(options: TuiOptions) -> Result<()> {
     info!("tui starting");
     if !io::stdout().is_terminal() {
         return Err(ParamsError::Config(
@@ -35,8 +45,9 @@ pub fn run() -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app::run_app(&mut terminal)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app::run_app(&mut terminal, options)
+    }));
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

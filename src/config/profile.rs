@@ -114,6 +114,10 @@ pub struct ProjectSafetyProfile {
     pub inspect_network: Option<bool>,
     pub shell_mode: Option<ShellMode>,
     pub block_destructive_shell: Option<bool>,
+    pub shell_allowlist: Option<Vec<String>>,
+    pub shell_denylist: Option<Vec<String>>,
+    pub network_allowlist: Option<Vec<String>>,
+    pub inspect_cloud_requests: Option<bool>,
 }
 
 /// Apply a project profile on top of a base Config.
@@ -193,6 +197,18 @@ pub fn apply_profile(mut base: Config, profile: ProjectProfile) -> Config {
     }
     if let Some(v) = profile.safety.block_destructive_shell {
         base.safety.block_destructive_shell = v;
+    }
+    if let Some(v) = profile.safety.shell_allowlist {
+        base.safety.shell_allowlist = v;
+    }
+    if let Some(v) = profile.safety.shell_denylist {
+        base.safety.shell_denylist = v;
+    }
+    if let Some(v) = profile.safety.network_allowlist {
+        base.safety.network_allowlist = v;
+    }
+    if let Some(v) = profile.safety.inspect_cloud_requests {
+        base.safety.inspect_cloud_requests = v;
     }
     base
 }
@@ -314,6 +330,10 @@ mod tests {
                 inspect_network: Some(false),
                 shell_mode: Some(ShellMode::ApproveInspect),
                 block_destructive_shell: Some(false),
+                shell_allowlist: Some(vec!["cargo ".to_string()]),
+                shell_denylist: Some(vec!["npm ".to_string()]),
+                network_allowlist: Some(vec!["example.com".to_string()]),
+                inspect_cloud_requests: Some(false),
             },
             ..ProjectProfile::default()
         };
@@ -322,5 +342,12 @@ mod tests {
         assert!(!merged.safety.block_private_network);
         assert!(!merged.safety.inspect_network);
         assert!(!merged.safety.block_destructive_shell);
+        assert_eq!(merged.safety.shell_allowlist, vec!["cargo ".to_string()]);
+        assert_eq!(merged.safety.shell_denylist, vec!["npm ".to_string()]);
+        assert_eq!(
+            merged.safety.network_allowlist,
+            vec!["example.com".to_string()]
+        );
+        assert!(!merged.safety.inspect_cloud_requests);
     }
 }

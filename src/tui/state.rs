@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::events::{PendingAction, ProgressStatus, ProgressTrace};
+use crate::events::{MemorySnapshot, PendingAction, ProgressStatus, ProgressTrace, SessionInfo};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Role {
@@ -63,6 +63,12 @@ pub struct AppState {
 
     /// Recently completed progress traces shown under the current activity
     pub recent_traces: VecDeque<TraceEntry>,
+
+    /// Active session metadata shown in the sidebar.
+    pub current_session: Option<SessionInfo>,
+
+    /// Current mirrored memory snapshot from the model thread.
+    pub memory_snapshot: MemorySnapshot,
 
     /// Action currently awaiting approval
     pub pending_action: Option<PendingAction>,
@@ -129,6 +135,8 @@ impl AppState {
             last_tool_call: None,
             current_trace: None,
             recent_traces: VecDeque::with_capacity(4),
+            current_session: None,
+            memory_snapshot: MemorySnapshot::default(),
             pending_action: None,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -518,9 +526,23 @@ impl AppState {
     /// Restore a previous session into the display. Called on startup when a saved session exists.
     /// Injected context messages (tool results, slash-command output) are shown as muted system
     /// lines rather than user messages to keep the display clean.
-    pub fn restore_session(&mut self, messages: Vec<(String, String)>, saved_at: u64) {
-        let age = describe_session_age(saved_at);
-        self.add_system_message(&format!("session resumed ({age})"));
+    pub fn restore_session(
+        &mut self,
+        session: SessionInfo,
+        messages: Vec<(String, String)>,
+        saved_at: Option<u64>,
+    ) {
+        self.clear_messages();
+        self.set_session_info(session.clone());
+        if let Some(saved_at) = saved_at {
+            let age = describe_session_age(saved_at);
+            let label = session
+                .name
+                .as_deref()
+                .map(|name| format!("{name} · {age}"))
+                .unwrap_or(age);
+            self.add_system_message(&format!("session resumed ({label})"));
+        }
 
         for (role, content) in messages {
             match role.as_str() {
@@ -545,6 +567,14 @@ impl AppState {
             }
         }
         self.scroll_offset = 0;
+    }
+
+    pub fn set_session_info(&mut self, session: SessionInfo) {
+        self.current_session = Some(session);
+    }
+
+    pub fn set_memory_snapshot(&mut self, snapshot: MemorySnapshot) {
+        self.memory_snapshot = snapshot;
     }
 
     pub fn clear_messages(&mut self) {

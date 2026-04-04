@@ -236,6 +236,25 @@ pub struct SafetyConfig {
 
     #[serde(default = "default_block_destructive_shell")]
     pub block_destructive_shell: bool,
+
+    /// Optional trusted shell command prefixes. If non-empty, every shell segment
+    /// must match one of these prefixes or the command is blocked before approval.
+    #[serde(default)]
+    pub shell_allowlist: Vec<String>,
+
+    /// Optional blocked shell command prefixes. Any matching segment is blocked
+    /// before approval, even if it also matches an allowlisted prefix.
+    #[serde(default)]
+    pub shell_denylist: Vec<String>,
+
+    /// Optional allowed public domains/hosts for outbound fetches and cloud API requests.
+    /// Entries match exact hosts or subdomains.
+    #[serde(default)]
+    pub network_allowlist: Vec<String>,
+
+    /// Whether to inspect outbound provider requests before cloud/API sends.
+    #[serde(default = "default_inspect_cloud_requests")]
+    pub inspect_cloud_requests: bool,
 }
 
 fn default_fact_ttl_days() -> u64 {
@@ -295,6 +314,10 @@ fn default_inspect_network() -> bool {
 }
 
 fn default_block_destructive_shell() -> bool {
+    true
+}
+
+fn default_inspect_cloud_requests() -> bool {
     true
 }
 

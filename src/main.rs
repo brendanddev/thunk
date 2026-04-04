@@ -41,6 +41,10 @@ struct Cli {
     /// Example: params "explain what this function does"
     prompt: Option<String>,
 
+    /// Start the TUI with a fresh unnamed session instead of auto-resuming the most recent one.
+    #[arg(long)]
+    no_resume: bool,
+
     /// Optional subcommand (pull, index, compare, bench, train).
     /// If a subcommand is present, the prompt field is ignored.
     #[command(subcommand)]
@@ -257,7 +261,9 @@ fn main() -> Result<()> {
             None => {
                 info!(mode = "tui", "starting tui");
                 // Launch the full TUI app
-                tui::run()?;
+                tui::run_with_options(tui::TuiOptions {
+                    no_resume: cli.no_resume,
+                })?;
             }
         },
     }

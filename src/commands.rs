@@ -122,6 +122,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         kind: BuiltinKind::Mutating,
     },
     BuiltinCommandSpec {
+        canonical: "/edit",
+        aliases: &[],
+        usage: "/edit <path>\\n```params-edit ... ```",
+        description: "propose a targeted file edit for approval",
+        kind: BuiltinKind::Mutating,
+    },
+    BuiltinCommandSpec {
         canonical: "/reflect",
         aliases: &[],
         usage: "/reflect <on|off|status>",
@@ -160,7 +167,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         canonical: "/clear",
         aliases: &["/c"],
         usage: "/clear",
-        description: "clear the current conversation and saved session",
+        description: "clear the current conversation and active saved session",
         kind: BuiltinKind::Session,
     },
     BuiltinCommandSpec {
@@ -190,6 +197,20 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         usage: "/commands [list|reload]",
         description: "list or reload custom slash commands",
         kind: BuiltinKind::Discovery,
+    },
+    BuiltinCommandSpec {
+        canonical: "/sessions",
+        aliases: &[],
+        usage: "/sessions <list|new|rename|resume|export>",
+        description: "manage saved sessions for this project",
+        kind: BuiltinKind::Session,
+    },
+    BuiltinCommandSpec {
+        canonical: "/memory",
+        aliases: &[],
+        usage: "/memory [status|facts|last]",
+        description: "inspect loaded memory and the latest memory update",
+        kind: BuiltinKind::Session,
     },
 ];
 
@@ -723,5 +744,24 @@ prompt = "Review $@"
         assert!(names.iter().any(|name| name == "/review_auth"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_allows_edit_as_final_mutating_step() {
+        let raw = RawCommandDefinition {
+            description: Some("Edit focused code".to_string()),
+            usage: Some("/edit_focus".to_string()),
+            prompt: None,
+            steps: Some(vec![RawCommandStep::Slash {
+                slash: "/edit src/main.rs\n```params-edit\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n```".to_string(),
+            }]),
+        };
+
+        let command =
+            validate_command("edit_focus".to_string(), raw, CommandOrigin::Local).expect("valid");
+        match command.body {
+            CustomCommandBody::Workflow(steps) => assert_eq!(steps.len(), 1),
+            CustomCommandBody::Prompt(_) => panic!("expected workflow"),
+        }
     }
 }

@@ -10,13 +10,17 @@ use tracing::{info, warn};
 use crate::commands::CommandRegistry;
 use crate::error::Result;
 use crate::events::InferenceEvent;
-use crate::inference::SessionCommand;
+use crate::inference::{SessionCommand, SessionRuntimeOptions};
 
 use super::commands::{handle_command_input, SlashJobOutcome};
 use super::render::draw;
 use super::state::AppState;
+use super::TuiOptions;
 
-pub(crate) fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+pub(crate) fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    options: TuiOptions,
+) -> Result<()> {
     let mut state = AppState::new();
     let mut command_registry = CommandRegistry::load();
 
@@ -26,7 +30,13 @@ pub(crate) fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> 
 
     let token_tx_clone = token_tx.clone();
     thread::spawn(move || {
-        crate::inference::model_thread(prompt_rx, token_tx_clone);
+        crate::inference::model_thread_with_options(
+            prompt_rx,
+            token_tx_clone,
+            SessionRuntimeOptions {
+                no_resume: options.no_resume,
+            },
+        );
     });
 
     let frame_duration = Duration::from_millis(16);
@@ -41,11 +51,15 @@ pub(crate) fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> 
                 InferenceEvent::Ready => {
                     state.set_status("ready");
                 }
-                InferenceEvent::SessionRestored {
+                InferenceEvent::SessionLoaded {
+                    session,
                     display_messages,
                     saved_at,
                 } => {
-                    state.restore_session(display_messages, saved_at);
+                    state.restore_session(session, display_messages, saved_at);
+                }
+                InferenceEvent::SessionStatus(session) => {
+                    state.set_session_info(session);
                 }
                 InferenceEvent::BackendName(name) => {
                     state.set_backend_name(name);
@@ -97,6 +111,12 @@ pub(crate) fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> 
                 }
                 InferenceEvent::PendingAction(action) => {
                     state.set_pending_action(action);
+                }
+                InferenceEvent::SystemMessage(message) => {
+                    state.add_system_message(&message);
+                }
+                InferenceEvent::MemoryState(snapshot) => {
+                    state.set_memory_snapshot(snapshot);
                 }
                 InferenceEvent::Done => {
                     state.clear_pending_action();
@@ -177,6 +197,20 @@ pub(crate) fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> 
                         let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
                     }
                     let _ = prompt_tx.send(SessionCommand::RequestFileWrite { path, content });
+                }
+                SlashJobOutcome::WorkflowEdit {
+                    finished_trace,
+                    contexts,
+                    path,
+                    edits,
+                } => {
+                    info!(label = finished_trace.label.as_str(), "trace.finished");
+                    state.apply_trace(finished_trace);
+                    for context in contexts {
+                        state.add_user_message(&context);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    }
+                    let _ = prompt_tx.send(SessionCommand::RequestFileEdit { path, edits });
                 }
                 SlashJobOutcome::Error {
                     failed_trace,

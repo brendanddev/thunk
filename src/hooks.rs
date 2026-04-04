@@ -76,6 +76,25 @@ pub enum HookEvent {
         saved_at: u64,
     },
 
+    /// Fired when a fresh session is created.
+    SessionCreated { session_id: String, named: bool },
+
+    /// Fired when an existing session becomes active.
+    SessionResumed {
+        session_id: String,
+        named: bool,
+        message_count: usize,
+    },
+
+    /// Fired when the active session is renamed.
+    SessionRenamed { session_id: String, named: bool },
+
+    /// Fired when a session transcript is exported.
+    SessionExported { session_id: String, format: String },
+
+    /// Fired when the active saved session is cleared.
+    SessionCleared { session_id: String },
+
     /// Fired when the model thread is about to exit (channel closed).
     /// This fires before fact extraction and consolidation.
     SessionEnding {
@@ -88,6 +107,19 @@ pub enum HookEvent {
         facts_pruned: usize,
         facts_deduped: usize,
         facts_capped: usize,
+    },
+
+    /// Fired when durable memory is loaded into the runtime.
+    MemoryFactsLoaded { fact_count: usize },
+
+    /// Fired when indexed summaries are selected for a turn.
+    MemorySummariesSelected { summary_count: usize },
+
+    /// Fired after verified memory update evaluation for a turn.
+    MemoryUpdateEvaluated {
+        accepted_count: usize,
+        skipped_count: usize,
+        duplicate_count: usize,
     },
 }
 
@@ -202,6 +234,25 @@ impl Hook for StructuralLogHook {
             } => {
                 debug!(message_count, saved_at, "hook.session_restored");
             }
+            HookEvent::SessionCreated { session_id, named } => {
+                debug!(session_id, named, "hook.session_created");
+            }
+            HookEvent::SessionResumed {
+                session_id,
+                named,
+                message_count,
+            } => {
+                debug!(session_id, named, message_count, "hook.session_resumed");
+            }
+            HookEvent::SessionRenamed { session_id, named } => {
+                debug!(session_id, named, "hook.session_renamed");
+            }
+            HookEvent::SessionExported { session_id, format } => {
+                debug!(session_id, format, "hook.session_exported");
+            }
+            HookEvent::SessionCleared { session_id } => {
+                debug!(session_id, "hook.session_cleared");
+            }
             HookEvent::SessionEnding { message_count } => {
                 debug!(message_count, "hook.session_ending");
             }
@@ -213,6 +264,22 @@ impl Hook for StructuralLogHook {
                 debug!(
                     facts_pruned,
                     facts_deduped, facts_capped, "hook.memory_consolidated"
+                );
+            }
+            HookEvent::MemoryFactsLoaded { fact_count } => {
+                debug!(fact_count, "hook.memory_facts_loaded");
+            }
+            HookEvent::MemorySummariesSelected { summary_count } => {
+                debug!(summary_count, "hook.memory_summaries_selected");
+            }
+            HookEvent::MemoryUpdateEvaluated {
+                accepted_count,
+                skipped_count,
+                duplicate_count,
+            } => {
+                debug!(
+                    accepted_count,
+                    skipped_count, duplicate_count, "hook.memory_update_evaluated"
                 );
             }
         }

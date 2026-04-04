@@ -273,6 +273,36 @@ pub fn inspect_write_target(display_path: &str, exists: bool) -> Result<Inspecti
     Ok(report)
 }
 
+pub fn inspect_edit_target(
+    display_path: &str,
+    replacement_count: usize,
+) -> Result<InspectionReport> {
+    let cfg = config::load_with_profile()?;
+    let replacement_label = if replacement_count == 1 {
+        "1 replacement block".to_string()
+    } else {
+        format!("{replacement_count} replacement blocks")
+    };
+    let report = InspectionReport {
+        operation: "edit_file".to_string(),
+        decision: if cfg.safety.enabled {
+            InspectionDecision::NeedsApproval
+        } else {
+            InspectionDecision::NeedsApproval
+        },
+        risk: RiskLevel::Medium,
+        summary: format!("Approve targeted edit of {display_path}"),
+        reasons: vec![format!(
+            "{replacement_label} will be applied after approval"
+        )],
+        targets: vec![display_path.to_string()],
+        segments: Vec::new(),
+        network_targets: Vec::new(),
+    };
+    log_inspection(&report);
+    Ok(report)
+}
+
 pub fn inspect_shell_command(command: &str) -> Result<InspectionReport> {
     let cfg = config::load_with_profile()?;
     let trimmed = command.trim();
@@ -319,6 +349,17 @@ pub fn inspect_shell_command(command: &str) -> Result<InspectionReport> {
         }
     }
 
+    if cfg.safety.enabled {
+        if matches_any_shell_pattern(&segments, &cfg.safety.shell_denylist) {
+            reasons.push("command matched configured shell denylist".to_string());
+        }
+        if !cfg.safety.shell_allowlist.is_empty()
+            && !matches_all_shell_segments(&segments, &cfg.safety.shell_allowlist)
+        {
+            reasons.push("command does not match configured shell allowlist".to_string());
+        }
+    }
+
     if !reasons.is_empty() {
         decision = InspectionDecision::Block;
         risk = RiskLevel::High;
@@ -358,6 +399,7 @@ pub fn inspect_fetch_url(raw: &str) -> Result<(String, InspectionReport)> {
     let cfg = config::load_with_profile()?;
     let url = normalize_url(raw)?;
     let (scheme, host) = parse_scheme_and_host(&url)?;
+    let host = normalize_host(&host);
     let mut reasons = Vec::new();
     let mut decision = InspectionDecision::Allow;
     let mut risk = RiskLevel::Low;
@@ -369,6 +411,12 @@ pub fn inspect_fetch_url(raw: &str) -> Result<(String, InspectionReport)> {
             reasons.push(
                 "private, loopback, link-local, or localhost targets are blocked".to_string(),
             );
+        } else if !cfg.safety.network_allowlist.is_empty()
+            && !host_matches_allowlist(&host, &cfg.safety.network_allowlist)
+        {
+            decision = InspectionDecision::Block;
+            risk = RiskLevel::High;
+            reasons.push("host is not in the configured network allowlist".to_string());
         } else {
             reasons
                 .push("Outbound fetch is limited to explicit public http/https URLs".to_string());
@@ -382,6 +430,56 @@ pub fn inspect_fetch_url(raw: &str) -> Result<(String, InspectionReport)> {
     };
     let report = InspectionReport {
         operation: "fetch_url".to_string(),
+        decision,
+        risk,
+        summary,
+        reasons,
+        targets: vec![url.clone()],
+        segments: Vec::new(),
+        network_targets: vec![host],
+    };
+    log_inspection(&report);
+    Ok((url, report))
+}
+
+pub fn inspect_provider_request(
+    operation: &str,
+    base_url: &str,
+    payload_chars: usize,
+) -> Result<(String, InspectionReport)> {
+    let cfg = config::load_with_profile()?;
+    let url = normalize_url(base_url)?;
+    let (scheme, host) = parse_scheme_and_host(&url)?;
+    let host = normalize_host(&host);
+    let mut reasons = Vec::new();
+    let mut decision = InspectionDecision::Allow;
+    let mut risk = if payload_chars > 20_000 {
+        RiskLevel::Medium
+    } else {
+        RiskLevel::Low
+    };
+
+    if cfg.safety.enabled && cfg.safety.inspect_cloud_requests {
+        if !cfg.safety.network_allowlist.is_empty()
+            && !host_matches_allowlist(&host, &cfg.safety.network_allowlist)
+        {
+            decision = InspectionDecision::Block;
+            risk = RiskLevel::High;
+            reasons.push("provider host is not in the configured network allowlist".to_string());
+        } else {
+            reasons.push(format!(
+                "Outbound provider request inspected before send ({payload_chars} chars)"
+            ));
+        }
+    }
+
+    let summary = if matches!(decision, InspectionDecision::Block) {
+        format!("Blocked provider request to {host}")
+    } else {
+        format!("Sending {scheme} provider request to {host}")
+    };
+    let report = InspectionReport {
+        operation: operation.to_string(),
         decision,
         risk,
         summary,
@@ -593,6 +691,53 @@ fn contains_destructive_rm(command: &str) -> bool {
     patterns.iter().any(|pattern| command.contains(pattern))
 }
 
+fn normalize_host(host: &str) -> String {
+    host.trim().trim_matches('.').to_ascii_lowercase()
+}
+
+fn normalize_policy_entry(entry: &str) -> Option<String> {
+    let trimmed = entry.trim().trim_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn matches_shell_prefix(segment: &str, pattern: &str) -> bool {
+    let segment = segment.trim().to_ascii_lowercase();
+    let Some(pattern) = normalize_policy_entry(pattern) else {
+        return false;
+    };
+    segment == pattern || segment.starts_with(&pattern)
+}
+
+fn matches_any_shell_pattern(segments: &[String], patterns: &[String]) -> bool {
+    segments.iter().any(|segment| {
+        patterns
+            .iter()
+            .any(|pattern| matches_shell_prefix(segment, pattern))
+    })
+}
+
+fn matches_all_shell_segments(segments: &[String], patterns: &[String]) -> bool {
+    segments.iter().all(|segment| {
+        patterns
+            .iter()
+            .any(|pattern| matches_shell_prefix(segment, pattern))
+    })
+}
+
+fn host_matches_allowlist(host: &str, allowlist: &[String]) -> bool {
+    let host = normalize_host(host);
+    allowlist.iter().any(|entry| {
+        let Some(entry) = normalize_policy_entry(entry) else {
+            return false;
+        };
+        host == entry || host.ends_with(&format!(".{entry}"))
+    })
+}
+
 fn looks_like_pipe_to_shell(command: &str) -> bool {
     (command.contains("curl ") || command.contains("wget "))
         && command.contains("|")
@@ -663,6 +808,18 @@ mod tests {
         dir
     }
 
+    fn with_temp_project<F: FnOnce(PathBuf)>(label: &str, f: F) {
+        let _guard = test_cwd_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = temp_project_dir(label);
+        fs::create_dir_all(root.join(".local")).expect("local dir");
+        let original = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+        f(root.clone());
+        std::env::set_current_dir(original).expect("restore cwd");
+    }
+
     #[test]
     fn blocks_private_ipv4_hosts() {
         assert!(is_blocked_network_host("127.0.0.1"));
@@ -676,6 +833,36 @@ mod tests {
     fn allows_public_hosts() {
         assert!(!is_blocked_network_host("example.com"));
         assert!(!is_blocked_network_host("8.8.8.8"));
+    }
+
+    #[test]
+    fn shell_denylist_blocks_matching_segments() {
+        with_temp_project("shell-deny", |_| {
+            let mut cfg = crate::config::Config::default();
+            cfg.safety.shell_denylist = vec!["cargo clippy".to_string()];
+            fs::write(
+                crate::config::config_path().unwrap(),
+                toml::to_string(&cfg).unwrap(),
+            )
+            .unwrap();
+            let report = inspect_shell_command("cargo clippy").expect("inspect");
+            assert!(matches!(report.decision, InspectionDecision::Block));
+        });
+    }
+
+    #[test]
+    fn shell_allowlist_blocks_unmatched_commands_when_configured() {
+        with_temp_project("shell-allow", |_| {
+            let mut cfg = crate::config::Config::default();
+            cfg.safety.shell_allowlist = vec!["cargo ".to_string()];
+            fs::write(
+                crate::config::config_path().unwrap(),
+                toml::to_string(&cfg).unwrap(),
+            )
+            .unwrap();
+            let report = inspect_shell_command("git status").expect("inspect");
+            assert!(matches!(report.decision, InspectionDecision::Block));
+        });
     }
 
     #[test]
@@ -713,36 +900,63 @@ mod tests {
     }
 
     #[test]
+    fn fetch_allowlist_accepts_exact_and_subdomain_matches() {
+        assert!(host_matches_allowlist(
+            "api.openai.com",
+            &[String::from("openai.com")]
+        ));
+        assert!(host_matches_allowlist(
+            "openai.com",
+            &[String::from("openai.com")]
+        ));
+        assert!(!host_matches_allowlist(
+            "example.net",
+            &[String::from("openai.com")]
+        ));
+    }
+
+    #[test]
+    fn provider_request_inspection_blocks_non_allowlisted_hosts() {
+        with_temp_project("provider-allow", |_| {
+            let mut cfg = crate::config::Config::default();
+            cfg.safety.network_allowlist = vec!["api.openai.com".to_string()];
+            fs::write(
+                crate::config::config_path().unwrap(),
+                toml::to_string(&cfg).unwrap(),
+            )
+            .unwrap();
+            let (_, report) = inspect_provider_request(
+                "openai_compat",
+                "https://example.com/v1/chat/completions",
+                1200,
+            )
+            .expect("inspect");
+            assert!(matches!(report.decision, InspectionDecision::Block));
+        });
+    }
+
+    #[test]
     fn project_path_rejects_parent_escape() {
-        let _guard = test_cwd_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let root = temp_project_dir("escape");
-        let original = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-        let result =
-            inspect_project_path("read_file", "../outside.txt", ProjectPathKind::File, false);
-        std::env::set_current_dir(original).expect("restore cwd");
-        assert!(result.is_err());
+        with_temp_project("escape", |_| {
+            let result =
+                inspect_project_path("read_file", "../outside.txt", ProjectPathKind::File, false);
+            assert!(result.is_err());
+        });
     }
 
     #[test]
     fn project_path_allows_files_inside_project() {
-        let _guard = test_cwd_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let root = temp_project_dir("inside");
-        let src = root.join("src");
-        fs::create_dir_all(&src).expect("mkdir");
-        let file = src.join("main.rs");
-        fs::write(&file, "fn main() {}\n").expect("write");
+        with_temp_project("inside", |root| {
+            let src = root.join("src");
+            fs::create_dir_all(&src).expect("mkdir");
+            let file = src.join("main.rs");
+            fs::write(&file, "fn main() {}\n").expect("write");
 
-        let original = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
-        let result = inspect_project_path("read_file", "src/main.rs", ProjectPathKind::File, false)
-            .expect("inspect");
-        std::env::set_current_dir(original).expect("restore cwd");
+            let result =
+                inspect_project_path("read_file", "src/main.rs", ProjectPathKind::File, false)
+                    .expect("inspect");
 
-        assert_eq!(result.display_path, "src/main.rs");
+            assert_eq!(result.display_path, "src/main.rs");
+        });
     }
 }

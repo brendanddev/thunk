@@ -8,6 +8,47 @@ use crate::safety::InspectionReport;
 pub enum PendingActionKind {
     ShellCommand,
     FileWrite,
+    FileEdit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactProvenance {
+    Legacy,
+    Verified,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryFactView {
+    pub content: String,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemorySkippedReasonCount {
+    pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryUpdateReport {
+    pub accepted_facts: Vec<MemoryFactView>,
+    pub skipped_reasons: Vec<MemorySkippedReasonCount>,
+    pub duplicate_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryConsolidationView {
+    pub ttl_pruned: usize,
+    pub dedup_removed: usize,
+    pub cap_removed: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemorySnapshot {
+    pub loaded_facts: Vec<MemoryFactView>,
+    pub last_summary_paths: Vec<String>,
+    pub last_update: Option<MemoryUpdateReport>,
+    pub last_consolidation: Option<MemoryConsolidationView>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,15 +91,25 @@ pub struct ProgressTrace {
     pub persist: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub message_count: usize,
+}
+
 pub enum InferenceEvent {
     /// Model/backend loaded and ready.
     Ready,
-    /// A previous session was restored. Carries display-friendly (role, content) pairs
-    /// and the unix timestamp when the session was saved.
-    SessionRestored {
+    /// A session was loaded into the active conversation. Carries display-friendly
+    /// (role, content) pairs and optional saved timestamp metadata.
+    SessionLoaded {
+        session: SessionInfo,
         display_messages: Vec<(String, String)>,
-        saved_at: u64,
+        saved_at: Option<u64>,
     },
+    /// The active session metadata changed.
+    SessionStatus(SessionInfo),
     /// Active backend name for the sidebar.
     BackendName(String),
     /// A generation phase started.
@@ -86,6 +137,10 @@ pub enum InferenceEvent {
     Cache(CacheUpdate),
     /// A mutating action needs user approval before execution.
     PendingAction(PendingAction),
+    /// A system/status message should be added to the chat.
+    SystemMessage(String),
+    /// The runtime memory snapshot changed.
+    MemoryState(MemorySnapshot),
     /// Generation finished.
     Done,
     /// An error occurred.

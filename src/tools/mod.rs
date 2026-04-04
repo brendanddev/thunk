@@ -15,6 +15,7 @@
 // the model can reason about the actual file contents.
 
 mod bash;
+mod edit;
 mod fs;
 mod git;
 mod lsp;
@@ -23,6 +24,7 @@ mod web;
 mod write;
 
 pub use bash::BashTool;
+pub use edit::{build_pending_edit_request, EditFileTool};
 pub use fs::{ListDir, ReadFile};
 pub use git::GitTool;
 pub use lsp::{rust_lsp_health_report, LspDefinitionTool, LspDiagnosticsTool, LspHoverTool};
@@ -83,6 +85,7 @@ impl ToolRegistry {
                 Box::new(LspDefinitionTool),
                 Box::new(FetchUrlTool),
                 Box::new(BashTool),
+                Box::new(EditFileTool),
                 Box::new(WriteFileTool),
             ],
         }
@@ -97,6 +100,8 @@ impl ToolRegistry {
              For normal tools, use one tag per line with the exact syntax `[tool_name: argument]`.\n\
              For `write_file`, put the tag on its own line and immediately follow it with a \
              ```params-file fenced block containing the full new file contents.\n\
+             For `edit_file`, put the tag on its own line and immediately follow it with a \
+             ```params-edit fenced block containing SEARCH/REPLACE sections.\n\
              After tool results are returned, continue in a follow-up response.\n\n"
         );
         for tool in &self.tools {
@@ -121,6 +126,8 @@ impl ToolRegistry {
              Use exact tags like `[tool_name: argument]`.\n\
              For `write_file`, place `[write_file: path]` on its own line and follow it with a \
              ```params-file block containing the full file contents.\n\
+             For `edit_file`, place `[edit_file: path]` on its own line and follow it with a \
+             ```params-edit block using SEARCH/REPLACE sections.\n\
              After tool results are returned, continue in a follow-up response.\n\n",
         );
         for tool in &self.tools {

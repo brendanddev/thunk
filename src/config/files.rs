@@ -84,16 +84,55 @@ pub fn find_model() -> Result<PathBuf> {
             dir.display()
         )));
     }
-    let model_path = std::fs::read_dir(&dir)?
+    let mut candidates = std::fs::read_dir(&dir)?
         .flatten()
         .map(|e| e.path())
-        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"));
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("gguf" | "GGUF")
+            )
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort();
+    let model_path = candidates.into_iter().max_by_key(model_selection_score);
+
     model_path.ok_or_else(|| {
         ParamsError::Model(format!(
             "No .gguf model found in {}. Run: params pull qwen2.5-coder-7b",
             dir.display()
         ))
     })
+}
+
+fn model_selection_score(path: &PathBuf) -> i32 {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mut score = 0;
+    if name.contains("embed") || name.contains("embedding") {
+        score -= 100;
+    }
+    if name.contains("coder") || name.contains("code") {
+        score += 60;
+    }
+    if name.contains("instruct") {
+        score += 40;
+    }
+    if name.contains("chat") {
+        score += 30;
+    }
+    if name.contains("assistant") {
+        score += 20;
+    }
+    if name.contains("-it") || name.contains("_it") {
+        score += 10;
+    }
+    score
 }
 
 pub fn load() -> Result<Config> {
@@ -155,7 +194,11 @@ pub fn load() -> Result<Config> {
              #   block_private_network = true\n\
              #   inspect_network = true\n\
              #   shell_mode = \"approve_inspect\"\n\
-             #   block_destructive_shell = true\n\n\
+             #   block_destructive_shell = true\n\
+             #   shell_allowlist = [\"cargo \", \"git \"]\n\
+             #   shell_denylist = [\"npm publish\", \"brew upgrade\"]\n\
+             #   network_allowlist = [\"example.com\", \"api.openai.com\"]\n\
+             #   inspect_cloud_requests = true\n\n\
              {toml}"
         );
 
@@ -168,4 +211,20 @@ pub fn load() -> Result<Config> {
         .map_err(|e| ParamsError::Config(format!("Config parse error: {e}")))?;
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_selection_score;
+    use std::path::PathBuf;
+
+    #[test]
+    fn prefers_instruct_coder_models_over_embeddings() {
+        let qwen = PathBuf::from("qwen2.5-3b-instruct-q4_k_m.gguf");
+        let gemma = PathBuf::from("google_gemma-3-1b-it-Q4_K_M.gguf");
+        let embed = PathBuf::from("nomic-embed-text-v1.5.Q8_0.gguf");
+
+        assert!(model_selection_score(&qwen) > model_selection_score(&gemma));
+        assert!(model_selection_score(&gemma) > model_selection_score(&embed));
+    }
 }

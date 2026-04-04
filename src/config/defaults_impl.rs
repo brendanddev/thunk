@@ -97,6 +97,10 @@ impl Default for SafetyConfig {
             inspect_network: default_inspect_network(),
             shell_mode: ShellMode::default(),
             block_destructive_shell: default_block_destructive_shell(),
+            shell_allowlist: Vec::new(),
+            shell_denylist: Vec::new(),
+            network_allowlist: Vec::new(),
+            inspect_cloud_requests: default_inspect_cloud_requests(),
         }
     }
 }

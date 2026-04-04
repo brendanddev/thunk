@@ -6,10 +6,18 @@ use tracing::{debug, info, warn};
 use crate::cache::ExactCache;
 use crate::config;
 use crate::debug_log;
-use crate::events::{InferenceEvent, ProgressStatus};
+use crate::error::Result;
+use crate::events::{
+    InferenceEvent, MemoryConsolidationView, MemoryFactView, MemorySnapshot, MemoryUpdateReport,
+    ProgressStatus, SessionInfo,
+};
 use crate::hooks::{HookEvent, Hooks};
-use crate::memory::{compression, facts::FactStore, index::ProjectIndex};
-use crate::session::SessionStore;
+use crate::memory::{
+    compression,
+    facts::{FactStore, TurnMemoryEvidence},
+    index::ProjectIndex,
+};
+use crate::session::{display_name, short_id, SessionExportFormat, SessionStore, SessionSummary};
 use crate::tools::{BashTool, Tool, ToolRegistry};
 
 use super::approval::{handle_pending_action, ApprovalContext};
@@ -26,17 +34,204 @@ use super::runtime::{
 };
 use super::{build_system_prompt, load_backend_with_fallback, Message, SessionCommand};
 
-fn save_session(store: Option<&SessionStore>, messages: &[Message], backend_name: &str) {
-    if let Some(s) = store {
-        if let Err(e) = s.save(messages, backend_name) {
-            warn!(error = %e, "session save failed");
+#[derive(Clone, Copy, Default)]
+pub struct SessionRuntimeOptions {
+    pub no_resume: bool,
+}
+
+fn session_info(summary: &SessionSummary) -> SessionInfo {
+    SessionInfo {
+        id: summary.id.clone(),
+        name: summary.name.clone(),
+        message_count: summary.message_count,
+    }
+}
+
+#[derive(Default)]
+struct RuntimeMemoryState {
+    loaded_facts: Vec<MemoryFactView>,
+    last_summary_paths: Vec<String>,
+    last_update: Option<MemoryUpdateReport>,
+    last_consolidation: Option<MemoryConsolidationView>,
+}
+
+impl RuntimeMemoryState {
+    fn snapshot(&self) -> MemorySnapshot {
+        MemorySnapshot {
+            loaded_facts: self.loaded_facts.clone(),
+            last_summary_paths: self.last_summary_paths.clone(),
+            last_update: self.last_update.clone(),
+            last_consolidation: self.last_consolidation.clone(),
         }
+    }
+}
+
+fn emit_memory_state(token_tx: &Sender<InferenceEvent>, memory_state: &RuntimeMemoryState) {
+    let _ = token_tx.send(InferenceEvent::MemoryState(memory_state.snapshot()));
+}
+
+fn save_session(
+    store: Option<&SessionStore>,
+    active_session: &mut Option<SessionSummary>,
+    messages: &[Message],
+    backend_name: &str,
+    token_tx: &Sender<InferenceEvent>,
+) {
+    if let (Some(s), Some(current)) = (store, active_session.as_ref()) {
+        match s.save_messages(&current.id, messages, backend_name) {
+            Ok(updated) => {
+                *active_session = Some(updated.clone());
+                let _ = token_tx.send(InferenceEvent::SessionStatus(session_info(&updated)));
+            }
+            Err(e) => warn!(error = %e, "session save failed"),
+        }
+    }
+}
+
+fn reset_session_runtime(
+    session_messages: &mut Vec<Message>,
+    tools: &ToolRegistry,
+    session_facts: &[String],
+    eco_enabled: bool,
+    budget: &mut SessionBudget,
+    cache_stats: &mut SessionCacheStats,
+    backend_name: &str,
+    token_tx: &Sender<InferenceEvent>,
+) {
+    session_messages.clear();
+    session_messages.push(Message::system(&build_system_prompt(
+        tools,
+        session_facts,
+        &[],
+        eco_enabled,
+    )));
+    *budget = SessionBudget {
+        has_cost_estimate: backend_name == "llama_cpp" || backend_name == "ollama",
+        ..SessionBudget::default()
+    };
+    *cache_stats = SessionCacheStats::default();
+    emit_budget_update(budget, token_tx);
+    emit_cache_update(cache_stats, false, token_tx);
+}
+
+fn skipped_fact_count(report: &MemoryUpdateReport) -> usize {
+    report
+        .skipped_reasons
+        .iter()
+        .map(|reason| reason.count)
+        .sum()
+}
+
+fn apply_memory_update(
+    token_tx: &Sender<InferenceEvent>,
+    hooks: &Hooks,
+    memory_state: &mut RuntimeMemoryState,
+    session_facts: &mut Vec<String>,
+    update: MemoryUpdateReport,
+) {
+    let accepted_count = update.accepted_facts.len();
+    let skipped_count = skipped_fact_count(&update);
+
+    for fact in &update.accepted_facts {
+        if !session_facts
+            .iter()
+            .any(|existing| existing == &fact.content)
+        {
+            session_facts.push(fact.content.clone());
+        }
+        if !memory_state
+            .loaded_facts
+            .iter()
+            .any(|existing| existing.content == fact.content)
+        {
+            memory_state.loaded_facts.push(fact.clone());
+        }
+    }
+
+    memory_state.last_update = Some(update.clone());
+    emit_memory_state(token_tx, memory_state);
+    hooks.dispatch(HookEvent::MemoryUpdateEvaluated {
+        accepted_count,
+        skipped_count,
+        duplicate_count: update.duplicate_count,
+    });
+
+    if accepted_count > 0 {
+        emit_trace(
+            token_tx,
+            ProgressStatus::Finished,
+            &format!(
+                "memory: stored {accepted_count} fact{}",
+                if accepted_count == 1 { "" } else { "s" }
+            ),
+            true,
+        );
+    } else if skipped_count > 0 || update.duplicate_count > 0 {
+        emit_trace(
+            token_tx,
+            ProgressStatus::Finished,
+            &format!(
+                "memory: skipped {} fact{}",
+                skipped_count + update.duplicate_count,
+                if skipped_count + update.duplicate_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            true,
+        );
+    }
+}
+
+fn format_sessions_list(sessions: &[SessionSummary], active_session_id: Option<&str>) -> String {
+    let mut lines = vec!["sessions:".to_string()];
+    if sessions.is_empty() {
+        lines.push("  (none saved for this project)".to_string());
+        return lines.join("\n");
+    }
+
+    for session in sessions {
+        let marker = if Some(session.id.as_str()) == active_session_id {
+            "*"
+        } else {
+            "-"
+        };
+        lines.push(format!(
+            "  {marker} {} — {} msg — updated {} — id {}",
+            display_name(session),
+            session.message_count,
+            crate::session::describe_session_age(session.updated_at),
+            short_id(&session.id)
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn parse_export_format(raw: Option<String>) -> Result<SessionExportFormat> {
+    match raw {
+        None => Ok(SessionExportFormat::Markdown),
+        Some(value) => SessionExportFormat::from_str(value.trim()).ok_or_else(|| {
+            crate::error::ParamsError::Config(
+                "Export format must be `markdown` or `json`".to_string(),
+            )
+        }),
     }
 }
 
 /// Persistent model thread — loads the backend once, handles prompts in a loop.
 /// After each response it checks for tool calls and runs a follow-up if needed.
+#[allow(dead_code)]
 pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<InferenceEvent>) {
+    model_thread_with_options(prompt_rx, token_tx, SessionRuntimeOptions::default());
+}
+
+pub fn model_thread_with_options(
+    prompt_rx: Receiver<SessionCommand>,
+    token_tx: Sender<InferenceEvent>,
+    options: SessionRuntimeOptions,
+) {
     let cfg = match config::load_with_profile() {
         Ok(c) => c,
         Err(e) => {
@@ -97,10 +292,27 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
     } else {
         project_index.as_ref().map(|_| IncrementalIndexState::new())
     };
-    let session_facts = fact_store
+    let loaded_fact_entries = fact_store
         .as_ref()
         .and_then(|store| store.get_relevant_facts(&project_name, "", 5).ok())
         .unwrap_or_default();
+    let mut session_facts = loaded_fact_entries
+        .iter()
+        .map(|fact| fact.content.clone())
+        .collect::<Vec<_>>();
+    let mut memory_state = RuntimeMemoryState {
+        loaded_facts: loaded_fact_entries
+            .into_iter()
+            .map(|fact| MemoryFactView {
+                content: fact.content,
+                provenance: fact.provenance,
+            })
+            .collect(),
+        ..RuntimeMemoryState::default()
+    };
+    hooks.dispatch(HookEvent::MemoryFactsLoaded {
+        fact_count: memory_state.loaded_facts.len(),
+    });
     let mut session_messages = vec![Message::system(&build_system_prompt(
         &tools,
         &session_facts,
@@ -114,35 +326,79 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
     let mut cache_stats = SessionCacheStats::default();
     emit_cache_update(&cache_stats, false, &token_tx);
     let mut next_action_id = 1u64;
+    emit_memory_state(&token_tx, &memory_state);
+    if !memory_state.loaded_facts.is_empty() {
+        emit_trace(
+            &token_tx,
+            ProgressStatus::Finished,
+            &format!(
+                "memory: loaded {} fact{}",
+                memory_state.loaded_facts.len(),
+                if memory_state.loaded_facts.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            true,
+        );
+    }
 
     let session_store = SessionStore::open().ok();
+    let mut active_session = None;
     if let Some(ref store) = session_store {
-        match store.load() {
-            Ok(Some(saved)) => {
-                let restored_count = saved.messages.len();
-                info!(
-                    msg_count = restored_count,
-                    saved_at = saved.saved_at,
-                    "restoring previous session"
-                );
-                let display_messages: Vec<(String, String)> = saved
-                    .messages
-                    .iter()
-                    .map(|m| (m.role.clone(), m.content.clone()))
-                    .collect();
-                session_messages.extend(saved.messages);
-                let _ = token_tx.send(InferenceEvent::SessionRestored {
-                    display_messages,
-                    saved_at: saved.saved_at,
-                });
-                hooks.dispatch(HookEvent::SessionRestored {
-                    message_count: restored_count,
-                    saved_at: saved.saved_at,
-                });
+        if !options.no_resume {
+            match store.load_most_recent() {
+                Ok(Some(saved)) => {
+                    let restored_count = saved.messages.len();
+                    info!(
+                        session_id = saved.summary.id.as_str(),
+                        msg_count = restored_count,
+                        saved_at = saved.saved_at,
+                        "restoring previous session"
+                    );
+                    let display_messages: Vec<(String, String)> = saved
+                        .messages
+                        .iter()
+                        .map(|m| (m.role.clone(), m.content.clone()))
+                        .collect();
+                    session_messages.extend(saved.messages);
+                    let info = session_info(&saved.summary);
+                    active_session = Some(saved.summary.clone());
+                    let _ = token_tx.send(InferenceEvent::SessionLoaded {
+                        session: info,
+                        display_messages,
+                        saved_at: Some(saved.saved_at),
+                    });
+                    hooks.dispatch(HookEvent::SessionRestored {
+                        message_count: restored_count,
+                        saved_at: saved.saved_at,
+                    });
+                    hooks.dispatch(HookEvent::SessionResumed {
+                        session_id: saved.summary.id.clone(),
+                        named: saved.summary.name.is_some(),
+                        message_count: restored_count,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(error = %e, "session load failed — starting fresh");
+                }
             }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(error = %e, "session load failed — starting fresh");
+        }
+
+        if active_session.is_none() {
+            match store.create_session(None, &backend.name()) {
+                Ok(summary) => {
+                    let info = session_info(&summary);
+                    hooks.dispatch(HookEvent::SessionCreated {
+                        session_id: summary.id.clone(),
+                        named: false,
+                    });
+                    active_session = Some(summary);
+                    let _ = token_tx.send(InferenceEvent::SessionStatus(info));
+                }
+                Err(e) => warn!(error = %e, "initial session create failed"),
             }
         }
     }
@@ -161,25 +417,242 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
         match command {
             SessionCommand::ClearSession => {
                 info!("session cleared");
-                if let Some(ref store) = session_store {
-                    if let Err(e) = store.clear() {
+                if let (Some(store), Some(current)) =
+                    (session_store.as_ref(), active_session.as_ref())
+                {
+                    if let Err(e) = store.delete_session(&current.id) {
                         warn!(error = %e, "session clear failed");
+                    } else {
+                        hooks.dispatch(HookEvent::SessionCleared {
+                            session_id: current.id.clone(),
+                        });
                     }
                 }
-                session_messages.clear();
-                session_messages.push(Message::system(&build_system_prompt(
+                reset_session_runtime(
+                    &mut session_messages,
                     &tools,
                     &session_facts,
-                    &[],
                     eco_enabled,
-                )));
-                budget = SessionBudget {
-                    has_cost_estimate: cfg.backend == "llama_cpp" || cfg.backend == "ollama",
-                    ..SessionBudget::default()
-                };
-                cache_stats = SessionCacheStats::default();
-                emit_budget_update(&budget, &token_tx);
-                emit_cache_update(&cache_stats, false, &token_tx);
+                    &mut budget,
+                    &mut cache_stats,
+                    &cfg.backend,
+                    &token_tx,
+                );
+                memory_state.last_summary_paths.clear();
+                memory_state.last_update = None;
+                emit_memory_state(&token_tx, &memory_state);
+                if let Some(ref store) = session_store {
+                    match store.create_session(None, &backend.name()) {
+                        Ok(summary) => {
+                            hooks.dispatch(HookEvent::SessionCreated {
+                                session_id: summary.id.clone(),
+                                named: false,
+                            });
+                            active_session = Some(summary.clone());
+                            let _ = token_tx.send(InferenceEvent::SessionLoaded {
+                                session: session_info(&summary),
+                                display_messages: Vec::new(),
+                                saved_at: None,
+                            });
+                            let _ = token_tx.send(InferenceEvent::SystemMessage(
+                                "conversation cleared".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "replacement session create failed");
+                            active_session = None;
+                            let _ = token_tx.send(InferenceEvent::SystemMessage(
+                                "conversation cleared".to_string(),
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+            SessionCommand::ListSessions => {
+                match session_store.as_ref().map(|store| store.list_sessions()) {
+                    Some(Ok(sessions)) => {
+                        let active_id = active_session.as_ref().map(|session| session.id.as_str());
+                        let _ = token_tx.send(InferenceEvent::SystemMessage(format_sessions_list(
+                            &sessions, active_id,
+                        )));
+                    }
+                    Some(Err(e)) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                    None => {
+                        let _ = token_tx.send(InferenceEvent::Error(
+                            "Session store is unavailable".to_string(),
+                        ));
+                    }
+                }
+                continue;
+            }
+            SessionCommand::NewSession(name) => {
+                save_session(
+                    session_store.as_ref(),
+                    &mut active_session,
+                    &session_messages,
+                    &backend.name(),
+                    &token_tx,
+                );
+                reset_session_runtime(
+                    &mut session_messages,
+                    &tools,
+                    &session_facts,
+                    eco_enabled,
+                    &mut budget,
+                    &mut cache_stats,
+                    &cfg.backend,
+                    &token_tx,
+                );
+                memory_state.last_summary_paths.clear();
+                memory_state.last_update = None;
+                emit_memory_state(&token_tx, &memory_state);
+                match session_store
+                    .as_ref()
+                    .map(|store| store.create_session(name.as_deref(), &backend.name()))
+                {
+                    Some(Ok(summary)) => {
+                        let session_label = display_name(&summary);
+                        hooks.dispatch(HookEvent::SessionCreated {
+                            session_id: summary.id.clone(),
+                            named: summary.name.is_some(),
+                        });
+                        active_session = Some(summary.clone());
+                        let _ = token_tx.send(InferenceEvent::SessionLoaded {
+                            session: session_info(&summary),
+                            display_messages: Vec::new(),
+                            saved_at: None,
+                        });
+                        let _ = token_tx.send(InferenceEvent::SystemMessage(format!(
+                            "started new session: {session_label}"
+                        )));
+                    }
+                    Some(Err(e)) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                    None => {
+                        let _ = token_tx.send(InferenceEvent::Error(
+                            "Session store is unavailable".to_string(),
+                        ));
+                    }
+                }
+                continue;
+            }
+            SessionCommand::RenameSession(name) => {
+                match (session_store.as_ref(), active_session.as_ref()) {
+                    (Some(store), Some(current)) => {
+                        match store.rename_session(&current.id, &name) {
+                            Ok(updated) => {
+                                hooks.dispatch(HookEvent::SessionRenamed {
+                                    session_id: updated.id.clone(),
+                                    named: updated.name.is_some(),
+                                });
+                                active_session = Some(updated.clone());
+                                let _ = token_tx
+                                    .send(InferenceEvent::SessionStatus(session_info(&updated)));
+                                let _ = token_tx.send(InferenceEvent::SystemMessage(format!(
+                                    "renamed session to {}",
+                                    display_name(&updated)
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = token_tx.send(InferenceEvent::Error(
+                            "No active session is available to rename".to_string(),
+                        ));
+                    }
+                }
+                continue;
+            }
+            SessionCommand::ResumeSession(selector) => {
+                save_session(
+                    session_store.as_ref(),
+                    &mut active_session,
+                    &session_messages,
+                    &backend.name(),
+                    &token_tx,
+                );
+                match session_store
+                    .as_ref()
+                    .map(|store| store.load_session(&selector))
+                {
+                    Some(Ok(saved)) => {
+                        reset_session_runtime(
+                            &mut session_messages,
+                            &tools,
+                            &session_facts,
+                            eco_enabled,
+                            &mut budget,
+                            &mut cache_stats,
+                            &cfg.backend,
+                            &token_tx,
+                        );
+                        memory_state.last_summary_paths.clear();
+                        memory_state.last_update = None;
+                        emit_memory_state(&token_tx, &memory_state);
+                        let display_messages = saved
+                            .messages
+                            .iter()
+                            .map(|m| (m.role.clone(), m.content.clone()))
+                            .collect::<Vec<_>>();
+                        session_messages.extend(saved.messages);
+                        hooks.dispatch(HookEvent::SessionResumed {
+                            session_id: saved.summary.id.clone(),
+                            named: saved.summary.name.is_some(),
+                            message_count: saved.summary.message_count,
+                        });
+                        active_session = Some(saved.summary.clone());
+                        let _ = token_tx.send(InferenceEvent::SessionLoaded {
+                            session: session_info(&saved.summary),
+                            display_messages,
+                            saved_at: Some(saved.saved_at),
+                        });
+                    }
+                    Some(Err(e)) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                    None => {
+                        let _ = token_tx.send(InferenceEvent::Error(
+                            "Session store is unavailable".to_string(),
+                        ));
+                    }
+                }
+                continue;
+            }
+            SessionCommand::ExportSession { selector, format } => {
+                match session_store.as_ref().map(|store| {
+                    parse_export_format(format).and_then(|fmt| store.export_session(&selector, fmt))
+                }) {
+                    Some(Ok((summary, path))) => {
+                        hooks.dispatch(HookEvent::SessionExported {
+                            session_id: summary.id.clone(),
+                            format: path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                        });
+                        let _ = token_tx.send(InferenceEvent::SystemMessage(format!(
+                            "exported session {} to {}",
+                            display_name(&summary),
+                            path.display()
+                        )));
+                    }
+                    Some(Err(e)) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                    None => {
+                        let _ = token_tx.send(InferenceEvent::Error(
+                            "Session store is unavailable".to_string(),
+                        ));
+                    }
+                }
                 continue;
             }
             SessionCommand::InjectUserContext(content) => {
@@ -208,6 +681,7 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                                 eco_enabled,
                                 hooks: &hooks,
                                 index_state: index_state.as_mut(),
+                                turn_memory: None,
                             },
                             next_action_id,
                             pending,
@@ -217,8 +691,10 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                         } else {
                             save_session(
                                 session_store.as_ref(),
+                                &mut active_session,
                                 &session_messages,
                                 &backend.name(),
+                                &token_tx,
                             );
                         }
                     }
@@ -254,6 +730,7 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                                 eco_enabled,
                                 hooks: &hooks,
                                 index_state: index_state.as_mut(),
+                                turn_memory: None,
                             },
                             next_action_id,
                             pending,
@@ -263,8 +740,56 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                         } else {
                             save_session(
                                 session_store.as_ref(),
+                                &mut active_session,
                                 &session_messages,
                                 &backend.name(),
+                                &token_tx,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                }
+                let _ = token_tx.send(InferenceEvent::Done);
+                next_action_id = next_action_id.saturating_add(1);
+                continue;
+            }
+            SessionCommand::RequestFileEdit { path, edits } => {
+                info!(path = path.as_str(), "file edit approval requested");
+                match crate::tools::build_pending_edit_request(&path, &edits) {
+                    Ok(pending) => {
+                        if let Err(e) = handle_pending_action(
+                            ApprovalContext {
+                                prompt_rx: &prompt_rx,
+                                token_tx: &token_tx,
+                                backend: &*backend,
+                                tools: &tools,
+                                exact_cache: exact_cache.as_ref(),
+                                session_messages: &mut session_messages,
+                                cfg: &cfg,
+                                project_root: &project_root,
+                                budget: &mut budget,
+                                cache_stats: &mut cache_stats,
+                                debug_logging_enabled,
+                                reflection_enabled,
+                                eco_enabled,
+                                hooks: &hooks,
+                                index_state: index_state.as_mut(),
+                                turn_memory: None,
+                            },
+                            next_action_id,
+                            pending,
+                            false,
+                        ) {
+                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                        } else {
+                            save_session(
+                                session_store.as_ref(),
+                                &mut active_session,
+                                &session_messages,
+                                &backend.name(),
+                                &token_tx,
                             );
                         }
                     }
@@ -365,6 +890,33 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                             .ok()
                     })
                     .unwrap_or_default();
+                let mut turn_memory =
+                    TurnMemoryEvidence::new(prompt.clone(), relevant_summaries.clone());
+                memory_state.last_summary_paths = relevant_summaries
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                memory_state.last_update = None;
+                emit_memory_state(&token_tx, &memory_state);
+                hooks.dispatch(HookEvent::MemorySummariesSelected {
+                    summary_count: relevant_summaries.len(),
+                });
+                if !relevant_summaries.is_empty() {
+                    emit_trace(
+                        &token_tx,
+                        ProgressStatus::Finished,
+                        &format!(
+                            "memory: selected {} summar{}",
+                            relevant_summaries.len(),
+                            if relevant_summaries.len() == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            }
+                        ),
+                        true,
+                    );
+                }
 
                 if let Some(first) = session_messages.first_mut() {
                     if first.role == "system" {
@@ -462,6 +1014,12 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                                 argument_chars: result.argument.chars().count(),
                                 result_chars: result.output.chars().count(),
                             });
+                            turn_memory.record_tool_result(
+                                result.tool_name.clone(),
+                                result.argument.clone(),
+                                result.output.clone(),
+                                false,
+                            );
                         }
 
                         if let Some(pending) = tool_execution.pending {
@@ -495,6 +1053,7 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                                     eco_enabled,
                                     hooks: &hooks,
                                     index_state: index_state.as_mut(),
+                                    turn_memory: Some(&mut turn_memory),
                                 },
                                 next_action_id,
                                 pending,
@@ -507,6 +1066,19 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                                     false,
                                 );
                                 let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                            } else if let Some(store) = fact_store.as_ref() {
+                                let update = store.verify_and_store_turn(
+                                    &project_name,
+                                    &turn_memory,
+                                    &*backend,
+                                );
+                                apply_memory_update(
+                                    &token_tx,
+                                    &hooks,
+                                    &mut memory_state,
+                                    &mut session_facts,
+                                    update,
+                                );
                             }
                             next_action_id = next_action_id.saturating_add(1);
                         } else if let Some(result_msg) = ToolRegistry::format_results_with_limit(
@@ -578,6 +1150,7 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
 
                                     match final_response {
                                         Ok(final_response) => {
+                                            turn_memory.set_final_response(final_response.clone());
                                             if !final_response.trim().is_empty() {
                                                 log_debug_response(
                                                     debug_logging_enabled,
@@ -605,6 +1178,20 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                                                 "answer ready",
                                                 false,
                                             );
+                                            if let Some(store) = fact_store.as_ref() {
+                                                let update = store.verify_and_store_turn(
+                                                    &project_name,
+                                                    &turn_memory,
+                                                    &*backend,
+                                                );
+                                                apply_memory_update(
+                                                    &token_tx,
+                                                    &hooks,
+                                                    &mut memory_state,
+                                                    &mut session_facts,
+                                                    update,
+                                                );
+                                            }
                                         }
                                         Err(e) => {
                                             warn!(error = %e, "reflection after tool follow-up failed");
@@ -655,6 +1242,7 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
 
                             match final_response {
                                 Ok(final_response) => {
+                                    turn_memory.set_final_response(final_response.clone());
                                     if !final_response.trim().is_empty() {
                                         log_debug_response(
                                             debug_logging_enabled,
@@ -689,6 +1277,20 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                                         "answer ready",
                                         false,
                                     );
+                                    if let Some(store) = fact_store.as_ref() {
+                                        let update = store.verify_and_store_turn(
+                                            &project_name,
+                                            &turn_memory,
+                                            &*backend,
+                                        );
+                                        apply_memory_update(
+                                            &token_tx,
+                                            &hooks,
+                                            &mut memory_state,
+                                            &mut session_facts,
+                                            update,
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "final response post-processing failed");
@@ -703,7 +1305,13 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                             }
                         }
 
-                        save_session(session_store.as_ref(), &session_messages, &backend.name());
+                        save_session(
+                            session_store.as_ref(),
+                            &mut active_session,
+                            &session_messages,
+                            &backend.name(),
+                            &token_tx,
+                        );
                         let _ = token_tx.send(InferenceEvent::Done);
                     }
                 }
@@ -715,9 +1323,13 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
         message_count: session_messages.len(),
     });
 
+    if let (Some(store), Some(current)) = (session_store.as_ref(), active_session.as_ref()) {
+        if let Err(e) = store.delete_if_empty_unnamed(&current.id) {
+            warn!(error = %e, "empty session cleanup failed");
+        }
+    }
+
     if let Some(store) = fact_store.as_ref() {
-        info!("persisting session facts");
-        store.extract_and_store(&session_messages, &project_name, &*backend);
         match store.consolidate(&project_name, &cfg.memory) {
             Ok(stats) => {
                 if stats.ttl_pruned + stats.dedup_removed + stats.cap_removed > 0 {
@@ -727,6 +1339,23 @@ pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<Infere
                         dedup_removed = stats.dedup_removed,
                         cap_removed = stats.cap_removed,
                         "memory consolidated"
+                    );
+                }
+                memory_state.last_consolidation = Some(MemoryConsolidationView {
+                    ttl_pruned: stats.ttl_pruned,
+                    dedup_removed: stats.dedup_removed,
+                    cap_removed: stats.cap_removed,
+                });
+                emit_memory_state(&token_tx, &memory_state);
+                if stats.ttl_pruned + stats.dedup_removed + stats.cap_removed > 0 {
+                    emit_trace(
+                        &token_tx,
+                        ProgressStatus::Finished,
+                        &format!(
+                            "memory: consolidated -{} dup",
+                            stats.dedup_removed + stats.cap_removed + stats.ttl_pruned
+                        ),
+                        true,
                     );
                 }
                 hooks.dispatch(HookEvent::MemoryConsolidated {

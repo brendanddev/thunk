@@ -177,7 +177,7 @@ fn read_existing_text_file(path: &Path, display_path: &str) -> Result<String> {
     }
 }
 
-fn build_diff(path: &str, old_content: &str, new_content: &str) -> Result<String> {
+pub(crate) fn build_diff(path: &str, old_content: &str, new_content: &str) -> Result<String> {
     let temp_dir = std::env::temp_dir();
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

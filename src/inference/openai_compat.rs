@@ -13,6 +13,7 @@ use std::sync::mpsc::Sender;
 use super::backend::{InferenceBackend, Message};
 use crate::error::{ParamsError, Result};
 use crate::events::InferenceEvent;
+use crate::safety::{self, InspectionDecision};
 
 /// OpenAI-compatible backend.
 /// Works with any provider that implements the /v1/chat/completions endpoint.
@@ -83,6 +84,10 @@ impl OpenAICompatBackend {
         }
 
         let url = format!("{}/models", self.base_url);
+        let (_, inspection) = safety::inspect_provider_request("openai_compat", &url, 0)?;
+        if matches!(inspection.decision, InspectionDecision::Block) {
+            return Err(ParamsError::Config(inspection.blocked_message()));
+        }
         let response = ureq::get(&url)
             .set("Authorization", &format!("Bearer {api_key}"))
             .call()
@@ -145,8 +150,14 @@ impl InferenceBackend for OpenAICompatBackend {
             // Don't set max_tokens here — let the provider use its default.
             // Users who want a cap can add it to config later.
         });
+        let body_text = body.to_string();
 
         let url = format!("{}/chat/completions", self.base_url);
+        let (_, inspection) =
+            safety::inspect_provider_request("openai_compat", &url, body_text.chars().count())?;
+        if matches!(inspection.decision, InspectionDecision::Block) {
+            return Err(ParamsError::Config(inspection.blocked_message()));
+        }
 
         let mut request = ureq::post(&url)
             .set("Content-Type", "application/json")
@@ -160,7 +171,7 @@ impl InferenceBackend for OpenAICompatBackend {
                 .set("X-Title", "params-cli");
         }
 
-        let response = request.send_string(&body.to_string()).map_err(|e| {
+        let response = request.send_string(&body_text).map_err(|e| {
             ParamsError::Config(format!("{} request failed: {e}", self.provider_name))
         })?;
 

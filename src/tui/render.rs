@@ -14,6 +14,7 @@ use super::format::{
     truncate_for_width, wrap_plain_text,
 };
 use super::state::{AppState, Role};
+use crate::session::short_id;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_SPEED: u64 = 6;
@@ -68,8 +69,34 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         };
 
     let backend_display = truncate_for_width(&state.backend_name, 18);
+    let session_display = state
+        .current_session
+        .as_ref()
+        .map(|session| {
+            let label = session
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("unnamed {}", short_id(&session.id)));
+            format!("{label} ({})", session.message_count)
+        })
+        .unwrap_or_else(|| "n/a".to_string());
     let current_turn_duration = state.current_turn_duration();
     let last_work_duration = state.last_work_duration();
+    let memory_facts_count = state.memory_snapshot.loaded_facts.len();
+    let memory_summaries_count = state.memory_snapshot.last_summary_paths.len();
+    let memory_update = state.memory_snapshot.last_update.as_ref();
+    let accepted_memory_count = memory_update
+        .map(|update| update.accepted_facts.len())
+        .unwrap_or(0);
+    let skipped_memory_count = memory_update
+        .map(|update| {
+            update
+                .skipped_reasons
+                .iter()
+                .map(|reason| reason.count)
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
     let mut items = vec![
         ListItem::new(Line::from(vec![
             Span::styled("● ", Style::default().fg(status_color)),
@@ -84,6 +111,14 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             format!("  {backend_display}"),
             Style::default().fg(Color::Cyan),
         )])),
+        ListItem::new(Line::from("")),
+        ListItem::new(Line::from(vec![
+            Span::styled("sess  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_for_width(&session_display, 18),
+                Style::default().fg(Color::White),
+            ),
+        ])),
         ListItem::new(Line::from("")),
         ListItem::new(Line::from(vec![
             Span::styled("msgs  ", Style::default().fg(Color::DarkGray)),
@@ -182,6 +217,20 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
                 Style::default().fg(Color::White),
             ),
         ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("mem   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{memory_facts_count}f/{memory_summaries_count}s"),
+                Style::default().fg(Color::White),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("mupd  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("+{accepted_memory_count}/-{skipped_memory_count}"),
+                Style::default().fg(Color::White),
+            ),
+        ])),
         ListItem::new(Line::from("")),
         ListItem::new(Line::from(vec![Span::styled(
             "activity",
@@ -268,6 +317,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled("clear", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
+            Span::styled("/sess  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("manage", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
             Span::styled("^y/^n  ", Style::default().fg(Color::DarkGray)),
             Span::styled("approve/reject", Style::default().fg(Color::DarkGray)),
         ])),
@@ -326,6 +379,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(" <p> <text>", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
+            Span::styled("/edit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <path>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
             Span::styled("/reflect", Style::default().fg(Color::DarkGray)),
             Span::styled(" on|off", Style::default().fg(Color::DarkGray)),
         ])),
@@ -342,7 +399,15 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(" list", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
-            Span::styled("write_file", Style::default().fg(Color::DarkGray)),
+            Span::styled("/sessions", Style::default().fg(Color::DarkGray)),
+            Span::styled(" list", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/memory", Style::default().fg(Color::DarkGray)),
+            Span::styled(" status", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("edit_file", Style::default().fg(Color::DarkGray)),
             Span::styled(" via model", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
@@ -641,7 +706,7 @@ fn pending_action_height(state: &AppState, width: usize) -> u16 {
 
     let preview_max_lines = match pending.kind {
         PendingActionKind::ShellCommand => 2,
-        PendingActionKind::FileWrite => 8,
+        PendingActionKind::FileWrite | PendingActionKind::FileEdit => 8,
     };
     lines += pending_preview_lines(&pending.preview, width, preview_max_lines).len();
     lines += 2;
@@ -749,11 +814,13 @@ fn draw_pending_action(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let preview_max_lines = match pending.kind {
         PendingActionKind::ShellCommand => 2,
-        PendingActionKind::FileWrite => 8,
+        PendingActionKind::FileWrite | PendingActionKind::FileEdit => 8,
     };
     let preview_style = match pending.kind {
         PendingActionKind::ShellCommand => Style::default().fg(Color::White),
-        PendingActionKind::FileWrite => Style::default().fg(Color::Gray),
+        PendingActionKind::FileWrite | PendingActionKind::FileEdit => {
+            Style::default().fg(Color::Gray)
+        }
     };
     for line in pending_preview_lines(&pending.preview, inner_width, preview_max_lines) {
         lines.push(Line::from(Span::styled(line, preview_style)));
