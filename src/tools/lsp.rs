@@ -2,8 +2,8 @@
 //
 // Rust-first LSP diagnostics tool.
 
-use std::fs;
 use std::collections::HashSet;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -13,9 +13,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use super::{Tool, ToolRunResult};
 use crate::config;
 use crate::error::{ParamsError, Result};
-use super::{Tool, ToolRunResult};
+use crate::safety::{self, ProjectPathKind};
 
 pub struct LspDiagnosticsTool;
 pub struct LspHoverTool;
@@ -62,13 +63,13 @@ impl Tool for LspDiagnosticsTool {
         let requested = arg.trim();
         if requested.is_empty() {
             return Err(ParamsError::Config(
-                "lsp_diagnostics requires a file path".to_string()
+                "lsp_diagnostics requires a file path".to_string(),
             ));
         }
 
         let cfg = config::load_with_profile()?;
-        let cwd = std::env::current_dir()?;
-        let path = resolve_input_path(&cwd, requested)?;
+        let cwd = safety::project_root()?;
+        let path = resolve_input_path(requested)?;
         validate_rust_file(&path)?;
         let display_path = display_path(&cwd, &path);
         let project_root = find_rust_project_root(&path)?;
@@ -96,13 +97,13 @@ impl Tool for LspHoverTool {
         let requested = arg.trim();
         if requested.is_empty() {
             return Err(ParamsError::Config(
-                "lsp_hover requires <file>:<line>:<col>".to_string()
+                "lsp_hover requires <file>:<line>:<col>".to_string(),
             ));
         }
 
         let cfg = config::load_with_profile()?;
-        let cwd = std::env::current_dir()?;
-        let hover_input = parse_hover_input(&cwd, requested)?;
+        let cwd = safety::project_root()?;
+        let hover_input = parse_hover_input(requested)?;
         validate_rust_file(&hover_input.path)?;
         let display_path = display_path(&cwd, &hover_input.path);
         let project_root = find_rust_project_root(&hover_input.path)?;
@@ -137,13 +138,13 @@ impl Tool for LspDefinitionTool {
         let requested = arg.trim();
         if requested.is_empty() {
             return Err(ParamsError::Config(
-                "lsp_definition requires <file>:<line>:<col>".to_string()
+                "lsp_definition requires <file>:<line>:<col>".to_string(),
             ));
         }
 
         let cfg = config::load_with_profile()?;
-        let cwd = std::env::current_dir()?;
-        let position_input = parse_hover_input(&cwd, requested)?;
+        let cwd = safety::project_root()?;
+        let position_input = parse_hover_input(requested)?;
         validate_rust_file(&position_input.path)?;
         let display_input = display_path(&cwd, &position_input.path);
         let project_root = find_rust_project_root(&position_input.path)?;
@@ -198,19 +199,11 @@ struct DefinitionLocation {
     column: usize,
 }
 
-fn resolve_input_path(cwd: &Path, requested: &str) -> Result<PathBuf> {
-    let candidate = Path::new(requested);
-    let joined = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        cwd.join(candidate)
-    };
-
-    let normalized = joined
-        .canonicalize()
-        .map_err(|_| ParamsError::Config(format!("File not found: {}", joined.display())))?;
-
-    Ok(normalized)
+fn resolve_input_path(requested: &str) -> Result<PathBuf> {
+    Ok(
+        safety::inspect_project_path("lsp_file", requested, ProjectPathKind::File, false)?
+            .resolved_path,
+    )
 }
 
 fn validate_rust_file(path: &Path) -> Result<()> {
@@ -223,35 +216,35 @@ fn validate_rust_file(path: &Path) -> Result<()> {
 
     if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
         return Err(ParamsError::Config(
-            "The first LSP slice currently supports Rust `.rs` files only".to_string()
+            "The first LSP slice currently supports Rust `.rs` files only".to_string(),
         ));
     }
 
     Ok(())
 }
 
-fn parse_hover_input(cwd: &Path, requested: &str) -> Result<HoverInput> {
+fn parse_hover_input(requested: &str) -> Result<HoverInput> {
     let Some((path_part, line_part, col_part)) = split_path_line_col(requested) else {
         return Err(ParamsError::Config(
-            "Expected <file>:<line>:<col>, for example src/main.rs:12:8".to_string()
+            "Expected <file>:<line>:<col>, for example src/main.rs:12:8".to_string(),
         ));
     };
 
-    let line = line_part.parse::<usize>().map_err(|_| {
-        ParamsError::Config("Hover line must be a positive integer".to_string())
-    })?;
-    let column = col_part.parse::<usize>().map_err(|_| {
-        ParamsError::Config("Hover column must be a positive integer".to_string())
-    })?;
+    let line = line_part
+        .parse::<usize>()
+        .map_err(|_| ParamsError::Config("Hover line must be a positive integer".to_string()))?;
+    let column = col_part
+        .parse::<usize>()
+        .map_err(|_| ParamsError::Config("Hover column must be a positive integer".to_string()))?;
 
     if line == 0 || column == 0 {
         return Err(ParamsError::Config(
-            "Hover line and column are 1-based and must be greater than 0".to_string()
+            "Hover line and column are 1-based and must be greater than 0".to_string(),
         ));
     }
 
     Ok(HoverInput {
-        path: resolve_input_path(cwd, path_part)?,
+        path: resolve_input_path(path_part)?,
         line,
         column,
     })
@@ -292,12 +285,14 @@ fn collect_rust_diagnostics(
 ) -> Result<Vec<LspDiagnostic>> {
     let server = resolve_rust_analyzer_command(cfg)?;
     let mut child = spawn_language_server(&server, project_root)?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        ParamsError::Inference("Failed to open rust-analyzer stdin".to_string())
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ParamsError::Inference("Failed to open rust-analyzer stdout".to_string())
-    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ParamsError::Inference("Failed to open rust-analyzer stdin".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ParamsError::Inference("Failed to open rust-analyzer stdout".to_string()))?;
 
     let (message_tx, message_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -317,60 +312,75 @@ fn collect_rust_diagnostics(
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "processId": serde_json::Value::Null,
-            "rootPath": project_root.to_str(),
-            "rootUri": root_uri,
-            "workspaceFolders": [{
-                "uri": root_uri,
-                "name": workspace_name,
-            }],
-            "capabilities": {},
-            "clientInfo": {
-                "name": "params-cli",
-                "version": env!("CARGO_PKG_VERSION"),
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": serde_json::Value::Null,
+                "rootPath": project_root.to_str(),
+                "rootUri": root_uri,
+                "workspaceFolders": [{
+                    "uri": root_uri,
+                    "name": workspace_name,
+                }],
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "params-cli",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
             }
-        }
-    }))?;
+        }),
+    )?;
     wait_for_response(&message_rx, 1, timeout)?;
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "initialized",
-        "params": {}
-    }))?;
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+    )?;
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": file_uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": source,
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": source,
+                }
             }
-        }
-    }))?;
+        }),
+    )?;
 
     let diagnostics = wait_for_diagnostics(&message_rx, &file_uri, timeout)?;
 
-    let _ = write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "shutdown",
-        "params": serde_json::Value::Null,
-    }));
+    let _ = write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "shutdown",
+            "params": serde_json::Value::Null,
+        }),
+    );
     let _ = wait_for_response(&message_rx, 2, Duration::from_millis(300));
-    let _ = write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "exit",
-        "params": serde_json::Value::Null,
-    }));
+    let _ = write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": serde_json::Value::Null,
+        }),
+    );
     let _ = child.kill();
     let _ = child.wait();
 
@@ -387,12 +397,14 @@ fn collect_rust_hover(
 ) -> Result<Option<String>> {
     let server = resolve_rust_analyzer_command(cfg)?;
     let mut child = spawn_language_server(&server, project_root)?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        ParamsError::Inference("Failed to open rust-analyzer stdin".to_string())
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ParamsError::Inference("Failed to open rust-analyzer stdout".to_string())
-    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ParamsError::Inference("Failed to open rust-analyzer stdin".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ParamsError::Inference("Failed to open rust-analyzer stdout".to_string()))?;
 
     let (message_tx, message_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -412,45 +424,54 @@ fn collect_rust_hover(
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "processId": serde_json::Value::Null,
-            "rootPath": project_root.to_str(),
-            "rootUri": root_uri,
-            "workspaceFolders": [{
-                "uri": root_uri,
-                "name": workspace_name,
-            }],
-            "capabilities": {},
-            "clientInfo": {
-                "name": "params-cli",
-                "version": env!("CARGO_PKG_VERSION"),
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": serde_json::Value::Null,
+                "rootPath": project_root.to_str(),
+                "rootUri": root_uri,
+                "workspaceFolders": [{
+                    "uri": root_uri,
+                    "name": workspace_name,
+                }],
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "params-cli",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
             }
-        }
-    }))?;
+        }),
+    )?;
     wait_for_response(&message_rx, 1, timeout)?;
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "initialized",
-        "params": {}
-    }))?;
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+    )?;
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": file_uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": source,
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": source,
+                }
             }
-        }
-    }))?;
+        }),
+    )?;
 
     // Let rust-analyzer finish opening/indexing this file before hover requests.
     // We already rely on publishDiagnostics as the readiness signal in `/diag`,
@@ -463,18 +484,21 @@ fn collect_rust_hover(
     for position in hover_positions {
         for _ in 0..3 {
             let utf16_col = line_column_to_utf16(source, position.line, position.column)?;
-            write_lsp_message(&mut stdin, &json!({
-                "jsonrpc": "2.0",
-                "id": next_id,
-                "method": "textDocument/hover",
-                "params": {
-                    "textDocument": { "uri": file_uri },
-                    "position": {
-                        "line": position.line.saturating_sub(1),
-                        "character": utf16_col,
+            write_lsp_message(
+                &mut stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": next_id,
+                    "method": "textDocument/hover",
+                    "params": {
+                        "textDocument": { "uri": file_uri },
+                        "position": {
+                            "line": position.line.saturating_sub(1),
+                            "character": utf16_col,
+                        }
                     }
-                }
-            }))?;
+                }),
+            )?;
 
             match wait_for_hover_response(&message_rx, next_id, timeout)? {
                 HoverResponse::Hover(text) => {
@@ -498,18 +522,24 @@ fn collect_rust_hover(
         }
     }
 
-    let _ = write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "id": next_id,
-        "method": "shutdown",
-        "params": serde_json::Value::Null,
-    }));
+    let _ = write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": next_id,
+            "method": "shutdown",
+            "params": serde_json::Value::Null,
+        }),
+    );
     let _ = wait_for_response(&message_rx, next_id, Duration::from_millis(300));
-    let _ = write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "exit",
-        "params": serde_json::Value::Null,
-    }));
+    let _ = write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": serde_json::Value::Null,
+        }),
+    );
     let _ = child.kill();
     let _ = child.wait();
 
@@ -526,12 +556,14 @@ fn collect_rust_definition(
 ) -> Result<Vec<DefinitionLocation>> {
     let server = resolve_rust_analyzer_command(cfg)?;
     let mut child = spawn_language_server(&server, project_root)?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        ParamsError::Inference("Failed to open rust-analyzer stdin".to_string())
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ParamsError::Inference("Failed to open rust-analyzer stdout".to_string())
-    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| ParamsError::Inference("Failed to open rust-analyzer stdin".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ParamsError::Inference("Failed to open rust-analyzer stdout".to_string()))?;
 
     let (message_tx, message_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -551,45 +583,54 @@ fn collect_rust_definition(
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "processId": serde_json::Value::Null,
-            "rootPath": project_root.to_str(),
-            "rootUri": root_uri,
-            "workspaceFolders": [{
-                "uri": root_uri,
-                "name": workspace_name,
-            }],
-            "capabilities": {},
-            "clientInfo": {
-                "name": "params-cli",
-                "version": env!("CARGO_PKG_VERSION"),
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": serde_json::Value::Null,
+                "rootPath": project_root.to_str(),
+                "rootUri": root_uri,
+                "workspaceFolders": [{
+                    "uri": root_uri,
+                    "name": workspace_name,
+                }],
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "params-cli",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
             }
-        }
-    }))?;
+        }),
+    )?;
     wait_for_response(&message_rx, 1, timeout)?;
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "initialized",
-        "params": {}
-    }))?;
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+    )?;
 
-    write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": file_uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": source,
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": source,
+                }
             }
-        }
-    }))?;
+        }),
+    )?;
 
     let _ = wait_for_diagnostics(&message_rx, &file_uri, timeout);
 
@@ -599,18 +640,21 @@ fn collect_rust_definition(
     for position in hover_positions {
         for _ in 0..3 {
             let utf16_col = line_column_to_utf16(source, position.line, position.column)?;
-            write_lsp_message(&mut stdin, &json!({
-                "jsonrpc": "2.0",
-                "id": next_id,
-                "method": "textDocument/definition",
-                "params": {
-                    "textDocument": { "uri": file_uri },
-                    "position": {
-                        "line": position.line.saturating_sub(1),
-                        "character": utf16_col,
+            write_lsp_message(
+                &mut stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": next_id,
+                    "method": "textDocument/definition",
+                    "params": {
+                        "textDocument": { "uri": file_uri },
+                        "position": {
+                            "line": position.line.saturating_sub(1),
+                            "character": utf16_col,
+                        }
                     }
-                }
-            }))?;
+                }),
+            )?;
 
             match wait_for_definition_response(&message_rx, next_id, timeout)? {
                 DefinitionResponse::Definitions(items) => {
@@ -618,7 +662,10 @@ fn collect_rust_definition(
                 }
                 DefinitionResponse::NoInfo => {}
                 DefinitionResponse::RetryableError(reason) => {
-                    warn!(tool = "lsp_definition", reason, "retrying definition request");
+                    warn!(
+                        tool = "lsp_definition",
+                        reason, "retrying definition request"
+                    );
                     next_id += 1;
                     std::thread::sleep(Duration::from_millis(75));
                     continue;
@@ -634,18 +681,24 @@ fn collect_rust_definition(
         }
     }
 
-    let _ = write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "id": next_id,
-        "method": "shutdown",
-        "params": serde_json::Value::Null,
-    }));
+    let _ = write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": next_id,
+            "method": "shutdown",
+            "params": serde_json::Value::Null,
+        }),
+    );
     let _ = wait_for_response(&message_rx, next_id, Duration::from_millis(300));
-    let _ = write_lsp_message(&mut stdin, &json!({
-        "jsonrpc": "2.0",
-        "method": "exit",
-        "params": serde_json::Value::Null,
-    }));
+    let _ = write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": serde_json::Value::Null,
+        }),
+    );
     let _ = child.kill();
     let _ = child.wait();
 
@@ -683,12 +736,7 @@ fn build_hover_positions(source: &str, line: usize, column: usize) -> Result<Vec
     push_hover_position(&mut positions, &mut seen, line, requested);
 
     if let Some((start, end)) = identifier_span_near(text, requested) {
-        let preferred = [
-            start + 1,
-            start + 2,
-            ((start + end) / 2) + 1,
-            end,
-        ];
+        let preferred = [start + 1, start + 2, ((start + end) / 2) + 1, end];
         for candidate in preferred {
             push_hover_position(&mut positions, &mut seen, line, candidate);
         }
@@ -826,8 +874,12 @@ fn format_lsp_health_report(cfg: &config::Config) -> String {
     if !found_ready {
         warn!("rust lsp health check found no runnable server");
         output.push_str("\nFix:\n");
-        output.push_str("- Install the rust-analyzer component with `rustup component add rust-analyzer`\n");
-        output.push_str("- Or set [lsp].rust_analyzer_path in .local/config.toml to a runnable binary\n");
+        output.push_str(
+            "- Install the rust-analyzer component with `rustup component add rust-analyzer`\n",
+        );
+        output.push_str(
+            "- Or set [lsp].rust_analyzer_path in .local/config.toml to a runnable binary\n",
+        );
     }
 
     output
@@ -856,7 +908,11 @@ fn probe_rust_analyzer(cfg: &config::Config) -> Vec<LspProbe> {
     probes.push(run_probe(LspCommandSpec {
         display: "rustup run stable rust-analyzer".to_string(),
         program: PathBuf::from("rustup"),
-        args: vec!["run".to_string(), "stable".to_string(), "rust-analyzer".to_string()],
+        args: vec![
+            "run".to_string(),
+            "stable".to_string(),
+            "rust-analyzer".to_string(),
+        ],
     }));
 
     probes
@@ -893,12 +949,28 @@ fn discover_rust_analyzer_candidates() -> Vec<PathBuf> {
 
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
-        push_candidate(&mut candidates, &mut seen, home.join(".cargo/bin/rust-analyzer"));
-        push_candidate(&mut candidates, &mut seen, home.join(".local/bin/rust-analyzer"));
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            home.join(".cargo/bin/rust-analyzer"),
+        );
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            home.join(".local/bin/rust-analyzer"),
+        );
     }
 
-    push_candidate(&mut candidates, &mut seen, PathBuf::from("/opt/homebrew/bin/rust-analyzer"));
-    push_candidate(&mut candidates, &mut seen, PathBuf::from("/usr/local/bin/rust-analyzer"));
+    push_candidate(
+        &mut candidates,
+        &mut seen,
+        PathBuf::from("/opt/homebrew/bin/rust-analyzer"),
+    );
+    push_candidate(
+        &mut candidates,
+        &mut seen,
+        PathBuf::from("/usr/local/bin/rust-analyzer"),
+    );
 
     candidates
 }
@@ -953,11 +1025,9 @@ fn rust_analyzer_component_installed() -> bool {
         .output();
 
     match output {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line.starts_with("rust-analyzer"))
-        }
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("rust-analyzer")),
         _ => false,
     }
 }
@@ -970,15 +1040,22 @@ fn spawn_language_server(server: &LspCommandSpec, project_root: &Path) -> Result
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| ParamsError::Inference(format!(
-            "Failed to start rust-analyzer via {}: {e}",
-            server.display
-        )))
+        .map_err(|e| {
+            ParamsError::Inference(format!(
+                "Failed to start rust-analyzer via {}: {e}",
+                server.display
+            ))
+        })
 }
 
 fn write_lsp_message(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
     let payload = value.to_string();
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", payload.len(), payload)?;
+    write!(
+        stdin,
+        "Content-Length: {}\r\n\r\n{}",
+        payload.len(),
+        payload
+    )?;
     stdin.flush()?;
     Ok(())
 }
@@ -991,7 +1068,7 @@ fn read_lsp_message(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
             return Err(ParamsError::Inference(
-                "Language server closed the connection".to_string()
+                "Language server closed the connection".to_string(),
             ));
         }
 
@@ -1001,31 +1078,23 @@ fn read_lsp_message(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
 
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
-                let parsed = value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|e| ParamsError::Inference(format!(
-                        "Invalid LSP Content-Length header: {e}"
-                    )))?;
+                let parsed = value.trim().parse::<usize>().map_err(|e| {
+                    ParamsError::Inference(format!("Invalid LSP Content-Length header: {e}"))
+                })?;
                 content_length = Some(parsed);
             }
         }
     }
 
-    let length = content_length.ok_or_else(|| {
-        ParamsError::Inference("Missing LSP Content-Length header".to_string())
-    })?;
+    let length = content_length
+        .ok_or_else(|| ParamsError::Inference("Missing LSP Content-Length header".to_string()))?;
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload)?;
     serde_json::from_slice(&payload)
         .map_err(|e| ParamsError::Inference(format!("Invalid LSP JSON payload: {e}")))
 }
 
-fn wait_for_response(
-    rx: &mpsc::Receiver<Value>,
-    id: u64,
-    timeout: Duration,
-) -> Result<Value> {
+fn wait_for_response(rx: &mpsc::Receiver<Value>, id: u64, timeout: Duration) -> Result<Value> {
     loop {
         let message = rx.recv_timeout(timeout).map_err(|_| {
             ParamsError::Inference(format!(
@@ -1064,7 +1133,9 @@ Increase [lsp].timeout_ms in .local/config.toml if rust-analyzer is slow to star
         if message.get("id").and_then(|v| v.as_u64()) == Some(id) {
             if let Some(error) = parse_lsp_response_error(&message) {
                 if is_retryable_lsp_query_error(&error) {
-                    return Ok(HoverResponse::RetryableError(format_lsp_response_error(&error)));
+                    return Ok(HoverResponse::RetryableError(format_lsp_response_error(
+                        &error,
+                    )));
                 }
                 return Err(ParamsError::Inference(format!(
                     "Language server error: {}",
@@ -1097,7 +1168,9 @@ Increase [lsp].timeout_ms in .local/config.toml if rust-analyzer is slow to star
         if message.get("id").and_then(|v| v.as_u64()) == Some(id) {
             if let Some(error) = parse_lsp_response_error(&message) {
                 if is_retryable_lsp_query_error(&error) {
-                    return Ok(DefinitionResponse::RetryableError(format_lsp_response_error(&error)));
+                    return Ok(DefinitionResponse::RetryableError(
+                        format_lsp_response_error(&error),
+                    ));
                 }
                 return Err(ParamsError::Inference(format!(
                     "Language server error: {}",
@@ -1190,7 +1263,9 @@ fn parse_lsp_response_error(message: &Value) -> Option<LspResponseError> {
 
 fn format_lsp_response_error(error: &LspResponseError) -> String {
     match &error.data {
-        Some(data) if !data.is_empty() => format!("code {}: {} ({data})", error.code, error.message),
+        Some(data) if !data.is_empty() => {
+            format!("code {}: {} ({data})", error.code, error.message)
+        }
         _ => format!("code {}: {}", error.code, error.message),
     }
 }
@@ -1198,7 +1273,10 @@ fn format_lsp_response_error(error: &LspResponseError) -> String {
 fn is_retryable_lsp_query_error(error: &LspResponseError) -> bool {
     matches!(error.code, -32803 | -32802 | -32801 | -32800 | -32002)
         || error.message.to_ascii_lowercase().contains("cancel")
-        || error.message.to_ascii_lowercase().contains("content modified")
+        || error
+            .message
+            .to_ascii_lowercase()
+            .contains("content modified")
 }
 
 fn parse_hover_response(message: &Value) -> Option<String> {
@@ -1260,10 +1338,17 @@ fn parse_definition_location(value: &Value) -> Option<DefinitionLocation> {
             value
                 .get("targetSelectionRange")
                 .and_then(|range| range.get("start"))
-                .or_else(|| value.get("targetRange").and_then(|range| range.get("start")))?,
+                .or_else(|| {
+                    value
+                        .get("targetRange")
+                        .and_then(|range| range.get("start"))
+                })?,
         )
     } else {
-        (value.get("uri")?.as_str()?, value.get("range")?.get("start")?)
+        (
+            value.get("uri")?.as_str()?,
+            value.get("range")?.get("start")?,
+        )
     };
 
     let path = file_uri_to_path(uri)?;
@@ -1322,13 +1407,19 @@ fn format_definition(
     definitions: &[DefinitionLocation],
 ) -> String {
     if definitions.is_empty() {
-        return format!("No definition found for {}:{}:{}", source_path, line, column);
+        return format!(
+            "No definition found for {}:{}:{}",
+            source_path, line, column
+        );
     }
 
     let mut output = format!("Definition for {}:{}:{}:\n\n", source_path, line, column);
     for definition in definitions {
         let path = display_path(cwd, &definition.path);
-        output.push_str(&format!("{path}:{}:{}\n", definition.line, definition.column));
+        output.push_str(&format!(
+            "{path}:{}:{}\n",
+            definition.line, definition.column
+        ));
     }
 
     output
@@ -1431,15 +1522,11 @@ mod tests {
 
     #[test]
     fn parses_hover_input() {
-        let cwd = Path::new("/tmp");
-        let path = Path::new("/tmp/params-lsp-hover-test.rs");
-        std::fs::write(path, "fn main() {}\n").unwrap();
-        let input = parse_hover_input(cwd, "/tmp/params-lsp-hover-test.rs:12:8").unwrap();
+        let input = parse_hover_input("src/main.rs:12:8").unwrap();
 
         assert_eq!(input.line, 12);
         assert_eq!(input.column, 8);
-        assert!(input.path.ends_with("params-lsp-hover-test.rs"));
-        let _ = std::fs::remove_file(path);
+        assert!(input.path.ends_with("src/main.rs"));
     }
 
     #[test]

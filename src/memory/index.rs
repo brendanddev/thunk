@@ -12,7 +12,7 @@
 // find_relevant() does simple keyword scoring for now. Semantic search via
 // embeddings can be layered on top later without changing the schema.
 
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -20,10 +20,10 @@ use std::time::UNIX_EPOCH;
 use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
+use super::run_prompt_sync;
 use crate::config;
 use crate::error::Result;
 use crate::inference::{InferenceBackend, Message};
-use super::run_prompt_sync;
 
 pub struct ProjectIndex {
     conn: Connection,
@@ -37,8 +37,8 @@ pub struct IndexDelta {
 }
 
 const INDEXABLE_EXTENSIONS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift",
-    "rb", "php", "cs", "toml", "yaml", "yml", "json", "md", "txt", "sh", "sql",
+    "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift", "rb",
+    "php", "cs", "toml", "yaml", "yml", "json", "md", "txt", "sh", "sql",
 ];
 const MAX_INDEXABLE_FILE_BYTES: u64 = 100_000;
 
@@ -82,9 +82,7 @@ impl ProjectIndex {
         let mtime = file_mtime(path).unwrap_or(0) as i64;
 
         let prompt = vec![
-            Message::system(
-                "You are a helpful assistant that writes concise code file summaries.",
-            ),
+            Message::system("You are a helpful assistant that writes concise code file summaries."),
             Message::user(&format!(
                 "Summarize this file in 2-3 sentences. \
                  State what it does and name its key types or functions.\n\
@@ -116,9 +114,7 @@ impl ProjectIndex {
     /// query by keyword overlap. Unmatched entries are excluded; ties are
     /// broken by match count descending.
     pub fn find_relevant(&self, query: &str, limit: usize) -> Result<Vec<(String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, summary FROM files")?;
+        let mut stmt = self.conn.prepare("SELECT path, summary FROM files")?;
 
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower.split_whitespace().collect();
@@ -351,11 +347,10 @@ mod tests {
         let delta = index.collect_delta(&root).expect("collect delta");
         assert_eq!(delta.removed, 1);
 
-        let count: i64 = index.conn.query_row(
-            "SELECT COUNT(*) FROM files",
-            [],
-            |row| row.get(0),
-        ).expect("count files");
+        let count: i64 = index
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .expect("count files");
         assert_eq!(count, 0);
 
         let _ = fs::remove_dir(root);

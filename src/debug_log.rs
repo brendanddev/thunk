@@ -45,10 +45,7 @@ pub fn clear() -> Result<()> {
 fn append_entry(kind: &str, text: &str) -> Result<()> {
     let _guard = log_lock().lock().ok();
     let path = config::debug_log_path()?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     writeln!(file, "=== {} {} ===", timestamp_secs(), kind)?;
     writeln!(file, "{text}")?;
@@ -86,8 +83,17 @@ mod tests {
     #[test]
     fn source_labels_are_stable() {
         assert_eq!(source_label(ResponseSource::Live), "(LIVE)");
-        assert_eq!(source_label(ResponseSource::ExactCache), "(EXACT CACHE HIT)");
-        assert_eq!(source_label(ResponseSource::PromptCache), "(PROMPT CACHE HIT)");
-        assert_eq!(source_label(ResponseSource::SemanticCache), "(SEMANTIC CACHE HIT)");
+        assert_eq!(
+            source_label(ResponseSource::ExactCache),
+            "(EXACT CACHE HIT)"
+        );
+        assert_eq!(
+            source_label(ResponseSource::PromptCache),
+            "(PROMPT CACHE HIT)"
+        );
+        assert_eq!(
+            source_label(ResponseSource::SemanticCache),
+            "(SEMANTIC CACHE HIT)"
+        );
     }
 }

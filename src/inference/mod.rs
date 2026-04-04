@@ -11,33 +11,35 @@ mod llama_cpp;
 mod ollama;
 mod openai_compat;
 
-pub use backend::{InferenceBackend, Message, SYSTEM_PROMPT, system_prompt_with_tools};
+pub use backend::{system_prompt_with_tools, InferenceBackend, Message, SYSTEM_PROMPT};
 pub use llama_cpp::LlamaCppBackend;
 pub use ollama::OllamaBackend;
 pub use openai_compat::OpenAICompatBackend;
 
-use std::path::PathBuf;
-use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
 use crate::cache::{build_cache_scope, ExactCache};
+use crate::config;
 use crate::debug_log;
+use crate::error::{ParamsError, Result};
 use crate::events::{
     BudgetUpdate, CacheUpdate, InferenceEvent, PendingAction, PendingActionKind, ProgressStatus,
     ProgressTrace,
 };
 use crate::hooks::{HookEvent, Hooks};
-use crate::session::SessionStore;
-use crate::config;
-use crate::error::{ParamsError, Result};
 use crate::memory::{compression, facts::FactStore, index::ProjectIndex};
-use crate::tools::{PendingToolAction, ToolRegistry};
+use crate::safety::InspectionReport;
+use crate::session::SessionStore;
+use crate::tools::{BashTool, PendingToolAction, Tool, ToolRegistry, ToolRunResult};
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 pub enum SessionCommand {
     SubmitUser(String),
     InjectUserContext(String),
     RequestShellCommand(String),
+    RequestFileWrite { path: String, content: String },
     SetReflection(bool),
     SetEco(bool),
     SetDebugLogging(bool),
@@ -182,18 +184,19 @@ fn run_idle_index_step(
     }
 }
 
-fn emit_generation_started(
-    token_tx: &Sender<InferenceEvent>,
-    label: &str,
-    show_placeholder: bool,
-) {
+fn emit_generation_started(token_tx: &Sender<InferenceEvent>, label: &str, show_placeholder: bool) {
     let _ = token_tx.send(InferenceEvent::GenerationStarted {
         label: label.to_string(),
         show_placeholder,
     });
 }
 
-fn emit_trace(token_tx: &Sender<InferenceEvent>, status: ProgressStatus, label: &str, persist: bool) {
+fn emit_trace(
+    token_tx: &Sender<InferenceEvent>,
+    status: ProgressStatus,
+    label: &str,
+    persist: bool,
+) {
     match status {
         ProgressStatus::Started => info!(label, "trace.started"),
         ProgressStatus::Updated => debug!(label, "trace.updated"),
@@ -209,10 +212,7 @@ fn emit_trace(token_tx: &Sender<InferenceEvent>, status: ProgressStatus, label: 
 
 /// Persistent model thread — loads the backend once, handles prompts in a loop.
 /// After each response it checks for tool calls and runs a follow-up if needed.
-pub fn model_thread(
-    prompt_rx: Receiver<SessionCommand>,
-    token_tx: Sender<InferenceEvent>,
-) {
+pub fn model_thread(prompt_rx: Receiver<SessionCommand>, token_tx: Sender<InferenceEvent>) {
     let cfg = match config::load_with_profile() {
         Ok(c) => c,
         Err(e) => {
@@ -239,7 +239,10 @@ pub fn model_thread(
     let mut debug_logging_enabled = cfg.debug_logging.content;
     info!(enabled = eco_enabled, "eco initial state");
     info!(enabled = reflection_enabled, "reflection initial state");
-    info!(enabled = debug_logging_enabled, "debug logging initial state");
+    info!(
+        enabled = debug_logging_enabled,
+        "debug logging initial state"
+    );
     let _ = token_tx.send(InferenceEvent::EcoEnabled(eco_enabled));
     let _ = token_tx.send(InferenceEvent::ReflectionEnabled(reflection_enabled));
     let _ = token_tx.send(InferenceEvent::DebugLoggingEnabled(debug_logging_enabled));
@@ -252,7 +255,12 @@ pub fn model_thread(
             .and_then(|n| n.to_str())
             .unwrap_or(config::PROJECT_PROFILE_FILE);
         info!(profile = name, "project profile active");
-        emit_trace(&token_tx, ProgressStatus::Finished, &format!("profile: {name}"), true);
+        emit_trace(
+            &token_tx,
+            ProgressStatus::Finished,
+            &format!("profile: {name}"),
+            true,
+        );
     }
 
     // Build the tool registry — same instance reused across all prompts
@@ -272,9 +280,12 @@ pub fn model_thread(
         .as_ref()
         .and_then(|store| store.get_relevant_facts(&project_name, "", 5).ok())
         .unwrap_or_default();
-    let mut session_messages = vec![Message::system(
-        &build_system_prompt(&tools, &session_facts, &[], eco_enabled),
-    )];
+    let mut session_messages = vec![Message::system(&build_system_prompt(
+        &tools,
+        &session_facts,
+        &[],
+        eco_enabled,
+    ))];
     let mut budget = SessionBudget {
         has_cost_estimate: cfg.backend == "llama_cpp" || cfg.backend == "ollama",
         ..SessionBudget::default()
@@ -289,8 +300,13 @@ pub fn model_thread(
         match store.load() {
             Ok(Some(saved)) => {
                 let restored_count = saved.messages.len();
-                info!(msg_count = restored_count, saved_at = saved.saved_at, "restoring previous session");
-                let display_messages: Vec<(String, String)> = saved.messages
+                info!(
+                    msg_count = restored_count,
+                    saved_at = saved.saved_at,
+                    "restoring previous session"
+                );
+                let display_messages: Vec<(String, String)> = saved
+                    .messages
                     .iter()
                     .map(|m| (m.role.clone(), m.content.clone()))
                     .collect();
@@ -331,9 +347,12 @@ pub fn model_thread(
                     }
                 }
                 session_messages.clear();
-                session_messages.push(Message::system(
-                    &build_system_prompt(&tools, &session_facts, &[], eco_enabled),
-                ));
+                session_messages.push(Message::system(&build_system_prompt(
+                    &tools,
+                    &session_facts,
+                    &[],
+                    eco_enabled,
+                )));
                 budget = SessionBudget {
                     has_cost_estimate: cfg.backend == "llama_cpp" || cfg.backend == "ollama",
                     ..SessionBudget::default()
@@ -350,37 +369,84 @@ pub fn model_thread(
             }
             SessionCommand::RequestShellCommand(command) => {
                 info!("shell command approval requested");
-                let pending = PendingToolAction {
-                    kind: PendingActionKind::ShellCommand,
-                    tool_name: "bash".to_string(),
-                    argument: command.clone(),
-                    display_argument: command.clone(),
-                    title: "Approve shell command".to_string(),
-                    preview: command,
-                };
-                if let Err(e) = handle_pending_action(
-                    &prompt_rx,
-                    &token_tx,
-                    &*backend,
-                    &tools,
-                    exact_cache.as_ref(),
-                    &mut session_messages,
-                    &cfg,
-                    &project_root,
-                    &mut budget,
-                    &mut cache_stats,
-                    debug_logging_enabled,
-                    reflection_enabled,
-                    eco_enabled,
-                    next_action_id,
-                    pending,
-                    false,
-                    &hooks,
-                    index_state.as_mut(),
-                ) {
-                    let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
-                } else {
-                    save_session(session_store.as_ref(), &session_messages, &backend.name());
+                match BashTool.run(&command) {
+                    Ok(ToolRunResult::RequiresApproval(pending)) => {
+                        if let Err(e) = handle_pending_action(
+                            &prompt_rx,
+                            &token_tx,
+                            &*backend,
+                            &tools,
+                            exact_cache.as_ref(),
+                            &mut session_messages,
+                            &cfg,
+                            &project_root,
+                            &mut budget,
+                            &mut cache_stats,
+                            debug_logging_enabled,
+                            reflection_enabled,
+                            eco_enabled,
+                            next_action_id,
+                            pending,
+                            false,
+                            &hooks,
+                            index_state.as_mut(),
+                        ) {
+                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                        } else {
+                            save_session(
+                                session_store.as_ref(),
+                                &session_messages,
+                                &backend.name(),
+                            );
+                        }
+                    }
+                    Ok(ToolRunResult::Immediate(output)) => {
+                        let _ = token_tx.send(InferenceEvent::ContextMessage(output));
+                    }
+                    Err(e) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                }
+                let _ = token_tx.send(InferenceEvent::Done);
+                next_action_id = next_action_id.saturating_add(1);
+                continue;
+            }
+            SessionCommand::RequestFileWrite { path, content } => {
+                info!(path = path.as_str(), "file write approval requested");
+                match crate::tools::build_pending_write_request(&path, &content) {
+                    Ok(pending) => {
+                        if let Err(e) = handle_pending_action(
+                            &prompt_rx,
+                            &token_tx,
+                            &*backend,
+                            &tools,
+                            exact_cache.as_ref(),
+                            &mut session_messages,
+                            &cfg,
+                            &project_root,
+                            &mut budget,
+                            &mut cache_stats,
+                            debug_logging_enabled,
+                            reflection_enabled,
+                            eco_enabled,
+                            next_action_id,
+                            pending,
+                            false,
+                            &hooks,
+                            index_state.as_mut(),
+                        ) {
+                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                        } else {
+                            save_session(
+                                session_store.as_ref(),
+                                &session_messages,
+                                &backend.name(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
                 }
                 let _ = token_tx.send(InferenceEvent::Done);
                 next_action_id = next_action_id.saturating_add(1);
@@ -403,12 +469,12 @@ pub fn model_thread(
                 reflection_enabled = effective_reflection(reflection_requested, eco_enabled);
                 info!(
                     enabled = eco_enabled,
-                    reflection_enabled,
-                    "eco state updated"
+                    reflection_enabled, "eco state updated"
                 );
                 if let Some(first) = session_messages.first_mut() {
                     if first.role == "system" {
-                        first.content = build_system_prompt(&tools, &session_facts, &[], eco_enabled);
+                        first.content =
+                            build_system_prompt(&tools, &session_facts, &[], eco_enabled);
                     }
                 }
                 let _ = token_tx.send(InferenceEvent::EcoEnabled(eco_enabled));
@@ -441,9 +507,8 @@ pub fn model_thread(
                         let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                     }
                     None => {
-                        let _ = token_tx.send(InferenceEvent::Error(
-                            "Cache is unavailable".to_string()
-                        ));
+                        let _ = token_tx
+                            .send(InferenceEvent::Error("Cache is unavailable".to_string()));
                     }
                 }
                 continue;
@@ -451,7 +516,7 @@ pub fn model_thread(
             SessionCommand::ApproveAction(_) | SessionCommand::RejectAction(_) => {
                 warn!("approval command received with no pending action");
                 let _ = token_tx.send(InferenceEvent::Error(
-                    "No action is currently awaiting approval".to_string()
+                    "No action is currently awaiting approval".to_string(),
                 ));
                 continue;
             }
@@ -470,7 +535,11 @@ pub fn model_thread(
 
                 let relevant_summaries = project_index
                     .as_ref()
-                    .and_then(|index| index.find_relevant(&prompt, summary_limit(eco_enabled)).ok())
+                    .and_then(|index| {
+                        index
+                            .find_relevant(&prompt, summary_limit(eco_enabled))
+                            .ok()
+                    })
                     .unwrap_or_default();
 
                 if let Some(first) = session_messages.first_mut() {
@@ -488,7 +557,12 @@ pub fn model_thread(
 
                 // Run generation — collect full response for tool call detection
                 emit_generation_started(&token_tx, "generating...", false);
-                emit_trace(&token_tx, ProgressStatus::Started, "drafting answer...", false);
+                emit_trace(
+                    &token_tx,
+                    ProgressStatus::Started,
+                    "drafting answer...",
+                    false,
+                );
                 hooks.dispatch(HookEvent::BeforeGeneration {
                     backend: backend.name(),
                     message_count: session_messages.len(),
@@ -515,7 +589,12 @@ pub fn model_thread(
 
                 match response {
                     Err(e) => {
-                        emit_trace(&token_tx, ProgressStatus::Failed, "generation failed", false);
+                        emit_trace(
+                            &token_tx,
+                            ProgressStatus::Failed,
+                            "generation failed",
+                            false,
+                        );
                         let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                     }
                     Ok(response) => {
@@ -529,8 +608,7 @@ pub fn model_thread(
                         let full_response = response.text;
                         info!(
                             response_chars = full_response.chars().count(),
-                            reflection_enabled,
-                            "generation completed"
+                            reflection_enabled, "generation completed"
                         );
                         if !response.hit {
                             record_generation_budget(
@@ -542,7 +620,12 @@ pub fn model_thread(
                             );
                         }
 
-                        emit_trace(&token_tx, ProgressStatus::Updated, "scanning tool calls...", false);
+                        emit_trace(
+                            &token_tx,
+                            ProgressStatus::Updated,
+                            "scanning tool calls...",
+                            false,
+                        );
                         // Check if the model used any tools
                         let tool_execution = tools.execute_tool_calls(&full_response);
                         let tool_results = tool_execution.results;
@@ -560,7 +643,12 @@ pub fn model_thread(
                         }
 
                         if let Some(pending) = tool_execution.pending {
-                            emit_trace(&token_tx, ProgressStatus::Updated, "waiting for approval...", false);
+                            emit_trace(
+                                &token_tx,
+                                ProgressStatus::Updated,
+                                "waiting for approval...",
+                                false,
+                            );
                             session_messages.push(Message::assistant(&full_response));
                             if let Some(result_msg) = ToolRegistry::format_results_with_limit(
                                 &tool_results,
@@ -588,7 +676,12 @@ pub fn model_thread(
                                 &hooks,
                                 index_state.as_mut(),
                             ) {
-                                emit_trace(&token_tx, ProgressStatus::Failed, "approval flow failed", false);
+                                emit_trace(
+                                    &token_tx,
+                                    ProgressStatus::Failed,
+                                    "approval flow failed",
+                                    false,
+                                );
                                 let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                             }
                             next_action_id = next_action_id.saturating_add(1);
@@ -596,13 +689,19 @@ pub fn model_thread(
                             &tool_results,
                             eco_tool_result_limit(eco_enabled),
                         ) {
-                            emit_trace(&token_tx, ProgressStatus::Updated, "running tool follow-up...", false);
+                            emit_trace(
+                                &token_tx,
+                                ProgressStatus::Updated,
+                                "running tool follow-up...",
+                                false,
+                            );
                             // Notify the UI that tool calls are being processed
                             let _ = token_tx.send(InferenceEvent::ToolCall(
-                                tool_results.iter()
+                                tool_results
+                                    .iter()
                                     .map(|r| format!("{}({})", r.tool_name, r.argument))
                                     .collect::<Vec<_>>()
-                                    .join(", ")
+                                    .join(", "),
                             ));
 
                             session_messages.push(Message::assistant(&full_response));
@@ -674,20 +773,37 @@ pub fn model_thread(
                                                     &session_messages,
                                                     &final_response,
                                                 );
-                                                session_messages.push(Message::assistant(&final_response));
+                                                session_messages
+                                                    .push(Message::assistant(&final_response));
                                             }
-                                            emit_trace(&token_tx, ProgressStatus::Finished, "answer ready", false);
+                                            emit_trace(
+                                                &token_tx,
+                                                ProgressStatus::Finished,
+                                                "answer ready",
+                                                false,
+                                            );
                                         }
                                         Err(e) => {
                                             warn!(error = %e, "reflection after tool follow-up failed");
-                                            emit_trace(&token_tx, ProgressStatus::Failed, "follow-up failed", false);
-                                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                                            emit_trace(
+                                                &token_tx,
+                                                ProgressStatus::Failed,
+                                                "follow-up failed",
+                                                false,
+                                            );
+                                            let _ =
+                                                token_tx.send(InferenceEvent::Error(e.to_string()));
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "tool follow-up generation failed");
-                                    emit_trace(&token_tx, ProgressStatus::Failed, "tool follow-up failed", false);
+                                    emit_trace(
+                                        &token_tx,
+                                        ProgressStatus::Failed,
+                                        "tool follow-up failed",
+                                        false,
+                                    );
                                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                 }
                             }
@@ -744,11 +860,21 @@ pub fn model_thread(
                                         );
                                         session_messages.push(Message::assistant(&final_response));
                                     }
-                                    emit_trace(&token_tx, ProgressStatus::Finished, "answer ready", false);
+                                    emit_trace(
+                                        &token_tx,
+                                        ProgressStatus::Finished,
+                                        "answer ready",
+                                        false,
+                                    );
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "final response post-processing failed");
-                                    emit_trace(&token_tx, ProgressStatus::Failed, "final answer failed", false);
+                                    emit_trace(
+                                        &token_tx,
+                                        ProgressStatus::Failed,
+                                        "final answer failed",
+                                        false,
+                                    );
                                     let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
                                 }
                             }
@@ -820,7 +946,9 @@ fn handle_pending_action(
         kind: pending.kind.clone(),
         title: pending.title.clone(),
         preview: pending.preview.clone(),
+        inspection: pending.inspection.clone(),
     };
+    dispatch_inspection_hook(hooks, &pending.inspection);
     info!(
         action_id,
         tool = pending.tool_name.as_str(),
@@ -832,19 +960,33 @@ fn handle_pending_action(
         tool_name: pending.tool_name.clone(),
         kind: format!("{:?}", pending.kind),
     });
-    emit_trace(token_tx, ProgressStatus::Started, "awaiting approval...", false);
+    emit_trace(
+        token_tx,
+        ProgressStatus::Started,
+        "awaiting approval...",
+        false,
+    );
     let _ = token_tx.send(InferenceEvent::PendingAction(event));
     let mut index_state = index_state;
 
     loop {
         match prompt_rx.recv() {
             Ok(SessionCommand::ApproveAction(id)) if id == action_id => {
-                info!(action_id, tool = pending.tool_name.as_str(), "pending action approved");
+                info!(
+                    action_id,
+                    tool = pending.tool_name.as_str(),
+                    "pending action approved"
+                );
                 hooks.dispatch(HookEvent::ApprovalResolved {
                     tool_name: pending.tool_name.clone(),
                     approved: true,
                 });
-                emit_trace(token_tx, ProgressStatus::Finished, "approval received", false);
+                emit_trace(
+                    token_tx,
+                    ProgressStatus::Finished,
+                    "approval received",
+                    false,
+                );
                 emit_trace(
                     token_tx,
                     ProgressStatus::Started,
@@ -862,7 +1004,12 @@ fn handle_pending_action(
                     argument_chars: pending.argument.chars().count(),
                     result_chars: result.output.chars().count(),
                 });
-                emit_trace(token_tx, ProgressStatus::Finished, "approved action complete", false);
+                emit_trace(
+                    token_tx,
+                    ProgressStatus::Finished,
+                    "approved action complete",
+                    false,
+                );
                 let _ = token_tx.send(InferenceEvent::ToolCall(format!(
                     "{}({})",
                     result.tool_name, result.argument
@@ -879,7 +1026,12 @@ fn handle_pending_action(
                 }
                 if run_follow_up {
                     emit_generation_started(token_tx, "generating...", true);
-                    emit_trace(token_tx, ProgressStatus::Started, "drafting follow-up...", false);
+                    emit_trace(
+                        token_tx,
+                        ProgressStatus::Started,
+                        "drafting follow-up...",
+                        false,
+                    );
                     let prompt_tokens = estimate_message_tokens(session_messages);
                     let follow_up = generate_with_cache(
                         backend,
@@ -904,7 +1056,12 @@ fn handle_pending_action(
                         );
                     }
                     let final_response = if reflection_enabled {
-                        emit_trace(token_tx, ProgressStatus::Updated, "reflecting final answer...", false);
+                        emit_trace(
+                            token_tx,
+                            ProgressStatus::Updated,
+                            "reflecting final answer...",
+                            false,
+                        );
                         reflect_response(
                             backend,
                             cfg,
@@ -944,7 +1101,11 @@ fn handle_pending_action(
                 return Ok(());
             }
             Ok(SessionCommand::RejectAction(id)) if id == action_id => {
-                info!(action_id, tool = pending.tool_name.as_str(), "pending action rejected");
+                info!(
+                    action_id,
+                    tool = pending.tool_name.as_str(),
+                    "pending action rejected"
+                );
                 hooks.dispatch(HookEvent::ApprovalResolved {
                     tool_name: pending.tool_name.clone(),
                     approved: false,
@@ -960,7 +1121,12 @@ fn handle_pending_action(
                 }
                 if run_follow_up {
                     emit_generation_started(token_tx, "generating...", true);
-                    emit_trace(token_tx, ProgressStatus::Started, "drafting follow-up...", false);
+                    emit_trace(
+                        token_tx,
+                        ProgressStatus::Started,
+                        "drafting follow-up...",
+                        false,
+                    );
                     let follow_up = generate_with_cache(
                         backend,
                         session_messages,
@@ -985,7 +1151,12 @@ fn handle_pending_action(
                         );
                     }
                     let final_response = if reflection_enabled {
-                        emit_trace(token_tx, ProgressStatus::Updated, "reflecting final answer...", false);
+                        emit_trace(
+                            token_tx,
+                            ProgressStatus::Updated,
+                            "reflecting final answer...",
+                            false,
+                        );
                         reflect_response(
                             backend,
                             cfg,
@@ -1026,20 +1197,40 @@ fn handle_pending_action(
             }
             Ok(SessionCommand::ClearSession) => {
                 warn!(action_id, "clear requested while pending action active");
-                emit_trace(token_tx, ProgressStatus::Failed, "approval interrupted", false);
+                emit_trace(
+                    token_tx,
+                    ProgressStatus::Failed,
+                    "approval interrupted",
+                    false,
+                );
                 return Err(ParamsError::Config(
-                    "Cannot clear session while an action is awaiting approval".to_string()
+                    "Cannot clear session while an action is awaiting approval".to_string(),
                 ));
             }
             Ok(_) => {}
             Err(_) => {
-                emit_trace(token_tx, ProgressStatus::Failed, "approval channel closed", false);
+                emit_trace(
+                    token_tx,
+                    ProgressStatus::Failed,
+                    "approval channel closed",
+                    false,
+                );
                 return Err(ParamsError::Inference(
-                    "Approval channel closed while waiting for user decision".to_string()
+                    "Approval channel closed while waiting for user decision".to_string(),
                 ));
             }
         }
     }
+}
+
+fn dispatch_inspection_hook(hooks: &Hooks, inspection: &InspectionReport) {
+    hooks.dispatch(HookEvent::InspectionEvaluated {
+        operation: inspection.operation.clone(),
+        decision: inspection.decision.to_string(),
+        risk: inspection.risk.to_string(),
+        target_count: inspection.targets.len() + inspection.network_targets.len(),
+        blocked_reason_count: inspection.reasons.len(),
+    });
 }
 
 fn estimate_message_tokens(messages: &[Message]) -> usize {
@@ -1067,11 +1258,19 @@ fn effective_reflection(reflection_requested: bool, eco_enabled: bool) -> bool {
 }
 
 fn summary_limit(eco_enabled: bool) -> usize {
-    if eco_enabled { 2 } else { 4 }
+    if eco_enabled {
+        2
+    } else {
+        4
+    }
 }
 
 fn eco_tool_result_limit(eco_enabled: bool) -> Option<usize> {
-    if eco_enabled { Some(1200) } else { None }
+    if eco_enabled {
+        Some(1200)
+    } else {
+        None
+    }
 }
 
 fn estimate_generation_cost_usd(
@@ -1083,10 +1282,7 @@ fn estimate_generation_cost_usd(
         "llama_cpp" | "ollama" => Some(0.0),
         "openai_compat" => {
             let input = cfg.budget.input_cost_per_million?;
-            let output = cfg
-                .budget
-                .output_cost_per_million
-                .unwrap_or(input);
+            let output = cfg.budget.output_cost_per_million.unwrap_or(input);
 
             Some(
                 (prompt_tokens as f64 / 1_000_000.0) * input
@@ -1120,7 +1316,9 @@ fn emit_budget_update(budget: &SessionBudget, token_tx: &Sender<InferenceEvent>)
     let _ = token_tx.send(InferenceEvent::Budget(BudgetUpdate {
         prompt_tokens: budget.prompt_tokens,
         completion_tokens: budget.completion_tokens,
-        total_tokens: budget.prompt_tokens.saturating_add(budget.completion_tokens),
+        total_tokens: budget
+            .prompt_tokens
+            .saturating_add(budget.completion_tokens),
         estimated_cost_usd: if budget.has_cost_estimate {
             Some(budget.estimated_cost_usd)
         } else {
@@ -1129,11 +1327,7 @@ fn emit_budget_update(budget: &SessionBudget, token_tx: &Sender<InferenceEvent>)
     }));
 }
 
-fn emit_cache_update(
-    stats: &SessionCacheStats,
-    last_hit: bool,
-    token_tx: &Sender<InferenceEvent>,
-) {
+fn emit_cache_update(stats: &SessionCacheStats, last_hit: bool, token_tx: &Sender<InferenceEvent>) {
     let _ = token_tx.send(InferenceEvent::Cache(CacheUpdate {
         last_hit,
         hits: stats.hits,
@@ -1162,9 +1356,10 @@ fn prompt_level_cache_key<'a>(messages: &'a [Message]) -> Option<(&'a str, &'a s
         return None;
     }
 
-    if messages.iter().any(|message| {
-        message.role == "user" && is_injected_context_message(&message.content)
-    }) {
+    if messages
+        .iter()
+        .any(|message| message.role == "user" && is_injected_context_message(&message.content))
+    {
         return None;
     }
 
@@ -1215,7 +1410,13 @@ fn store_prompt_level_cache(
         return;
     };
 
-    if let Err(e) = cache.put_prompt_level(backend_name, system_prompt, user_prompt, response, &cache_scope) {
+    if let Err(e) = cache.put_prompt_level(
+        backend_name,
+        system_prompt,
+        user_prompt,
+        response,
+        &cache_scope,
+    ) {
         warn!(error = %e, "prompt-level cache store failed");
     }
 }
@@ -1266,8 +1467,8 @@ fn generate_with_cache(
     if let (Some(cache), Some(cache_scope)) = (exact_cache, cache_scope.as_ref()) {
         match cache.get(&backend.name(), messages, cache_scope) {
             Ok(Some(cached)) => {
-                let saved = estimate_message_tokens(messages)
-                    .saturating_add(estimate_text_tokens(&cached));
+                let saved =
+                    estimate_message_tokens(messages).saturating_add(estimate_text_tokens(&cached));
                 cache_stats.hits = cache_stats.hits.saturating_add(1);
                 cache_stats.tokens_saved = cache_stats.tokens_saved.saturating_add(saved);
                 info!(saved_tokens = saved, "exact cache hit");
@@ -1290,7 +1491,12 @@ fn generate_with_cache(
 
         if matches!(cache_mode, CacheMode::PreferPromptLevel) {
             if let Some((system_prompt, user_prompt)) = prompt_level_cache_key(messages) {
-                match cache.get_prompt_level(&backend.name(), system_prompt, user_prompt, cache_scope) {
+                match cache.get_prompt_level(
+                    &backend.name(),
+                    system_prompt,
+                    user_prompt,
+                    cache_scope,
+                ) {
                     Ok(Some(cached)) => {
                         let saved = estimate_message_tokens(messages)
                             .saturating_add(estimate_text_tokens(&cached));
@@ -1314,7 +1520,12 @@ fn generate_with_cache(
                     }
                 }
 
-                match cache.get_semantic_prompt_level(&backend.name(), system_prompt, user_prompt, cache_scope) {
+                match cache.get_semantic_prompt_level(
+                    &backend.name(),
+                    system_prompt,
+                    user_prompt,
+                    cache_scope,
+                ) {
                     Ok(Some(cached)) => {
                         let saved = estimate_message_tokens(messages)
                             .saturating_add(estimate_text_tokens(&cached));
@@ -1400,15 +1611,16 @@ fn run_and_collect(
     });
 
     backend.generate(messages, intercept_tx)?;
-    relay.join().map_err(|_| {
-        ParamsError::Inference("token relay thread panicked".to_string())
-    })?;
+    relay
+        .join()
+        .map_err(|_| ParamsError::Inference("token relay thread panicked".to_string()))?;
 
-    let result = buffer.lock()
-        .map(|b| b.clone())
-        .unwrap_or_default();
+    let result = buffer.lock().map(|b| b.clone()).unwrap_or_default();
 
-    debug!(chars = result.chars().count(), stream_tokens, "run_and_collect completed");
+    debug!(
+        chars = result.chars().count(),
+        stream_tokens, "run_and_collect completed"
+    );
 
     Ok(result)
 }
@@ -1428,7 +1640,10 @@ fn reflect_response(
         return Ok(String::new());
     }
 
-    info!(draft_chars = draft.chars().count(), "reflection pass started");
+    info!(
+        draft_chars = draft.chars().count(),
+        "reflection pass started"
+    );
     let reflection_messages = build_reflection_messages(session_messages, draft);
     let prompt_tokens = estimate_message_tokens(&reflection_messages);
     emit_generation_started(token_tx, "reflecting...", false);
@@ -1451,7 +1666,10 @@ fn reflect_response(
         warn!("reflection returned empty or meta response, falling back to draft");
         Ok(draft.to_string())
     } else {
-        info!(chars = reflected.text.chars().count(), "reflection pass completed");
+        info!(
+            chars = reflected.text.chars().count(),
+            "reflection pass completed"
+        );
         Ok(reflected.text)
     }
 }
@@ -1510,7 +1728,10 @@ mod tests {
         let reflection = build_reflection_messages(&session_messages, "final draft");
 
         assert_eq!(reflection[0].role, "system");
-        assert!(!reflection.iter().skip(1).any(|m| m.content == "tool-heavy system prompt"));
+        assert!(!reflection
+            .iter()
+            .skip(1)
+            .any(|m| m.content == "tool-heavy system prompt"));
         assert_eq!(reflection[1].role, "user");
         assert_eq!(reflection[1].content, "question");
         assert_eq!(reflection[2].role, "assistant");
@@ -1526,7 +1747,9 @@ mod tests {
             "The draft is already good. No further edits needed."
         ));
         assert!(looks_like_reflection_meta("No changes needed."));
-        assert!(!looks_like_reflection_meta("A pointer stores the memory address of another value."));
+        assert!(!looks_like_reflection_meta(
+            "A pointer stores the memory address of another value."
+        ));
     }
 
     #[test]
@@ -1637,9 +1860,9 @@ fn load_backend_with_fallback(
         "ollama" => {
             let backend = OllamaBackend::new(&cfg.ollama.url, &cfg.ollama.model);
             if let Err(e) = backend.health_check() {
-                let _ = token_tx.send(InferenceEvent::Error(
-                    format!("Ollama failed: {e} — falling back to llama.cpp")
-                ));
+                let _ = token_tx.send(InferenceEvent::Error(format!(
+                    "Ollama failed: {e} — falling back to llama.cpp"
+                )));
                 load_llama_cpp_backend(cfg)
             } else {
                 Ok(Box::new(backend))

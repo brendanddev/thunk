@@ -8,9 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers,
-    },
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -24,6 +22,10 @@ use ratatui::{
 };
 use tracing::{info, warn};
 
+use crate::commands::{
+    builtin_command_specs, resolve_builtin_command, BuiltinKind, CommandRegistry, CustomCommand,
+    CustomCommandBody, CustomCommandStep,
+};
 use crate::error::{ParamsError, Result};
 use crate::events::{InferenceEvent, PendingActionKind, ProgressStatus, ProgressTrace};
 use crate::inference::SessionCommand;
@@ -31,51 +33,39 @@ use state::{AppState, Role};
 
 // Spinner frames
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SLASH_COMMANDS: &[&str] = &[
-    "/read",
-    "/r",
-    "/ls",
-    "/list",
-    "/search",
-    "/s",
-    "/grep",
-    "/git",
-    "/diag",
-    "/lsp",
-    "/hover",
-    "/def",
-    "/definition",
-    "/lcheck",
-    "/lsp-check",
-    "/run",
-    "/bash",
-    "/reflect",
-    "/eco",
-    "/debug-log",
-    "/fetch",
-    "/web",
-    "/approve",
-    "/reject",
-    "/clear",
-    "/c",
-    "/clear-cache",
-    "/cache-clear",
-    "/clear-debug-log",
-    "/help",
-    "/h",
-    "/?",
-];
+const MAX_INPUT_VISIBLE_ROWS: usize = 8;
 
 // How often to advance the spinner (every N ticks at ~60fps = ~100ms per frame)
 const SPINNER_SPEED: u64 = 6;
 
 enum SlashJobOutcome {
+    Trace(ProgressTrace),
     Context {
-        finished_trace: String,
+        finished_trace: ProgressTrace,
         context: String,
     },
+    ContextBatch {
+        finished_trace: ProgressTrace,
+        contexts: Vec<String>,
+    },
+    WorkflowPrompt {
+        finished_trace: ProgressTrace,
+        contexts: Vec<String>,
+        prompt: String,
+    },
+    WorkflowShell {
+        finished_trace: ProgressTrace,
+        contexts: Vec<String>,
+        command: String,
+    },
+    WorkflowWrite {
+        finished_trace: ProgressTrace,
+        contexts: Vec<String>,
+        path: String,
+        content: String,
+    },
     Error {
-        failed_trace: String,
+        failed_trace: ProgressTrace,
         message: String,
     },
 }
@@ -186,7 +176,11 @@ pub fn run() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_app(&mut terminal)));
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
     info!("tui exiting");
     match result {
@@ -199,6 +193,7 @@ pub fn run() -> Result<()> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut state = AppState::new();
+    let mut command_registry = CommandRegistry::load();
 
     let (token_tx, token_rx) = mpsc::channel::<InferenceEvent>();
     let (prompt_tx, prompt_rx) = mpsc::channel::<SessionCommand>();
@@ -227,7 +222,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 InferenceEvent::Ready => {
                     state.set_status("ready");
                 }
-                InferenceEvent::SessionRestored { display_messages, saved_at } => {
+                InferenceEvent::SessionRestored {
+                    display_messages,
+                    saved_at,
+                } => {
                     state.restore_session(display_messages, saved_at);
                 }
                 InferenceEvent::BackendName(name) => {
@@ -279,16 +277,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     );
                 }
                 InferenceEvent::PendingAction(action) => {
-                    let title = action.title.clone();
-                    let preview = action.preview.clone();
-                    let kind = match action.kind {
-                        PendingActionKind::ShellCommand => "shell command",
-                        PendingActionKind::FileWrite => "file write",
-                    };
                     state.set_pending_action(action);
-                    state.add_system_message(&format!(
-                        "Pending {kind}:\n{title}\nUse /approve or /reject.\n\n{preview}"
-                    ));
                 }
                 InferenceEvent::Done => {
                     state.clear_pending_action();
@@ -303,30 +292,83 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
         while let Ok(outcome) = slash_rx.try_recv() {
             match outcome {
+                SlashJobOutcome::Trace(trace) => {
+                    state.apply_trace(trace);
+                }
                 SlashJobOutcome::Context {
                     finished_trace,
                     context,
                 } => {
-                    info!(label = finished_trace.as_str(), "trace.finished");
-                    state.apply_trace(ProgressTrace {
-                        status: ProgressStatus::Finished,
-                        label: finished_trace,
-                        persist: true,
-                    });
+                    info!(label = finished_trace.label.as_str(), "trace.finished");
+                    state.apply_trace(finished_trace);
                     state.add_user_message(&context);
                     let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
                     state.finish_response();
+                }
+                SlashJobOutcome::ContextBatch {
+                    finished_trace,
+                    contexts,
+                } => {
+                    info!(label = finished_trace.label.as_str(), "trace.finished");
+                    state.apply_trace(finished_trace);
+                    for context in contexts {
+                        state.add_user_message(&context);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    }
+                    state.finish_response();
+                }
+                SlashJobOutcome::WorkflowPrompt {
+                    finished_trace,
+                    contexts,
+                    prompt,
+                } => {
+                    info!(label = finished_trace.label.as_str(), "trace.finished");
+                    state.apply_trace(finished_trace);
+                    for context in contexts {
+                        state.add_user_message(&context);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    }
+                    state.add_user_message(&prompt);
+                    let _ = prompt_tx.send(SessionCommand::SubmitUser(prompt));
+                    state.start_generation("generating...", true);
+                }
+                SlashJobOutcome::WorkflowShell {
+                    finished_trace,
+                    contexts,
+                    command,
+                } => {
+                    info!(label = finished_trace.label.as_str(), "trace.finished");
+                    state.apply_trace(finished_trace);
+                    for context in contexts {
+                        state.add_user_message(&context);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    }
+                    let _ = prompt_tx.send(SessionCommand::RequestShellCommand(command));
+                }
+                SlashJobOutcome::WorkflowWrite {
+                    finished_trace,
+                    contexts,
+                    path,
+                    content,
+                } => {
+                    info!(label = finished_trace.label.as_str(), "trace.finished");
+                    state.apply_trace(finished_trace);
+                    for context in contexts {
+                        state.add_user_message(&context);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    }
+                    let _ = prompt_tx.send(SessionCommand::RequestFileWrite { path, content });
                 }
                 SlashJobOutcome::Error {
                     failed_trace,
                     message,
                 } => {
-                    warn!(label = failed_trace.as_str(), message = message.as_str(), "trace.failed");
-                    state.apply_trace(ProgressTrace {
-                        status: ProgressStatus::Failed,
-                        label: failed_trace,
-                        persist: true,
-                    });
+                    warn!(
+                        label = failed_trace.label.as_str(),
+                        message = message.as_str(),
+                        "trace.failed"
+                    );
+                    state.apply_trace(failed_trace);
                     state.add_system_message(&message);
                     state.finish_response();
                 }
@@ -348,16 +390,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                             return Ok(());
                         }
 
+                        // Shift+Enter — newline when the terminal reports it
+                        (KeyCode::Enter, KeyModifiers::SHIFT) => {
+                            if !state.is_generating && state.is_ready() {
+                                state.insert_newline();
+                            }
+                        }
+
                         // Submit
                         (KeyCode::Enter, _) => {
                             if !state.input.is_empty() && !state.is_generating && state.is_ready() {
                                 let prompt = state.submit_input();
 
                                 if state.pending_action.is_some()
-                                    && !matches!(
-                                        prompt.as_str(),
-                                        "/approve" | "/reject"
-                                    )
+                                    && !matches!(prompt.as_str(), "/approve" | "/reject")
                                     && !prompt.starts_with("/approve ")
                                     && !prompt.starts_with("/reject ")
                                 {
@@ -371,12 +417,26 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                                 // These run tools directly and inject results into context
                                 // without requiring the model to format a tool call tag.
                                 if prompt.starts_with('/') {
-                                    handle_slash_command(&prompt, &mut state, &prompt_tx, &slash_tx);
+                                    handle_command_input(
+                                        &prompt,
+                                        &mut state,
+                                        &prompt_tx,
+                                        &slash_tx,
+                                        &mut command_registry,
+                                    );
                                 } else {
                                     state.add_user_message(&prompt);
-                                    let _ = prompt_tx.send(SessionCommand::SubmitUser(prompt.clone()));
+                                    let _ =
+                                        prompt_tx.send(SessionCommand::SubmitUser(prompt.clone()));
                                     state.start_generation("generating...", true);
                                 }
+                            }
+                        }
+
+                        // Ctrl+J — newline fallback for multiline input
+                        (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                            if !state.is_generating && state.is_ready() {
+                                state.insert_newline();
                             }
                         }
 
@@ -458,12 +518,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         // Tab / Shift+Tab — autocomplete slash commands
                         (KeyCode::Tab, KeyModifiers::NONE) => {
                             if state.is_ready() && !state.is_generating {
-                                state.autocomplete_command(SLASH_COMMANDS, false);
+                                let autocomplete_names = command_registry.autocomplete_names();
+                                state.autocomplete_command(&autocomplete_names, false);
                             }
                         }
                         (KeyCode::BackTab, _) => {
                             if state.is_ready() && !state.is_generating {
-                                state.autocomplete_command(SLASH_COMMANDS, true);
+                                let autocomplete_names = command_registry.autocomplete_names();
+                                state.autocomplete_command(&autocomplete_names, true);
                             }
                         }
 
@@ -479,8 +541,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
                 // Handle paste events
                 Event::Paste(text) => {
-                    // Strip newlines from paste — treat as single line
-                    let clean: String = text.chars().filter(|&c| c != '\n' && c != '\r').collect();
+                    let clean = AppState::normalized_paste(&text);
                     state.insert_str(&clean);
                 }
 
@@ -532,11 +593,12 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         state.status.clone()
     };
 
-    let status_color = if state.pending_action.is_some() || state.is_generating || !state.model_ready {
-        Color::Yellow
-    } else {
-        Color::Green
-    };
+    let status_color =
+        if state.pending_action.is_some() || state.is_generating || !state.model_ready {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
 
     // Truncate backend name to fit sidebar
     let backend_display = truncate_for_width(&state.backend_name, 18);
@@ -603,7 +665,11 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled("refl  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                if state.reflection_enabled { "on" } else { "off" },
+                if state.reflection_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
                 Style::default().fg(Color::White),
             ),
         ])),
@@ -617,7 +683,11 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled("dlog  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                if state.debug_logging_enabled { "on" } else { "off" },
+                if state.debug_logging_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
                 Style::default().fg(Color::White),
             ),
         ])),
@@ -686,7 +756,11 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
 
     for trace in state.recent_traces.iter().take(3) {
         let icon = if trace.success { "  ✓ " } else { "  ✕ " };
-        let color = if trace.success { Color::Green } else { Color::Red };
+        let color = if trace.success {
+            Color::Green
+        } else {
+            Color::Red
+        };
         items.push(ListItem::new(Line::from(vec![
             Span::styled(icon, Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -706,6 +780,14 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled("enter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("send", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("S-enter", Style::default().fg(Color::DarkGray)),
+            Span::styled(" newline", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("^j     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("newline", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
             Span::styled("↑↓ pg  ", Style::default().fg(Color::DarkGray)),
@@ -774,6 +856,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(" <cmd>", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
+            Span::styled("/write ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" <p> <text>", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
             Span::styled("/reflect", Style::default().fg(Color::DarkGray)),
             Span::styled(" on|off", Style::default().fg(Color::DarkGray)),
         ])),
@@ -784,6 +870,10 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled("/debug-log", Style::default().fg(Color::DarkGray)),
             Span::styled(" on|off", Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("/commands", Style::default().fg(Color::DarkGray)),
+            Span::styled(" list", Style::default().fg(Color::DarkGray)),
         ])),
         ListItem::new(Line::from(vec![
             Span::styled("write_file", Style::default().fg(Color::DarkGray)),
@@ -811,13 +901,28 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_main(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    let input_height = if state.autocomplete_hint().is_some() { 4 } else { 3 };
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(input_height)])
-        .split(area);
-    draw_chat(frame, state, vertical[0]);
-    draw_input(frame, state, vertical[1]);
+    let input_height = input_area_height(state, area.width.saturating_sub(2) as usize);
+    if state.has_pending_action() {
+        let card_height = pending_action_height(state, area.width.saturating_sub(2) as usize);
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(card_height),
+                Constraint::Length(input_height),
+            ])
+            .split(area);
+        draw_chat(frame, state, vertical[0]);
+        draw_pending_action(frame, state, vertical[1]);
+        draw_input(frame, state, vertical[2]);
+    } else {
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(input_height)])
+            .split(area);
+        draw_chat(frame, state, vertical[0]);
+        draw_input(frame, state, vertical[1]);
+    }
 }
 
 fn draw_chat(frame: &mut Frame, state: &mut AppState, area: Rect) {
@@ -943,10 +1048,13 @@ fn draw_chat(frame: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
+    let is_multiline = state.input.contains('\n');
     let (title, border_color) = if !state.model_ready {
         (" loading... ", Color::DarkGray)
     } else if state.is_generating {
         (" generating... ", Color::Yellow)
+    } else if is_multiline {
+        (" message (multiline) ", Color::Cyan)
     } else {
         (" message ", Color::DarkGray)
     };
@@ -956,47 +1064,248 @@ fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(title, Style::default().fg(border_color)));
 
-    // Show input with cursor position indicated by █
-    let before_cursor = &state.input[..state.cursor];
-    let after_cursor = &state.input[state.cursor..];
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let max_visible_rows = max_input_content_rows(area);
+    let (visible_rows, cursor_row, cursor_col) =
+        state.input_display_lines(inner_width, max_visible_rows);
+    let dimmed = state.is_generating || !state.model_ready;
+    let mut lines = Vec::new();
 
-    let input_spans = if state.is_generating || !state.model_ready {
-        // Dimmed when not accepting input
-        vec![Span::styled(
-            state.input.clone(),
-            Style::default().fg(Color::DarkGray),
-        )]
-    } else if after_cursor.is_empty() {
-        vec![
-            Span::styled(before_cursor.to_string(), Style::default().fg(Color::White)),
-            Span::styled(
-                "█",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ),
-        ]
-    } else {
-        let mut chars = after_cursor.chars();
-        let at_cursor = chars.next().unwrap_or(' ').to_string();
-        let rest: String = chars.collect();
-        vec![
-            Span::styled(before_cursor.to_string(), Style::default().fg(Color::White)),
-            Span::styled(
-                at_cursor,
-                Style::default().fg(Color::Black).bg(Color::White),
-            ),
-            Span::styled(rest, Style::default().fg(Color::White)),
-        ]
-    };
+    for (row_idx, row_text) in visible_rows.iter().enumerate() {
+        let mut row_spans = Vec::new();
+        let style = if dimmed {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
 
-    let mut lines = vec![Line::from(input_spans)];
+        if row_idx == cursor_row && !dimmed {
+            let safe_col = cursor_col.min(row_text.chars().count());
+            let before: String = row_text.chars().take(safe_col).collect();
+            let after: String = row_text.chars().skip(safe_col).collect();
+            if after.is_empty() {
+                row_spans.push(Span::styled(before, style));
+                row_spans.push(Span::styled(
+                    "█",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ));
+            } else {
+                let mut after_chars = after.chars();
+                let at_cursor = after_chars.next().unwrap_or(' ');
+                let rest: String = after_chars.collect();
+                row_spans.push(Span::styled(before, style));
+                row_spans.push(Span::styled(
+                    at_cursor.to_string(),
+                    Style::default().fg(Color::Black).bg(Color::White),
+                ));
+                row_spans.push(Span::styled(rest, style));
+            }
+        } else if row_idx == cursor_row && dimmed && row_text.is_empty() {
+            row_spans.push(Span::styled(String::new(), style));
+        } else {
+            row_spans.push(Span::styled(row_text.clone(), style));
+        }
+
+        lines.push(Line::from(row_spans));
+    }
+
     if let Some(hint) = state.autocomplete_hint() {
         lines.push(Line::from(Span::styled(
             format!("  {hint}"),
             Style::default().fg(Color::DarkGray),
         )));
     }
+    if !dimmed {
+        let multiline_hint = if is_multiline {
+            "  Enter sends • Shift+Enter / Ctrl+J add newline"
+        } else {
+            "  Enter sends • Shift+Enter / Ctrl+J for multiline"
+        };
+        lines.push(Line::from(Span::styled(
+            multiline_hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn input_area_height(state: &AppState, width: usize) -> u16 {
+    let content_rows = state.input_content_rows(width).min(MAX_INPUT_VISIBLE_ROWS);
+    let hint_rows = if state.autocomplete_hint().is_some() {
+        2
+    } else {
+        1
+    };
+    (content_rows + hint_rows + 2).max(3) as u16
+}
+
+fn max_input_content_rows(area: Rect) -> usize {
+    area.height.saturating_sub(2) as usize
+}
+
+fn pending_action_height(state: &AppState, width: usize) -> u16 {
+    let Some(pending) = state.pending_action.as_ref() else {
+        return 0;
+    };
+
+    let mut lines = 6usize;
+    lines += wrap_plain_text(&pending.title, width).len();
+    lines += 1;
+    lines += wrap_plain_text(&pending.inspection.summary, width).len();
+    if !pending.inspection.targets.is_empty() {
+        lines += wrap_plain_text(
+            &format!("Targets: {}", pending.inspection.targets.join(", ")),
+            width,
+        )
+        .len();
+    }
+    if !pending.inspection.segments.is_empty() {
+        lines += wrap_plain_text(
+            &format!("Segments: {}", pending.inspection.segments.join(" | ")),
+            width,
+        )
+        .len();
+    }
+    if !pending.inspection.network_targets.is_empty() {
+        lines += wrap_plain_text(
+            &format!("Network: {}", pending.inspection.network_targets.join(", ")),
+            width,
+        )
+        .len();
+    }
+    for reason in &pending.inspection.reasons {
+        lines += wrap_plain_text(&format!("- {reason}"), width).len();
+    }
+
+    let preview_max_lines = match pending.kind {
+        PendingActionKind::ShellCommand => 2,
+        PendingActionKind::FileWrite => 8,
+    };
+    lines += pending_preview_lines(&pending.preview, width, preview_max_lines).len();
+    lines += 2;
+
+    lines.clamp(10, 20) as u16
+}
+
+fn pending_preview_lines(preview: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for raw_line in preview.lines() {
+        lines.extend(wrap_plain_text(raw_line, width));
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if lines.len() > max_lines {
+        let mut truncated = lines[..max_lines.saturating_sub(1)].to_vec();
+        truncated.push("[preview truncated]".to_string());
+        truncated
+    } else {
+        lines
+    }
+}
+
+fn draw_pending_action(frame: &mut Frame, state: &AppState, area: Rect) {
+    let Some(pending) = state.pending_action.as_ref() else {
+        return;
+    };
+
+    let (accent, title) = match pending.inspection.risk {
+        crate::safety::RiskLevel::Low => (Color::Cyan, " pending approval "),
+        crate::safety::RiskLevel::Medium => (Color::Yellow, " pending approval "),
+        crate::safety::RiskLevel::High => (Color::Red, " pending approval "),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .title(Span::styled(
+            title,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let mut lines = Vec::new();
+
+    push_wrapped_styled(
+        &mut lines,
+        &pending.title,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        inner_width,
+    );
+    lines.push(Line::from(Span::styled(
+        format!(
+            "Policy: {} / {} risk",
+            pending.inspection.decision, pending.inspection.risk
+        ),
+        Style::default().fg(accent),
+    )));
+    push_wrapped_styled(
+        &mut lines,
+        &format!("Summary: {}", pending.inspection.summary),
+        Style::default().fg(Color::Gray),
+        inner_width,
+    );
+
+    if !pending.inspection.targets.is_empty() {
+        push_wrapped_styled(
+            &mut lines,
+            &format!("Targets: {}", pending.inspection.targets.join(", ")),
+            Style::default().fg(Color::DarkGray),
+            inner_width,
+        );
+    }
+    if !pending.inspection.segments.is_empty() {
+        push_wrapped_styled(
+            &mut lines,
+            &format!("Segments: {}", pending.inspection.segments.join(" | ")),
+            Style::default().fg(Color::DarkGray),
+            inner_width,
+        );
+    }
+    if !pending.inspection.network_targets.is_empty() {
+        push_wrapped_styled(
+            &mut lines,
+            &format!("Network: {}", pending.inspection.network_targets.join(", ")),
+            Style::default().fg(Color::DarkGray),
+            inner_width,
+        );
+    }
+    if !pending.inspection.reasons.is_empty() {
+        for reason in &pending.inspection.reasons {
+            push_wrapped_styled(
+                &mut lines,
+                &format!("- {reason}"),
+                Style::default().fg(Color::DarkGray),
+                inner_width,
+            );
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    let preview_max_lines = match pending.kind {
+        PendingActionKind::ShellCommand => 2,
+        PendingActionKind::FileWrite => 8,
+    };
+    let preview_style = match pending.kind {
+        PendingActionKind::ShellCommand => Style::default().fg(Color::White),
+        PendingActionKind::FileWrite => Style::default().fg(Color::Gray),
+    };
+    for line in pending_preview_lines(&pending.preview, inner_width, preview_max_lines) {
+        lines.push(Line::from(Span::styled(line, preview_style)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Ctrl+Y approve, Ctrl+N reject, or use /approve /reject",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let paragraph = Paragraph::new(Text::from(lines)).block(block);
     frame.render_widget(paragraph, area);
@@ -1041,7 +1350,43 @@ fn sanitize_for_display(s: &str) -> String {
     result
 }
 
-fn run_tool_immediate<T: crate::tools::Tool>(tool: T, arg: &str) -> std::result::Result<String, String> {
+fn decode_slash_write_content(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek().copied() {
+                Some('n') => {
+                    chars.next();
+                    output.push('\n');
+                }
+                Some('t') => {
+                    chars.next();
+                    output.push('\t');
+                }
+                Some('\\') => {
+                    chars.next();
+                    output.push('\\');
+                }
+                Some('"') => {
+                    chars.next();
+                    output.push('"');
+                }
+                _ => output.push(ch),
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+
+    output
+}
+
+fn run_tool_immediate<T: crate::tools::Tool>(
+    tool: T,
+    arg: &str,
+) -> std::result::Result<String, String> {
     match crate::tools::Tool::run(&tool, arg) {
         Ok(crate::tools::ToolRunResult::Immediate(output)) => Ok(output),
         Ok(crate::tools::ToolRunResult::RequiresApproval(_)) => {
@@ -1051,38 +1396,62 @@ fn run_tool_immediate<T: crate::tools::Tool>(tool: T, arg: &str) -> std::result:
     }
 }
 
-fn spawn_slash_context_job<F>(
-    state: &mut AppState,
-    slash_tx: &mpsc::Sender<SlashJobOutcome>,
-    running_status: &str,
+type SlashWork = Box<dyn FnOnce() -> std::result::Result<String, String> + Send>;
+
+struct SlashContextSpec {
+    running_status: String,
     started_trace: String,
     finished_trace: String,
     failed_trace: String,
     context_prefix: String,
-    work: F,
-) where
-    F: FnOnce() -> std::result::Result<String, String> + Send + 'static,
-{
-    state.start_generation(running_status, false);
-    info!(label = started_trace.as_str(), "trace.started");
-    state.apply_trace(ProgressTrace {
-        status: ProgressStatus::Started,
-        label: started_trace,
-        persist: false,
-    });
+    work: SlashWork,
+}
+
+fn make_trace(status: ProgressStatus, label: impl Into<String>, persist: bool) -> ProgressTrace {
+    ProgressTrace {
+        status,
+        label: label.into(),
+        persist,
+    }
+}
+
+fn parse_command_parts(input: &str) -> (String, &str) {
+    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+    let cmd = parts[0].to_lowercase();
+    let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    (cmd, arg)
+}
+
+fn spawn_slash_context_job(
+    state: &mut AppState,
+    slash_tx: &mpsc::Sender<SlashJobOutcome>,
+    spec: SlashContextSpec,
+    persist: bool,
+) {
+    state.start_generation(&spec.running_status, false);
+    info!(label = spec.started_trace.as_str(), "trace.started");
+    state.apply_trace(make_trace(
+        ProgressStatus::Started,
+        spec.started_trace.clone(),
+        false,
+    ));
     let tx = slash_tx.clone();
     thread::spawn(move || {
-        let outcome = match work() {
+        let outcome = match (spec.work)() {
             Ok(output) => {
                 let safe = sanitize_for_display(&output);
-                let context = format!("{context_prefix}\n\n{safe}");
+                let context = format!("{}\n\n{safe}", spec.context_prefix);
                 SlashJobOutcome::Context {
-                    finished_trace,
+                    finished_trace: make_trace(
+                        ProgressStatus::Finished,
+                        spec.finished_trace,
+                        persist,
+                    ),
                     context,
                 }
             }
             Err(error) => SlashJobOutcome::Error {
-                failed_trace,
+                failed_trace: make_trace(ProgressStatus::Failed, spec.failed_trace, persist),
                 message: error,
             },
         };
@@ -1090,176 +1459,498 @@ fn spawn_slash_context_job<F>(
     });
 }
 
-fn handle_slash_command(
+fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
+    let canonical = resolve_builtin_command(cmd)?.canonical;
+    match canonical {
+        "/read" => {
+            if arg.is_empty() {
+                return None;
+            }
+            let arg_owned = arg.to_string();
+            Some(SlashContextSpec {
+                running_status: "reading file...".to_string(),
+                started_trace: format!("reading {arg}"),
+                finished_trace: format!("loaded {arg}"),
+                failed_trace: format!("read failed for {arg}"),
+                context_prefix: "I've loaded this file for context:".to_string(),
+                work: Box::new(move || {
+                    run_tool_immediate(crate::tools::ReadFile, &arg_owned)
+                        .map_err(|e| format!("error reading {arg_owned}: {e}"))
+                }),
+            })
+        }
+        "/ls" => {
+            let path = if arg.is_empty() { "." } else { arg };
+            let path_owned = path.to_string();
+            Some(SlashContextSpec {
+                running_status: "listing directory...".to_string(),
+                started_trace: format!("listing {path}"),
+                finished_trace: format!("listed {path}"),
+                failed_trace: format!("list failed for {path}"),
+                context_prefix: "Directory listing:".to_string(),
+                work: Box::new(move || {
+                    run_tool_immediate(crate::tools::ListDir, &path_owned)
+                        .map_err(|e| format!("error listing {path_owned}: {e}"))
+                }),
+            })
+        }
+        "/search" => {
+            if arg.is_empty() {
+                return None;
+            }
+            let arg_owned = arg.to_string();
+            Some(SlashContextSpec {
+                running_status: "searching code...".to_string(),
+                started_trace: format!("searching for {arg}"),
+                finished_trace: format!("search complete for {arg}"),
+                failed_trace: format!("search failed for {arg}"),
+                context_prefix: "Search results:".to_string(),
+                work: Box::new(move || {
+                    run_tool_immediate(crate::tools::SearchCode, &arg_owned)
+                        .map_err(|e| format!("error searching: {e}"))
+                }),
+            })
+        }
+        "/git" => {
+            let git_arg = if arg.is_empty() { "status" } else { arg };
+            let git_arg_owned = git_arg.to_string();
+            Some(SlashContextSpec {
+                running_status: "running git...".to_string(),
+                started_trace: format!("running git {git_arg}"),
+                finished_trace: format!("git: {git_arg}"),
+                failed_trace: format!("git failed for {git_arg}"),
+                context_prefix: format!("Git context ({git_arg}):"),
+                work: Box::new(move || {
+                    run_tool_immediate(crate::tools::GitTool, &git_arg_owned)
+                        .map_err(|e| format!("git error: {e}"))
+                }),
+            })
+        }
+        "/diag" => {
+            if arg.is_empty() {
+                return None;
+            }
+            let arg_owned = arg.to_string();
+            Some(SlashContextSpec {
+                running_status: "running diagnostics...".to_string(),
+                started_trace: format!("running diagnostics for {arg}"),
+                finished_trace: format!("diagnostics ready for {arg}"),
+                failed_trace: format!("diagnostics failed for {arg}"),
+                context_prefix: "LSP diagnostics:".to_string(),
+                work: Box::new(move || {
+                    run_tool_immediate(crate::tools::LspDiagnosticsTool, &arg_owned)
+                        .map_err(|e| format!("diagnostics error: {e}"))
+                }),
+            })
+        }
+        "/hover" => {
+            if arg.is_empty() {
+                return None;
+            }
+            let arg_owned = arg.to_string();
+            Some(SlashContextSpec {
+                running_status: "loading hover info...".to_string(),
+                started_trace: format!("loading hover for {arg}"),
+                finished_trace: format!("hover ready for {arg}"),
+                failed_trace: format!("hover failed for {arg}"),
+                context_prefix: "LSP hover:".to_string(),
+                work: Box::new(move || {
+                    run_tool_immediate(crate::tools::LspHoverTool, &arg_owned)
+                        .map_err(|e| format!("hover error: {e}"))
+                }),
+            })
+        }
+        "/def" => {
+            if arg.is_empty() {
+                return None;
+            }
+            let arg_owned = arg.to_string();
+            Some(SlashContextSpec {
+                running_status: "resolving definition...".to_string(),
+                started_trace: format!("resolving definition for {arg}"),
+                finished_trace: format!("definition ready for {arg}"),
+                failed_trace: format!("definition failed for {arg}"),
+                context_prefix: "LSP definition:".to_string(),
+                work: Box::new(move || {
+                    run_tool_immediate(crate::tools::LspDefinitionTool, &arg_owned)
+                        .map_err(|e| format!("definition error: {e}"))
+                }),
+            })
+        }
+        "/lcheck" => Some(SlashContextSpec {
+            running_status: "checking rust lsp...".to_string(),
+            started_trace: "checking rust lsp".to_string(),
+            finished_trace: "rust lsp check complete".to_string(),
+            failed_trace: "rust lsp check failed".to_string(),
+            context_prefix: "LSP check:".to_string(),
+            work: Box::new(move || Ok(crate::tools::rust_lsp_health_report())),
+        }),
+        "/fetch" => {
+            if arg.is_empty() {
+                return None;
+            }
+            let arg_owned = arg.to_string();
+            Some(SlashContextSpec {
+                running_status: "fetching webpage...".to_string(),
+                started_trace: format!("fetching {arg}"),
+                finished_trace: format!("fetched {arg}"),
+                failed_trace: format!("fetch failed for {arg}"),
+                context_prefix: "Fetched web context:".to_string(),
+                work: Box::new(move || {
+                    run_tool_immediate(crate::tools::FetchUrlTool, &arg_owned)
+                        .map_err(|e| format!("fetch error: {e}"))
+                }),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn custom_help_text() -> String {
+    let mut lines = vec!["built-in slash commands:".to_string()];
+    for spec in builtin_command_specs() {
+        let mut line = format!("  {:<18} — {}", spec.usage, spec.description);
+        if !spec.aliases.is_empty() {
+            line.push_str(&format!(" (aliases: {})", spec.aliases.join(", ")));
+        }
+        lines.push(line);
+    }
+    lines.push("".to_string());
+    lines.push("input: Enter sends • Shift+Enter or Ctrl+J insert newlines".to_string());
+    lines.push("custom commands: /commands list • /commands reload".to_string());
+    lines.join("\n")
+}
+
+fn format_custom_commands_list(registry: &CommandRegistry) -> String {
+    let mut lines = vec!["built-ins:".to_string()];
+    for spec in builtin_command_specs() {
+        lines.push(format!("  {:<12} — {}", spec.canonical, spec.description));
+    }
+    lines.push(String::new());
+    lines.push("custom commands:".to_string());
+    if registry.list().is_empty() {
+        lines.push("  (none loaded)".to_string());
+    } else {
+        for command in registry.list() {
+            let usage = command
+                .usage
+                .as_ref()
+                .map(|value| format!(" — {value}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  {:<12} [{}] — {}{}",
+                command.name, command.origin, command.description, usage
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn execute_custom_template(
+    command: &CustomCommand,
+    args: &[&str],
+    state: &mut AppState,
+    prompt_tx: &mpsc::Sender<SessionCommand>,
+) {
+    let CustomCommandBody::Prompt(template) = &command.body else {
+        return;
+    };
+    let expanded = crate::commands::expand_positional_args(template, args);
+    info!(
+        command = command.name.as_str(),
+        origin = command.origin.as_str(),
+        "custom command started"
+    );
+    state.start_generation(&format!("running {}...", command.name), false);
+    state.apply_trace(make_trace(
+        ProgressStatus::Started,
+        format!("running {}", command.name),
+        false,
+    ));
+    state.apply_trace(make_trace(
+        ProgressStatus::Finished,
+        format!("prepared {}", command.name),
+        false,
+    ));
+    state.add_user_message(&expanded);
+    let _ = prompt_tx.send(SessionCommand::SubmitUser(expanded));
+    state.start_generation("generating...", true);
+}
+
+fn execute_custom_workflow(
+    command: CustomCommand,
+    args: Vec<&str>,
+    state: &mut AppState,
+    slash_tx: &mpsc::Sender<SlashJobOutcome>,
+) {
+    let CustomCommandBody::Workflow(steps) = command.body.clone() else {
+        return;
+    };
+
+    let expanded_steps = steps
+        .into_iter()
+        .map(|step| match step {
+            CustomCommandStep::Slash(text) => {
+                CustomCommandStep::Slash(crate::commands::expand_positional_args(&text, &args))
+            }
+            CustomCommandStep::Prompt(text) => {
+                CustomCommandStep::Prompt(crate::commands::expand_positional_args(&text, &args))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let workflow_name = command.name.clone();
+    let origin = command.origin;
+
+    state.start_generation(&format!("running {}...", workflow_name), false);
+    state.apply_trace(make_trace(
+        ProgressStatus::Started,
+        format!("running {workflow_name}"),
+        false,
+    ));
+    info!(
+        command = workflow_name.as_str(),
+        origin = origin.as_str(),
+        "custom command started"
+    );
+
+    let tx = slash_tx.clone();
+    thread::spawn(move || {
+        let mut contexts = Vec::new();
+
+        for step in expanded_steps {
+            match step {
+                CustomCommandStep::Slash(slash) => {
+                    let (cmd, arg) = parse_command_parts(&slash);
+                    let Some(spec_meta) = resolve_builtin_command(&cmd) else {
+                        let _ = tx.send(SlashJobOutcome::Error {
+                            failed_trace: make_trace(
+                                ProgressStatus::Failed,
+                                format!("custom command failed: {workflow_name}"),
+                                false,
+                            ),
+                            message: format!("custom workflow references unsupported step: {cmd}"),
+                        });
+                        return;
+                    };
+
+                    match spec_meta.kind {
+                        BuiltinKind::Context => {
+                            let Some(spec) = build_context_spec(&cmd, arg) else {
+                                let _ = tx.send(SlashJobOutcome::Error {
+                                    failed_trace: make_trace(
+                                        ProgressStatus::Failed,
+                                        format!("custom command failed: {workflow_name}"),
+                                        false,
+                                    ),
+                                    message: format!("invalid usage for workflow step `{slash}`"),
+                                });
+                                return;
+                            };
+
+                            let _ = tx.send(SlashJobOutcome::Trace(make_trace(
+                                ProgressStatus::Started,
+                                spec.started_trace.clone(),
+                                false,
+                            )));
+                            match (spec.work)() {
+                                Ok(output) => {
+                                    let safe = sanitize_for_display(&output);
+                                    contexts.push(format!("{}\n\n{safe}", spec.context_prefix));
+                                    let _ = tx.send(SlashJobOutcome::Trace(make_trace(
+                                        ProgressStatus::Finished,
+                                        spec.finished_trace,
+                                        false,
+                                    )));
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(SlashJobOutcome::Trace(make_trace(
+                                        ProgressStatus::Failed,
+                                        spec.failed_trace,
+                                        false,
+                                    )));
+                                    let _ = tx.send(SlashJobOutcome::Error {
+                                        failed_trace: make_trace(
+                                            ProgressStatus::Failed,
+                                            format!("custom command failed: {workflow_name}"),
+                                            false,
+                                        ),
+                                        message: error,
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                        BuiltinKind::Mutating => {
+                            let final_trace = make_trace(
+                                ProgressStatus::Finished,
+                                format!("completed {workflow_name}"),
+                                false,
+                            );
+                            match spec_meta.canonical {
+                                "/run" => {
+                                    let _ = tx.send(SlashJobOutcome::WorkflowShell {
+                                        finished_trace: final_trace,
+                                        contexts,
+                                        command: arg.to_string(),
+                                    });
+                                }
+                                "/write" => {
+                                    let Some((path, raw_content)) = arg.split_once(' ') else {
+                                        let _ = tx.send(SlashJobOutcome::Error {
+                                            failed_trace: make_trace(
+                                                ProgressStatus::Failed,
+                                                format!("custom command failed: {workflow_name}"),
+                                                false,
+                                            ),
+                                            message: "workflow /write step must use `/write <path> <content>`".to_string(),
+                                        });
+                                        return;
+                                    };
+                                    let _ = tx.send(SlashJobOutcome::WorkflowWrite {
+                                        finished_trace: final_trace,
+                                        contexts,
+                                        path: path.trim().to_string(),
+                                        content: decode_slash_write_content(raw_content.trim()),
+                                    });
+                                }
+                                _ => {}
+                            }
+                            return;
+                        }
+                        BuiltinKind::Session | BuiltinKind::Discovery => {
+                            let _ = tx.send(SlashJobOutcome::Error {
+                                failed_trace: make_trace(
+                                    ProgressStatus::Failed,
+                                    format!("custom command failed: {workflow_name}"),
+                                    false,
+                                ),
+                                message: format!(
+                                    "workflow step `{}` is not supported in custom commands",
+                                    spec_meta.canonical
+                                ),
+                            });
+                            return;
+                        }
+                    }
+                }
+                CustomCommandStep::Prompt(prompt) => {
+                    let _ = tx.send(SlashJobOutcome::WorkflowPrompt {
+                        finished_trace: make_trace(
+                            ProgressStatus::Finished,
+                            format!("completed {workflow_name}"),
+                            false,
+                        ),
+                        contexts,
+                        prompt,
+                    });
+                    return;
+                }
+            }
+        }
+
+        let _ = tx.send(SlashJobOutcome::ContextBatch {
+            finished_trace: make_trace(
+                ProgressStatus::Finished,
+                format!("completed {workflow_name}"),
+                false,
+            ),
+            contexts,
+        });
+    });
+}
+
+fn handle_command_input(
     input: &str,
     state: &mut AppState,
     prompt_tx: &mpsc::Sender<SessionCommand>,
     slash_tx: &mpsc::Sender<SlashJobOutcome>,
+    command_registry: &mut CommandRegistry,
 ) {
-    // Parse command and argument
-    let parts: Vec<&str> = input.splitn(2, ' ').collect();
-    let cmd = parts[0].to_lowercase();
-    let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    let (cmd, arg) = parse_command_parts(input);
     info!(command = cmd.as_str(), "slash command received");
 
-    match cmd.as_str() {
-        "/read" | "/r" => {
-            if arg.is_empty() {
-                state.add_system_message("Usage: /read <file_path>");
+    if resolve_builtin_command(&cmd).is_some() {
+        handle_builtin_slash_command(&cmd, arg, state, prompt_tx, slash_tx, command_registry);
+        return;
+    }
+
+    let Some(command) = command_registry.resolve(&cmd).cloned() else {
+        state.add_system_message(&format!(
+            "unknown command: {cmd}. Type /help for available commands."
+        ));
+        return;
+    };
+
+    let args = if arg.is_empty() {
+        Vec::new()
+    } else {
+        arg.split_whitespace().collect::<Vec<_>>()
+    };
+    match &command.body {
+        CustomCommandBody::Prompt(_) => execute_custom_template(&command, &args, state, prompt_tx),
+        CustomCommandBody::Workflow(_) => execute_custom_workflow(command, args, state, slash_tx),
+    }
+}
+
+fn handle_builtin_slash_command(
+    cmd: &str,
+    arg: &str,
+    state: &mut AppState,
+    prompt_tx: &mpsc::Sender<SessionCommand>,
+    slash_tx: &mpsc::Sender<SlashJobOutcome>,
+    command_registry: &mut CommandRegistry,
+) {
+    let canonical = resolve_builtin_command(cmd)
+        .map(|spec| spec.canonical)
+        .unwrap_or(cmd);
+
+    match canonical {
+        "/read" | "/search" | "/diag" | "/hover" | "/def" | "/fetch" => {
+            let Some(spec) = build_context_spec(canonical, arg) else {
+                let usage = resolve_builtin_command(canonical)
+                    .map(|spec| spec.usage)
+                    .unwrap_or("/help");
+                state.add_system_message(&format!("Usage: {usage}"));
                 return;
+            };
+            spawn_slash_context_job(state, slash_tx, spec, true);
+        }
+        "/ls" | "/git" | "/lcheck" => {
+            if let Some(spec) = build_context_spec(canonical, arg) {
+                spawn_slash_context_job(state, slash_tx, spec, true);
             }
-            let arg_owned = arg.to_string();
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "reading file...",
-                format!("reading {arg}"),
-                format!("loaded {arg}"),
-                format!("read failed for {arg}"),
-                "I've loaded this file for context:".to_string(),
-                move || run_tool_immediate(crate::tools::ReadFile, &arg_owned)
-                    .map_err(|e| format!("error reading {arg_owned}: {e}")),
-            );
         }
-
-        "/ls" | "/list" => {
-            let path = if arg.is_empty() { "." } else { arg };
-            let path_owned = path.to_string();
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "listing directory...",
-                format!("listing {path}"),
-                format!("listed {path}"),
-                format!("list failed for {path}"),
-                "Directory listing:".to_string(),
-                move || run_tool_immediate(crate::tools::ListDir, &path_owned)
-                    .map_err(|e| format!("error listing {path_owned}: {e}")),
-            );
-        }
-
-        "/search" | "/s" | "/grep" => {
-            if arg.is_empty() {
-                state.add_system_message("Usage: /search <query>");
-                return;
-            }
-            let arg_owned = arg.to_string();
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "searching code...",
-                format!("searching for {arg}"),
-                format!("search complete for {arg}"),
-                format!("search failed for {arg}"),
-                "Search results:".to_string(),
-                move || run_tool_immediate(crate::tools::SearchCode, &arg_owned)
-                    .map_err(|e| format!("error searching: {e}")),
-            );
-        }
-
-        "/git" => {
-            let git_arg = if arg.is_empty() { "status" } else { arg };
-            let git_arg_owned = git_arg.to_string();
-            let status_message = format!("git: {git_arg}");
-            let context_prefix = format!("Git context ({git_arg}):");
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "running git...",
-                format!("running git {git_arg}"),
-                status_message,
-                format!("git failed for {git_arg}"),
-                context_prefix,
-                move || run_tool_immediate(crate::tools::GitTool, &git_arg_owned)
-                    .map_err(|e| format!("git error: {e}")),
-            );
-        }
-
-        "/diag" | "/lsp" => {
-            if arg.is_empty() {
-                state.add_system_message("Usage: /diag <rust_file>");
-                return;
-            }
-            let arg_owned = arg.to_string();
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "running diagnostics...",
-                format!("running diagnostics for {arg}"),
-                format!("diagnostics ready for {arg}"),
-                format!("diagnostics failed for {arg}"),
-                "LSP diagnostics:".to_string(),
-                move || run_tool_immediate(crate::tools::LspDiagnosticsTool, &arg_owned)
-                    .map_err(|e| format!("diagnostics error: {e}")),
-            );
-        }
-
-        "/hover" => {
-            if arg.is_empty() {
-                state.add_system_message("Usage: /hover <file>:<line>:<col>");
-                return;
-            }
-            let arg_owned = arg.to_string();
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "loading hover info...",
-                format!("loading hover for {arg}"),
-                format!("hover ready for {arg}"),
-                format!("hover failed for {arg}"),
-                "LSP hover:".to_string(),
-                move || run_tool_immediate(crate::tools::LspHoverTool, &arg_owned)
-                    .map_err(|e| format!("hover error: {e}")),
-            );
-        }
-
-        "/def" | "/definition" => {
-            if arg.is_empty() {
-                state.add_system_message("Usage: /def <file>:<line>:<col>");
-                return;
-            }
-            let arg_owned = arg.to_string();
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "resolving definition...",
-                format!("resolving definition for {arg}"),
-                format!("definition ready for {arg}"),
-                format!("definition failed for {arg}"),
-                "LSP definition:".to_string(),
-                move || run_tool_immediate(crate::tools::LspDefinitionTool, &arg_owned)
-                    .map_err(|e| format!("definition error: {e}")),
-            );
-        }
-
-        "/lcheck" | "/lsp-check" => {
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "checking rust lsp...",
-                "checking rust lsp".to_string(),
-                "rust lsp check complete".to_string(),
-                "rust lsp check failed".to_string(),
-                "LSP check:".to_string(),
-                move || Ok(crate::tools::rust_lsp_health_report()),
-            );
-        }
-
-        "/run" | "/bash" => {
+        "/run" => {
             if arg.is_empty() {
                 state.add_system_message("Usage: /run <command>");
                 return;
             }
             let _ = prompt_tx.send(SessionCommand::RequestShellCommand(arg.to_string()));
         }
-
+        "/write" => {
+            let Some((path, raw_content)) = arg.split_once(' ') else {
+                state
+                    .add_system_message("Usage: /write <path> <content>. Use \\n for line breaks.");
+                return;
+            };
+            if path.trim().is_empty() || raw_content.trim().is_empty() {
+                state
+                    .add_system_message("Usage: /write <path> <content>. Use \\n for line breaks.");
+                return;
+            }
+            let _ = prompt_tx.send(SessionCommand::RequestFileWrite {
+                path: path.trim().to_string(),
+                content: decode_slash_write_content(raw_content.trim()),
+            });
+        }
         "/reflect" => {
             let mode = arg.to_ascii_lowercase();
             match mode.as_str() {
                 "on" => {
                     if state.eco_enabled {
                         state.add_system_message(
-                            "reflection stays off while eco mode is enabled. Use /eco off first."
+                            "reflection stays off while eco mode is enabled. Use /eco off first.",
                         );
                         return;
                     }
@@ -1275,15 +1966,16 @@ fn handle_slash_command(
                 "" | "status" => {
                     state.add_system_message(&format!(
                         "reflection is {}",
-                        if state.reflection_enabled { "on" } else { "off" }
+                        if state.reflection_enabled {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     ));
                 }
-                _ => {
-                    state.add_system_message("Usage: /reflect <on|off|status>");
-                }
+                _ => state.add_system_message("Usage: /reflect <on|off|status>"),
             }
         }
-
         "/eco" => {
             let mode = arg.to_ascii_lowercase();
             match mode.as_str() {
@@ -1304,12 +1996,9 @@ fn handle_slash_command(
                         if state.eco_enabled { "on" } else { "off" }
                     ));
                 }
-                _ => {
-                    state.add_system_message("Usage: /eco <on|off|status>");
-                }
+                _ => state.add_system_message("Usage: /eco <on|off|status>"),
             }
         }
-
         "/debug-log" => {
             let mode = arg.to_ascii_lowercase();
             match mode.as_str() {
@@ -1326,98 +2015,80 @@ fn handle_slash_command(
                 "" | "status" => {
                     state.add_system_message(&format!(
                         "debug content logging is {}",
-                        if state.debug_logging_enabled { "on" } else { "off" }
+                        if state.debug_logging_enabled {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     ));
                 }
-                _ => {
-                    state.add_system_message("Usage: /debug-log <on|off|status>");
-                }
+                _ => state.add_system_message("Usage: /debug-log <on|off|status>"),
             }
         }
-
-        "/fetch" | "/web" => {
-            if arg.is_empty() {
-                state.add_system_message("Usage: /fetch <url>");
-                return;
+        "/approve" => match state.pending_action_id() {
+            Some(id) => {
+                let _ = prompt_tx.send(SessionCommand::ApproveAction(id));
+                state.mark_pending_action_submitted("processing approval");
             }
-            let arg_owned = arg.to_string();
-            spawn_slash_context_job(
-                state,
-                slash_tx,
-                "fetching webpage...",
-                format!("fetching {arg}"),
-                format!("fetched {arg}"),
-                format!("fetch failed for {arg}"),
-                "Fetched web context:".to_string(),
-                move || run_tool_immediate(crate::tools::FetchUrlTool, &arg_owned)
-                    .map_err(|e| format!("fetch error: {e}")),
-            );
-        }
-
-        "/approve" => {
-            match state.pending_action_id() {
-                Some(id) => {
-                    let _ = prompt_tx.send(SessionCommand::ApproveAction(id));
-                    state.mark_pending_action_submitted("processing approval");
-                }
-                None => state.add_system_message("No pending action to approve."),
+            None => state.add_system_message("No pending action to approve."),
+        },
+        "/reject" => match state.pending_action_id() {
+            Some(id) => {
+                let _ = prompt_tx.send(SessionCommand::RejectAction(id));
+                state.mark_pending_action_submitted("processing rejection");
             }
-        }
-
-        "/reject" => {
-            match state.pending_action_id() {
-                Some(id) => {
-                    let _ = prompt_tx.send(SessionCommand::RejectAction(id));
-                    state.mark_pending_action_submitted("processing rejection");
-                }
-                None => state.add_system_message("No pending action to reject."),
-            }
-        }
-
-        "/clear" | "/c" => {
+            None => state.add_system_message("No pending action to reject."),
+        },
+        "/clear" => {
             state.clear_messages();
             state.add_system_message("conversation cleared");
             let _ = prompt_tx.send(SessionCommand::ClearSession);
         }
-
-        "/clear-cache" | "/cache-clear" => {
+        "/clear-cache" => {
             state.add_system_message("clearing exact cache...");
             let _ = prompt_tx.send(SessionCommand::ClearCache);
         }
-
         "/clear-debug-log" => {
             state.add_system_message("clearing separate debug content log...");
             let _ = prompt_tx.send(SessionCommand::ClearDebugLog);
         }
-
-        "/help" | "/h" | "/?" => {
-            state.add_system_message(
-                "/read <path>    — load a file into context\n  \
-                 /ls [path]      — list directory (default: current)\n  \
-                 /search <query> — search source files\n  \
-                 /git [command]  — git status, diff, log\n  \
-                 /diag <file>    — Rust LSP diagnostics for a file\n  \
-                 /hover <f:l:c>  — Rust LSP hover at file:line:col\n  \
-                 /def <f:l:c>    — Rust LSP definition at file:line:col\n  \
-                 /lcheck         — Rust LSP setup check\n  \
-                 /fetch <url>    — fetch a webpage into context\n  \
-                 /run <command>  — propose a shell command\n  \
-                 /reflect on|off — toggle reflection pass\n  \
-                 /eco on|off     — toggle lower-token mode\n  \
-                 /debug-log on|off — toggle separate content debug log\n  \
-                 /approve        — approve pending action\n  \
-                 /reject         — reject pending action\n  \
-                 /clear          — clear conversation\n  \
-                 /clear-cache    — clear exact response cache\n  \
-                 /clear-debug-log — clear separate debug content log\n  \
-                 /help           — show this message",
-            );
+        "/help" => {
+            state.add_system_message(&custom_help_text());
         }
-
+        "/commands" => {
+            let subcommand = if arg.is_empty() { "list" } else { arg };
+            match subcommand {
+                "list" => {
+                    state.add_system_message(&format_custom_commands_list(command_registry));
+                }
+                "reload" => {
+                    let report = CommandRegistry::load_report();
+                    *command_registry = report.registry;
+                    state.add_system_message(&format!(
+                        "reloaded custom commands: {} loaded, {} invalid, {} source file(s)",
+                        report.loaded, report.invalid, report.sources_loaded
+                    ));
+                }
+                _ => {
+                    state.add_system_message("Usage: /commands [list|reload]");
+                }
+            }
+        }
         _ => {
             state.add_system_message(&format!(
                 "unknown command: {cmd}. Type /help for available commands."
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_slash_write_content;
+
+    #[test]
+    fn decode_slash_write_content_expands_common_escapes() {
+        let decoded = decode_slash_write_content("hello\\nfrom\\tparams\\\\");
+        assert_eq!(decoded, "hello\nfrom\tparams\\");
     }
 }

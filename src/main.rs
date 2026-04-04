@@ -2,15 +2,17 @@
 //
 // Entry point.
 
-mod error;
 mod cache;
+mod commands;
 mod config;
 mod debug_log;
+mod error;
 mod events;
 mod hooks;
 mod inference;
 #[allow(dead_code)]
 mod memory;
+mod safety;
 mod session;
 mod tools;
 mod tui;
@@ -223,9 +225,7 @@ fn main() -> Result<()> {
                 let mut collected = String::new();
 
                 // Spawn generation on a thread, print tokens as they arrive.
-                let handle = std::thread::spawn(move || {
-                    backend.generate(&messages, tx)
-                });
+                let handle = std::thread::spawn(move || backend.generate(&messages, tx));
 
                 for event in rx {
                     match event {
@@ -249,7 +249,7 @@ fn main() -> Result<()> {
                     Ok(result) => result?,
                     Err(_) => {
                         return Err(ParamsError::Inference(
-                            "generation thread panicked".to_string()
+                            "generation thread panicked".to_string(),
                         ));
                     }
                 }
@@ -317,6 +317,11 @@ fn run_index_command(path: &str) -> Result<()> {
         skipped,
         delta.removed
     );
-    info!(indexed, skipped, removed = delta.removed, "project index completed");
+    info!(
+        indexed,
+        skipped,
+        removed = delta.removed,
+        "project index completed"
+    );
     Ok(())
 }

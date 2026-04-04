@@ -12,14 +12,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
-use crate::error::{ParamsError, Result};
 use super::{Tool, ToolRunResult};
+use crate::error::{ParamsError, Result};
+use crate::safety;
 
 // File extensions we'll search — avoids binary files and build artifacts
 const SEARCHABLE_EXTENSIONS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h",
-    "java", "kt", "swift", "rb", "php", "cs", "toml", "yaml", "yml",
-    "json", "md", "txt", "sh", "env", "sql",
+    "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift", "rb",
+    "php", "cs", "toml", "yaml", "yml", "json", "md", "txt", "sh", "env", "sql",
 ];
 
 pub struct SearchCode;
@@ -42,14 +42,17 @@ impl Tool for SearchCode {
             return Err(ParamsError::Config("Search query cannot be empty".into()));
         }
 
-        let current_dir = Path::new(".");
+        let current_dir = safety::project_root()?;
+        let _ = safety::inspect_search_scope()?;
         let mut matches: Vec<SearchMatch> = Vec::new();
 
         // Walk the directory tree
-        walk_and_search(current_dir, query, &mut matches)?;
+        walk_and_search(&current_dir, query, &mut matches)?;
 
         if matches.is_empty() {
-            return Ok(ToolRunResult::Immediate(format!("No results found for: {query}")));
+            return Ok(ToolRunResult::Immediate(format!(
+                "No results found for: {query}"
+            )));
         }
 
         // Cap results to avoid flooding context
@@ -71,7 +74,11 @@ impl Tool for SearchCode {
                 output.push_str(&format!("\n{}:\n", file_str));
                 current_file = file_str;
             }
-            output.push_str(&format!("  {:4}: {}\n", m.line_number, m.line_content.trim()));
+            output.push_str(&format!(
+                "  {:4}: {}\n",
+                m.line_number,
+                m.line_content.trim()
+            ));
         }
 
         Ok(ToolRunResult::Immediate(output))

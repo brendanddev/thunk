@@ -179,6 +179,11 @@ impl AppState {
         self.clear_autocomplete();
     }
 
+    /// Insert a newline at the cursor position.
+    pub fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
     /// Delete character before cursor (backspace)
     pub fn delete_char_before(&mut self) {
         if self.cursor == 0 {
@@ -234,12 +239,12 @@ impl AppState {
 
     /// Move cursor to start of line
     pub fn cursor_home(&mut self) {
-        self.cursor = 0;
+        self.cursor = self.current_line_start();
     }
 
     /// Move cursor to end of line
     pub fn cursor_end(&mut self) {
-        self.cursor = self.input.len();
+        self.cursor = self.current_line_end();
     }
 
     pub fn add_user_message(&mut self, content: &str) {
@@ -343,7 +348,8 @@ impl AppState {
     pub fn set_backend_name(&mut self, name: String) {
         self.backend_name = name.clone();
         if self.total_tokens == 0 {
-            self.estimated_cost_usd = if name.starts_with("llama.cpp") || name.starts_with("ollama") {
+            self.estimated_cost_usd = if name.starts_with("llama.cpp") || name.starts_with("ollama")
+            {
                 Some(0.0)
             } else {
                 None
@@ -375,6 +381,40 @@ impl AppState {
         self.pending_action.as_ref().map(|action| action.id)
     }
 
+    pub fn has_pending_action(&self) -> bool {
+        self.pending_action.is_some()
+    }
+
+    pub fn normalized_paste(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    pub fn input_display_lines(
+        &self,
+        width: usize,
+        max_visible_rows: usize,
+    ) -> (Vec<String>, usize, usize) {
+        let wrapped = wrap_input_for_display(&self.input, width);
+        let cursor = cursor_visual_position(&self.input, self.cursor, width);
+        let total_rows = wrapped.len().max(1);
+        let start_row = if total_rows <= max_visible_rows {
+            0
+        } else {
+            cursor
+                .0
+                .saturating_add(1)
+                .saturating_sub(max_visible_rows)
+                .min(total_rows.saturating_sub(max_visible_rows))
+        };
+        let end_row = (start_row + max_visible_rows).min(total_rows);
+        let visible = wrapped[start_row..end_row].to_vec();
+        (visible, cursor.0.saturating_sub(start_row), cursor.1)
+    }
+
+    pub fn input_content_rows(&self, width: usize) -> usize {
+        wrap_input_for_display(&self.input, width).len().max(1)
+    }
+
     pub fn update_budget(
         &mut self,
         prompt_tokens: usize,
@@ -400,7 +440,13 @@ impl AppState {
         self.debug_logging_enabled = enabled;
     }
 
-    pub fn update_cache(&mut self, last_hit: bool, hits: usize, misses: usize, tokens_saved: usize) {
+    pub fn update_cache(
+        &mut self,
+        last_hit: bool,
+        hits: usize,
+        misses: usize,
+        tokens_saved: usize,
+    ) {
         self.cache_hits = hits;
         self.cache_misses = misses;
         self.tokens_saved = tokens_saved;
@@ -565,7 +611,7 @@ impl AppState {
         }
     }
 
-    pub fn autocomplete_command(&mut self, commands: &[&str], reverse: bool) -> bool {
+    pub fn autocomplete_command<S: AsRef<str>>(&mut self, commands: &[S], reverse: bool) -> bool {
         let Some((start, end, typed_prefix)) = slash_prefix_range(&self.input, self.cursor) else {
             self.clear_autocomplete();
             return false;
@@ -575,17 +621,15 @@ impl AppState {
             && self.autocomplete_index < self.autocomplete_matches.len()
             && self.autocomplete_matches[self.autocomplete_index] == self.input[..end]
         {
-            self.autocomplete_prefix
-                .clone()
-                .unwrap_or(typed_prefix)
+            self.autocomplete_prefix.clone().unwrap_or(typed_prefix)
         } else {
             typed_prefix
         };
 
         let matches = commands
             .iter()
-            .filter(|cmd| cmd.starts_with(prefix.as_str()))
-            .map(|cmd| (*cmd).to_string())
+            .filter(|cmd| cmd.as_ref().starts_with(prefix.as_str()))
+            .map(|cmd| cmd.as_ref().to_string())
             .collect::<Vec<_>>();
 
         if matches.is_empty() {
@@ -608,7 +652,8 @@ impl AppState {
                     self.autocomplete_index -= 1;
                 }
             } else {
-                self.autocomplete_index = (self.autocomplete_index + 1) % self.autocomplete_matches.len();
+                self.autocomplete_index =
+                    (self.autocomplete_index + 1) % self.autocomplete_matches.len();
             }
         } else {
             self.autocomplete_matches = matches;
@@ -704,6 +749,20 @@ impl AppState {
         self.autocomplete_index = 0;
         self.autocomplete_prefix = None;
     }
+
+    fn current_line_start(&self) -> usize {
+        self.input[..self.cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0)
+    }
+
+    fn current_line_end(&self) -> usize {
+        self.input[self.cursor..]
+            .find('\n')
+            .map(|offset| self.cursor + offset)
+            .unwrap_or(self.input.len())
+    }
 }
 
 fn slash_prefix_range(input: &str, cursor: usize) -> Option<(usize, usize, String)> {
@@ -758,6 +817,69 @@ fn summarize_trace_steps(steps: &[String]) -> String {
     }
 }
 
+fn wrap_input_for_display(input: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+
+    if input.is_empty() {
+        return vec![String::new()];
+    }
+
+    for raw_line in input.split('\n') {
+        let wrapped = wrap_preserving_empty_line(raw_line, width);
+        lines.extend(wrapped);
+    }
+
+    if input.ends_with('\n') {
+        lines.push(String::new());
+    }
+
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn wrap_preserving_empty_line(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut wrapped = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let end = (start + width).min(chars.len());
+        wrapped.push(chars[start..end].iter().collect());
+        start = end;
+    }
+    wrapped
+}
+
+fn cursor_visual_position(input: &str, cursor: usize, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    let safe_cursor = cursor.min(input.len());
+    let before = &input[..safe_cursor];
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for ch in before.chars() {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        col += 1;
+        if col >= width {
+            row += 1;
+            col = 0;
+        }
+    }
+
+    (row, col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +894,16 @@ mod tests {
             kind: crate::events::PendingActionKind::ShellCommand,
             title: "Approve".to_string(),
             preview: "echo hi".to_string(),
+            inspection: crate::safety::InspectionReport {
+                operation: "bash".to_string(),
+                decision: crate::safety::InspectionDecision::NeedsApproval,
+                risk: crate::safety::RiskLevel::Low,
+                summary: "test".to_string(),
+                reasons: Vec::new(),
+                targets: Vec::new(),
+                segments: vec!["echo hi".to_string()],
+                network_targets: Vec::new(),
+            },
         });
         let paused = state.current_turn_duration().unwrap();
         assert!(paused >= Duration::from_millis(1));
@@ -847,6 +979,118 @@ mod tests {
 
         assert!(state.autocomplete_command(&["/reject"], false));
         assert_eq!(state.input, "/reject ");
+    }
+
+    #[test]
+    fn pending_action_sets_waiting_status_without_chat_message() {
+        let mut state = AppState::new();
+        assert_eq!(state.messages.len(), 0);
+
+        state.set_pending_action(PendingAction {
+            id: 1,
+            kind: crate::events::PendingActionKind::ShellCommand,
+            title: "Approve shell command".to_string(),
+            preview: "cargo check".to_string(),
+            inspection: crate::safety::InspectionReport {
+                operation: "bash".to_string(),
+                decision: crate::safety::InspectionDecision::NeedsApproval,
+                risk: crate::safety::RiskLevel::Low,
+                summary: "Shell command requires approval before execution".to_string(),
+                reasons: Vec::new(),
+                targets: Vec::new(),
+                segments: vec!["cargo check".to_string()],
+                network_targets: Vec::new(),
+            },
+        });
+
+        assert!(state.has_pending_action());
+        assert_eq!(state.status, "awaiting approval");
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn clearing_pending_action_removes_card_state() {
+        let mut state = AppState::new();
+        state.set_pending_action(PendingAction {
+            id: 1,
+            kind: crate::events::PendingActionKind::ShellCommand,
+            title: "Approve shell command".to_string(),
+            preview: "cargo check".to_string(),
+            inspection: crate::safety::InspectionReport {
+                operation: "bash".to_string(),
+                decision: crate::safety::InspectionDecision::NeedsApproval,
+                risk: crate::safety::RiskLevel::Low,
+                summary: "Shell command requires approval before execution".to_string(),
+                reasons: Vec::new(),
+                targets: Vec::new(),
+                segments: vec!["cargo check".to_string()],
+                network_targets: Vec::new(),
+            },
+        });
+
+        state.clear_pending_action();
+
+        assert!(!state.has_pending_action());
+        assert_eq!(state.status, "ready");
+    }
+
+    #[test]
+    fn insert_newline_preserves_multiline_input() {
+        let mut state = AppState::new();
+        state.input = "hello".to_string();
+        state.cursor = state.input.len();
+
+        state.insert_newline();
+        state.insert_str("world");
+
+        assert_eq!(state.input, "hello\nworld");
+    }
+
+    #[test]
+    fn submit_input_returns_multiline_content_unchanged() {
+        let mut state = AppState::new();
+        state.input = "one\ntwo\nthree".to_string();
+        state.cursor = state.input.len();
+
+        let submitted = state.submit_input();
+
+        assert_eq!(submitted, "one\ntwo\nthree");
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn normalized_paste_preserves_newlines() {
+        assert_eq!(
+            AppState::normalized_paste("one\r\ntwo\rthree"),
+            "one\ntwo\nthree"
+        );
+    }
+
+    #[test]
+    fn home_and_end_operate_on_current_line() {
+        let mut state = AppState::new();
+        state.input = "first\nsecond\nthird".to_string();
+        state.cursor = "first\nsec".len();
+
+        state.cursor_end();
+        assert_eq!(state.cursor, "first\nsecond".len());
+
+        state.cursor_home();
+        assert_eq!(state.cursor, "first\n".len());
+    }
+
+    #[test]
+    fn input_display_lines_wrap_and_keep_cursor_visible() {
+        let mut state = AppState::new();
+        state.input = "123456789\nabc".to_string();
+        state.cursor = state.input.len();
+
+        let (lines, cursor_row, cursor_col) = state.input_display_lines(4, 3);
+
+        assert!(!lines.is_empty());
+        assert!(lines.iter().any(|line| line == "abc"));
+        assert_eq!(cursor_row, 2);
+        assert_eq!(cursor_col, 3);
     }
 }
 

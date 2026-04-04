@@ -5,8 +5,9 @@
 use std::process::Command;
 use tracing::info;
 
-use crate::error::{ParamsError, Result};
 use super::{Tool, ToolRunResult};
+use crate::error::{ParamsError, Result};
+use crate::safety;
 
 pub struct GitTool;
 
@@ -22,20 +23,27 @@ impl Tool for GitTool {
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
         info!(tool = "git", "tool called");
         let trimmed = arg.trim();
-        let subcommand = if trimmed.is_empty() { "status" } else { trimmed };
+        let subcommand = if trimmed.is_empty() {
+            "status"
+        } else {
+            trimmed
+        };
         let mut parts = subcommand.split_whitespace();
         let head = parts.next().unwrap_or("status");
 
         match head {
-            "status" => run_git(&["status", "--short", "--branch"]),
-            "diff" => run_git(&["diff", "--stat", "--patch", "--minimal"]),
+            "status" => run_git(subcommand, &["status", "--short", "--branch"]),
+            "diff" => run_git(subcommand, &["diff", "--stat", "--patch", "--minimal"]),
             "log" => {
                 let count = parts
                     .next()
                     .and_then(|n| n.parse::<usize>().ok())
                     .unwrap_or(5)
                     .clamp(1, 20);
-                run_git(&["log", &format!("-n{count}"), "--oneline", "--decorate"])
+                run_git(
+                    subcommand,
+                    &["log", &format!("-n{count}"), "--oneline", "--decorate"],
+                )
             }
             other => Err(ParamsError::Config(format!(
                 "Unsupported git command: {other}. Use status, diff, or log [n]."
@@ -44,10 +52,10 @@ impl Tool for GitTool {
     }
 }
 
-fn run_git(args: &[&str]) -> Result<ToolRunResult> {
-    let output = Command::new("git")
-        .args(args)
-        .output()?;
+fn run_git(subcommand: &str, args: &[&str]) -> Result<ToolRunResult> {
+    let _ = safety::inspect_git_operation(subcommand)?;
+    let root = safety::project_root()?;
+    let output = Command::new("git").args(args).current_dir(root).output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

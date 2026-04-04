@@ -1,9 +1,9 @@
 // src/inference/backend.rs
 
+use crate::error::Result;
+use crate::events::InferenceEvent;
 use serde::Serialize;
 use std::sync::mpsc::Sender;
-use crate::events::InferenceEvent;
-use crate::error::Result;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Message {
@@ -13,13 +13,22 @@ pub struct Message {
 
 impl Message {
     pub fn system(content: &str) -> Self {
-        Self { role: "system".to_string(), content: content.to_string() }
+        Self {
+            role: "system".to_string(),
+            content: content.to_string(),
+        }
     }
     pub fn user(content: &str) -> Self {
-        Self { role: "user".to_string(), content: content.to_string() }
+        Self {
+            role: "user".to_string(),
+            content: content.to_string(),
+        }
     }
     pub fn assistant(content: &str) -> Self {
-        Self { role: "assistant".to_string(), content: content.to_string() }
+        Self {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+        }
     }
 }
 
@@ -40,11 +49,7 @@ pub fn system_prompt_with_tools(tool_descriptions: &str) -> String {
 pub const SYSTEM_PROMPT: &str = SYSTEM_PROMPT_BASE;
 
 pub trait InferenceBackend: Send {
-    fn generate(
-        &self,
-        messages: &[Message],
-        tx: Sender<InferenceEvent>,
-    ) -> Result<()>;
+    fn generate(&self, messages: &[Message], tx: Sender<InferenceEvent>) -> Result<()>;
 
     fn name(&self) -> String;
 }

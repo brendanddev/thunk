@@ -5,9 +5,10 @@
 use std::process::Command;
 use tracing::info;
 
+use super::{PendingToolAction, Tool, ToolRunResult};
 use crate::error::{ParamsError, Result};
 use crate::events::PendingActionKind;
-use super::{PendingToolAction, Tool, ToolRunResult};
+use crate::safety::{self, InspectionDecision};
 
 pub struct BashTool;
 
@@ -22,32 +23,12 @@ impl Tool for BashTool {
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
         info!(tool = "bash", phase = "proposal", "tool called");
-        let command = arg.trim();
-        if command.is_empty() {
-            return Err(ParamsError::Config("Shell command cannot be empty".into()));
-        }
-        if command.contains('\n') || command.contains('\r') {
-            return Err(ParamsError::Config(
-                "Multiline shell commands are not supported".into()
-            ));
-        }
-
-        Ok(ToolRunResult::RequiresApproval(PendingToolAction {
-            kind: PendingActionKind::ShellCommand,
-            tool_name: self.name().to_string(),
-            argument: command.to_string(),
-            display_argument: command.to_string(),
-            title: "Approve shell command".to_string(),
-            preview: command.to_string(),
-        }))
+        build_pending_shell_action(arg).map(ToolRunResult::RequiresApproval)
     }
 
     fn run_approved(&self, arg: &str) -> Result<String> {
         info!(tool = "bash", phase = "execute", "approved tool executing");
-        let output = Command::new("/bin/zsh")
-            .arg("-lc")
-            .arg(arg)
-            .output()?;
+        let output = Command::new("/bin/zsh").arg("-lc").arg(arg).output()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -66,6 +47,24 @@ impl Tool for BashTool {
 
         Ok(result)
     }
+}
+
+pub fn build_pending_shell_action(arg: &str) -> Result<PendingToolAction> {
+    let command = arg.trim();
+    let inspection = safety::inspect_shell_command(command)?;
+    if matches!(inspection.decision, InspectionDecision::Block) {
+        return Err(ParamsError::Config(inspection.blocked_message()));
+    }
+
+    Ok(PendingToolAction {
+        kind: PendingActionKind::ShellCommand,
+        tool_name: "bash".to_string(),
+        argument: command.to_string(),
+        display_argument: command.to_string(),
+        title: "Approve shell command".to_string(),
+        preview: command.to_string(),
+        inspection,
+    })
 }
 
 fn truncate_output(output: &str, max_chars: usize) -> String {

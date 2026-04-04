@@ -97,7 +97,12 @@ impl ExactCache {
         Ok(())
     }
 
-    pub fn get(&self, backend: &str, messages: &[Message], scope: &CacheScope) -> Result<Option<String>> {
+    pub fn get(
+        &self,
+        backend: &str,
+        messages: &[Message],
+        scope: &CacheScope,
+    ) -> Result<Option<String>> {
         let payload = canonical_payload(backend, messages)?;
         let key = hash_key(&payload);
         let row = self
@@ -292,8 +297,16 @@ impl ExactCache {
             return Ok(None);
         };
 
-        if let Some(reason) = stale_reason(row.expires_at, row.project_fingerprint.as_deref(), scope) {
-            debug!(table, cache_name, reason, key = row.key_hash, "cache entry invalidated");
+        if let Some(reason) =
+            stale_reason(row.expires_at, row.project_fingerprint.as_deref(), scope)
+        {
+            debug!(
+                table,
+                cache_name,
+                reason,
+                key = row.key_hash,
+                "cache entry invalidated"
+            );
             self.delete_key(table, &row.key_hash)?;
             return Ok(None);
         }
@@ -320,7 +333,11 @@ impl ExactCache {
 pub fn build_cache_scope(project_root: &Path, ttl_seconds: u64) -> Result<CacheScope> {
     Ok(CacheScope {
         project_fingerprint: fingerprint_project(project_root)?,
-        ttl_seconds: if ttl_seconds == 0 { None } else { Some(ttl_seconds) },
+        ttl_seconds: if ttl_seconds == 0 {
+            None
+        } else {
+            Some(ttl_seconds)
+        },
     })
 }
 
@@ -410,7 +427,8 @@ fn stale_reason(
 }
 
 fn expires_at(scope: &CacheScope) -> Option<i64> {
-    scope.ttl_seconds
+    scope
+        .ttl_seconds
         .map(|ttl| now_unix().saturating_add(ttl) as i64)
 }
 
@@ -462,9 +480,38 @@ fn normalize_prompt(prompt: &str) -> String {
         .collect();
 
     let stopwords = [
-        "a", "an", "the", "what", "is", "are", "was", "were", "do", "does", "did", "can",
-        "could", "would", "should", "please", "tell", "me", "about", "explain", "define",
-        "in", "programming", "code", "for", "to", "of", "and", "or", "how", "whats", "s",
+        "a",
+        "an",
+        "the",
+        "what",
+        "is",
+        "are",
+        "was",
+        "were",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "would",
+        "should",
+        "please",
+        "tell",
+        "me",
+        "about",
+        "explain",
+        "define",
+        "in",
+        "programming",
+        "code",
+        "for",
+        "to",
+        "of",
+        "and",
+        "or",
+        "how",
+        "whats",
+        "s",
     ];
 
     cleaned
@@ -576,7 +623,9 @@ mod tests {
     fn exact_cache_invalidates_when_project_changes() {
         let cache = test_cache();
         let messages = vec![Message::user("hello")];
-        cache.put("llama.cpp:test", &messages, "world", &scope("a")).unwrap();
+        cache
+            .put("llama.cpp:test", &messages, "world", &scope("a"))
+            .unwrap();
 
         let hit = cache.get("llama.cpp:test", &messages, &scope("b")).unwrap();
         assert!(hit.is_none());
@@ -589,7 +638,9 @@ mod tests {
             project_fingerprint: "a".to_string(),
             ttl_seconds: Some(0),
         };
-        cache.put_prompt_level("llama.cpp:test", "system", "hello", "world", &expired_scope).unwrap();
+        cache
+            .put_prompt_level("llama.cpp:test", "system", "hello", "world", &expired_scope)
+            .unwrap();
 
         let hit = cache
             .get_prompt_level("llama.cpp:test", "system", "hello", &scope("a"))

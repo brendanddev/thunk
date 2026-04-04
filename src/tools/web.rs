@@ -6,8 +6,9 @@ use std::io::Read;
 
 use tracing::info;
 
-use crate::error::{ParamsError, Result};
 use super::{Tool, ToolRunResult};
+use crate::error::{ParamsError, Result};
+use crate::safety::{self, InspectionDecision};
 
 const MAX_FETCH_BYTES: u64 = 100_000;
 
@@ -23,7 +24,10 @@ impl Tool for FetchUrlTool {
     }
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
-        let url = normalize_url(arg)?;
+        let (url, inspection) = safety::inspect_fetch_url(arg)?;
+        if matches!(inspection.decision, InspectionDecision::Block) {
+            return Err(ParamsError::Config(inspection.blocked_message()));
+        }
         info!(tool = "fetch_url", "tool called");
 
         let response = ureq::get(&url)
@@ -47,27 +51,6 @@ impl Tool for FetchUrlTool {
 
         Ok(ToolRunResult::Immediate(formatted))
     }
-}
-
-fn normalize_url(raw: &str) -> Result<String> {
-    let url = raw.trim();
-    if url.is_empty() {
-        return Err(ParamsError::Config("URL cannot be empty".to_string()));
-    }
-
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(ParamsError::Config(
-            "Only absolute http:// or https:// URLs are supported".to_string()
-        ));
-    }
-
-    if url.contains(char::is_whitespace) {
-        return Err(ParamsError::Config(
-            "URL cannot contain whitespace".to_string()
-        ));
-    }
-
-    Ok(url.to_string())
 }
 
 fn is_textual_content_type(content_type: &str) -> bool {
@@ -104,9 +87,7 @@ fn format_fetched_content(url: &str, content_type: &str, body: &str) -> String {
         body.trim().to_string()
     };
 
-    format!(
-        "Fetched URL: {url}\nContent-Type: {content_type}\n\n{content}"
-    )
+    format!("Fetched URL: {url}\nContent-Type: {content_type}\n\n{content}")
 }
 
 fn html_to_text(html: &str) -> String {
@@ -147,13 +128,13 @@ mod tests {
 
     #[test]
     fn rejects_non_http_urls() {
-        let result = normalize_url("file:///tmp/test.txt");
+        let result = safety::normalize_url("file:///tmp/test.txt");
         assert!(result.is_err());
     }
 
     #[test]
     fn accepts_https_urls() {
-        let result = normalize_url("https://example.com/docs");
+        let result = safety::normalize_url("https://example.com/docs");
         assert_eq!(result.expect("valid url"), "https://example.com/docs");
     }
 

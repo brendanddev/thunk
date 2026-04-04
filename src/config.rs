@@ -10,10 +10,11 @@
 // Use load_with_profile() to get the fully-merged Config.
 // Use load() only when you explicitly need the raw global config without a profile.
 
-use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
 use crate::error::{ParamsError, Result};
+use crate::safety::{ReadScope, ShellMode};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use tracing::{info, warn};
 
 /// File name searched in the current working directory for project-level overrides.
 pub const PROJECT_PROFILE_FILE: &str = ".params.toml";
@@ -59,6 +60,9 @@ pub struct Config {
     #[serde(default)]
     pub memory: MemoryConfig,
 
+    #[serde(default)]
+    pub safety: SafetyConfig,
+
     /// Path to the active project profile, if one was found.
     /// Set by load_with_profile() — never read from or written to the TOML file.
     #[serde(skip)]
@@ -103,7 +107,7 @@ pub struct OllamaConfig {
 ///     url = "https://api.x.ai/v1"
 ///     api_key = ""   # set XAI_API_KEY env var
 ///     model = "grok-2-latest"
-/// 
+///
 /// Note: look into how to turn this type of configuration into
 /// a preset script or command line option even
 #[derive(Debug, Serialize, Deserialize)]
@@ -198,18 +202,73 @@ pub struct MemoryConfig {
     pub max_facts_per_project: usize,
 }
 
-fn default_fact_ttl_days() -> u64 { 90 }
-fn default_max_facts_per_project() -> usize { 150 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SafetyConfig {
+    #[serde(default = "default_safety_enabled")]
+    pub enabled: bool,
 
-fn default_backend() -> String { "llama_cpp".to_string() }
-fn default_ollama_url() -> String { "http://localhost:11434".to_string() }
-fn default_ollama_model() -> String { "qwen2.5-coder:7b".to_string() }
-fn default_openai_url() -> String { "https://api.groq.com/openai/v1".to_string() }
-fn default_openai_model() -> String { "llama-3.3-70b-versatile".to_string() }
-fn default_max_tokens() -> i32 { 512 }
-fn default_temperature() -> f32 { 0.8 }
-fn default_cache_ttl_seconds() -> u64 { 21600 }
-fn default_lsp_timeout_ms() -> u64 { 15000 }
+    #[serde(default)]
+    pub read_scope: ReadScope,
+
+    #[serde(default = "default_block_private_network")]
+    pub block_private_network: bool,
+
+    #[serde(default = "default_inspect_network")]
+    pub inspect_network: bool,
+
+    #[serde(default)]
+    pub shell_mode: ShellMode,
+
+    #[serde(default = "default_block_destructive_shell")]
+    pub block_destructive_shell: bool,
+}
+
+fn default_fact_ttl_days() -> u64 {
+    90
+}
+fn default_max_facts_per_project() -> usize {
+    150
+}
+
+fn default_backend() -> String {
+    "llama_cpp".to_string()
+}
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+fn default_ollama_model() -> String {
+    "qwen2.5-coder:7b".to_string()
+}
+fn default_openai_url() -> String {
+    "https://api.groq.com/openai/v1".to_string()
+}
+fn default_openai_model() -> String {
+    "llama-3.3-70b-versatile".to_string()
+}
+fn default_max_tokens() -> i32 {
+    512
+}
+fn default_temperature() -> f32 {
+    0.8
+}
+fn default_cache_ttl_seconds() -> u64 {
+    21600
+}
+fn default_lsp_timeout_ms() -> u64 {
+    15000
+}
+fn default_safety_enabled() -> bool {
+    true
+}
+fn default_block_private_network() -> bool {
+    true
+}
+fn default_inspect_network() -> bool {
+    true
+}
+fn default_block_destructive_shell() -> bool {
+    true
+}
 
 impl OpenAICompatConfig {
     /// Infer a human-readable provider name from the URL if not set in config.
@@ -217,21 +276,32 @@ impl OpenAICompatConfig {
         if !self.provider_name.is_empty() {
             return self.provider_name.clone();
         }
-        if self.url.contains("groq.com") { "groq".to_string() }
-        else if self.url.contains("openai.com") { "openai".to_string() }
-        else if self.url.contains("openrouter.ai") { "openrouter".to_string() }
-        else if self.url.contains("x.ai") { "grok".to_string() }
-        else { "api".to_string() }
+        if self.url.contains("groq.com") {
+            "groq".to_string()
+        } else if self.url.contains("openai.com") {
+            "openai".to_string()
+        } else if self.url.contains("openrouter.ai") {
+            "openrouter".to_string()
+        } else if self.url.contains("x.ai") {
+            "grok".to_string()
+        } else {
+            "api".to_string()
+        }
     }
 }
 
 impl Default for LlamaCppConfig {
-    fn default() -> Self { Self { model_path: None } }
+    fn default() -> Self {
+        Self { model_path: None }
+    }
 }
 
 impl Default for OllamaConfig {
     fn default() -> Self {
-        Self { url: default_ollama_url(), model: default_ollama_model() }
+        Self {
+            url: default_ollama_url(),
+            model: default_ollama_model(),
+        }
     }
 }
 
@@ -248,7 +318,10 @@ impl Default for OpenAICompatConfig {
 
 impl Default for GenerationConfig {
     fn default() -> Self {
-        Self { max_tokens: default_max_tokens(), temperature: default_temperature() }
+        Self {
+            max_tokens: default_max_tokens(),
+            temperature: default_temperature(),
+        }
     }
 }
 
@@ -299,6 +372,7 @@ impl Default for Config {
             eco: EcoConfig::default(),
             debug_logging: DebugLoggingConfig::default(),
             memory: MemoryConfig::default(),
+            safety: SafetyConfig::default(),
             active_profile: None,
         }
     }
@@ -321,6 +395,19 @@ impl Default for MemoryConfig {
         Self {
             fact_ttl_days: default_fact_ttl_days(),
             max_facts_per_project: default_max_facts_per_project(),
+        }
+    }
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_safety_enabled(),
+            read_scope: ReadScope::default(),
+            block_private_network: default_block_private_network(),
+            inspect_network: default_inspect_network(),
+            shell_mode: ShellMode::default(),
+            block_destructive_shell: default_block_destructive_shell(),
         }
     }
 }
@@ -425,8 +512,8 @@ pub fn load() -> Result<Config> {
             std::fs::create_dir_all(parent)?;
         }
         let default = Config::default();
-        let toml = toml::to_string_pretty(&default)
-            .map_err(|e| ParamsError::Config(e.to_string()))?;
+        let toml =
+            toml::to_string_pretty(&default).map_err(|e| ParamsError::Config(e.to_string()))?;
 
         let with_comments = format!(
             "# params-cli configuration\n\
@@ -467,7 +554,16 @@ pub fn load() -> Result<Config> {
              #\n\
              # Separate content debug logging (prompts/final answers only):\n\
              #   [debug_logging]\n\
-             #   content = false\n\n\
+             #   content = false\n\
+             #\n\
+             # Safety policy sandbox and inspection:\n\
+             #   [safety]\n\
+             #   enabled = true\n\
+             #   read_scope = \"project_only\"\n\
+             #   block_private_network = true\n\
+             #   inspect_network = true\n\
+             #   shell_mode = \"approve_inspect\"\n\
+             #   block_destructive_shell = true\n\n\
              {toml}"
         );
 
@@ -538,6 +634,9 @@ pub struct ProjectProfile {
 
     #[serde(default)]
     pub memory: ProjectMemoryProfile,
+
+    #[serde(default)]
+    pub safety: ProjectSafetyProfile,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -598,28 +697,94 @@ pub struct ProjectMemoryProfile {
     pub max_facts_per_project: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ProjectSafetyProfile {
+    pub enabled: Option<bool>,
+    pub read_scope: Option<ReadScope>,
+    pub block_private_network: Option<bool>,
+    pub inspect_network: Option<bool>,
+    pub shell_mode: Option<ShellMode>,
+    pub block_destructive_shell: Option<bool>,
+}
+
 /// Apply a project profile on top of a base Config.
 /// Fields that are None in the profile are left unchanged.
 pub fn apply_profile(mut base: Config, profile: ProjectProfile) -> Config {
-    if let Some(b) = profile.backend { base.backend = b; }
-    if let Some(p) = profile.llama_cpp.model_path { base.llama_cpp.model_path = Some(p); }
-    if let Some(u) = profile.ollama.url { base.ollama.url = u; }
-    if let Some(m) = profile.ollama.model { base.ollama.model = m; }
-    if let Some(u) = profile.openai_compat.url { base.openai_compat.url = u; }
-    if let Some(m) = profile.openai_compat.model { base.openai_compat.model = m; }
-    if let Some(k) = profile.openai_compat.api_key { base.openai_compat.api_key = k; }
-    if let Some(n) = profile.openai_compat.provider_name { base.openai_compat.provider_name = n; }
-    if let Some(t) = profile.generation.max_tokens { base.generation.max_tokens = t; }
-    if let Some(t) = profile.generation.temperature { base.generation.temperature = t; }
-    if let Some(v) = profile.budget.input_cost_per_million { base.budget.input_cost_per_million = Some(v); }
-    if let Some(v) = profile.budget.output_cost_per_million { base.budget.output_cost_per_million = Some(v); }
-    if let Some(v) = profile.cache.ttl_seconds { base.cache.ttl_seconds = v; }
-    if let Some(p) = profile.lsp.rust_analyzer_path { base.lsp.rust_analyzer_path = Some(p); }
-    if let Some(t) = profile.lsp.timeout_ms { base.lsp.timeout_ms = t; }
-    if let Some(e) = profile.reflection.enabled { base.reflection.enabled = e; }
-    if let Some(e) = profile.eco.enabled { base.eco.enabled = e; }
-    if let Some(v) = profile.memory.fact_ttl_days { base.memory.fact_ttl_days = v; }
-    if let Some(v) = profile.memory.max_facts_per_project { base.memory.max_facts_per_project = v; }
+    if let Some(b) = profile.backend {
+        base.backend = b;
+    }
+    if let Some(p) = profile.llama_cpp.model_path {
+        base.llama_cpp.model_path = Some(p);
+    }
+    if let Some(u) = profile.ollama.url {
+        base.ollama.url = u;
+    }
+    if let Some(m) = profile.ollama.model {
+        base.ollama.model = m;
+    }
+    if let Some(u) = profile.openai_compat.url {
+        base.openai_compat.url = u;
+    }
+    if let Some(m) = profile.openai_compat.model {
+        base.openai_compat.model = m;
+    }
+    if let Some(k) = profile.openai_compat.api_key {
+        base.openai_compat.api_key = k;
+    }
+    if let Some(n) = profile.openai_compat.provider_name {
+        base.openai_compat.provider_name = n;
+    }
+    if let Some(t) = profile.generation.max_tokens {
+        base.generation.max_tokens = t;
+    }
+    if let Some(t) = profile.generation.temperature {
+        base.generation.temperature = t;
+    }
+    if let Some(v) = profile.budget.input_cost_per_million {
+        base.budget.input_cost_per_million = Some(v);
+    }
+    if let Some(v) = profile.budget.output_cost_per_million {
+        base.budget.output_cost_per_million = Some(v);
+    }
+    if let Some(v) = profile.cache.ttl_seconds {
+        base.cache.ttl_seconds = v;
+    }
+    if let Some(p) = profile.lsp.rust_analyzer_path {
+        base.lsp.rust_analyzer_path = Some(p);
+    }
+    if let Some(t) = profile.lsp.timeout_ms {
+        base.lsp.timeout_ms = t;
+    }
+    if let Some(e) = profile.reflection.enabled {
+        base.reflection.enabled = e;
+    }
+    if let Some(e) = profile.eco.enabled {
+        base.eco.enabled = e;
+    }
+    if let Some(v) = profile.memory.fact_ttl_days {
+        base.memory.fact_ttl_days = v;
+    }
+    if let Some(v) = profile.memory.max_facts_per_project {
+        base.memory.max_facts_per_project = v;
+    }
+    if let Some(v) = profile.safety.enabled {
+        base.safety.enabled = v;
+    }
+    if let Some(v) = profile.safety.read_scope {
+        base.safety.read_scope = v;
+    }
+    if let Some(v) = profile.safety.block_private_network {
+        base.safety.block_private_network = v;
+    }
+    if let Some(v) = profile.safety.inspect_network {
+        base.safety.inspect_network = v;
+    }
+    if let Some(v) = profile.safety.shell_mode {
+        base.safety.shell_mode = v;
+    }
+    if let Some(v) = profile.safety.block_destructive_shell {
+        base.safety.block_destructive_shell = v;
+    }
     base
 }
 
@@ -693,7 +858,9 @@ mod tests {
     fn apply_profile_overrides_only_set_fields() {
         let base = Config::default();
         let profile = ProjectProfile {
-            reflection: ProjectReflectionProfile { enabled: Some(true) },
+            reflection: ProjectReflectionProfile {
+                enabled: Some(true),
+            },
             ..ProjectProfile::default()
         };
         let merged = apply_profile(base, profile);
@@ -727,5 +894,26 @@ mod tests {
         assert_eq!(merged.cache.ttl_seconds, 3600);
         // ollama settings unchanged
         assert_eq!(merged.ollama.model, "qwen2.5-coder:7b");
+    }
+
+    #[test]
+    fn apply_profile_overrides_safety_settings() {
+        let base = Config::default();
+        let profile = ProjectProfile {
+            safety: ProjectSafetyProfile {
+                enabled: Some(false),
+                read_scope: Some(ReadScope::ProjectOnly),
+                block_private_network: Some(false),
+                inspect_network: Some(false),
+                shell_mode: Some(ShellMode::ApproveInspect),
+                block_destructive_shell: Some(false),
+            },
+            ..ProjectProfile::default()
+        };
+        let merged = apply_profile(base, profile);
+        assert!(!merged.safety.enabled);
+        assert!(!merged.safety.block_private_network);
+        assert!(!merged.safety.inspect_network);
+        assert!(!merged.safety.block_destructive_shell);
     }
 }

@@ -4,16 +4,19 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use super::{PendingToolAction, Tool, ToolRunResult};
 use crate::error::{ParamsError, Result};
 use crate::events::PendingActionKind;
-use super::{PendingToolAction, Tool, ToolRunResult};
+use crate::safety::{self, ProjectPathKind};
 
 pub struct WriteFileTool;
 
@@ -35,21 +38,26 @@ impl Tool for WriteFileTool {
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
         if arg.trim().is_empty() {
-            return Err(ParamsError::Config("write_file path cannot be empty".into()));
+            return Err(ParamsError::Config(
+                "write_file path cannot be empty".into(),
+            ));
         }
         Err(ParamsError::Config(
-            "write_file requires a following ```params-file fenced block".into()
+            "write_file requires a following ```params-file fenced block".into(),
         ))
     }
 
     fn run_with_context(&self, arg: &str, following_text: &str) -> Result<ToolRunResult> {
         info!(tool = "write_file", phase = "proposal", "tool called");
-        let root = std::env::current_dir()?;
-        build_pending_write(&root, arg, following_text)
+        build_pending_write_from_block(arg, following_text)
     }
 
     fn run_approved(&self, arg: &str) -> Result<String> {
-        info!(tool = "write_file", phase = "execute", "approved tool executing");
+        info!(
+            tool = "write_file",
+            phase = "execute",
+            "approved tool executing"
+        );
         let payload: WriteFilePayload = serde_json::from_str(arg)
             .map_err(|e| ParamsError::Config(format!("Invalid write payload: {e}")))?;
 
@@ -65,43 +73,67 @@ impl Tool for WriteFileTool {
         }
 
         fs::write(path, payload.content)?;
-        info!(tool = "write_file", phase = "execute", "approved tool finished");
+        info!(
+            tool = "write_file",
+            phase = "execute",
+            "approved tool finished"
+        );
         Ok(format!("Wrote file: {}", payload.display_path))
     }
 }
 
-fn build_pending_write(root: &Path, arg: &str, following_text: &str) -> Result<ToolRunResult> {
-    let requested_path = arg.trim();
+pub fn build_pending_write_request(path: &str, content: &str) -> Result<PendingToolAction> {
+    match build_pending_write(path, content)? {
+        Some(pending) => Ok(pending),
+        None => Err(ParamsError::Config(format!(
+            "No changes needed for {}",
+            path.trim()
+        ))),
+    }
+}
+
+fn build_pending_write_from_block(arg: &str, following_text: &str) -> Result<ToolRunResult> {
+    let new_content = extract_file_block(following_text)?;
+    match build_pending_write(arg, &new_content)? {
+        Some(pending) => Ok(ToolRunResult::RequiresApproval(pending)),
+        None => Ok(ToolRunResult::Immediate(format!(
+            "No changes needed for {}",
+            arg.trim()
+        ))),
+    }
+}
+
+fn build_pending_write(
+    requested_path: &str,
+    new_content: &str,
+) -> Result<Option<PendingToolAction>> {
+    let requested_path = requested_path.trim();
     if requested_path.is_empty() {
-        return Err(ParamsError::Config("write_file path cannot be empty".into()));
+        return Err(ParamsError::Config(
+            "write_file path cannot be empty".into(),
+        ));
     }
 
-    let resolved_path = resolve_target_path(root, requested_path)?;
-    let display_path = resolved_path
-        .strip_prefix(root)
-        .ok()
-        .and_then(|p| p.to_str())
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| requested_path.to_string());
+    let path_info =
+        safety::inspect_project_path("write_file", requested_path, ProjectPathKind::File, true)?;
+    let resolved_path = path_info.resolved_path;
+    let display_path = path_info.display_path;
 
-    let new_content = extract_file_block(following_text)?;
     let existing = read_existing_text_file(&resolved_path, &display_path)?;
 
     if existing == new_content {
-        return Ok(ToolRunResult::Immediate(format!(
-            "No changes needed for {}",
-            display_path
-        )));
+        return Ok(None);
     }
 
     let diff = build_diff(&display_path, &existing, &new_content)?;
     let payload = WriteFilePayload {
         path: resolved_path.to_string_lossy().to_string(),
         display_path: display_path.clone(),
-        content: new_content,
+        content: new_content.to_string(),
     };
+    let inspection = safety::inspect_write_target(&display_path, path_info.exists)?;
 
-    Ok(ToolRunResult::RequiresApproval(PendingToolAction {
+    Ok(Some(PendingToolAction {
         kind: PendingActionKind::FileWrite,
         tool_name: "write_file".to_string(),
         argument: serde_json::to_string(&payload)
@@ -109,6 +141,7 @@ fn build_pending_write(root: &Path, arg: &str, following_text: &str) -> Result<T
         display_argument: display_path.clone(),
         title: format!("Approve file write: {display_path}"),
         preview: diff,
+        inspection,
     }))
 }
 
@@ -116,7 +149,7 @@ fn extract_file_block(text: &str) -> Result<String> {
     let marker = "```params-file";
     let start = text.find(marker).ok_or_else(|| {
         ParamsError::Config(
-            "write_file requires a following ```params-file fenced block".to_string()
+            "write_file requires a following ```params-file fenced block".to_string(),
         )
     })?;
 
@@ -124,53 +157,13 @@ fn extract_file_block(text: &str) -> Result<String> {
     let after_newline = after_marker
         .strip_prefix("\r\n")
         .or_else(|| after_marker.strip_prefix('\n'))
-        .ok_or_else(|| {
-            ParamsError::Config(
-                "Expected newline after ```params-file".to_string()
-            )
-        })?;
+        .ok_or_else(|| ParamsError::Config("Expected newline after ```params-file".to_string()))?;
 
-    let end = after_newline.find("```").ok_or_else(|| {
-        ParamsError::Config("Unclosed ```params-file fenced block".to_string())
-    })?;
+    let end = after_newline
+        .find("```")
+        .ok_or_else(|| ParamsError::Config("Unclosed ```params-file fenced block".to_string()))?;
 
     Ok(after_newline[..end].to_string())
-}
-
-fn resolve_target_path(root: &Path, requested: &str) -> Result<PathBuf> {
-    let requested = Path::new(requested);
-    let candidate = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        root.join(requested)
-    };
-
-    let normalized = normalize_path(candidate);
-    if !normalized.starts_with(root) {
-        return Err(ParamsError::Config(
-            "write_file path must stay within the current project".to_string()
-        ));
-    }
-
-    Ok(normalized)
-}
-
-fn normalize_path(path: PathBuf) -> PathBuf {
-    let mut normalized = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-            Component::RootDir => normalized.push(Path::new("/")),
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-        }
-    }
-
-    normalized
 }
 
 fn read_existing_text_file(path: &Path, display_path: &str) -> Result<String> {
@@ -254,35 +247,48 @@ mod tests {
 
     #[test]
     fn extracts_params_file_block() {
-        let content = extract_file_block(
-            "Some lead-in\n```params-file\nfn main() {}\n```\ntrailing",
-        )
-        .expect("extract block");
+        let content =
+            extract_file_block("Some lead-in\n```params-file\nfn main() {}\n```\ntrailing")
+                .expect("extract block");
 
         assert_eq!(content, "fn main() {}\n");
     }
 
     #[test]
     fn rejects_paths_outside_project() {
+        let _guard = crate::safety::test_cwd_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_project_dir("escape");
-        let result = resolve_target_path(&root, "../outside.txt");
+        let original = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+        let result = safety::inspect_project_path(
+            "write_file",
+            "../outside.txt",
+            ProjectPathKind::File,
+            true,
+        );
+        std::env::set_current_dir(original).expect("restore cwd");
 
         assert!(result.is_err());
     }
 
     #[test]
     fn no_op_write_returns_immediate_result() {
+        let _guard = crate::safety::test_cwd_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_project_dir("noop");
         let file_path = root.join("src").join("main.rs");
         fs::create_dir_all(file_path.parent().expect("parent")).expect("mkdir");
         fs::write(&file_path, "fn main() {}\n").expect("write file");
+        let original = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
 
-        let result = build_pending_write(
-            &root,
-            "src/main.rs",
-            "```params-file\nfn main() {}\n```",
-        )
-        .expect("build write");
+        let result =
+            build_pending_write_from_block("src/main.rs", "```params-file\nfn main() {}\n```")
+                .expect("build write");
+        std::env::set_current_dir(original).expect("restore cwd");
 
         match result {
             ToolRunResult::Immediate(message) => {
@@ -294,13 +300,18 @@ mod tests {
 
     #[test]
     fn write_payload_uses_display_path_and_writes_file() {
+        let _guard = crate::safety::test_cwd_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_project_dir("approve");
-        let result = build_pending_write(
-            &root,
+        let original = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+        let result = build_pending_write_from_block(
             "src/lib.rs",
             "```params-file\npub fn value() -> i32 { 42 }\n```",
         )
         .expect("build write");
+        std::env::set_current_dir(original.clone()).expect("restore cwd");
 
         let pending = match result {
             ToolRunResult::RequiresApproval(pending) => pending,
@@ -311,10 +322,30 @@ mod tests {
         assert!(pending.preview.contains("src/lib.rs"));
 
         let tool = WriteFileTool;
-        let output = tool.run_approved(&pending.argument).expect("write approved");
+        let output = tool
+            .run_approved(&pending.argument)
+            .expect("write approved");
         assert!(output.contains("Wrote file: src/lib.rs"));
 
         let written = fs::read_to_string(root.join("src/lib.rs")).expect("read written file");
         assert_eq!(written, "pub fn value() -> i32 { 42 }\n");
+    }
+
+    #[test]
+    fn direct_write_request_builds_pending_action() {
+        let _guard = crate::safety::test_cwd_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = temp_project_dir("direct");
+        let original = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let pending = build_pending_write_request("scratch/demo.txt", "hello\nfrom\nparams\n")
+            .expect("pending write");
+
+        std::env::set_current_dir(original).expect("restore cwd");
+
+        assert_eq!(pending.display_argument, "scratch/demo.txt");
+        assert!(pending.preview.contains("scratch/demo.txt"));
     }
 }

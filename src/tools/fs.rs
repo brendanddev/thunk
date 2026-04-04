@@ -7,12 +7,12 @@
 // With them, you can say "look at src/auth.rs and tell me what's wrong"
 // and the model will actually read the file.
 
-use std::path::Path;
 use std::fs;
 use tracing::info;
 
-use crate::error::{ParamsError, Result};
 use super::{Tool, ToolRunResult};
+use crate::error::{ParamsError, Result};
+use crate::safety::{self, ProjectPathKind};
 
 /// Reads the contents of a file and returns them as a string.
 ///
@@ -30,20 +30,9 @@ impl Tool for ReadFile {
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
         info!(tool = "read_file", "tool called");
-        let path = Path::new(arg.trim());
-
-        if !path.exists() {
-            return Err(ParamsError::Config(format!(
-                "File not found: {}", path.display()
-            )));
-        }
-
-        if !path.is_file() {
-            return Err(ParamsError::Config(format!(
-                "{} is a directory, not a file. Use list_dir instead.",
-                path.display()
-            )));
-        }
+        let inspected =
+            safety::inspect_project_path("read_file", arg.trim(), ProjectPathKind::File, false)?;
+        let path = &inspected.resolved_path;
 
         // Cap file size to avoid feeding massive files into context
         let metadata = fs::metadata(path)?;
@@ -62,7 +51,7 @@ impl Tool for ReadFile {
         // Include the path and line count as a header so the model has context
         Ok(ToolRunResult::Immediate(format!(
             "File: {}\nLines: {line_count}\n\n```\n{content}\n```",
-            path.display()
+            inspected.display_path
         )))
     }
 }
@@ -83,27 +72,17 @@ impl Tool for ListDir {
 
     fn run(&self, arg: &str) -> Result<ToolRunResult> {
         info!(tool = "list_dir", "tool called");
-        let path = Path::new(arg.trim());
-
-        // Default to current directory if empty
-        let path = if arg.trim().is_empty() {
-            Path::new(".")
-        } else {
-            path
-        };
-
-        if !path.exists() {
-            return Err(ParamsError::Config(format!(
-                "Path not found: {}", path.display()
-            )));
-        }
-
-        if !path.is_dir() {
-            return Err(ParamsError::Config(format!(
-                "{} is a file, not a directory. Use read_file instead.",
-                path.display()
-            )));
-        }
+        let inspected = safety::inspect_project_path(
+            "list_dir",
+            if arg.trim().is_empty() {
+                "."
+            } else {
+                arg.trim()
+            },
+            ProjectPathKind::Directory,
+            false,
+        )?;
+        let path = &inspected.resolved_path;
 
         let mut entries: Vec<String> = Vec::new();
 
@@ -119,7 +98,10 @@ impl Tool for ListDir {
             if name.starts_with('.') {
                 continue;
             }
-            if matches!(name.as_str(), "target" | "node_modules" | "__pycache__" | ".git") {
+            if matches!(
+                name.as_str(),
+                "target" | "node_modules" | "__pycache__" | ".git"
+            ) {
                 continue;
             }
 
@@ -139,13 +121,13 @@ impl Tool for ListDir {
         if entries.is_empty() {
             return Ok(ToolRunResult::Immediate(format!(
                 "Directory {} is empty.",
-                path.display()
+                inspected.display_path
             )));
         }
 
         Ok(ToolRunResult::Immediate(format!(
             "Directory: {}\n\n{}",
-            path.display(),
+            inspected.display_path,
             entries.join("\n")
         )))
     }

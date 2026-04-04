@@ -25,13 +25,16 @@ mod write;
 pub use bash::BashTool;
 pub use fs::{ListDir, ReadFile};
 pub use git::GitTool;
-pub use lsp::{LspDefinitionTool, LspDiagnosticsTool, LspHoverTool, rust_lsp_health_report};
+pub use lsp::{rust_lsp_health_report, LspDefinitionTool, LspDiagnosticsTool, LspHoverTool};
 pub use search::SearchCode;
 pub use web::FetchUrlTool;
-pub use write::WriteFileTool;
+pub use write::{build_pending_write_request, WriteFileTool};
 
 use crate::error::{ParamsError, Result};
 use crate::events::PendingActionKind;
+use crate::safety::InspectionReport;
+#[cfg(test)]
+use crate::safety::{InspectionDecision, RiskLevel};
 
 /// The contract every tool must fulfill.
 /// Tools are simple — they take a string argument and return a string result.
@@ -106,7 +109,7 @@ impl ToolRegistry {
         }
         desc.push_str(
             "Only use tools when you actually need repo or file context.\n\
-             Do not use tools for questions that don't require file access."
+             Do not use tools for questions that don't require file access.",
         );
         desc
     }
@@ -118,7 +121,7 @@ impl ToolRegistry {
              Use exact tags like `[tool_name: argument]`.\n\
              For `write_file`, place `[write_file: path]` on its own line and follow it with a \
              ```params-file block containing the full file contents.\n\
-             After tool results are returned, continue in a follow-up response.\n\n"
+             After tool results are returned, continue in a follow-up response.\n\n",
         );
         for tool in &self.tools {
             desc.push_str(&format!("  {}: {}\n", tool.name(), tool.description()));
@@ -142,12 +145,13 @@ impl ToolRegistry {
 
                 // Find the closing ]
                 if let Some(end_offset) = response[after_tag..].find(']') {
-                    let arg = response[after_tag..after_tag + end_offset].trim().to_string();
+                    let arg = response[after_tag..after_tag + end_offset]
+                        .trim()
+                        .to_string();
 
-                    let tool_run = match tool.run_with_context(
-                        &arg,
-                        &response[after_tag + end_offset + 1..],
-                    ) {
+                    let tool_run = match tool
+                        .run_with_context(&arg, &response[after_tag + end_offset + 1..])
+                    {
                         Ok(output) => output,
                         Err(e) => ToolRunResult::Immediate(format!("Error: {e}")),
                     };
@@ -252,6 +256,7 @@ pub struct PendingToolAction {
     pub display_argument: String,
     pub title: String,
     pub preview: String,
+    pub inspection: InspectionReport,
 }
 
 fn truncate_tool_output(output: &str, max_chars: Option<usize>) -> String {
@@ -338,6 +343,16 @@ mod tests {
                 display_argument: format!("display:{arg}"),
                 title: "Approve test action".to_string(),
                 preview: "preview".to_string(),
+                inspection: InspectionReport {
+                    operation: "pending".to_string(),
+                    decision: InspectionDecision::NeedsApproval,
+                    risk: RiskLevel::Low,
+                    summary: "test".to_string(),
+                    reasons: Vec::new(),
+                    targets: vec!["display".to_string()],
+                    segments: Vec::new(),
+                    network_targets: Vec::new(),
+                },
             }))
         }
     }
@@ -348,9 +363,8 @@ mod tests {
             tools: vec![Box::new(ContextTool)],
         };
 
-        let execution = registry.execute_tool_calls(
-            "[context_tool: src/main.rs]\n```params-file\nhello\n```",
-        );
+        let execution =
+            registry.execute_tool_calls("[context_tool: src/main.rs]\n```params-file\nhello\n```");
 
         assert!(execution.pending.is_none());
         assert_eq!(execution.results.len(), 1);
@@ -381,9 +395,8 @@ mod tests {
             tools: vec![Box::new(ImmediateTool), Box::new(PendingTool)],
         };
 
-        let execution = registry.execute_tool_calls(
-            "[immediate: first]\n[pending: second]\nignored text",
-        );
+        let execution =
+            registry.execute_tool_calls("[immediate: first]\n[pending: second]\nignored text");
 
         assert_eq!(execution.results.len(), 1);
         assert_eq!(execution.results[0].output, "immediate:first");

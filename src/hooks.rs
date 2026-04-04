@@ -19,7 +19,6 @@
 
 use tracing::debug;
 
-
 /// Events fired at key points in the agent lifecycle.
 ///
 /// All fields are structural — no user text, no prompt content.
@@ -58,9 +57,15 @@ pub enum HookEvent {
     },
 
     /// Fired when the user resolves a pending approval (approve or reject).
-    ApprovalResolved {
-        tool_name: String,
-        approved: bool,
+    ApprovalResolved { tool_name: String, approved: bool },
+
+    /// Fired when the policy inspection layer evaluates an action.
+    InspectionEvaluated {
+        operation: String,
+        decision: String,
+        risk: String,
+        target_count: usize,
+        blocked_reason_count: usize,
     },
 
     /// Fired when a previous session is successfully loaded from disk.
@@ -85,7 +90,6 @@ pub enum HookEvent {
         facts_capped: usize,
     },
 }
-
 
 /// The interface every hook implementation must satisfy.
 pub trait Hook: Send {
@@ -129,7 +133,6 @@ impl Default for Hooks {
     }
 }
 
-
 // Writes each lifecycle event to the structured audit log (params.log) at
 // debug level. This surfaces timing, tool, and session metadata as distinct
 // structured log entries — complementing the higher-level info!/warn! calls
@@ -140,53 +143,78 @@ struct StructuralLogHook;
 impl Hook for StructuralLogHook {
     fn on_event(&self, event: &HookEvent) {
         match event {
-            HookEvent::BeforeGeneration { backend, message_count, eco, reflection } => {
+            HookEvent::BeforeGeneration {
+                backend,
+                message_count,
+                eco,
+                reflection,
+            } => {
                 debug!(
                     backend,
-                    message_count,
-                    eco,
-                    reflection,
-                    "hook.before_generation"
+                    message_count, eco, reflection, "hook.before_generation"
                 );
             }
-            HookEvent::AfterGeneration { backend, response_chars, from_cache, elapsed_ms } => {
+            HookEvent::AfterGeneration {
+                backend,
+                response_chars,
+                from_cache,
+                elapsed_ms,
+            } => {
                 debug!(
                     backend,
-                    response_chars,
-                    from_cache,
-                    elapsed_ms,
-                    "hook.after_generation"
+                    response_chars, from_cache, elapsed_ms, "hook.after_generation"
                 );
             }
-            HookEvent::ToolExecuted { tool_name, argument_chars, result_chars } => {
+            HookEvent::ToolExecuted {
+                tool_name,
+                argument_chars,
+                result_chars,
+            } => {
                 debug!(
                     tool_name,
-                    argument_chars,
-                    result_chars,
-                    "hook.tool_executed"
+                    argument_chars, result_chars, "hook.tool_executed"
                 );
             }
             HookEvent::ApprovalRequested { tool_name, kind } => {
                 debug!(tool_name, kind, "hook.approval_requested");
             }
-            HookEvent::ApprovalResolved { tool_name, approved } => {
+            HookEvent::ApprovalResolved {
+                tool_name,
+                approved,
+            } => {
                 debug!(tool_name, approved, "hook.approval_resolved");
             }
-            HookEvent::SessionRestored { message_count, saved_at } => {
+            HookEvent::InspectionEvaluated {
+                operation,
+                decision,
+                risk,
+                target_count,
+                blocked_reason_count,
+            } => {
+                debug!(
+                    operation,
+                    decision, risk, target_count, blocked_reason_count, "hook.inspection_evaluated"
+                );
+            }
+            HookEvent::SessionRestored {
+                message_count,
+                saved_at,
+            } => {
                 debug!(message_count, saved_at, "hook.session_restored");
             }
             HookEvent::SessionEnding { message_count } => {
                 debug!(message_count, "hook.session_ending");
             }
-            HookEvent::MemoryConsolidated { facts_pruned, facts_deduped, facts_capped } => {
+            HookEvent::MemoryConsolidated {
+                facts_pruned,
+                facts_deduped,
+                facts_capped,
+            } => {
                 debug!(
                     facts_pruned,
-                    facts_deduped,
-                    facts_capped,
-                    "hook.memory_consolidated"
+                    facts_deduped, facts_capped, "hook.memory_consolidated"
                 );
             }
         }
     }
 }
-

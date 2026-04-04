@@ -2,6 +2,8 @@
 //
 // Shared event types for communication between the model thread and the UI thread.
 
+use crate::safety::InspectionReport;
+
 #[derive(Debug, Clone)]
 pub enum PendingActionKind {
     ShellCommand,
@@ -14,6 +16,7 @@ pub struct PendingAction {
     pub kind: PendingActionKind,
     pub title: String,
     pub preview: String,
+    pub inspection: InspectionReport,
 }
 
 #[derive(Debug, Clone)]

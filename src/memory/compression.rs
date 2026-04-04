@@ -18,8 +18,8 @@
 
 use tracing::{debug, info, warn};
 
-use crate::inference::{InferenceBackend, Message};
 use super::run_prompt_sync;
+use crate::inference::{InferenceBackend, Message};
 
 /// Non-system messages above this count trigger compression (8 turns).
 const COMPRESSION_THRESHOLD: usize = 16;
@@ -54,9 +54,7 @@ pub fn compress_history(
 
     debug!(
         messages = non_system,
-        threshold,
-        eco_enabled,
-        "history over threshold, compressing"
+        threshold, eco_enabled, "history over threshold, compressing"
     );
 
     // Index where real history starts (after optional system prompt).
@@ -66,7 +64,11 @@ pub fn compress_history(
         0
     };
 
-    let keep_pairs = if eco_enabled { ECO_KEEP_PAIRS } else { KEEP_PAIRS };
+    let keep_pairs = if eco_enabled {
+        ECO_KEEP_PAIRS
+    } else {
+        KEEP_PAIRS
+    };
     let keep_tail = keep_pairs * 2;
 
     // Guard: nothing meaningful left to summarize.
@@ -88,9 +90,7 @@ pub fn compress_history(
         .collect();
 
     let prompt = vec![
-        Message::system(
-            "You are a helpful assistant that writes concise conversation summaries.",
-        ),
+        Message::system("You are a helpful assistant that writes concise conversation summaries."),
         Message::user(&format!(
             "Summarize the following conversation in 3-5 sentences. \
              Focus on what was discussed, which files were examined, and any \

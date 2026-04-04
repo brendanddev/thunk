@@ -101,7 +101,10 @@ impl SessionStore {
 
                 let messages: Vec<Message> = stored
                     .into_iter()
-                    .map(|m| Message { role: m.role, content: m.content })
+                    .map(|m| Message {
+                        role: m.role,
+                        content: m.content,
+                    })
                     .collect();
 
                 info!(msg_count = messages.len(), "session loaded");

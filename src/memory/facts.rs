@@ -20,10 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
+use super::run_prompt_sync;
 use crate::config::{self, MemoryConfig};
 use crate::error::Result;
 use crate::inference::{InferenceBackend, Message};
-use super::run_prompt_sync;
 
 pub struct FactStore {
     conn: Connection,
@@ -114,9 +114,9 @@ impl FactStore {
         let now = now_secs();
 
         // Load existing facts to check for near-duplicates.
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content FROM facts WHERE project = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content FROM facts WHERE project = ?1")?;
 
         let existing: Vec<(i64, String)> = stmt
             .query_map(params![project], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -149,9 +149,17 @@ impl FactStore {
     ///
     /// Called at end of session (non-blocking — runs on the model thread after
     /// the user has already quit). Degrades gracefully on failure.
-    pub fn consolidate(&self, project: &str, memory_cfg: &MemoryConfig) -> Result<ConsolidationStats> {
+    pub fn consolidate(
+        &self,
+        project: &str,
+        memory_cfg: &MemoryConfig,
+    ) -> Result<ConsolidationStats> {
         let now = now_secs();
-        let mut stats = ConsolidationStats { ttl_pruned: 0, dedup_removed: 0, cap_removed: 0 };
+        let mut stats = ConsolidationStats {
+            ttl_pruned: 0,
+            dedup_removed: 0,
+            cap_removed: 0,
+        };
 
         // --- Step 1: TTL pruning ---
         if memory_cfg.fact_ttl_days > 0 {
@@ -169,9 +177,9 @@ impl FactStore {
 
         // --- Step 2: Near-duplicate removal ---
         // Load all facts ordered by most recently seen (keep the freshest).
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content FROM facts WHERE project = ?1 ORDER BY last_seen DESC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content FROM facts WHERE project = ?1 ORDER BY last_seen DESC")?;
 
         let rows: Vec<(i64, String)> = stmt
             .query_map(params![project], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -183,7 +191,9 @@ impl FactStore {
         let mut ids_to_delete: Vec<i64> = Vec::new();
 
         for (id, content) in rows {
-            let is_dup = contents_kept.iter().any(|kept| are_near_duplicate(&content, kept));
+            let is_dup = contents_kept
+                .iter()
+                .any(|kept| are_near_duplicate(&content, kept));
             if is_dup {
                 ids_to_delete.push(id);
             } else {
@@ -193,12 +203,17 @@ impl FactStore {
         }
 
         for id in &ids_to_delete {
-            self.conn.execute("DELETE FROM facts WHERE id = ?1", params![id])?;
+            self.conn
+                .execute("DELETE FROM facts WHERE id = ?1", params![id])?;
             stats.dedup_removed += 1;
         }
 
         if stats.dedup_removed > 0 {
-            debug!(project, count = stats.dedup_removed, "near-duplicate facts removed");
+            debug!(
+                project,
+                count = stats.dedup_removed,
+                "near-duplicate facts removed"
+            );
         }
 
         // --- Step 3: Cap enforcement (remove oldest beyond limit) ---
@@ -207,11 +222,17 @@ impl FactStore {
             // seen_ids is already in DESC order (most recent first), so trim the tail.
             let to_remove = &seen_ids[cap..];
             for id in to_remove {
-                self.conn.execute("DELETE FROM facts WHERE id = ?1", params![id])?;
+                self.conn
+                    .execute("DELETE FROM facts WHERE id = ?1", params![id])?;
                 stats.cap_removed += 1;
             }
             if stats.cap_removed > 0 {
-                debug!(project, count = stats.cap_removed, cap, "facts removed to enforce cap");
+                debug!(
+                    project,
+                    count = stats.cap_removed,
+                    cap,
+                    "facts removed to enforce cap"
+                );
             }
         }
 
@@ -299,7 +320,10 @@ impl FactStore {
         if stored > 0 {
             info!(project, stored, skipped, "session facts stored");
         } else if skipped > 0 {
-            debug!(project, skipped, "all extracted facts were filtered or deduplicated");
+            debug!(
+                project,
+                skipped, "all extracted facts were filtered or deduplicated"
+            );
         }
     }
 }
@@ -396,18 +420,26 @@ mod tests {
 
     #[test]
     fn quality_fact_rejects_question() {
-        assert!(!is_quality_fact("Is this the right approach for the cache?"));
+        assert!(!is_quality_fact(
+            "Is this the right approach for the cache?"
+        ));
     }
 
     #[test]
     fn quality_fact_rejects_numbered_line() {
-        assert!(!is_quality_fact("1. The cache was refactored to use SQLite"));
+        assert!(!is_quality_fact(
+            "1. The cache was refactored to use SQLite"
+        ));
     }
 
     #[test]
     fn quality_fact_rejects_meta_commentary() {
-        assert!(!is_quality_fact("The user asked about fixing the inference loop"));
-        assert!(!is_quality_fact("the session covered memory hardening topics"));
+        assert!(!is_quality_fact(
+            "The user asked about fixing the inference loop"
+        ));
+        assert!(!is_quality_fact(
+            "the session covered memory hardening topics"
+        ));
     }
 
     #[test]

@@ -14,16 +14,18 @@ Switch backends by editing `.local/config.toml`.
 
 ## What Works Today
 
-- Streaming Ratatui TUI with slash commands and approval flow
+- Streaming Ratatui TUI with multiline input, slash commands, autocomplete, and a docked approval card
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands and whole-file writes with diff preview
+- Policy sandbox and inspection: project-only read scope, richer approval previews, destructive shell blocking, and private-network fetch blocking
 - Three-level memory: session compression, incremental project index maintenance, cross-session facts with quality filtering, deduplication, TTL pruning, and per-project cap
 - Budget tracking, per-turn timing in the sidebar, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, with TTL + project-change invalidation and `/clear-cache`
 - Session persistence: conversation history auto-saved to `.local/sessions.db` and restored on the next startup; `/clear` starts a fresh session
 - Project profiles: add `.params.toml` to any project directory to override backend, model, reflection, eco, LSP, and budget settings for that project
+- Custom slash commands: load repo-local commands from `.local/commands.toml`
 
 ---
 
@@ -129,6 +131,14 @@ enabled = false
 [memory]
 fact_ttl_days = 90      # days before a cross-session fact is pruned; 0 disables TTL
 max_facts_per_project = 150  # per-project cap; oldest facts removed first when exceeded
+
+[safety]
+enabled = true
+read_scope = "project_only"
+block_private_network = true
+inspect_network = true
+shell_mode = "approve_inspect"
+block_destructive_shell = true
 ```
 
 ### Project profile — `.params.toml`
@@ -152,6 +162,9 @@ ttl_seconds = 3600
 fact_ttl_days = 30
 max_facts_per_project = 200
 
+[safety]
+block_private_network = false
+
 [reflection]
 enabled = true
 ```
@@ -166,7 +179,7 @@ You can commit `.params.toml` to share project settings with collaborators, or a
 - removes stale rows for deleted files
 - skips oversized files
 
-During normal TUI use, params also maintains the project index in the background while idle, refreshing one stale file at a time with the active backend instead of forcing a full re-index on startup.
+During normal TUI use, params also maintains the project index in the background while idle for non-`llama_cpp` backends, refreshing one stale file at a time with the active backend instead of forcing a full re-index on startup.
 
 ---
 
@@ -182,9 +195,12 @@ params "explain what this function does"
 
 **TUI keybindings:**
 - `Enter` — send message
+- `Shift+Enter` — insert newline when supported by your terminal
+- `Ctrl+J` — guaranteed newline fallback
 - `↑ ↓` — scroll one line
 - `PageUp / PageDown` — scroll ten lines
 - `Ctrl+Q` — quit
+- multiline paste is preserved
 
 **Useful slash commands:**
 - `/read <path>`
@@ -193,9 +209,66 @@ params "explain what this function does"
 - `/git [status|diff|log]`
 - `/fetch <url>`
 - `/run <command>`
+- `/write <path> <content>` with `\n` escapes for line breaks
 - `/reflect on|off|status`
 - `/eco on|off|status`
+- `/commands list`
+- `/commands reload`
 - `/clear-cache`
+
+Safety behavior:
+- `/read`, `/ls`, `/search`, and Rust LSP file lookups are restricted to the current project
+- `/fetch` only allows explicit public `http://` and `https://` URLs and blocks localhost/private-network targets
+- `/run`, `/write`, and model tool approvals use a docked approval card with policy/risk summary, preview, and approve/reject shortcuts
+- `/run` and model `[bash: ...]` calls remain approval-driven, but now show a policy summary and block clearly destructive commands
+
+## Custom Slash Commands
+
+Custom commands are loaded from:
+- `.local/commands.toml` — repo-local, gitignored command definitions for this checkout
+
+Resolution rules:
+- built-in slash commands are reserved and cannot be overridden
+- valid custom commands appear in slash autocomplete and `/commands list`
+
+Schema:
+
+```toml
+[commands.review_auth]
+description = "Load auth files, then ask for a focused review"
+usage = "/review_auth <focus>"
+steps = [
+  { slash = "/read src/auth.rs" },
+  { slash = "/search auth middleware" },
+  { prompt = "Review the loaded auth context with focus on $@. Call out bugs first." }
+]
+```
+
+Prompt-template example:
+
+```toml
+[commands.commit_msg]
+description = "Draft a concise commit message"
+usage = "/commit_msg <change summary>"
+prompt = "Write a Conventional Commit message for this change: $@"
+```
+
+Workflow example:
+
+```toml
+[commands.rust_check]
+description = "Run the local Rust verification flow"
+usage = "/rust_check"
+steps = [
+  { slash = "/read Cargo.toml" },
+  { slash = "/run cargo check" }
+]
+```
+
+Notes:
+- positional placeholders are `$1`, `$2`, and `$@`
+- workflow steps can use built-in context commands, and may end with a single final `/run` or `/write`
+- nested custom commands are intentionally not supported in v1
 
 ---
 
@@ -204,10 +277,12 @@ params "explain what this function does"
 ```
 src/
   main.rs            — CLI entry point, argument routing
+  commands.rs        — built-in slash metadata and custom command registry
   cache/             — exact response cache
   config.rs          — config loading, .local/config.toml
   error.rs           — unified error type
   events.rs          — shared channel event types
+  safety.rs          — policy sandbox and typed request inspection
   inference/
     mod.rs           — public API, persistent model thread
     backend.rs       — InferenceBackend trait

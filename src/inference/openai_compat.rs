@@ -10,9 +10,9 @@
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::Sender;
 
+use super::backend::{InferenceBackend, Message};
 use crate::error::{ParamsError, Result};
 use crate::events::InferenceEvent;
-use super::backend::{InferenceBackend, Message};
 
 /// OpenAI-compatible backend.
 /// Works with any provider that implements the /v1/chat/completions endpoint.
@@ -86,9 +86,12 @@ impl OpenAICompatBackend {
         let response = ureq::get(&url)
             .set("Authorization", &format!("Bearer {api_key}"))
             .call()
-            .map_err(|e| ParamsError::Config(format!(
-                "{} not reachable at {}: {}", self.provider_name, self.base_url, e
-            )))?;
+            .map_err(|e| {
+                ParamsError::Config(format!(
+                    "{} not reachable at {}: {}",
+                    self.provider_name, self.base_url, e
+                ))
+            })?;
 
         if response.status() == 200 || response.status() == 404 {
             // 404 on /models is fine — some providers don't implement it
@@ -127,10 +130,12 @@ impl InferenceBackend for OpenAICompatBackend {
         // This format is identical across all compatible providers.
         let messages_json: Vec<serde_json::Value> = messages
             .iter()
-            .map(|m| serde_json::json!({
-                "role": m.role,
-                "content": m.content,
-            }))
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                })
+            })
             .collect();
 
         let body = serde_json::json!({
@@ -155,11 +160,9 @@ impl InferenceBackend for OpenAICompatBackend {
                 .set("X-Title", "params-cli");
         }
 
-        let response = request
-            .send_string(&body.to_string())
-            .map_err(|e| ParamsError::Config(format!(
-                "{} request failed: {e}", self.provider_name
-            )))?;
+        let response = request.send_string(&body.to_string()).map_err(|e| {
+            ParamsError::Config(format!("{} request failed: {e}", self.provider_name))
+        })?;
 
         // Read the Server-Sent Events (SSE) stream line by line.
         //

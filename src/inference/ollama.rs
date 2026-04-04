@@ -5,9 +5,9 @@
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::Sender;
 
+use super::backend::{InferenceBackend, Message};
 use crate::error::{ParamsError, Result};
 use crate::events::InferenceEvent;
-use super::backend::{InferenceBackend, Message};
 
 /// The Ollama backend. Makes HTTP requests to an Ollama server.
 pub struct OllamaBackend {
@@ -27,9 +27,9 @@ impl OllamaBackend {
     /// Returns Ok(()) if healthy, Err if not running or unreachable.
     pub fn health_check(&self) -> Result<()> {
         let url = format!("{}/api/tags", self.base_url);
-        let response = ureq::get(&url)
-            .call()
-            .map_err(|e| ParamsError::Config(format!("Ollama not reachable at {}: {}", self.base_url, e)))?;
+        let response = ureq::get(&url).call().map_err(|e| {
+            ParamsError::Config(format!("Ollama not reachable at {}: {}", self.base_url, e))
+        })?;
 
         if response.status() == 200 {
             Ok(())
@@ -53,10 +53,12 @@ impl InferenceBackend for OllamaBackend {
         // exactly like OpenAI's chat format. We convert our Message type to JSON.
         let messages_json: Vec<serde_json::Value> = messages
             .iter()
-            .map(|m| serde_json::json!({
-                "role": m.role,
-                "content": m.content,
-            }))
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                })
+            })
             .collect();
 
         let body = serde_json::json!({
