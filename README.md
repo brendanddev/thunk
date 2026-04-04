@@ -279,19 +279,32 @@ src/
   main.rs            — CLI entry point, argument routing
   commands.rs        — built-in slash metadata and custom command registry
   cache/             — exact response cache
-  config.rs          — config loading, .local/config.toml
+  config.rs          — config facade and core config types
+  config/            — config loading, .local helpers, project profile merge logic
   error.rs           — unified error type
   events.rs          — shared channel event types
   safety.rs          — policy sandbox and typed request inspection
   inference/
-    mod.rs           — public API, persistent model thread
+    mod.rs           — public facade, backend loading, session command API
     backend.rs       — InferenceBackend trait
+    session.rs       — model thread + session lifecycle orchestration
+    budget.rs        — budget/cache accounting helpers
+    cache.rs         — exact/prompt/semantic cache helpers
+    approval.rs      — approval flow helpers
+    indexing.rs      — idle incremental indexing helpers
+    reflection.rs    — hidden reflection helpers
+    runtime.rs       — traces and generation/runtime helpers
     llama_cpp.rs     — llama.cpp implementation
     ollama.rs        — Ollama HTTP implementation
     openai_compat.rs — OpenAI-compatible API implementation
   tools/             — tool registry and built-in tools
+  tools/lsp/         — rust-analyzer probing, transport, parsing, and formatting helpers
   memory/            — compression, project index, cross-session facts
   tui/
-    mod.rs           — Ratatui app, layout, event loop
+    mod.rs           — thin Ratatui facade
+    app.rs           — event loop and keyboard handling
+    commands.rs      — built-in/custom slash command dispatch
+    render.rs        — layout and drawing helpers
+    format.rs        — display-only formatting helpers
     state.rs         — app state
 ```
