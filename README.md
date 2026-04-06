@@ -14,7 +14,7 @@ Switch backends by editing `.local/config.toml`.
 
 ## What Works Today
 
-- Streaming Ratatui TUI with multiline input, slash commands, autocomplete, and a docked approval card
+- Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a compact top runtime strip, transcript-first single-column flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript cards, reverse history search, and a docked approval sheet
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands, targeted file edits, and whole-file writes with diff preview
@@ -204,6 +204,10 @@ params "explain what this function does"
 - `Enter` — send message
 - `Shift+Enter` — insert newline when supported by your terminal
 - `Ctrl+J` — guaranteed newline fallback
+- `Alt+Up / Alt+Down` — recall and edit previous submitted prompts/commands
+- `Ctrl+R` — reverse-search submitted prompts/commands in the composer
+- `Ctrl+O` — expand/collapse focused transcript context block
+- `[` / `]` — move transcript focus when the input is empty
 - `↑ ↓` — scroll one line
 - `PageUp / PageDown` — scroll ten lines
 - `Ctrl+Q` — quit
@@ -228,6 +232,7 @@ params "explain what this function does"
 - `/sessions resume <name-or-id>`
 - `/sessions export <name-or-id> [markdown|json]`
 - `/memory [status|facts|last]`
+- `/transcript [status|collapse|expand|toggle]`
 - `/clear-cache`
 
 Safety behavior:
@@ -249,6 +254,18 @@ Memory behavior:
 - `/memory status` shows loaded fact count and the most recent summary paths used for retrieval
 - `/memory facts` lists the currently loaded durable facts with `legacy` vs `verified` tags
 - `/memory last` shows the latest accepted/skipped memory update plus the most recent consolidation stats
+
+Transcript behavior:
+- injected tool results and slash-loaded context blocks auto-collapse into compact transcript cards
+- `Ctrl+O` toggles the focused collapsed/expanded context block
+- `Alt+Up` recalls the previous submitted prompt or slash command into the composer for editing, and `Alt+Down` moves forward through recall history back to your unsent draft
+- `/transcript expand` and `/transcript collapse` control all collapsible transcript blocks at once
+
+Rendering behavior:
+- the visible UI is now painted by a custom framebuffer renderer on top of Crossterm rather than Ratatui widgets
+- each frame renders into an off-screen cell buffer, diffs against the previous frame, and writes only changed runs back to the terminal
+- packed styles, symbol interning, transcript fragment caching, paced redraw scheduling, and explicit resize invalidation keep streaming smoother and reduce flicker
+- status and telemetry are folded into a compact top strip instead of a persistent sidebar/rail, so the transcript stays dominant
 
 ## Custom Slash Commands
 
@@ -336,10 +353,10 @@ src/
   tools/lsp/         — rust-analyzer probing, transport, parsing, and formatting helpers
   memory/            — compression, project index, cross-session facts
   tui/
-    mod.rs           — thin Ratatui facade
+    mod.rs           — terminal setup/cleanup and public TUI entrypoints
     app.rs           — event loop and keyboard handling
     commands.rs      — built-in/custom slash command dispatch
-    render.rs        — layout and drawing helpers
-    format.rs        — display-only formatting helpers
+    renderer/        — custom framebuffer, layout, paint, and diff renderer
+    format.rs        — display sanitization helpers
     state.rs         — app state
 ```

@@ -212,6 +212,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         description: "inspect loaded memory and the latest memory update",
         kind: BuiltinKind::Session,
     },
+    BuiltinCommandSpec {
+        canonical: "/transcript",
+        aliases: &[],
+        usage: "/transcript [status|collapse|expand|toggle]",
+        description: "control collapsible transcript context blocks",
+        kind: BuiltinKind::Session,
+    },
 ];
 
 #[derive(Debug, Clone)]

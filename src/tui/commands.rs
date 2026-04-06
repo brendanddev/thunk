@@ -345,6 +345,7 @@ fn custom_help_text() -> String {
     }
     lines.push("".to_string());
     lines.push("input: Enter sends • Shift+Enter or Ctrl+J insert newlines".to_string());
+    lines.push("transcript: Ctrl+O toggle • [ / ] move focus when input is empty".to_string());
     lines.push("custom commands: /commands list • /commands reload".to_string());
     lines.join("\n")
 }
@@ -461,6 +462,22 @@ fn format_memory_last(snapshot: &MemorySnapshot) -> String {
     }
 
     lines.join("\n")
+}
+
+fn format_transcript_status(total: usize, collapsed: usize) -> String {
+    let mode = if total == 0 {
+        "no collapsible blocks".to_string()
+    } else if collapsed == total {
+        "fully collapsed".to_string()
+    } else if collapsed == 0 {
+        "fully expanded".to_string()
+    } else if collapsed * 2 >= total {
+        "mostly collapsed".to_string()
+    } else {
+        "mostly expanded".to_string()
+    };
+
+    format!("transcript blocks: {total} collapsible, {collapsed} collapsed ({mode})")
 }
 
 fn execute_custom_template(
@@ -956,6 +973,28 @@ fn handle_builtin_slash_command(
                 _ => state.add_system_message("Usage: /memory [status|facts|last]"),
             }
         }
+        "/transcript" => {
+            let subcommand = if arg.is_empty() { "status" } else { arg.trim() };
+            match subcommand {
+                "status" => {
+                    let (total, collapsed) = state.transcript_item_counts();
+                    state.add_system_message(&format_transcript_status(total, collapsed));
+                }
+                "collapse" => {
+                    let changed = state.collapse_all_transcript_items();
+                    state.add_system_message(&format!("collapsed {changed} transcript block(s)"));
+                }
+                "expand" => {
+                    let changed = state.expand_all_transcript_items();
+                    state.add_system_message(&format!("expanded {changed} transcript block(s)"));
+                }
+                "toggle" => {
+                    let changed = state.toggle_all_transcript_items();
+                    state.add_system_message(&format!("toggled {changed} transcript block(s)"));
+                }
+                _ => state.add_system_message("Usage: /transcript [status|collapse|expand|toggle]"),
+            }
+        }
         "/help" => {
             state.add_system_message(&custom_help_text());
         }
@@ -990,7 +1029,7 @@ fn handle_builtin_slash_command(
 mod tests {
     use super::{
         decode_slash_write_content, format_memory_facts, format_memory_last, format_memory_status,
-        parse_sessions_export_args, parse_slash_edit_body,
+        format_transcript_status, parse_sessions_export_args, parse_slash_edit_body,
     };
     use crate::events::{
         FactProvenance, MemoryConsolidationView, MemoryFactView, MemorySkippedReasonCount,
@@ -1068,5 +1107,14 @@ mod tests {
         assert!(facts.contains("[legacy]"));
         assert!(last.contains("duplicates: 1"));
         assert!(last.contains("dedup removed: 2"));
+    }
+
+    #[test]
+    fn transcript_status_reports_collapse_mode() {
+        assert!(format_transcript_status(0, 0).contains("no collapsible blocks"));
+        assert!(format_transcript_status(3, 3).contains("fully collapsed"));
+        assert!(format_transcript_status(3, 0).contains("fully expanded"));
+        assert!(format_transcript_status(4, 3).contains("mostly collapsed"));
+        assert!(format_transcript_status(4, 1).contains("mostly expanded"));
     }
 }

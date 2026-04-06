@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::events::{MemorySnapshot, PendingAction, ProgressStatus, ProgressTrace, SessionInfo};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Role {
     System,
     User,
@@ -14,14 +14,61 @@ pub enum Role {
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
+    pub id: u64,
     pub role: Role,
     pub content: String,
+    pub transcript: TranscriptPresentation,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptPresentation {
+    pub collapsible: bool,
+    pub collapsed: bool,
+    pub summary: Option<String>,
+    pub preview_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
     pub label: String,
     pub success: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirtySections(u8);
+
+impl DirtySections {
+    pub const NONE: Self = Self(0);
+    pub const SIDEBAR: Self = Self(1 << 0);
+    pub const HEADER: Self = Self(1 << 1);
+    pub const CHAT: Self = Self(1 << 2);
+    pub const APPROVAL: Self = Self(1 << 3);
+    pub const INPUT: Self = Self(1 << 4);
+    pub const ALL: Self =
+        Self(Self::SIDEBAR.0 | Self::HEADER.0 | Self::CHAT.0 | Self::APPROVAL.0 | Self::INPUT.0);
+
+    #[cfg(test)]
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::ops::BitOr for DirtySections {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for DirtySections {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 
 pub struct AppState {
@@ -33,6 +80,9 @@ pub struct AppState {
 
     /// All chat messages
     pub messages: Vec<ChatMessage>,
+
+    /// Next transcript item id for local UI-only metadata.
+    next_message_id: u64,
 
     /// Whether the model is generating
     pub is_generating: bool,
@@ -117,6 +167,36 @@ pub struct AppState {
 
     /// Input prefix used to build the current autocomplete cycle.
     autocomplete_prefix: Option<String>,
+
+    /// Submitted prompts/commands available for recall and edit.
+    input_history: Vec<String>,
+
+    /// Current history position when recalling prior submissions.
+    history_cursor: Option<usize>,
+
+    /// Draft input preserved while navigating submitted history.
+    history_draft: Option<String>,
+
+    /// Whether reverse search is active for submitted prompts/commands.
+    reverse_search_active: bool,
+
+    /// Query text for the current reverse search.
+    reverse_search_query: String,
+
+    /// Selected match index within the current reverse-search results.
+    reverse_search_selection: usize,
+
+    /// Draft input preserved while reverse search is active.
+    reverse_search_draft: Option<String>,
+
+    /// Focused collapsible transcript item id, if any.
+    focused_collapsible_id: Option<u64>,
+
+    /// Collapsible transcript items visible in the current chat viewport.
+    visible_collapsible_ids: Vec<u64>,
+
+    /// Dirty UI sections used by the paced render loop.
+    dirty_sections: DirtySections,
 }
 
 impl AppState {
@@ -125,6 +205,7 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             messages: Vec::new(),
+            next_message_id: 1,
             is_generating: false,
             scroll_offset: 0,
             max_scroll: 0,
@@ -157,6 +238,16 @@ impl AppState {
             autocomplete_matches: Vec::new(),
             autocomplete_index: 0,
             autocomplete_prefix: None,
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: None,
+            reverse_search_active: false,
+            reverse_search_query: String::new(),
+            reverse_search_selection: 0,
+            reverse_search_draft: None,
+            focused_collapsible_id: None,
+            visible_collapsible_ids: Vec::new(),
+            dirty_sections: DirtySections::ALL,
         }
     }
 
@@ -167,9 +258,17 @@ impl AppState {
 
     /// Submit input and clear it, returning the text
     pub fn submit_input(&mut self) -> String {
+        let submitted = self.input.clone();
+        if !submitted.is_empty() {
+            self.input_history.push(submitted.clone());
+        }
+        self.history_cursor = None;
+        self.history_draft = None;
+        self.exit_reverse_search();
         self.cursor = 0;
         self.scroll_offset = 0;
         self.clear_autocomplete();
+        self.mark_dirty(DirtySections::INPUT | DirtySections::CHAT | DirtySections::SIDEBAR);
         std::mem::take(&mut self.input)
     }
 
@@ -177,14 +276,22 @@ impl AppState {
     pub fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.history_cursor = None;
+        self.history_draft = None;
+        self.exit_reverse_search();
         self.clear_autocomplete();
+        self.mark_dirty(DirtySections::INPUT);
     }
 
     /// Insert a string at cursor (for paste)
     pub fn insert_str(&mut self, s: &str) {
         self.input.insert_str(self.cursor, s);
         self.cursor += s.len();
+        self.history_cursor = None;
+        self.history_draft = None;
+        self.exit_reverse_search();
         self.clear_autocomplete();
+        self.mark_dirty(DirtySections::INPUT);
     }
 
     /// Insert a newline at the cursor position.
@@ -205,6 +312,7 @@ impl AppState {
         self.input.remove(prev);
         self.cursor = prev;
         self.clear_autocomplete();
+        self.mark_dirty(DirtySections::INPUT);
     }
 
     /// Delete word before cursor (Alt+Backspace)
@@ -219,6 +327,7 @@ impl AppState {
         self.input.drain(word_start..self.cursor);
         self.cursor = word_start;
         self.clear_autocomplete();
+        self.mark_dirty(DirtySections::INPUT);
     }
 
     /// Move cursor left one character
@@ -231,6 +340,7 @@ impl AppState {
             prev -= 1;
         }
         self.cursor = prev;
+        self.mark_dirty(DirtySections::INPUT);
     }
 
     /// Move cursor right one character
@@ -243,32 +353,169 @@ impl AppState {
             next += 1;
         }
         self.cursor = next;
+        self.mark_dirty(DirtySections::INPUT);
     }
 
     /// Move cursor to start of line
     pub fn cursor_home(&mut self) {
         self.cursor = self.current_line_start();
+        self.mark_dirty(DirtySections::INPUT);
     }
 
     /// Move cursor to end of line
     pub fn cursor_end(&mut self) {
         self.cursor = self.current_line_end();
+        self.mark_dirty(DirtySections::INPUT);
+    }
+
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+        self.history_cursor = None;
+        self.history_draft = None;
+        self.exit_reverse_search();
+        self.clear_autocomplete();
+        self.mark_dirty(DirtySections::INPUT);
+    }
+
+    pub fn recall_previous_input(&mut self) -> bool {
+        if self.input_history.is_empty() {
+            return false;
+        }
+
+        let next_index = match self.history_cursor {
+            Some(current) if current > 0 => current - 1,
+            Some(current) => current,
+            None => {
+                self.history_draft = Some(self.input.clone());
+                self.input_history.len() - 1
+            }
+        };
+        self.history_cursor = Some(next_index);
+        self.set_input_text(self.input_history[next_index].clone());
+        true
+    }
+
+    pub fn recall_next_input(&mut self) -> bool {
+        let Some(current) = self.history_cursor else {
+            return false;
+        };
+
+        if current + 1 < self.input_history.len() {
+            self.history_cursor = Some(current + 1);
+            self.set_input_text(self.input_history[current + 1].clone());
+        } else {
+            let draft = self.history_draft.take().unwrap_or_default();
+            self.history_cursor = None;
+            self.set_input_text(draft);
+        }
+        true
+    }
+
+    pub fn is_reverse_search_active(&self) -> bool {
+        self.reverse_search_active
+    }
+
+    pub fn activate_reverse_search(&mut self) -> bool {
+        if self.input_history.is_empty() {
+            return false;
+        }
+        if !self.reverse_search_active {
+            self.reverse_search_active = true;
+            self.reverse_search_query.clear();
+            self.reverse_search_selection = 0;
+            self.reverse_search_draft = Some(self.input.clone());
+        }
+        self.apply_reverse_search_match();
+        self.mark_dirty(DirtySections::INPUT);
+        true
+    }
+
+    pub fn reverse_search_push_char(&mut self, c: char) {
+        if !self.reverse_search_active {
+            return;
+        }
+        self.reverse_search_query.push(c);
+        self.reverse_search_selection = 0;
+        self.apply_reverse_search_match();
+        self.mark_dirty(DirtySections::INPUT);
+    }
+
+    pub fn reverse_search_backspace(&mut self) {
+        if !self.reverse_search_active {
+            return;
+        }
+        self.reverse_search_query.pop();
+        self.reverse_search_selection = 0;
+        self.apply_reverse_search_match();
+        self.mark_dirty(DirtySections::INPUT);
+    }
+
+    pub fn reverse_search_cycle(&mut self) -> bool {
+        if !self.reverse_search_active {
+            return self.activate_reverse_search();
+        }
+
+        let matches = self.reverse_search_matches();
+        if matches.is_empty() {
+            return false;
+        }
+
+        self.reverse_search_selection = (self.reverse_search_selection + 1) % matches.len();
+        self.set_input_text(matches[self.reverse_search_selection].clone());
+        self.mark_dirty(DirtySections::INPUT);
+        true
+    }
+
+    pub fn accept_reverse_search(&mut self) -> bool {
+        if !self.reverse_search_active {
+            return false;
+        }
+        self.reverse_search_active = false;
+        self.reverse_search_query.clear();
+        self.reverse_search_selection = 0;
+        self.reverse_search_draft = None;
+        self.mark_dirty(DirtySections::INPUT);
+        true
+    }
+
+    pub fn cancel_reverse_search(&mut self) -> bool {
+        if !self.reverse_search_active {
+            return false;
+        }
+        let draft = self.reverse_search_draft.take().unwrap_or_default();
+        self.reverse_search_active = false;
+        self.reverse_search_query.clear();
+        self.reverse_search_selection = 0;
+        self.set_input_text(draft);
+        self.mark_dirty(DirtySections::INPUT);
+        true
+    }
+
+    pub fn reverse_search_view(&self) -> Option<(String, String)> {
+        if !self.reverse_search_active {
+            return None;
+        }
+        let current = self
+            .reverse_search_matches()
+            .get(self.reverse_search_selection)
+            .cloned()
+            .unwrap_or_default();
+        Some((self.reverse_search_query.clone(), current))
     }
 
     pub fn add_user_message(&mut self, content: &str) {
-        self.messages.push(ChatMessage {
-            role: Role::User,
-            content: content.to_string(),
-        });
+        let message = self.build_chat_message(Role::User, content);
+        self.messages.push(message);
         self.scroll_offset = 0;
+        self.mark_dirty(DirtySections::CHAT | DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     pub fn start_assistant_message(&mut self) {
-        self.messages.push(ChatMessage {
-            role: Role::Assistant,
-            content: String::new(),
-        });
+        let message = self.build_chat_message(Role::Assistant, String::new());
+        self.messages.push(message);
         self.scroll_offset = 0;
+        self.mark_dirty(DirtySections::CHAT | DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     fn ensure_open_assistant_message(&mut self) {
@@ -294,6 +541,7 @@ impl AppState {
             self.ensure_open_assistant_message();
         }
         self.scroll_offset = 0;
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER | DirtySections::CHAT);
     }
 
     pub fn append_token(&mut self, token: &str) {
@@ -304,6 +552,7 @@ impl AppState {
             }
         }
         self.scroll_offset = 0;
+        self.mark_dirty(DirtySections::CHAT);
     }
 
     pub fn finish_response(&mut self) {
@@ -313,6 +562,7 @@ impl AppState {
         self.last_tool_call = None;
         self.current_trace = None;
         self.flush_grouped_trace_summary();
+        self.mark_dirty(DirtySections::ALL);
     }
 
     pub fn add_error(&mut self, error: &str) {
@@ -321,11 +571,10 @@ impl AppState {
         self.status = "ready".to_string();
         self.current_trace = None;
         self.flush_grouped_trace_summary();
-        self.messages.push(ChatMessage {
-            role: Role::Assistant,
-            content: format!("error: {error}"),
-        });
+        let message = self.build_chat_message(Role::Assistant, format!("error: {error}"));
+        self.messages.push(message);
         self.scroll_offset = 0;
+        self.mark_dirty(DirtySections::ALL);
     }
 
     pub fn message_count(&self) -> usize {
@@ -340,10 +589,12 @@ impl AppState {
             .scroll_offset
             .saturating_add(lines)
             .min(self.max_scroll);
+        self.mark_dirty(DirtySections::CHAT);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.mark_dirty(DirtySections::CHAT);
     }
 
     pub fn set_status(&mut self, status: &str) {
@@ -351,6 +602,7 @@ impl AppState {
         if status == "ready" {
             self.model_ready = true;
         }
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER | DirtySections::INPUT);
     }
 
     pub fn set_backend_name(&mut self, name: String) {
@@ -363,6 +615,7 @@ impl AppState {
                 None
             };
         }
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     pub fn set_pending_action(&mut self, action: PendingAction) {
@@ -370,11 +623,15 @@ impl AppState {
         self.pending_action = Some(action);
         self.is_generating = false;
         self.status = "awaiting approval".to_string();
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER | DirtySections::APPROVAL);
     }
 
     pub fn mark_pending_action_submitted(&mut self, decision: &str) {
         if self.pending_action.is_some() {
             self.status = format!("{decision}...");
+            self.mark_dirty(
+                DirtySections::SIDEBAR | DirtySections::HEADER | DirtySections::APPROVAL,
+            );
         }
     }
 
@@ -383,6 +640,7 @@ impl AppState {
         if !self.is_generating {
             self.status = "ready".to_string();
         }
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER | DirtySections::APPROVAL);
     }
 
     pub fn pending_action_id(&self) -> Option<u64> {
@@ -434,18 +692,22 @@ impl AppState {
         self.completion_tokens = completion_tokens;
         self.total_tokens = total_tokens;
         self.estimated_cost_usd = estimated_cost_usd;
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     pub fn set_reflection_enabled(&mut self, enabled: bool) {
         self.reflection_enabled = enabled;
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     pub fn set_eco_enabled(&mut self, enabled: bool) {
         self.eco_enabled = enabled;
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     pub fn set_debug_logging_enabled(&mut self, enabled: bool) {
         self.debug_logging_enabled = enabled;
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     pub fn update_cache(
@@ -459,6 +721,7 @@ impl AppState {
         self.cache_misses = misses;
         self.tokens_saved = tokens_saved;
         self.last_cache_hit = Some(last_hit);
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     pub fn is_ready(&self) -> bool {
@@ -466,11 +729,10 @@ impl AppState {
     }
 
     pub fn add_system_message(&mut self, content: &str) {
-        self.messages.push(ChatMessage {
-            role: Role::System,
-            content: content.to_string(),
-        });
+        let message = self.build_chat_message(Role::System, content);
+        self.messages.push(message);
         self.scroll_offset = 0;
+        self.mark_dirty(DirtySections::CHAT | DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     fn push_recent_trace(&mut self, label: &str, success: bool) {
@@ -497,6 +759,7 @@ impl AppState {
                 if trace.persist && matches!(trace.status, ProgressStatus::Started) {
                     self.add_trace_chat_message("→", &trace.label);
                 }
+                self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
             }
             ProgressStatus::Finished => {
                 self.current_trace = None;
@@ -508,6 +771,7 @@ impl AppState {
                 if trace.persist {
                     self.add_trace_chat_message("✓", &trace.label);
                 }
+                self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
             }
             ProgressStatus::Failed => {
                 self.current_trace = None;
@@ -519,6 +783,7 @@ impl AppState {
                 if trace.persist {
                     self.add_trace_chat_message("✕", &trace.label);
                 }
+                self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
             }
         }
     }
@@ -547,10 +812,8 @@ impl AppState {
         for (role, content) in messages {
             match role.as_str() {
                 "assistant" => {
-                    self.messages.push(ChatMessage {
-                        role: Role::Assistant,
-                        content,
-                    });
+                    let message = self.build_chat_message(Role::Assistant, content);
+                    self.messages.push(message);
                 }
                 "user" => {
                     let display_role = if is_injected_context(&content) {
@@ -558,23 +821,159 @@ impl AppState {
                     } else {
                         Role::User
                     };
-                    self.messages.push(ChatMessage {
-                        role: display_role,
-                        content,
-                    });
+                    let message = self.build_chat_message(display_role, content);
+                    self.messages.push(message);
                 }
                 _ => {}
             }
         }
         self.scroll_offset = 0;
+        self.mark_dirty(DirtySections::ALL);
     }
 
     pub fn set_session_info(&mut self, session: SessionInfo) {
         self.current_session = Some(session);
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     pub fn set_memory_snapshot(&mut self, snapshot: MemorySnapshot) {
         self.memory_snapshot = snapshot;
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
+    }
+
+    pub fn transcript_item_counts(&self) -> (usize, usize) {
+        let total = self
+            .messages
+            .iter()
+            .filter(|message| message.transcript.collapsible)
+            .count();
+        let collapsed = self
+            .messages
+            .iter()
+            .filter(|message| message.transcript.collapsible && message.transcript.collapsed)
+            .count();
+        (total, collapsed)
+    }
+
+    pub fn collapse_all_transcript_items(&mut self) -> usize {
+        let mut changed = 0usize;
+        for message in &mut self.messages {
+            if message.transcript.collapsible && !message.transcript.collapsed {
+                message.transcript.collapsed = true;
+                changed += 1;
+            }
+        }
+        self.ensure_focused_transcript_available();
+        self.mark_dirty(DirtySections::CHAT);
+        changed
+    }
+
+    pub fn expand_all_transcript_items(&mut self) -> usize {
+        let mut changed = 0usize;
+        for message in &mut self.messages {
+            if message.transcript.collapsible && message.transcript.collapsed {
+                message.transcript.collapsed = false;
+                changed += 1;
+            }
+        }
+        self.ensure_focused_transcript_available();
+        self.mark_dirty(DirtySections::CHAT);
+        changed
+    }
+
+    pub fn toggle_all_transcript_items(&mut self) -> usize {
+        if self
+            .messages
+            .iter()
+            .any(|message| message.transcript.collapsible && message.transcript.collapsed)
+        {
+            self.expand_all_transcript_items()
+        } else {
+            self.collapse_all_transcript_items()
+        }
+    }
+
+    pub fn set_visible_collapsible_ids(&mut self, ids: Vec<u64>) {
+        if self.visible_collapsible_ids == ids {
+            return;
+        }
+        let previous_focus = self.focused_collapsible_id;
+        self.visible_collapsible_ids = ids;
+        self.ensure_focused_transcript_available();
+        if previous_focus != self.focused_collapsible_id {
+            self.mark_dirty(DirtySections::CHAT);
+        }
+    }
+
+    pub fn focus_next_visible_collapsible(&mut self) -> bool {
+        if self.visible_collapsible_ids.is_empty() {
+            return false;
+        }
+        let next_index = match self.focused_collapsible_id {
+            Some(current) => self
+                .visible_collapsible_ids
+                .iter()
+                .position(|id| *id == current)
+                .map(|idx| (idx + 1) % self.visible_collapsible_ids.len())
+                .unwrap_or(0),
+            None => 0,
+        };
+        self.focused_collapsible_id = Some(self.visible_collapsible_ids[next_index]);
+        self.mark_dirty(DirtySections::CHAT);
+        true
+    }
+
+    pub fn focus_prev_visible_collapsible(&mut self) -> bool {
+        if self.visible_collapsible_ids.is_empty() {
+            return false;
+        }
+        let prev_index = match self.focused_collapsible_id {
+            Some(current) => self
+                .visible_collapsible_ids
+                .iter()
+                .position(|id| *id == current)
+                .map(|idx| {
+                    if idx == 0 {
+                        self.visible_collapsible_ids.len() - 1
+                    } else {
+                        idx - 1
+                    }
+                })
+                .unwrap_or(self.visible_collapsible_ids.len() - 1),
+            None => self.visible_collapsible_ids.len() - 1,
+        };
+        self.focused_collapsible_id = Some(self.visible_collapsible_ids[prev_index]);
+        self.mark_dirty(DirtySections::CHAT);
+        true
+    }
+
+    pub fn toggle_focused_collapsible(&mut self) -> bool {
+        let target_id = self
+            .focused_collapsible_id
+            .or_else(|| self.visible_collapsible_ids.first().copied());
+        let Some(target_id) = target_id else {
+            return false;
+        };
+
+        let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == target_id)
+        else {
+            return false;
+        };
+        if !message.transcript.collapsible {
+            return false;
+        }
+
+        message.transcript.collapsed = !message.transcript.collapsed;
+        self.focused_collapsible_id = Some(target_id);
+        self.mark_dirty(DirtySections::CHAT);
+        true
+    }
+
+    pub fn is_focused_collapsible(&self, id: u64) -> bool {
+        self.focused_collapsible_id == Some(id)
     }
 
     pub fn clear_messages(&mut self) {
@@ -588,6 +987,9 @@ impl AppState {
         self.grouped_trace_steps.clear();
         self.grouped_trace_failed = false;
         self.clear_autocomplete();
+        self.focused_collapsible_id = None;
+        self.visible_collapsible_ids.clear();
+        self.next_message_id = 1;
         self.prompt_tokens = 0;
         self.completion_tokens = 0;
         self.total_tokens = 0;
@@ -602,6 +1004,7 @@ impl AppState {
         self.cache_misses = 0;
         self.tokens_saved = 0;
         self.last_cache_hit = None;
+        self.mark_dirty(DirtySections::ALL);
     }
 
     pub fn current_turn_duration(&self) -> Option<Duration> {
@@ -639,6 +1042,14 @@ impl AppState {
         } else {
             Some(preview)
         }
+    }
+
+    pub fn autocomplete_preview_matches(&self, max: usize) -> Vec<String> {
+        self.autocomplete_matches
+            .iter()
+            .take(max)
+            .cloned()
+            .collect()
     }
 
     pub fn autocomplete_command<S: AsRef<str>>(&mut self, commands: &[S], reverse: bool) -> bool {
@@ -704,6 +1115,7 @@ impl AppState {
             self.cursor += 1;
         }
 
+        self.mark_dirty(DirtySections::INPUT);
         true
     }
 
@@ -772,12 +1184,69 @@ impl AppState {
         self.push_recent_trace(&summary, !self.grouped_trace_failed);
         self.grouped_trace_steps.clear();
         self.grouped_trace_failed = false;
+        self.mark_dirty(DirtySections::SIDEBAR | DirtySections::HEADER);
     }
 
     fn clear_autocomplete(&mut self) {
         self.autocomplete_matches.clear();
         self.autocomplete_index = 0;
         self.autocomplete_prefix = None;
+        self.mark_dirty(DirtySections::INPUT);
+    }
+
+    pub fn dirty_sections(&self) -> DirtySections {
+        self.dirty_sections
+    }
+
+    pub fn has_dirty_sections(&self) -> bool {
+        !self.dirty_sections.is_empty()
+    }
+
+    pub fn clear_dirty_sections(&mut self) {
+        self.dirty_sections = DirtySections::NONE;
+    }
+
+    pub fn mark_dirty(&mut self, sections: DirtySections) {
+        self.dirty_sections |= sections;
+    }
+
+    fn next_transcript_id(&mut self) -> u64 {
+        let id = self.next_message_id;
+        self.next_message_id = self.next_message_id.saturating_add(1);
+        id
+    }
+
+    fn build_chat_message(&mut self, role: Role, content: impl Into<String>) -> ChatMessage {
+        let content = content.into();
+        let transcript = transcript_presentation_for_content(&content);
+        let id = self.next_transcript_id();
+        if transcript.collapsible {
+            self.focused_collapsible_id = Some(id);
+        }
+
+        ChatMessage {
+            id,
+            role,
+            content,
+            transcript,
+        }
+    }
+
+    fn ensure_focused_transcript_available(&mut self) {
+        let visible_contains_focus = self
+            .focused_collapsible_id
+            .map(|id| self.visible_collapsible_ids.contains(&id))
+            .unwrap_or(false);
+        if visible_contains_focus {
+            return;
+        }
+
+        self.focused_collapsible_id = self.visible_collapsible_ids.first().copied().or_else(|| {
+            self.messages
+                .iter()
+                .find(|message| message.transcript.collapsible)
+                .map(|message| message.id)
+        });
     }
 
     fn current_line_start(&self) -> usize {
@@ -792,6 +1261,48 @@ impl AppState {
             .find('\n')
             .map(|offset| self.cursor + offset)
             .unwrap_or(self.input.len())
+    }
+
+    fn set_input_text(&mut self, text: String) {
+        self.input = text;
+        self.cursor = self.input.len();
+        self.clear_autocomplete();
+        self.mark_dirty(DirtySections::INPUT);
+    }
+
+    fn reverse_search_matches(&self) -> Vec<String> {
+        let query = self.reverse_search_query.to_lowercase();
+        self.input_history
+            .iter()
+            .rev()
+            .filter(|entry| {
+                if query.is_empty() {
+                    true
+                } else {
+                    entry.to_lowercase().contains(&query)
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn apply_reverse_search_match(&mut self) {
+        let matches = self.reverse_search_matches();
+        if matches.is_empty() {
+            self.set_input_text(self.reverse_search_query.clone());
+            return;
+        }
+        self.reverse_search_selection = self
+            .reverse_search_selection
+            .min(matches.len().saturating_sub(1));
+        self.set_input_text(matches[self.reverse_search_selection].clone());
+    }
+
+    fn exit_reverse_search(&mut self) {
+        self.reverse_search_active = false;
+        self.reverse_search_query.clear();
+        self.reverse_search_selection = 0;
+        self.reverse_search_draft = None;
     }
 }
 
@@ -908,6 +1419,184 @@ fn cursor_visual_position(input: &str, cursor: usize, width: usize) -> (usize, u
     }
 
     (row, col)
+}
+
+impl TranscriptPresentation {
+    fn plain() -> Self {
+        Self {
+            collapsible: false,
+            collapsed: false,
+            summary: None,
+            preview_lines: Vec::new(),
+        }
+    }
+}
+
+fn transcript_presentation_for_content(content: &str) -> TranscriptPresentation {
+    classify_collapsible_context(content).unwrap_or_else(TranscriptPresentation::plain)
+}
+
+fn classify_collapsible_context(content: &str) -> Option<TranscriptPresentation> {
+    if content.starts_with("Tool results:\n") {
+        let tool_count = content
+            .lines()
+            .filter(|line| line.starts_with("--- "))
+            .count()
+            .max(1);
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some(format!(
+                "tool results • {tool_count} tool{}",
+                if tool_count == 1 { "" } else { "s" }
+            )),
+            preview_lines: extract_preview_lines(content, &["Tool results:", ""], 2),
+        });
+    }
+
+    if content.starts_with("I've loaded this file for context:") {
+        let file_label = extract_value_after_label(content, "File:")
+            .unwrap_or_else(|| "file context".to_string());
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some(format!("file context • {file_label}")),
+            preview_lines: extract_preview_lines(
+                content,
+                &["I've loaded this file for context:", ""],
+                2,
+            ),
+        });
+    }
+
+    if content.starts_with("Directory listing:") {
+        let dir = extract_value_after_label(content, "Directory:")
+            .unwrap_or_else(|| "directory".to_string());
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some(format!("directory listing • {dir}")),
+            preview_lines: extract_preview_lines(
+                content,
+                &["Directory listing:", "", &format!("Directory: {dir}")],
+                2,
+            ),
+        });
+    }
+
+    if content.starts_with("Search results:\n") {
+        let query = content
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Search results for '")
+                    .and_then(|rest| rest.split_once('\'').map(|(query, _)| query.to_string()))
+            })
+            .unwrap_or_else(|| "query output".to_string());
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some(format!("search results • {query}")),
+            preview_lines: extract_preview_lines(content, &["Search results:", ""], 2),
+        });
+    }
+
+    if content.starts_with("Git context (") {
+        let mode = content
+            .strip_prefix("Git context (")
+            .and_then(|rest| rest.split_once("):").map(|(mode, _)| mode.to_string()))
+            .unwrap_or_else(|| "status".to_string());
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some(format!("git context • {mode}")),
+            preview_lines: extract_preview_lines(content, &[&format!("Git context ({mode}):")], 2),
+        });
+    }
+
+    if content.starts_with("LSP diagnostics:\n") {
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some("diagnostics".to_string()),
+            preview_lines: extract_preview_lines(content, &["LSP diagnostics:", ""], 2),
+        });
+    }
+
+    if content.starts_with("LSP check:\n") {
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some("rust lsp check".to_string()),
+            preview_lines: extract_preview_lines(content, &["LSP check:", ""], 2),
+        });
+    }
+
+    if content.starts_with("LSP hover:") {
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some("hover".to_string()),
+            preview_lines: extract_preview_lines(content, &["LSP hover:", ""], 2),
+        });
+    }
+
+    if content.starts_with("LSP definition:") {
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some("definition".to_string()),
+            preview_lines: extract_preview_lines(content, &["LSP definition:", ""], 2),
+        });
+    }
+
+    if content.starts_with("Fetched web context:\n") {
+        let url =
+            extract_value_after_label(content, "Fetched URL:").unwrap_or_else(|| "web".to_string());
+        let host = url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or(url.as_str())
+            .to_string();
+        return Some(TranscriptPresentation {
+            collapsible: true,
+            collapsed: true,
+            summary: Some(format!("web context • {host}")),
+            preview_lines: extract_preview_lines(content, &["Fetched web context:", ""], 2),
+        });
+    }
+
+    None
+}
+
+fn extract_preview_lines(content: &str, skip_lines: &[&str], max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || skip_lines.iter().any(|skip| trimmed == *skip) {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+        if lines.len() >= max_lines {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        vec!["(no preview)".to_string()]
+    } else {
+        lines
+    }
+}
+
+fn extract_value_after_label(content: &str, label: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix(label)
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -1121,6 +1810,191 @@ mod tests {
         assert!(lines.iter().any(|line| line == "abc"));
         assert_eq!(cursor_row, 2);
         assert_eq!(cursor_col, 3);
+    }
+
+    #[test]
+    fn history_recall_restores_previous_submission_and_draft() {
+        let mut state = AppState::new();
+        state.input = "first".to_string();
+        state.cursor = state.input.len();
+        assert_eq!(state.submit_input(), "first");
+
+        state.input = "second".to_string();
+        state.cursor = state.input.len();
+        assert_eq!(state.submit_input(), "second");
+
+        state.input = "draft".to_string();
+        state.cursor = state.input.len();
+
+        assert!(state.recall_previous_input());
+        assert_eq!(state.input, "second");
+        assert!(state.recall_previous_input());
+        assert_eq!(state.input, "first");
+        assert!(state.recall_next_input());
+        assert_eq!(state.input, "second");
+        assert!(state.recall_next_input());
+        assert_eq!(state.input, "draft");
+    }
+
+    #[test]
+    fn scroll_and_input_mutations_mark_dirty_sections() {
+        let mut state = AppState::new();
+        state.clear_dirty_sections();
+
+        state.insert_char('a');
+        assert!(state.dirty_sections().contains(DirtySections::INPUT));
+
+        state.clear_dirty_sections();
+        state.add_user_message("hello");
+        assert!(state.dirty_sections().contains(DirtySections::CHAT));
+        assert!(state.dirty_sections().contains(DirtySections::SIDEBAR));
+
+        state.clear_dirty_sections();
+        state.scroll_up(1);
+        assert!(state.dirty_sections().contains(DirtySections::CHAT));
+    }
+
+    #[test]
+    fn injected_context_messages_default_to_collapsed() {
+        let mut state = AppState::new();
+        state.add_user_message(
+            "Tool results:\n\n--- read_file(src/main.rs) ---\nFile: src/main.rs\n\n```",
+        );
+
+        let message = state.messages.last().expect("message");
+        assert!(message.transcript.collapsible);
+        assert!(message.transcript.collapsed);
+        assert_eq!(
+            message.transcript.summary.as_deref(),
+            Some("tool results • 1 tool")
+        );
+    }
+
+    #[test]
+    fn normal_messages_stay_non_collapsible() {
+        let mut state = AppState::new();
+        state.add_user_message("hello there");
+
+        let message = state.messages.last().expect("message");
+        assert!(!message.transcript.collapsible);
+        assert!(!message.transcript.collapsed);
+    }
+
+    #[test]
+    fn restore_session_collapses_injected_context_rows() {
+        let mut state = AppState::new();
+        state.restore_session(
+            SessionInfo {
+                id: "session".to_string(),
+                name: None,
+                message_count: 1,
+            },
+            vec![(
+                "user".to_string(),
+                "Search results:\n\nSearch results for 'cache' (1 matches):".to_string(),
+            )],
+            None,
+        );
+
+        let message = state.messages.last().expect("restored message");
+        assert_eq!(message.role, Role::System);
+        assert!(message.transcript.collapsible);
+        assert!(message.transcript.collapsed);
+    }
+
+    #[test]
+    fn transcript_focus_and_toggle_use_visible_collapsible_items() {
+        let mut state = AppState::new();
+        state.add_user_message("hello");
+        state.add_user_message("Tool results:\n\n--- read_file(src/main.rs) ---");
+        state.add_user_message("Directory listing:\n\nDirectory: src\n\nmain.rs");
+
+        let first_id = state.messages[1].id;
+        let second_id = state.messages[2].id;
+        state.set_visible_collapsible_ids(vec![first_id, second_id]);
+
+        assert!(state.is_focused_collapsible(second_id));
+        assert!(state.focus_next_visible_collapsible());
+        assert!(state.is_focused_collapsible(first_id));
+        assert!(state.toggle_focused_collapsible());
+        assert!(!state.messages[1].transcript.collapsed);
+        assert!(state.focus_prev_visible_collapsible());
+        assert!(state.is_focused_collapsible(second_id));
+    }
+
+    #[test]
+    fn transcript_global_collapse_expand_preserves_content() {
+        let mut state = AppState::new();
+        state.add_user_message("Tool results:\n\n--- read_file(src/main.rs) ---");
+        let original = state.messages[0].content.clone();
+
+        assert_eq!(state.expand_all_transcript_items(), 1);
+        assert!(!state.messages[0].transcript.collapsed);
+        assert_eq!(state.collapse_all_transcript_items(), 1);
+        assert!(state.messages[0].transcript.collapsed);
+        assert_eq!(state.messages[0].content, original);
+    }
+
+    #[test]
+    fn reverse_search_recalls_previous_submission_without_submitting() {
+        let mut state = AppState::new();
+        state.input = "first prompt".to_string();
+        state.cursor = state.input.len();
+        assert_eq!(state.submit_input(), "first prompt");
+
+        state.input = "second prompt".to_string();
+        state.cursor = state.input.len();
+        assert_eq!(state.submit_input(), "second prompt");
+
+        state.input = "draft".to_string();
+        state.cursor = state.input.len();
+
+        assert!(state.activate_reverse_search());
+        state.reverse_search_push_char('f');
+        state.reverse_search_push_char('i');
+
+        assert!(state.is_reverse_search_active());
+        assert_eq!(state.input, "first prompt");
+        assert!(state.accept_reverse_search());
+        assert_eq!(state.input, "first prompt");
+        assert!(!state.is_reverse_search_active());
+    }
+
+    #[test]
+    fn reverse_search_cancel_restores_original_draft() {
+        let mut state = AppState::new();
+        state.input = "alpha".to_string();
+        state.cursor = state.input.len();
+        assert_eq!(state.submit_input(), "alpha");
+
+        state.input = "draft text".to_string();
+        state.cursor = state.input.len();
+
+        assert!(state.activate_reverse_search());
+        state.reverse_search_push_char('a');
+        assert_eq!(state.input, "alpha");
+
+        assert!(state.cancel_reverse_search());
+        assert_eq!(state.input, "draft text");
+        assert!(!state.is_reverse_search_active());
+    }
+
+    #[test]
+    fn reverse_search_cycle_walks_matching_history() {
+        let mut state = AppState::new();
+        for value in ["fix lint", "find bug", "finish docs"] {
+            state.input = value.to_string();
+            state.cursor = state.input.len();
+            assert_eq!(state.submit_input(), value);
+        }
+
+        assert!(state.activate_reverse_search());
+        state.reverse_search_push_char('f');
+        state.reverse_search_push_char('i');
+        assert_eq!(state.input, "finish docs");
+
+        assert!(state.reverse_search_cycle());
+        assert_eq!(state.input, "find bug");
     }
 }
 

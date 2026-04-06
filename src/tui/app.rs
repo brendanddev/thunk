@@ -4,8 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use ratatui::{backend::CrosstermBackend, Terminal};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::commands::CommandRegistry;
 use crate::error::Result;
@@ -13,16 +12,76 @@ use crate::events::InferenceEvent;
 use crate::inference::{SessionCommand, SessionRuntimeOptions};
 
 use super::commands::{handle_command_input, SlashJobOutcome};
-use super::render::draw;
-use super::state::AppState;
+use super::renderer::Renderer;
+use super::state::{AppState, DirtySections};
 use super::TuiOptions;
 
-pub(crate) fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    options: TuiOptions,
-) -> Result<()> {
+const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const SLOW_FRAME_INTERVAL: Duration = Duration::from_millis(66);
+const IDLE_FRAME_INTERVAL: Duration = Duration::from_millis(180);
+
+struct RenderScheduler {
+    last_draw_at: Instant,
+    heavy_frame_streak: u8,
+}
+
+impl RenderScheduler {
+    fn new() -> Self {
+        Self {
+            last_draw_at: Instant::now() - IDLE_FRAME_INTERVAL,
+            heavy_frame_streak: 0,
+        }
+    }
+
+    fn desired_interval(&self, state: &AppState) -> Duration {
+        if state.is_generating || state.current_trace.is_some() || !state.is_ready() {
+            if self.heavy_frame_streak >= 3 {
+                SLOW_FRAME_INTERVAL
+            } else {
+                ACTIVE_FRAME_INTERVAL
+            }
+        } else {
+            IDLE_FRAME_INTERVAL
+        }
+    }
+
+    fn should_draw(&self, state: &AppState) -> bool {
+        if state.has_dirty_sections() {
+            return true;
+        }
+
+        if state.is_generating || state.current_trace.is_some() || !state.is_ready() {
+            return self.last_draw_at.elapsed() >= self.desired_interval(state);
+        }
+
+        false
+    }
+
+    fn poll_timeout(&self, state: &AppState) -> Duration {
+        if state.has_dirty_sections() {
+            Duration::ZERO
+        } else {
+            self.desired_interval(state)
+                .saturating_sub(self.last_draw_at.elapsed())
+        }
+    }
+
+    fn record_draw(&mut self, elapsed: Duration) {
+        self.last_draw_at = Instant::now();
+        if elapsed > Duration::from_millis(24) {
+            self.heavy_frame_streak = self.heavy_frame_streak.saturating_add(1);
+        } else {
+            self.heavy_frame_streak = 0;
+        }
+    }
+}
+
+pub(crate) fn run_app(stdout: &mut io::Stdout, options: TuiOptions) -> Result<()> {
     let mut state = AppState::new();
     let mut command_registry = CommandRegistry::load();
+    let (width, height) = crossterm::terminal::size()?;
+    let mut renderer = Renderer::new(width, height);
+    let mut render_scheduler = RenderScheduler::new();
 
     let (token_tx, token_rx) = mpsc::channel::<InferenceEvent>();
     let (prompt_tx, prompt_rx) = mpsc::channel::<SessionCommand>();
@@ -39,13 +98,7 @@ pub(crate) fn run_app(
         );
     });
 
-    let frame_duration = Duration::from_millis(16);
-
     loop {
-        let frame_start = Instant::now();
-        state.tick();
-        terminal.draw(|frame| draw(frame, &mut state))?;
-
         while let Ok(event) = token_rx.try_recv() {
             match event {
                 InferenceEvent::Ready => {
@@ -80,6 +133,9 @@ pub(crate) fn run_app(
                     state.clear_pending_action();
                     state.last_tool_call = Some(call);
                     state.status = "running tool...".to_string();
+                    state.mark_dirty(
+                        DirtySections::SIDEBAR | DirtySections::HEADER | DirtySections::APPROVAL,
+                    );
                 }
                 InferenceEvent::ContextMessage(message) => {
                     state.add_user_message(&message);
@@ -228,15 +284,52 @@ pub(crate) fn run_app(
             }
         }
 
-        let elapsed = frame_start.elapsed();
-        let remaining = frame_duration.saturating_sub(elapsed);
+        if render_scheduler.should_draw(&state) {
+            state.tick();
+            let stats = renderer.render(stdout, &mut state)?;
+            render_scheduler.record_draw(Duration::from_millis(stats.frame_time_ms));
+            if state.debug_logging_enabled {
+                debug!(
+                    elapsed_ms = stats.frame_time_ms,
+                    dirty = ?state.dirty_sections(),
+                    changed_cells = stats.changed_cells,
+                    changed_runs = stats.changed_runs,
+                    cache_hits = stats.cache_hits,
+                    cache_misses = stats.cache_misses,
+                    symbol_pool_size = stats.symbol_pool_size,
+                    "tui.render"
+                );
+            }
+            state.clear_dirty_sections();
+        }
 
-        if event::poll(remaining)? {
+        if event::poll(render_scheduler.poll_timeout(&state))? {
             match event::read()? {
                 Event::Key(key) => match (key.code, key.modifiers) {
                     (KeyCode::Char('c'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                         return Ok(());
+                    }
+                    (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                        if state.is_ready() && !state.is_generating {
+                            state.reverse_search_cycle();
+                        }
+                    }
+                    (KeyCode::Esc, _) => {
+                        if state.is_reverse_search_active() {
+                            state.cancel_reverse_search();
+                        }
+                    }
+                    (KeyCode::Enter, _) if state.is_reverse_search_active() => {
+                        state.accept_reverse_search();
+                    }
+                    (KeyCode::Backspace, _) if state.is_reverse_search_active() => {
+                        state.reverse_search_backspace();
+                    }
+                    (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        if state.is_reverse_search_active() =>
+                    {
+                        state.reverse_search_push_char(c);
                     }
                     (KeyCode::Enter, KeyModifiers::SHIFT) => {
                         if !state.is_generating && state.is_ready() {
@@ -303,11 +396,15 @@ pub(crate) fn run_app(
                         state.cursor_end();
                     }
                     (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                        state.input.clear();
-                        state.cursor = 0;
+                        state.clear_input();
                     }
                     (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
                         state.delete_word_before();
+                    }
+                    (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                        if state.is_ready() && !state.is_generating {
+                            state.toggle_focused_collapsible();
+                        }
                     }
                     (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
                         if let Some(id) = state.pending_action_id() {
@@ -321,6 +418,12 @@ pub(crate) fn run_app(
                             state.mark_pending_action_submitted("processing rejection");
                         }
                     }
+                    (KeyCode::Up, KeyModifiers::ALT) => {
+                        state.recall_previous_input();
+                    }
+                    (KeyCode::Down, KeyModifiers::ALT) => {
+                        state.recall_next_input();
+                    }
                     (KeyCode::Up, _) => {
                         state.scroll_up(1);
                     }
@@ -332,6 +435,20 @@ pub(crate) fn run_app(
                     }
                     (KeyCode::PageDown, _) => {
                         state.scroll_down(10);
+                    }
+                    (KeyCode::Char('['), _) => {
+                        if state.is_ready() && !state.is_generating && state.input.is_empty() {
+                            state.focus_prev_visible_collapsible();
+                        } else {
+                            state.insert_char('[');
+                        }
+                    }
+                    (KeyCode::Char(']'), _) => {
+                        if state.is_ready() && !state.is_generating && state.input.is_empty() {
+                            state.focus_next_visible_collapsible();
+                        } else {
+                            state.insert_char(']');
+                        }
                     }
                     (KeyCode::Tab, KeyModifiers::NONE) => {
                         if state.is_ready() && !state.is_generating {
@@ -351,6 +468,15 @@ pub(crate) fn run_app(
                     }
                     _ => {}
                 },
+                Event::Resize(width, height) => {
+                    renderer.resize(width, height);
+                    crossterm::execute!(
+                        stdout,
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                    )?;
+                    renderer.invalidate();
+                    state.mark_dirty(DirtySections::ALL);
+                }
                 Event::Paste(text) => {
                     let clean = AppState::normalized_paste(&text);
                     state.insert_str(&clean);
