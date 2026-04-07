@@ -3,7 +3,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::{
+    cursor::SetCursorStyle,
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::SetTitle,
+};
 use tracing::{debug, info, warn};
 
 use crate::commands::CommandRegistry;
@@ -23,6 +28,15 @@ const IDLE_FRAME_INTERVAL: Duration = Duration::from_millis(180);
 struct RenderScheduler {
     last_draw_at: Instant,
     heavy_frame_streak: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalCursorMode {
+    Compose,
+    Search,
+    Launcher,
+    Pending,
+    Busy,
 }
 
 impl RenderScheduler {
@@ -82,6 +96,8 @@ pub(crate) fn run_app(stdout: &mut io::Stdout, options: TuiOptions) -> Result<()
     let (width, height) = crossterm::terminal::size()?;
     let mut renderer = Renderer::new(width, height);
     let mut render_scheduler = RenderScheduler::new();
+    let mut last_terminal_title = String::new();
+    let mut last_cursor_mode: Option<TerminalCursorMode> = None;
 
     let (token_tx, token_rx) = mpsc::channel::<InferenceEvent>();
     let (prompt_tx, prompt_rx) = mpsc::channel::<SessionCommand>();
@@ -286,6 +302,12 @@ pub(crate) fn run_app(stdout: &mut io::Stdout, options: TuiOptions) -> Result<()
 
         if render_scheduler.should_draw(&state) {
             state.tick();
+            sync_terminal_affordances(
+                stdout,
+                &state,
+                &mut last_terminal_title,
+                &mut last_cursor_mode,
+            )?;
             let stats = renderer.render(stdout, &mut state)?;
             render_scheduler.record_draw(Duration::from_millis(stats.frame_time_ms));
             if state.debug_logging_enabled {
@@ -310,10 +332,39 @@ pub(crate) fn run_app(stdout: &mut io::Stdout, options: TuiOptions) -> Result<()
                     | (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
+                    (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                        if state.is_ready() && !state.is_generating {
+                            if state.is_command_launcher_active() {
+                                state.command_launcher_cycle(false);
+                            } else {
+                                state.activate_command_launcher(command_registry.suggestions());
+                            }
+                        }
+                    }
                     (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                         if state.is_ready() && !state.is_generating {
                             state.reverse_search_cycle();
                         }
+                    }
+                    (KeyCode::Esc, _) if state.is_command_launcher_active() => {
+                        state.cancel_command_launcher();
+                    }
+                    (KeyCode::Enter, _) if state.is_command_launcher_active() => {
+                        state.accept_command_launcher();
+                    }
+                    (KeyCode::Backspace, _) if state.is_command_launcher_active() => {
+                        state.command_launcher_backspace();
+                    }
+                    (KeyCode::Up, _) if state.is_command_launcher_active() => {
+                        state.command_launcher_cycle(true);
+                    }
+                    (KeyCode::Down, _) if state.is_command_launcher_active() => {
+                        state.command_launcher_cycle(false);
+                    }
+                    (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                        if state.is_command_launcher_active() =>
+                    {
+                        state.command_launcher_push_char(c);
                     }
                     (KeyCode::Esc, _) => {
                         if state.is_reverse_search_active() {
@@ -485,4 +536,51 @@ pub(crate) fn run_app(stdout: &mut io::Stdout, options: TuiOptions) -> Result<()
             }
         }
     }
+}
+
+fn sync_terminal_affordances(
+    stdout: &mut io::Stdout,
+    state: &AppState,
+    last_title: &mut String,
+    last_cursor_mode: &mut Option<TerminalCursorMode>,
+) -> Result<()> {
+    let session = state
+        .current_session
+        .as_ref()
+        .and_then(|session| session.name.as_ref())
+        .cloned()
+        .unwrap_or_else(|| "unnamed".to_string());
+    let title = format!(
+        "params • {} • {} • {}",
+        state.backend_name, session, state.status
+    );
+    if *last_title != title {
+        execute!(stdout, SetTitle(title.clone()))?;
+        *last_title = title;
+    }
+
+    let cursor_mode = if state.is_command_launcher_active() {
+        TerminalCursorMode::Launcher
+    } else if state.is_reverse_search_active() {
+        TerminalCursorMode::Search
+    } else if state.has_pending_action() {
+        TerminalCursorMode::Pending
+    } else if state.is_generating {
+        TerminalCursorMode::Busy
+    } else {
+        TerminalCursorMode::Compose
+    };
+    if last_cursor_mode != &Some(cursor_mode) {
+        let style = match cursor_mode {
+            TerminalCursorMode::Compose => SetCursorStyle::SteadyBar,
+            TerminalCursorMode::Search => SetCursorStyle::SteadyUnderScore,
+            TerminalCursorMode::Launcher => SetCursorStyle::BlinkingUnderScore,
+            TerminalCursorMode::Pending => SetCursorStyle::BlinkingBlock,
+            TerminalCursorMode::Busy => SetCursorStyle::SteadyBlock,
+        };
+        execute!(stdout, style)?;
+        *last_cursor_mode = Some(cursor_mode);
+    }
+
+    Ok(())
 }

@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::commands::CommandSuggestion;
 use crate::events::{MemorySnapshot, PendingAction, ProgressStatus, ProgressTrace, SessionInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -189,6 +190,21 @@ pub struct AppState {
     /// Draft input preserved while reverse search is active.
     reverse_search_draft: Option<String>,
 
+    /// Whether the command launcher is active.
+    command_launcher_active: bool,
+
+    /// Query text for the current command launcher.
+    command_launcher_query: String,
+
+    /// Available command suggestions for the launcher.
+    command_launcher_entries: Vec<CommandSuggestion>,
+
+    /// Selected result within the launcher.
+    command_launcher_selection: usize,
+
+    /// Draft input preserved while command launcher is active.
+    command_launcher_draft: Option<String>,
+
     /// Focused collapsible transcript item id, if any.
     focused_collapsible_id: Option<u64>,
 
@@ -245,6 +261,11 @@ impl AppState {
             reverse_search_query: String::new(),
             reverse_search_selection: 0,
             reverse_search_draft: None,
+            command_launcher_active: false,
+            command_launcher_query: String::new(),
+            command_launcher_entries: Vec::new(),
+            command_launcher_selection: 0,
+            command_launcher_draft: None,
             focused_collapsible_id: None,
             visible_collapsible_ids: Vec::new(),
             dirty_sections: DirtySections::ALL,
@@ -265,6 +286,7 @@ impl AppState {
         self.history_cursor = None;
         self.history_draft = None;
         self.exit_reverse_search();
+        self.exit_command_launcher();
         self.cursor = 0;
         self.scroll_offset = 0;
         self.clear_autocomplete();
@@ -279,6 +301,7 @@ impl AppState {
         self.history_cursor = None;
         self.history_draft = None;
         self.exit_reverse_search();
+        self.exit_command_launcher();
         self.clear_autocomplete();
         self.mark_dirty(DirtySections::INPUT);
     }
@@ -290,6 +313,7 @@ impl AppState {
         self.history_cursor = None;
         self.history_draft = None;
         self.exit_reverse_search();
+        self.exit_command_launcher();
         self.clear_autocomplete();
         self.mark_dirty(DirtySections::INPUT);
     }
@@ -311,6 +335,7 @@ impl AppState {
         }
         self.input.remove(prev);
         self.cursor = prev;
+        self.exit_command_launcher();
         self.clear_autocomplete();
         self.mark_dirty(DirtySections::INPUT);
     }
@@ -326,6 +351,7 @@ impl AppState {
         let word_start = before[..trim_end].rfind(' ').map(|i| i + 1).unwrap_or(0);
         self.input.drain(word_start..self.cursor);
         self.cursor = word_start;
+        self.exit_command_launcher();
         self.clear_autocomplete();
         self.mark_dirty(DirtySections::INPUT);
     }
@@ -374,6 +400,7 @@ impl AppState {
         self.history_cursor = None;
         self.history_draft = None;
         self.exit_reverse_search();
+        self.exit_command_launcher();
         self.clear_autocomplete();
         self.mark_dirty(DirtySections::INPUT);
     }
@@ -414,6 +441,10 @@ impl AppState {
 
     pub fn is_reverse_search_active(&self) -> bool {
         self.reverse_search_active
+    }
+
+    pub fn is_command_launcher_active(&self) -> bool {
+        self.command_launcher_active
     }
 
     pub fn activate_reverse_search(&mut self) -> bool {
@@ -502,6 +533,113 @@ impl AppState {
             .cloned()
             .unwrap_or_default();
         Some((self.reverse_search_query.clone(), current))
+    }
+
+    pub fn activate_command_launcher(&mut self, entries: Vec<CommandSuggestion>) -> bool {
+        if entries.is_empty() {
+            return false;
+        }
+        if !self.command_launcher_active {
+            self.command_launcher_active = true;
+            self.command_launcher_query.clear();
+            self.command_launcher_selection = 0;
+            self.command_launcher_draft = Some(self.input.clone());
+        }
+        self.command_launcher_entries = entries;
+        self.apply_command_launcher_match();
+        self.mark_dirty(DirtySections::INPUT);
+        true
+    }
+
+    pub fn command_launcher_push_char(&mut self, c: char) {
+        if !self.command_launcher_active {
+            return;
+        }
+        self.command_launcher_query.push(c);
+        self.command_launcher_selection = 0;
+        self.apply_command_launcher_match();
+        self.mark_dirty(DirtySections::INPUT);
+    }
+
+    pub fn command_launcher_backspace(&mut self) {
+        if !self.command_launcher_active {
+            return;
+        }
+        self.command_launcher_query.pop();
+        self.command_launcher_selection = 0;
+        self.apply_command_launcher_match();
+        self.mark_dirty(DirtySections::INPUT);
+    }
+
+    pub fn command_launcher_cycle(&mut self, reverse: bool) -> bool {
+        if !self.command_launcher_active {
+            return false;
+        }
+        let matches = self.command_launcher_matches();
+        if matches.is_empty() {
+            return false;
+        }
+        if reverse {
+            if self.command_launcher_selection == 0 {
+                self.command_launcher_selection = matches.len() - 1;
+            } else {
+                self.command_launcher_selection -= 1;
+            }
+        } else {
+            self.command_launcher_selection = (self.command_launcher_selection + 1) % matches.len();
+        }
+        self.apply_command_launcher_match();
+        self.mark_dirty(DirtySections::INPUT);
+        true
+    }
+
+    pub fn accept_command_launcher(&mut self) -> Option<String> {
+        if !self.command_launcher_active {
+            return None;
+        }
+        let selected = self
+            .command_launcher_matches()
+            .get(self.command_launcher_selection)
+            .map(|item| item.name.clone())?;
+        self.command_launcher_active = false;
+        self.command_launcher_query.clear();
+        self.command_launcher_selection = 0;
+        self.command_launcher_draft = None;
+        let command = format!("{selected} ");
+        self.set_input_text(command.clone());
+        self.mark_dirty(DirtySections::INPUT);
+        Some(command)
+    }
+
+    pub fn cancel_command_launcher(&mut self) -> bool {
+        if !self.command_launcher_active {
+            return false;
+        }
+        let draft = self.command_launcher_draft.take().unwrap_or_default();
+        self.command_launcher_active = false;
+        self.command_launcher_query.clear();
+        self.command_launcher_selection = 0;
+        self.command_launcher_entries.clear();
+        self.set_input_text(draft);
+        self.mark_dirty(DirtySections::INPUT);
+        true
+    }
+
+    pub fn command_launcher_view(
+        &self,
+        max: usize,
+    ) -> Option<(String, Vec<(CommandSuggestion, bool)>)> {
+        if !self.command_launcher_active {
+            return None;
+        }
+        let preview = self
+            .command_launcher_matches()
+            .into_iter()
+            .take(max)
+            .enumerate()
+            .map(|(idx, item)| (item, idx == self.command_launcher_selection))
+            .collect::<Vec<_>>();
+        Some((self.command_launcher_query.clone(), preview))
     }
 
     pub fn add_user_message(&mut self, content: &str) {
@@ -1052,6 +1190,15 @@ impl AppState {
             .collect()
     }
 
+    pub fn autocomplete_preview_items(&self, max: usize) -> Vec<(String, bool)> {
+        self.autocomplete_matches
+            .iter()
+            .take(max)
+            .enumerate()
+            .map(|(idx, value)| (value.clone(), idx == self.autocomplete_index))
+            .collect()
+    }
+
     pub fn autocomplete_command<S: AsRef<str>>(&mut self, commands: &[S], reverse: bool) -> bool {
         let Some((start, end, typed_prefix)) = slash_prefix_range(&self.input, self.cursor) else {
             self.clear_autocomplete();
@@ -1303,6 +1450,45 @@ impl AppState {
         self.reverse_search_query.clear();
         self.reverse_search_selection = 0;
         self.reverse_search_draft = None;
+    }
+
+    fn command_launcher_matches(&self) -> Vec<CommandSuggestion> {
+        let query = self.command_launcher_query.to_lowercase();
+        let mut matches = self
+            .command_launcher_entries
+            .iter()
+            .filter(|entry| {
+                query.is_empty()
+                    || entry.name.to_lowercase().contains(&query)
+                    || entry.description.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| a.name.cmp(&b.name));
+        matches
+    }
+
+    fn apply_command_launcher_match(&mut self) {
+        let matches = self.command_launcher_matches();
+        if matches.is_empty() {
+            self.set_input_text(self.command_launcher_query.clone());
+            return;
+        }
+        self.command_launcher_selection = self
+            .command_launcher_selection
+            .min(matches.len().saturating_sub(1));
+        self.set_input_text(format!(
+            "{} ",
+            matches[self.command_launcher_selection].name
+        ));
+    }
+
+    fn exit_command_launcher(&mut self) {
+        self.command_launcher_active = false;
+        self.command_launcher_query.clear();
+        self.command_launcher_selection = 0;
+        self.command_launcher_entries.clear();
+        self.command_launcher_draft = None;
     }
 }
 
@@ -1995,6 +2181,55 @@ mod tests {
 
         assert!(state.reverse_search_cycle());
         assert_eq!(state.input, "find bug");
+    }
+
+    #[test]
+    fn command_launcher_selects_command_without_submitting() {
+        let mut state = AppState::new();
+        state.input = "draft".to_string();
+        state.cursor = state.input.len();
+
+        assert!(state.activate_command_launcher(vec![
+            CommandSuggestion {
+                name: "/read".to_string(),
+                usage: "/read <path>".to_string(),
+                description: "load a file".to_string(),
+                source: "builtin",
+                group: "context",
+            },
+            CommandSuggestion {
+                name: "/search".to_string(),
+                usage: "/search <query>".to_string(),
+                description: "search project files".to_string(),
+                source: "builtin",
+                group: "context",
+            },
+        ]));
+
+        state.command_launcher_push_char('s');
+        let accepted = state.accept_command_launcher().expect("command");
+        assert_eq!(accepted, "/search ");
+        assert_eq!(state.input, "/search ");
+        assert!(!state.is_command_launcher_active());
+    }
+
+    #[test]
+    fn command_launcher_cancel_restores_draft() {
+        let mut state = AppState::new();
+        state.input = "draft".to_string();
+        state.cursor = state.input.len();
+
+        assert!(state.activate_command_launcher(vec![CommandSuggestion {
+            name: "/read".to_string(),
+            usage: "/read <path>".to_string(),
+            description: "load a file".to_string(),
+            source: "builtin",
+            group: "context",
+        }]));
+
+        state.command_launcher_push_char('r');
+        assert!(state.cancel_command_launcher());
+        assert_eq!(state.input, "draft");
     }
 }
 

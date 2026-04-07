@@ -14,7 +14,7 @@ Switch backends by editing `.local/config.toml`.
 
 ## What Works Today
 
-- Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a compact top runtime strip, transcript-first single-column flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript cards, reverse history search, and a docked approval sheet
+- Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a one-line runtime strip with subtle motion and state-aware color, transcript-first single-column flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript rows, reverse history search, and inline prompt-adjacent approvals
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands, targeted file edits, and whole-file writes with diff preview
@@ -206,6 +206,7 @@ params "explain what this function does"
 - `Ctrl+J` — guaranteed newline fallback
 - `Alt+Up / Alt+Down` — recall and edit previous submitted prompts/commands
 - `Ctrl+R` — reverse-search submitted prompts/commands in the composer
+- `Ctrl+K` — open the command launcher
 - `Ctrl+O` — expand/collapse focused transcript context block
 - `[` / `]` — move transcript focus when the input is empty
 - `↑ ↓` — scroll one line
@@ -238,7 +239,7 @@ params "explain what this function does"
 Safety behavior:
 - `/read`, `/ls`, `/search`, and Rust LSP file lookups are restricted to the current project
 - `/fetch` only allows explicit public `http://` and `https://` URLs and blocks localhost/private-network targets
-- `/run`, `/write`, `/edit`, and model tool approvals use a docked approval card with policy/risk summary, preview, and approve/reject shortcuts
+- `/run`, `/write`, `/edit`, and model tool approvals render inline above the prompt with policy/risk summary, preview, and approve/reject shortcuts
 - `/run` and model `[bash: ...]` calls remain approval-driven, show a policy summary, block clearly destructive commands, and can be further tightened with `shell_allowlist` / `shell_denylist`
 - `/edit` and model `[edit_file: ...]` calls use exact `SEARCH/REPLACE` blocks and reject stale approvals if the file changed after proposal
 - `network_allowlist` restricts `/fetch` and `openai_compat` provider destinations to exact hosts or subdomains you explicitly trust
@@ -259,13 +260,18 @@ Transcript behavior:
 - injected tool results and slash-loaded context blocks auto-collapse into compact transcript cards
 - `Ctrl+O` toggles the focused collapsed/expanded context block
 - `Alt+Up` recalls the previous submitted prompt or slash command into the composer for editing, and `Alt+Down` moves forward through recall history back to your unsent draft
+- `Ctrl+K` opens a lightweight command launcher with built-in and custom slash commands plus descriptions
 - `/transcript expand` and `/transcript collapse` control all collapsible transcript blocks at once
+- pending approvals are now rendered inline above the prompt/composer instead of as a separate stacked panel, so the approval flow feels more like part of the terminal command surface
+- the composer is flatter and more prompt-like now: the terminal uses lighter separators, mode-sensitive prompt markers, and less permanent panel chrome so the transcript stays primary
+- the runtime strip uses a subtle spinner and state-reactive color again for loading, streaming, and approval states, while keeping the overall UI calm and terminal-native
 
 Rendering behavior:
 - the visible UI is now painted by a custom framebuffer renderer on top of Crossterm rather than Ratatui widgets
 - each frame renders into an off-screen cell buffer, diffs against the previous frame, and writes only changed runs back to the terminal
 - packed styles, symbol interning, transcript fragment caching, paced redraw scheduling, and explicit resize invalidation keep streaming smoother and reduce flicker
 - status and telemetry are folded into a compact top strip instead of a persistent sidebar/rail, so the transcript stays dominant
+- the terminal title and cursor shape now reflect the current mode more directly: normal compose, reverse search, command launcher, pending approval, and active generation each use distinct native terminal affordances
 
 ## Custom Slash Commands
 

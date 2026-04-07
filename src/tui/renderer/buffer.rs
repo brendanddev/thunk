@@ -46,6 +46,10 @@ impl CellBuffer {
         self.cells.fill(self.blank);
     }
 
+    pub fn fill(&mut self, cell: Cell) {
+        self.cells.fill(cell);
+    }
+
     pub fn get(&self, x: u16, y: u16) -> Cell {
         self.cells[self.index(x, y)]
     }
@@ -141,5 +145,17 @@ mod tests {
         let written = buf.write_text_clipped(0, 0, "hello", 3, blank_cell().style, &mut pool);
         assert_eq!(written, 3);
         assert_eq!(pool.get(buf.get(2, 0).symbol_id), "l");
+    }
+
+    #[test]
+    fn buffer_fill_replaces_all_cells() {
+        let mut buf = CellBuffer::new(2, 2, blank_cell());
+        let filled = Cell {
+            symbol_id: 9,
+            style: blank_cell().style,
+        };
+        buf.fill(filled);
+        assert_eq!(buf.get(0, 0), filled);
+        assert_eq!(buf.get(1, 1), filled);
     }
 }

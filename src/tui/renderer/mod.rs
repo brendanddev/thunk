@@ -16,7 +16,7 @@ use self::buffer::{Cell, CellBuffer};
 use self::diff::PatchWriter;
 use self::layout::layout_for;
 use self::paint::{build_render_model, build_transcript_block, paint_model, StyledLine};
-use self::style::Theme;
+use self::style::{PackedStyle, Theme};
 use self::symbols::SymbolPool;
 
 use super::state::AppState;
@@ -53,7 +53,7 @@ impl Renderer {
             symbol_id: symbols.blank_id(),
             style: Theme::default().base(),
         };
-        Self {
+        let mut renderer = Self {
             theme: Theme::default(),
             symbols,
             frames: FrameState {
@@ -64,7 +64,9 @@ impl Renderer {
             transcript_cache: HashMap::new(),
             cache_hits: 0,
             cache_misses: 0,
-        }
+        };
+        renderer.invalidate();
+        renderer
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -74,10 +76,10 @@ impl Renderer {
     }
 
     pub fn invalidate(&mut self) {
-        self.frames.previous.clear();
+        self.symbols.reset();
+        self.poison_previous_frame();
         self.frames.current.clear();
         self.transcript_cache.clear();
-        self.symbols.reset();
         self.patch_writer.reset_style();
         self.cache_hits = 0;
         self.cache_misses = 0;
@@ -92,13 +94,8 @@ impl Renderer {
         let width = self.frames.current.width();
         let height = self.frames.current.height();
 
-        let approval_height = if state.has_pending_action() {
-            Some(self.estimate_approval_height(width))
-        } else {
-            None
-        };
         let composer_height = self.estimate_composer_height(state, width);
-        let layout = layout_for(width, height, composer_height, approval_height);
+        let layout = layout_for(width, height, composer_height);
         let transcript_width = layout.transcript.width.saturating_sub(1).max(12);
         let theme = self.theme;
         let mut cache_hits = 0usize;
@@ -160,11 +157,21 @@ impl Renderer {
         let inner_width = width.saturating_sub(4).max(8) as usize;
         let content_rows = state.input_content_rows(inner_width).min(8) as u16;
         let hint_rows = 2u16;
-        content_rows + hint_rows + 1
+        let divider_rows = 1u16;
+        let approval_rows = if state.has_pending_action() {
+            (width / 12).clamp(5, 9)
+        } else {
+            0
+        };
+        content_rows + hint_rows + divider_rows + approval_rows
     }
 
-    fn estimate_approval_height(&self, width: u16) -> u16 {
-        (width / 8).clamp(7, 12)
+    fn poison_previous_frame(&mut self) {
+        let repaint_cell = Cell {
+            symbol_id: self.symbols.intern("~"),
+            style: PackedStyle::new(self.theme.background, self.theme.text),
+        };
+        self.frames.previous.fill(repaint_cell);
     }
 }
 
@@ -198,4 +205,22 @@ fn message_signature(message: &ChatMessage) -> u64 {
     message.transcript.summary.hash(&mut hasher);
     message.transcript.preview_lines.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::state::AppState;
+
+    #[test]
+    fn first_render_forces_full_viewport_repaint() {
+        let mut renderer = Renderer::new(8, 3);
+        let mut out = Vec::new();
+        let mut state = AppState::new();
+
+        let stats = renderer.render(&mut out, &mut state).expect("render");
+
+        assert!(stats.changed_cells >= 24);
+        assert!(stats.changed_runs > 0);
+    }
 }

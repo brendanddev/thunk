@@ -230,6 +230,15 @@ pub struct CustomCommand {
     pub body: CustomCommandBody,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSuggestion {
+    pub name: String,
+    pub usage: String,
+    pub description: String,
+    pub source: &'static str,
+    pub group: &'static str,
+}
+
 #[derive(Debug, Clone)]
 pub enum CustomCommandBody {
     Prompt(String),
@@ -305,6 +314,42 @@ impl CommandRegistry {
         names.sort();
         names.dedup();
         names
+    }
+
+    pub fn suggestions(&self) -> Vec<CommandSuggestion> {
+        let mut suggestions = builtin_command_specs()
+            .iter()
+            .map(|spec| CommandSuggestion {
+                name: spec.canonical.to_string(),
+                usage: spec.usage.to_string(),
+                description: spec.description.to_string(),
+                source: "builtin",
+                group: builtin_group_label(spec.kind),
+            })
+            .collect::<Vec<_>>();
+        suggestions.extend(self.commands.values().map(|command| {
+            CommandSuggestion {
+                name: command.name.clone(),
+                usage: command
+                    .usage
+                    .clone()
+                    .unwrap_or_else(|| command.name.clone()),
+                description: command.description.clone(),
+                source: command.origin.as_str(),
+                group: "custom",
+            }
+        }));
+        suggestions.sort_by(|a, b| a.name.cmp(&b.name));
+        suggestions
+    }
+}
+
+fn builtin_group_label(kind: BuiltinKind) -> &'static str {
+    match kind {
+        BuiltinKind::Context => "context",
+        BuiltinKind::Mutating => "action",
+        BuiltinKind::Session => "session",
+        BuiltinKind::Discovery => "help",
     }
 }
 

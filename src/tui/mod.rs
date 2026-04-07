@@ -7,10 +7,14 @@ mod state;
 use std::io::{self, IsTerminal};
 
 use crossterm::{
-    cursor::{Hide, Show},
+    cursor::{Hide, SetCursorStyle, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::Clear,
+    terminal::ClearType,
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    },
 };
 use tracing::info;
 
@@ -42,12 +46,25 @@ pub fn run_with_options(options: TuiOptions) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        EnableBracketedPaste,
+        Hide
+    )?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         app::run_app(&mut stdout, options)
     }));
     disable_raw_mode()?;
-    execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste, Show)?;
+    execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        Show,
+        SetCursorStyle::DefaultUserShape,
+        SetTitle("params")
+    )?;
     info!("tui exiting");
     match result {
         Ok(result) => result,

@@ -28,18 +28,12 @@ pub(crate) struct LayoutPlan {
     pub mode: RootLayoutMode,
     pub top_bar: Rect,
     pub transcript: Rect,
-    pub approval: Option<Rect>,
     pub composer: Rect,
 }
 
 const TOP_BAR_HEIGHT: u16 = 2;
 
-pub(crate) fn layout_for(
-    width: u16,
-    height: u16,
-    composer_height: u16,
-    approval_height: Option<u16>,
-) -> LayoutPlan {
+pub(crate) fn layout_for(width: u16, height: u16, composer_height: u16) -> LayoutPlan {
     let mode = if width >= 100 && height >= 28 {
         RootLayoutMode::Wide
     } else {
@@ -58,33 +52,12 @@ pub(crate) fn layout_for(
     );
     content_height = content_height.saturating_sub(composer_height);
 
-    let approval = approval_height.map(|approval_height| {
-        Rect::new(
-            0,
-            composer.y.saturating_sub(approval_height),
-            width,
-            approval_height,
-        )
-    });
-    if let Some(approval) = approval {
-        let transcript_y = content_y;
-        let transcript_height = approval.y.saturating_sub(content_y);
-        return LayoutPlan {
-            mode,
-            top_bar,
-            transcript: Rect::new(0, transcript_y, width, transcript_height),
-            approval: Some(approval),
-            composer,
-        };
-    }
-
     let transcript_y = content_y;
     let transcript_height = content_height;
     LayoutPlan {
         mode,
         top_bar,
         transcript: Rect::new(0, transcript_y, width, transcript_height),
-        approval: None,
         composer,
     }
 }
@@ -95,15 +68,16 @@ mod tests {
 
     #[test]
     fn layout_switches_to_compact_for_small_terminal() {
-        let plan = layout_for(80, 24, 5, None);
+        let plan = layout_for(80, 24, 5);
         assert_eq!(plan.mode, RootLayoutMode::Compact);
     }
 
     #[test]
     fn layout_keeps_single_column_for_large_terminal() {
-        let plan = layout_for(140, 40, 5, Some(8));
+        let plan = layout_for(140, 40, 5);
         assert_eq!(plan.mode, RootLayoutMode::Wide);
         assert_eq!(plan.transcript.width, 140);
+        assert_eq!(plan.transcript.y, 2);
         assert_eq!(plan.composer.y, 35);
     }
 }
