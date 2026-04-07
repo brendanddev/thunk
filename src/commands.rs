@@ -201,7 +201,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
     BuiltinCommandSpec {
         canonical: "/sessions",
         aliases: &[],
-        usage: "/sessions <list|new|rename|resume|export>",
+        usage: "/sessions <list|new|rename|resume|delete|export>",
         description: "manage saved sessions for this project",
         kind: BuiltinKind::Session,
     },
@@ -237,6 +237,7 @@ pub struct CommandSuggestion {
     pub description: String,
     pub source: &'static str,
     pub group: &'static str,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +326,11 @@ impl CommandRegistry {
                 description: spec.description.to_string(),
                 source: "builtin",
                 group: builtin_group_label(spec.kind),
+                aliases: spec
+                    .aliases
+                    .iter()
+                    .map(|alias| (*alias).to_string())
+                    .collect(),
             })
             .collect::<Vec<_>>();
         suggestions.extend(self.commands.values().map(|command| {
@@ -337,6 +343,7 @@ impl CommandRegistry {
                 description: command.description.clone(),
                 source: command.origin.as_str(),
                 group: "custom",
+                aliases: Vec::new(),
             }
         }));
         suggestions.sort_by(|a, b| a.name.cmp(&b.name));

@@ -950,6 +950,13 @@ fn handle_builtin_slash_command(
                     }
                     let _ = prompt_tx.send(SessionCommand::ResumeSession(rest.to_string()));
                 }
+                "delete" => {
+                    if rest.is_empty() {
+                        state.add_system_message("Usage: /sessions delete <name-or-id>");
+                        return;
+                    }
+                    let _ = prompt_tx.send(SessionCommand::DeleteSession(rest.to_string()));
+                }
                 "export" => {
                     let Some((selector, format)) = parse_sessions_export_args(rest) else {
                         state.add_system_message(
@@ -960,7 +967,9 @@ fn handle_builtin_slash_command(
                     let _ = prompt_tx.send(SessionCommand::ExportSession { selector, format });
                 }
                 _ => {
-                    state.add_system_message("Usage: /sessions <list|new|rename|resume|export>");
+                    state.add_system_message(
+                        "Usage: /sessions <list|new|rename|resume|delete|export>",
+                    );
                 }
             }
         }

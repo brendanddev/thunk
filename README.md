@@ -14,7 +14,7 @@ Switch backends by editing `.local/config.toml`.
 
 ## What Works Today
 
-- Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a one-line runtime strip with subtle motion and state-aware color, transcript-first single-column flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript rows, reverse history search, and inline prompt-adjacent approvals
+- Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a trimmed runtime status line with subtle motion and state-aware color, an optional transient activity row, transcript-first single-column flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript rows, reverse history search, and inline prompt-adjacent approvals
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands, targeted file edits, and whole-file writes with diff preview
@@ -23,7 +23,7 @@ Switch backends by editing `.local/config.toml`.
 - Budget tracking, per-turn timing in the sidebar, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, with TTL + project-change invalidation and `/clear-cache`
-- Session continuity: conversation history auto-saved to `.local/sessions.db`, the most recently opened session auto-restores on startup, `--no-resume` starts fresh, and `/sessions list|new|rename|resume|export` manages project-scoped saved sessions
+- Session continuity: conversation history auto-saved to `.local/sessions.db`, the most recently opened session auto-restores on startup, `--no-resume` starts fresh, and `/sessions list|new|rename|resume|delete|export` manages project-scoped saved sessions
 - Project profiles: add `.params.toml` to any project directory to override backend, model, reflection, eco, LSP, and budget settings for that project
 - Custom slash commands: load repo-local commands from `.local/commands.toml`
 
@@ -231,6 +231,7 @@ params "explain what this function does"
 - `/sessions new [name]`
 - `/sessions rename <name>`
 - `/sessions resume <name-or-id>`
+- `/sessions delete <name-or-id>`
 - `/sessions export <name-or-id> [markdown|json]`
 - `/memory [status|facts|last]`
 - `/transcript [status|collapse|expand|toggle]`
@@ -239,7 +240,7 @@ params "explain what this function does"
 Safety behavior:
 - `/read`, `/ls`, `/search`, and Rust LSP file lookups are restricted to the current project
 - `/fetch` only allows explicit public `http://` and `https://` URLs and blocks localhost/private-network targets
-- `/run`, `/write`, `/edit`, and model tool approvals render inline above the prompt with policy/risk summary, preview, and approve/reject shortcuts
+- `/run`, `/write`, `/edit`, and model tool approvals render inline above the prompt as tighter terminal-native interrupts with policy/risk summary, preview, and approve/reject shortcuts
 - `/run` and model `[bash: ...]` calls remain approval-driven, show a policy summary, block clearly destructive commands, and can be further tightened with `shell_allowlist` / `shell_denylist`
 - `/edit` and model `[edit_file: ...]` calls use exact `SEARCH/REPLACE` blocks and reject stale approvals if the file changed after proposal
 - `network_allowlist` restricts `/fetch` and `openai_compat` provider destinations to exact hosts or subdomains you explicitly trust
@@ -248,6 +249,7 @@ Safety behavior:
 Session behavior:
 - params resumes the most recently opened session for the current project by default
 - `params --no-resume` starts a fresh unnamed session without deleting saved sessions
+- session selectors accept either an exact real session name or a unique id prefix from `/sessions list`
 - exported session transcripts are written under `.local/exports/sessions/`
 
 Memory behavior:
@@ -255,22 +257,24 @@ Memory behavior:
 - `/memory status` shows loaded fact count and the most recent summary paths used for retrieval
 - `/memory facts` lists the currently loaded durable facts with `legacy` vs `verified` tags
 - `/memory last` shows the latest accepted/skipped memory update plus the most recent consolidation stats
+- routine memory activity stays in runtime/status telemetry instead of injecting extra transcript breaks into assistant replies
 
 Transcript behavior:
 - injected tool results and slash-loaded context blocks auto-collapse into compact transcript cards
 - `Ctrl+O` toggles the focused collapsed/expanded context block
 - `Alt+Up` recalls the previous submitted prompt or slash command into the composer for editing, and `Alt+Down` moves forward through recall history back to your unsent draft
-- `Ctrl+K` opens a lightweight command launcher with built-in and custom slash commands plus descriptions
+- `Ctrl+K` opens a flatter command palette with built-in and custom slash commands, ranked search, aliases, usage preview, and inline group/source metadata
 - `/transcript expand` and `/transcript collapse` control all collapsible transcript blocks at once
 - pending approvals are now rendered inline above the prompt/composer instead of as a separate stacked panel, so the approval flow feels more like part of the terminal command surface
-- the composer is flatter and more prompt-like now: the terminal uses lighter separators, mode-sensitive prompt markers, and less permanent panel chrome so the transcript stays primary
-- the runtime strip uses a subtle spinner and state-reactive color again for loading, streaming, and approval states, while keeping the overall UI calm and terminal-native
+- the composer is flatter and more prompt-like now: the terminal uses mode-sensitive prompt markers, an idle placeholder instead of a permanent tutorial footer, and less permanent panel chrome so the transcript stays primary
+- the runtime strip uses a subtle spinner and state-reactive color for loading, streaming, and approval states, while transient activity moves into a separate short-lived row instead of permanent ambient chrome
+- transcript spacing is less uniform now: same-kind message runs stay tighter, while conversation shifts still breathe so the terminal reads more like a flowing transcript than stacked cards
 
 Rendering behavior:
 - the visible UI is now painted by a custom framebuffer renderer on top of Crossterm rather than Ratatui widgets
 - each frame renders into an off-screen cell buffer, diffs against the previous frame, and writes only changed runs back to the terminal
 - packed styles, symbol interning, transcript fragment caching, paced redraw scheduling, and explicit resize invalidation keep streaming smoother and reduce flicker
-- status and telemetry are folded into a compact top strip instead of a persistent sidebar/rail, so the transcript stays dominant
+- status and telemetry are folded into a compact top strip instead of a persistent sidebar/rail, with only identity/state always visible and transient activity shown separately when needed
 - the terminal title and cursor shape now reflect the current mode more directly: normal compose, reverse search, command launcher, pending approval, and active generation each use distinct native terminal affordances
 
 ## Custom Slash Commands

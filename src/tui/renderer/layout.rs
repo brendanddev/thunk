@@ -31,7 +31,7 @@ pub(crate) struct LayoutPlan {
     pub composer: Rect,
 }
 
-const TOP_BAR_HEIGHT: u16 = 2;
+const TOP_BAR_HEIGHT: u16 = 3;
 
 pub(crate) fn layout_for(width: u16, height: u16, composer_height: u16) -> LayoutPlan {
     let mode = if width >= 100 && height >= 28 {
@@ -77,7 +77,7 @@ mod tests {
         let plan = layout_for(140, 40, 5);
         assert_eq!(plan.mode, RootLayoutMode::Wide);
         assert_eq!(plan.transcript.width, 140);
-        assert_eq!(plan.transcript.y, 2);
+        assert_eq!(plan.transcript.y, 3);
         assert_eq!(plan.composer.y, 35);
     }
 }

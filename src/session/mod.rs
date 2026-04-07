@@ -396,6 +396,33 @@ impl SessionStore {
             return Ok(summary);
         }
 
+        let id_matches = self
+            .list_sessions()?
+            .into_iter()
+            .filter(|session| session.id.starts_with(selector))
+            .collect::<Vec<_>>();
+
+        match id_matches.len() {
+            1 => return Ok(id_matches.into_iter().next().unwrap()),
+            n if n > 1 => {
+                let options = id_matches
+                    .into_iter()
+                    .map(|session| {
+                        format!(
+                            "{} ({})",
+                            short_id(&session.id),
+                            describe_session_age(session.updated_at)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ParamsError::Config(format!(
+                    "Multiple sessions matched id prefix `{selector}`: {options}"
+                )));
+            }
+            _ => {}
+        }
+
         let matches = self
             .list_sessions()?
             .into_iter()
@@ -654,6 +681,30 @@ mod tests {
 
         let err = store.load_session("same").unwrap_err().to_string();
         assert!(err.contains("Multiple sessions matched"));
+    }
+
+    #[test]
+    fn deletes_saved_session_by_id() {
+        let store = open_store("delete");
+        let session = store.create_session(Some("trash"), "llama.cpp").unwrap();
+        let _ = store
+            .save_messages(&session.id, &[Message::user("hello")], "llama.cpp")
+            .unwrap();
+
+        store.delete_session(&session.id).unwrap();
+
+        let sessions = store.list_sessions().unwrap();
+        assert!(sessions.iter().all(|saved| saved.id != session.id));
+    }
+
+    #[test]
+    fn resolves_session_by_short_id_prefix() {
+        let store = open_store("prefix");
+        let session = store.create_session(Some("review"), "llama.cpp").unwrap();
+
+        let resolved = store.resolve_session(&short_id(&session.id)).unwrap();
+
+        assert_eq!(resolved.id, session.id);
     }
 
     #[test]

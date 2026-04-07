@@ -50,6 +50,7 @@ pub enum SessionCommand {
     NewSession(Option<String>),
     RenameSession(String),
     ResumeSession(String),
+    DeleteSession(String),
     ExportSession {
         selector: String,
         format: Option<String>,

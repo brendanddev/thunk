@@ -92,6 +92,12 @@ pub enum HookEvent {
     /// Fired when a session transcript is exported.
     SessionExported { session_id: String, format: String },
 
+    /// Fired when a saved session is deleted.
+    SessionDeleted {
+        session_id: String,
+        was_active: bool,
+    },
+
     /// Fired when the active saved session is cleared.
     SessionCleared { session_id: String },
 
@@ -249,6 +255,12 @@ impl Hook for StructuralLogHook {
             }
             HookEvent::SessionExported { session_id, format } => {
                 debug!(session_id, format, "hook.session_exported");
+            }
+            HookEvent::SessionDeleted {
+                session_id,
+                was_active,
+            } => {
+                debug!(session_id, was_active, "hook.session_deleted");
             }
             HookEvent::SessionCleared { session_id } => {
                 debug!(session_id, "hook.session_cleared");

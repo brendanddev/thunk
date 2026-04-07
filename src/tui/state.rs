@@ -1457,15 +1457,17 @@ impl AppState {
         let mut matches = self
             .command_launcher_entries
             .iter()
-            .filter(|entry| {
-                query.is_empty()
-                    || entry.name.to_lowercase().contains(&query)
-                    || entry.description.to_lowercase().contains(&query)
+            .filter_map(|entry| {
+                command_match_score(entry, &query).map(|score| (score, entry.clone()))
             })
-            .cloned()
             .collect::<Vec<_>>();
-        matches.sort_by(|a, b| a.name.cmp(&b.name));
-        matches
+        matches.sort_by(|(left_score, left), (right_score, right)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| group_rank(left.group).cmp(&group_rank(right.group)))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        matches.into_iter().map(|(_, entry)| entry).collect()
     }
 
     fn apply_command_launcher_match(&mut self) {
@@ -1489,6 +1491,61 @@ impl AppState {
         self.command_launcher_selection = 0;
         self.command_launcher_entries.clear();
         self.command_launcher_draft = None;
+    }
+}
+
+fn command_match_score(entry: &CommandSuggestion, query: &str) -> Option<(u8, usize)> {
+    if query.is_empty() {
+        return Some((0, 0));
+    }
+
+    let name = entry.name.to_lowercase();
+    if name == query {
+        return Some((0, 0));
+    }
+    if name.starts_with(query) {
+        return Some((1, name.len()));
+    }
+    if entry
+        .aliases
+        .iter()
+        .map(|alias| alias.to_lowercase())
+        .any(|alias| alias == query)
+    {
+        return Some((2, 0));
+    }
+    if entry
+        .aliases
+        .iter()
+        .map(|alias| alias.to_lowercase())
+        .any(|alias| alias.starts_with(query))
+    {
+        return Some((3, 0));
+    }
+    if name.contains(query) {
+        return Some((4, name.len()));
+    }
+    if entry.usage.to_lowercase().contains(query) {
+        return Some((5, entry.usage.len()));
+    }
+    if entry.description.to_lowercase().contains(query) {
+        return Some((6, entry.description.len()));
+    }
+    if entry.group.to_lowercase().contains(query) {
+        return Some((7, entry.group.len()));
+    }
+
+    None
+}
+
+fn group_rank(group: &str) -> u8 {
+    match group {
+        "context" => 0,
+        "action" => 1,
+        "session" => 2,
+        "help" => 3,
+        "custom" => 4,
+        _ => 5,
     }
 }
 
@@ -1864,6 +1921,23 @@ mod tests {
     }
 
     #[test]
+    fn non_persisted_traces_do_not_inject_chat_messages() {
+        let mut state = AppState::new();
+        state.apply_trace(ProgressTrace {
+            status: ProgressStatus::Finished,
+            label: "memory: stored 1 fact".to_string(),
+            persist: false,
+        });
+
+        assert!(state.messages.is_empty());
+        assert_eq!(state.recent_traces.len(), 1);
+        assert_eq!(
+            state.recent_traces.front().unwrap().label,
+            "memory: stored 1 fact"
+        );
+    }
+
+    #[test]
     fn command_autocomplete_cycles_matches() {
         let mut state = AppState::new();
         state.input = "/d".to_string();
@@ -2196,6 +2270,7 @@ mod tests {
                 description: "load a file".to_string(),
                 source: "builtin",
                 group: "context",
+                aliases: vec!["/r".to_string()],
             },
             CommandSuggestion {
                 name: "/search".to_string(),
@@ -2203,6 +2278,7 @@ mod tests {
                 description: "search project files".to_string(),
                 source: "builtin",
                 group: "context",
+                aliases: vec!["/s".to_string()],
             },
         ]));
 
@@ -2225,11 +2301,46 @@ mod tests {
             description: "load a file".to_string(),
             source: "builtin",
             group: "context",
+            aliases: vec!["/r".to_string()],
         }]));
 
         state.command_launcher_push_char('r');
         assert!(state.cancel_command_launcher());
         assert_eq!(state.input, "draft");
+    }
+
+    #[test]
+    fn command_launcher_matches_aliases_and_usage() {
+        let mut state = AppState::new();
+        assert!(state.activate_command_launcher(vec![
+            CommandSuggestion {
+                name: "/read".to_string(),
+                usage: "/read <path>".to_string(),
+                description: "load a file".to_string(),
+                source: "builtin",
+                group: "context",
+                aliases: vec!["/r".to_string()],
+            },
+            CommandSuggestion {
+                name: "/sessions".to_string(),
+                usage: "/sessions <list|new|rename|resume|export>".to_string(),
+                description: "manage saved sessions".to_string(),
+                source: "builtin",
+                group: "session",
+                aliases: Vec::new(),
+            },
+        ]));
+
+        state.command_launcher_push_char('r');
+        let view = state.command_launcher_view(5).expect("view");
+        assert_eq!(view.1[0].0.name, "/read");
+
+        state.command_launcher_backspace();
+        for ch in "resume".chars() {
+            state.command_launcher_push_char(ch);
+        }
+        let view = state.command_launcher_view(5).expect("view");
+        assert_eq!(view.1[0].0.name, "/sessions");
     }
 }
 

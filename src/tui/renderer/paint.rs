@@ -59,17 +59,8 @@ pub(crate) fn build_render_model(
 }
 
 fn build_top_bar(state: &AppState, theme: Theme, width: u16) -> Vec<StyledLine> {
-    let session_label = state
-        .current_session
-        .as_ref()
-        .map(|session| {
-            session
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("unnamed {}", short_id(&session.id)))
-        })
-        .unwrap_or_else(|| "fresh".to_string());
-    let runtime_label = runtime_label(state);
+    let session_label = session_label(state, width);
+    let runtime_label = persistent_runtime_label(state);
     let runtime_style = runtime_style(state, theme);
     let runtime_display = if is_runtime_animated(state) {
         format!(
@@ -80,39 +71,17 @@ fn build_top_bar(state: &AppState, theme: Theme, width: u16) -> Vec<StyledLine> 
     } else {
         truncate(&runtime_label, 22)
     };
-    let cache_label = match state.last_cache_hit {
-        Some(true) => "cache hit",
-        Some(false) => "cache miss",
-        None => "cache n/a",
-    };
-
-    let segments = [
+    let segments = vec![
         TopSegment::new("params", theme.base().with_bold(), 0),
         TopSegment::new(&runtime_display, runtime_style, 1),
-        TopSegment::new(&truncate(&state.backend_name, 16), theme.muted(), 2),
-        TopSegment::new(&truncate(&session_label, 16), theme.muted(), 3),
-        TopSegment::new(&format!("{} msgs", state.message_count()), theme.dim(), 4),
-        TopSegment::new(cache_label, theme.dim(), 5),
-        TopSegment::new(
-            &format!(
-                "mem {}/{}",
-                state.memory_snapshot.loaded_facts.len(),
-                state.memory_snapshot.last_summary_paths.len()
-            ),
-            theme.dim(),
-            6,
-        ),
-        TopSegment::new(&format!("view +{}", state.scroll_offset), theme.dim(), 7),
+        TopSegment::new(&session_label, theme.muted(), 2),
     ];
 
-    vec![build_segmented_top_line(
-        segments
-            .into_iter()
-            .filter(|segment| segment.text != "view +0")
-            .collect(),
-        width,
-        theme,
-    )]
+    let mut lines = vec![build_segmented_top_line(segments, width, theme)];
+    if let Some(activity_line) = build_activity_line(state, theme, width) {
+        lines.push(activity_line);
+    }
+    lines
 }
 
 fn build_transcript(
@@ -133,26 +102,30 @@ fn build_transcript(
         return blocks;
     }
 
-    for message in &state.messages {
+    for (idx, message) in state.messages.iter().enumerate() {
+        let next = state.messages.get(idx + 1);
         if message.transcript.collapsible {
             let focused = state.is_focused_collapsible(message.id);
+            let mut lines = cached_block(message, focused, width);
+            if needs_transcript_gap(message, next) {
+                lines.push(blank_line());
+            }
             blocks.push(RenderBlock {
                 message_id: Some(message.id),
-                lines: cached_block(message, focused, width),
+                lines,
             });
         } else {
             let is_active_assistant = message.role == Role::Assistant
                 && state.is_generating
                 && state.messages.last().map(|last| last.id) == Some(message.id);
+            let mut lines =
+                build_standard_message(message, theme, width, is_active_assistant, state.tick);
+            if needs_transcript_gap(message, next) {
+                lines.push(blank_line());
+            }
             blocks.push(RenderBlock {
                 message_id: None,
-                lines: build_standard_message(
-                    message,
-                    theme,
-                    width,
-                    is_active_assistant,
-                    state.tick,
-                ),
+                lines,
             });
         }
     }
@@ -257,7 +230,6 @@ fn build_badged_message(
             last.spans.push(cursor_span);
         }
     }
-    lines.push(blank_line());
     lines
 }
 
@@ -328,7 +300,7 @@ fn build_collapsed_context(
                     style: edge_style,
                 },
                 StyledSpan {
-                    text: " open with Ctrl+O • move with [ ]".to_string(),
+                    text: " Ctrl+O • [ ]".to_string(),
                     style: theme.dim(),
                 },
             ],
@@ -400,7 +372,7 @@ fn build_expanded_context(
                     style: edge_style,
                 },
                 StyledSpan {
-                    text: " collapse with Ctrl+O".to_string(),
+                    text: " Ctrl+O".to_string(),
                     style: theme.dim(),
                 },
             ],
@@ -421,45 +393,38 @@ fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<Styl
         RiskLevel::Medium => theme.chip_warning(),
         RiskLevel::High => theme.chip_danger(),
     };
-    let mut lines = vec![
-        StyledLine {
-            spans: vec![
-                StyledSpan {
-                    text: "approval".to_string(),
-                    style: approval_style,
-                },
-                StyledSpan {
-                    text: format!("  {}", pending.title),
-                    style: theme.base(),
-                },
-            ],
-        },
-        StyledLine {
-            spans: vec![
-                StyledSpan {
-                    text: format!(
-                        "{} / {}",
-                        pending.inspection.decision, pending.inspection.risk
-                    ),
-                    style: risk_chip,
-                },
-                StyledSpan {
-                    text: format!("  {}", pending.inspection.summary),
-                    style: theme.muted(),
-                },
-            ],
-        },
-    ];
-    for reason in &pending.inspection.reasons {
+    let mut lines = vec![StyledLine {
+        spans: vec![
+            StyledSpan {
+                text: approval_kind_label(pending.kind.clone()).to_string(),
+                style: approval_style,
+            },
+            StyledSpan {
+                text: format!(
+                    "  {}",
+                    truncate(&pending.title, width.saturating_sub(16) as usize)
+                ),
+                style: theme.base(),
+            },
+            StyledSpan {
+                text: format!("  [{} risk]", pending.inspection.risk),
+                style: risk_chip,
+            },
+        ],
+    }];
+    let summary = approval_summary_line(pending, width);
+    lines.extend(wrap_plain_to_lines(&summary, theme.muted(), width));
+
+    if let Some(reason) = pending.inspection.reasons.first() {
         lines.extend(wrap_plain_to_lines(
-            &format!("• {reason}"),
+            &format!("· {reason}"),
             theme.dim(),
             width,
         ));
     }
     let preview_lines = match pending.kind {
         PendingActionKind::ShellCommand => 2,
-        PendingActionKind::FileWrite | PendingActionKind::FileEdit => 8,
+        PendingActionKind::FileWrite | PendingActionKind::FileEdit => 4,
     };
     for line in preview_snippet(&pending.preview, width.saturating_sub(2), preview_lines) {
         lines.push(StyledLine {
@@ -475,10 +440,7 @@ fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<Styl
             ],
         });
     }
-    lines.push(single_span(
-        "Ctrl+Y approve  Ctrl+N reject  /approve  /reject",
-        theme.dim(),
-    ));
+    lines.push(single_span("Ctrl+Y approve  Ctrl+N reject", theme.dim()));
     Some(lines)
 }
 
@@ -499,7 +461,6 @@ fn build_composer(
         for line in approval_lines {
             lines.push(line.clone());
         }
-        lines.push(blank_line());
         prompt_offset = lines.len() as u16;
     }
 
@@ -544,6 +505,7 @@ fn build_composer(
     }
 
     if let Some((query, entries)) = state.command_launcher_view(5) {
+        let searching = !query.is_empty();
         let selected_entry = entries
             .iter()
             .find(|(_, selected)| *selected)
@@ -562,7 +524,7 @@ fn build_composer(
                     style: theme.base().with_bold(),
                 },
                 StyledSpan {
-                    text: "  Ctrl+K next  ↑↓ move  Enter choose  Esc close".to_string(),
+                    text: "  ↑↓ move  Enter choose  Esc close".to_string(),
                     style: theme.dim(),
                 },
             ],
@@ -595,11 +557,16 @@ fn build_composer(
                         style: theme.dim(),
                     },
                     StyledSpan {
-                        text: truncate(
-                            &format!("{} • {}", entry.group, entry.description),
-                            width.saturating_sub(26) as usize,
-                        ),
+                        text: truncate(&entry.description, width.saturating_sub(26) as usize),
                         style: theme.muted(),
+                    },
+                    StyledSpan {
+                        text: if searching {
+                            format!("  [{}]", entry.group)
+                        } else {
+                            format!("  [{} · {}]", entry.group, entry.source)
+                        },
+                        style: theme.dim(),
                     },
                 ],
             });
@@ -610,6 +577,22 @@ fn build_composer(
                     "usage: {}",
                     truncate(&selected.usage, width.saturating_sub(7) as usize)
                 ),
+                theme.dim(),
+            ));
+            if !selected.aliases.is_empty() {
+                lines.push(single_span(
+                    &format!(
+                        "aliases: {}",
+                        truncate(
+                            &selected.aliases.join(", "),
+                            width.saturating_sub(9) as usize
+                        )
+                    ),
+                    theme.dim(),
+                ));
+            }
+            lines.push(single_span(
+                &format!("group: {} • source: {}", selected.group, selected.source),
                 theme.dim(),
             ));
         }
@@ -658,11 +641,8 @@ fn build_composer(
                 ],
             });
         }
-    } else {
-        lines.push(single_span(
-            "Enter send • Shift+Enter newline • Alt+↑ history • Ctrl+R search • Ctrl+K commands",
-            theme.dim(),
-        ));
+    } else if state.input.trim().is_empty() && approval.is_none() {
+        lines.push(single_span("ask about the code…", theme.dim()));
     }
 
     let cursor_x = 2 + cursor_col as u16;
@@ -707,7 +687,7 @@ pub(crate) fn paint_model(
         state,
     );
 
-    paint_sheet(
+    let composer_offset = paint_sheet(
         buffer,
         symbols,
         &layout.composer,
@@ -721,7 +701,7 @@ pub(crate) fn paint_model(
         layout
             .composer
             .y
-            .saturating_add(1)
+            .saturating_add(composer_offset)
             .saturating_add(model.composer_cursor.1),
     )
 }
@@ -742,21 +722,24 @@ fn paint_transcript(
         }
     }
 
-    let max_scroll = flattened.len().saturating_sub(rect.height as usize);
+    let indicator_rows = usize::from(state.scroll_offset > 0) * usize::from(rect.height >= 2) * 2;
+    let content_capacity = rect.height as usize - indicator_rows.min(rect.height as usize);
+    let max_scroll = flattened.len().saturating_sub(content_capacity.max(1));
     state.max_scroll = max_scroll;
     state.scroll_offset = state.scroll_offset.min(max_scroll);
     let end = flattened.len().saturating_sub(state.scroll_offset);
-    let start = end.saturating_sub(rect.height as usize);
+    let start = end.saturating_sub(content_capacity.max(1));
     let visible = &flattened[start..end];
 
     let mut y = rect.y;
-    if state.scroll_offset > 0 && y < rect.y.saturating_add(rect.height) {
-        let indicator = single_span(&format!("↑ {} older", state.scroll_offset), theme.dim());
+    let show_jump_indicator = state.scroll_offset > 0 && rect.height >= 2;
+    if show_jump_indicator && y < rect.y.saturating_add(rect.height) {
+        let indicator = single_span(&format!("↑ {} above", state.scroll_offset), theme.dim());
         paint_line(buffer, symbols, rect.x, y, rect.width, &indicator);
         y += 1;
     }
 
-    for (message_id, line) in visible.iter().take(rect.height as usize) {
+    for (message_id, line) in visible.iter().take(content_capacity.max(1)) {
         if y >= rect.y.saturating_add(rect.height) {
             break;
         }
@@ -769,8 +752,8 @@ fn paint_transcript(
         y += 1;
     }
 
-    if state.scroll_offset == 0 && max_scroll > 0 && y < rect.y.saturating_add(rect.height) {
-        let indicator = single_span(&format!("↓ {} earlier", max_scroll), theme.dim());
+    if show_jump_indicator && y < rect.y.saturating_add(rect.height) {
+        let indicator = single_span("↓ jump to latest", theme.dim());
         paint_line(buffer, symbols, rect.x, y, rect.width, &indicator);
     }
 
@@ -784,8 +767,7 @@ fn paint_sheet(
     lines: &[StyledLine],
     theme: Theme,
     title: &str,
-) {
-    paint_divider(buffer, symbols, rect.x, rect.y, rect.width, theme);
+) -> u16 {
     if !title.is_empty() {
         paint_line(
             buffer,
@@ -795,18 +777,22 @@ fn paint_sheet(
             rect.width,
             &single_span(title, theme.dim().with_bold()),
         );
+        paint_lines(
+            buffer,
+            symbols,
+            &Rect::new(
+                rect.x,
+                rect.y.saturating_add(1),
+                rect.width,
+                rect.height.saturating_sub(1),
+            ),
+            lines,
+        );
+        1
+    } else {
+        paint_lines(buffer, symbols, rect, lines);
+        0
     }
-    paint_lines(
-        buffer,
-        symbols,
-        &Rect::new(
-            rect.x,
-            rect.y.saturating_add(1),
-            rect.width,
-            rect.height.saturating_sub(1),
-        ),
-        lines,
-    );
 }
 
 fn paint_divider(
@@ -945,6 +931,49 @@ fn preview_snippet(preview: &str, width: u16, max_lines: usize) -> Vec<String> {
     }
 }
 
+fn needs_transcript_gap(current: &ChatMessage, next: Option<&ChatMessage>) -> bool {
+    let Some(next) = next else {
+        return false;
+    };
+    transcript_block_kind(current) != transcript_block_kind(next)
+}
+
+fn transcript_block_kind(message: &ChatMessage) -> u8 {
+    if message.transcript.collapsible {
+        0
+    } else {
+        match message.role {
+            Role::User => 1,
+            Role::Assistant => 2,
+            Role::System => 3,
+        }
+    }
+}
+
+fn approval_kind_label(kind: PendingActionKind) -> &'static str {
+    match kind {
+        PendingActionKind::ShellCommand => "shell",
+        PendingActionKind::FileWrite => "write",
+        PendingActionKind::FileEdit => "edit",
+    }
+}
+
+fn approval_summary_line(pending: &crate::events::PendingAction, width: u16) -> String {
+    let mut summary = pending.inspection.summary.clone();
+    if pending.inspection.reasons.len() > 1 {
+        let extra = pending.inspection.reasons[1..]
+            .iter()
+            .take(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(reason) = extra.first() {
+            summary.push_str(" · ");
+            summary.push_str(reason);
+        }
+    }
+    truncate(&summary, width.saturating_sub(2) as usize)
+}
+
 #[derive(Debug, Clone)]
 struct TopSegment {
     text: String,
@@ -1005,24 +1034,53 @@ fn segmented_width(segments: &[TopSegment], separator: &str) -> usize {
     text_width + separators
 }
 
-fn runtime_label(state: &AppState) -> String {
-    state
-        .current_trace
-        .as_deref()
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if state.pending_action.is_some() {
-                "awaiting approval".to_string()
-            } else if state.status.starts_with("error") {
-                "error".to_string()
-            } else if state.is_generating {
-                "streaming".to_string()
-            } else if state.is_ready() {
-                "ready".to_string()
-            } else {
-                "loading".to_string()
-            }
+fn session_label(state: &AppState, width: u16) -> String {
+    let base = state
+        .current_session
+        .as_ref()
+        .map(|session| {
+            session
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("unnamed {}", short_id(&session.id)))
         })
+        .unwrap_or_else(|| "fresh".to_string());
+
+    if width >= 72 && state.backend_name != "..." {
+        format!("{base} ({})", truncate(&state.backend_name, 16))
+    } else {
+        truncate(&base, 22)
+    }
+}
+
+fn persistent_runtime_label(state: &AppState) -> String {
+    if state.pending_action.is_some() {
+        "awaiting approval".to_string()
+    } else if state.status.starts_with("error") {
+        "error".to_string()
+    } else if state.is_generating {
+        "streaming".to_string()
+    } else if state.is_ready() {
+        "ready".to_string()
+    } else {
+        "loading".to_string()
+    }
+}
+
+fn build_activity_line(state: &AppState, theme: Theme, width: u16) -> Option<StyledLine> {
+    let label = state.current_trace.as_deref()?;
+    Some(StyledLine {
+        spans: vec![
+            StyledSpan {
+                text: "· ".to_string(),
+                style: theme.dim(),
+            },
+            StyledSpan {
+                text: truncate(label, width.saturating_sub(2) as usize),
+                style: theme.dim(),
+            },
+        ],
+    })
 }
 
 fn runtime_style(state: &AppState, theme: Theme) -> PackedStyle {
@@ -1125,10 +1183,57 @@ mod tests {
             description: "load a file".to_string(),
             source: "builtin",
             group: "context",
+            aliases: vec!["/r".to_string()],
         }]));
 
         let (lines, _) = build_composer(&state, Theme::default(), 80, None);
         assert_eq!(lines[0].spans[0].text, ": ");
+    }
+
+    #[test]
+    fn idle_empty_composer_uses_placeholder_instead_of_long_hint_line() {
+        let state = AppState::new();
+        let (lines, _) = build_composer(&state, Theme::default(), 80, None);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+
+        assert!(text.contains("ask about the code"));
+        assert!(!text.contains("Enter send"));
+    }
+
+    #[test]
+    fn active_command_launcher_search_flattens_group_headers() {
+        let mut state = AppState::new();
+        assert!(state.activate_command_launcher(vec![
+            CommandSuggestion {
+                name: "/read".to_string(),
+                usage: "/read <path>".to_string(),
+                description: "load a file".to_string(),
+                source: "builtin",
+                group: "context",
+                aliases: vec!["/r".to_string()],
+            },
+            CommandSuggestion {
+                name: "/sessions".to_string(),
+                usage: "/sessions list".to_string(),
+                description: "manage sessions".to_string(),
+                source: "builtin",
+                group: "session",
+                aliases: Vec::new(),
+            },
+        ]));
+        state.command_launcher_push_char('r');
+
+        let (lines, _) = build_composer(&state, Theme::default(), 80, None);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+
+        assert!(text.contains("[context]"));
+        assert!(!text.contains("context:"));
     }
 
     #[test]
@@ -1156,8 +1261,112 @@ mod tests {
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
             .collect::<String>();
-        assert!(joined.contains("approval"));
+        assert!(joined.contains("shell"));
         assert!(joined.contains("│ cargo check"));
+        assert!(joined.contains("Ctrl+Y approve  Ctrl+N reject"));
+        assert!(!joined.contains("/approve"));
+    }
+
+    #[test]
+    fn transcript_only_adds_blank_line_when_message_kind_changes() {
+        let mut state = AppState::new();
+        state.messages.push(ChatMessage {
+            id: 1,
+            role: Role::User,
+            content: "first".to_string(),
+            transcript: crate::tui::state::TranscriptPresentation {
+                collapsible: false,
+                collapsed: false,
+                summary: None,
+                preview_lines: Vec::new(),
+            },
+        });
+        state.messages.push(ChatMessage {
+            id: 2,
+            role: Role::User,
+            content: "second".to_string(),
+            transcript: crate::tui::state::TranscriptPresentation {
+                collapsible: false,
+                collapsed: false,
+                summary: None,
+                preview_lines: Vec::new(),
+            },
+        });
+        state.messages.push(ChatMessage {
+            id: 3,
+            role: Role::Assistant,
+            content: "reply".to_string(),
+            transcript: crate::tui::state::TranscriptPresentation {
+                collapsible: false,
+                collapsed: false,
+                summary: None,
+                preview_lines: Vec::new(),
+            },
+        });
+
+        let blocks = build_transcript(&mut state, Theme::default(), 80, |message, _, width| {
+            build_transcript_block(message, Theme::default(), width, false)
+        });
+
+        assert!(!blocks[0].lines.last().unwrap().spans.is_empty());
+        assert!(blocks[1].lines.last().unwrap().spans.is_empty());
+        assert!(!blocks[2].lines.last().unwrap().spans.is_empty());
+    }
+
+    #[test]
+    fn composer_sheet_no_longer_paints_a_full_width_divider() {
+        let theme = Theme::default();
+        let mut symbols = SymbolPool::new();
+        let blank = Cell {
+            symbol_id: symbols.blank_id(),
+            style: PackedStyle::new(theme.text, theme.background),
+        };
+        let mut buffer = CellBuffer::new(20, 4, blank);
+        let rect = Rect::new(0, 0, 20, 4);
+
+        let offset = paint_sheet(
+            &mut buffer,
+            &mut symbols,
+            &rect,
+            &[single_span("› hello", theme.base())],
+            theme,
+            "",
+        );
+
+        assert_eq!(offset, 0);
+        let divider = symbols.intern("─");
+        let row_has_divider = (0..buffer.width()).all(|x| buffer.get(x, 0).symbol_id == divider);
+        assert!(!row_has_divider);
+    }
+
+    #[test]
+    fn top_bar_divider_renders_on_reserved_separator_row() {
+        let theme = Theme::default();
+        let mut symbols = SymbolPool::new();
+        let blank = Cell {
+            symbol_id: symbols.blank_id(),
+            style: PackedStyle::new(theme.text, theme.background),
+        };
+        let mut buffer = CellBuffer::new(20, 8, blank);
+        let mut state = AppState::new();
+        let model = RenderModel {
+            top_bar: vec![single_span("params · ready · fresh", theme.base())],
+            transcript: vec![],
+            composer: vec![single_span("› ", theme.base())],
+            composer_cursor: (2, 0),
+        };
+        let layout = LayoutPlan {
+            mode: RootLayoutMode::Compact,
+            top_bar: Rect::new(0, 0, 20, 3),
+            transcript: Rect::new(0, 3, 20, 3),
+            composer: Rect::new(0, 6, 20, 2),
+        };
+
+        let _ = paint_model(&mut buffer, &mut symbols, &model, layout, theme, &mut state);
+
+        let divider = symbols.intern("─");
+        let row_has_divider = (0..buffer.width()).all(|x| buffer.get(x, 2).symbol_id == divider);
+        assert!(row_has_divider);
     }
 
     #[test]
@@ -1171,6 +1380,10 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(loading_text.contains("loading"));
+        assert!(!loading_text.contains("msgs"));
+        assert!(!loading_text.contains("cache"));
+        assert!(!loading_text.contains("mem"));
+        assert_eq!(loading.len(), 1);
         assert!(loading[0]
             .spans
             .iter()
@@ -1179,6 +1392,7 @@ mod tests {
         state.model_ready = true;
         state.is_generating = true;
         state.tick = 5;
+        state.current_trace = Some("indexing summaries".to_string());
         let streaming = build_top_bar(&state, Theme::default(), 120);
         let streaming_text = streaming[0]
             .spans
@@ -1186,6 +1400,13 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(streaming_text.contains("streaming"));
+        assert_eq!(streaming.len(), 2);
+        let activity_text = streaming[1]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(activity_text.contains("indexing summaries"));
         assert!(streaming[0]
             .spans
             .iter()
@@ -1243,7 +1464,47 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("streaming"));
-        assert!(!text.contains("cache hit"));
+        assert!(!text.contains("cache"));
+        assert!(!text.contains("msgs"));
+    }
+
+    #[test]
+    fn transcript_scroll_indicators_match_hidden_direction() {
+        let theme = Theme::default();
+        let mut state = AppState::new();
+        state.scroll_offset = 2;
+        let blocks = vec![RenderBlock {
+            message_id: None,
+            lines: (0..6)
+                .map(|idx| single_span(&format!("line {idx}"), theme.base()))
+                .collect(),
+        }];
+
+        let mut symbols = SymbolPool::new();
+        let blank = Cell {
+            symbol_id: symbols.blank_id(),
+            style: PackedStyle::new(theme.text, theme.background),
+        };
+        let mut buffer = CellBuffer::new(40, 4, blank);
+
+        paint_transcript(
+            &mut buffer,
+            &mut symbols,
+            &Rect::new(0, 0, 40, 4),
+            &blocks,
+            theme,
+            &mut state,
+        );
+
+        let top = (0..12)
+            .map(|x| symbols.get(buffer.get(x, 0).symbol_id))
+            .collect::<String>();
+        let bottom = (0..20)
+            .map(|x| symbols.get(buffer.get(x, 3).symbol_id))
+            .collect::<String>();
+
+        assert!(top.contains("↑ 2 above"));
+        assert!(bottom.contains("↓ jump to latest"));
     }
 
     #[test]

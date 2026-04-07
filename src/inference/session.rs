@@ -164,7 +164,7 @@ fn apply_memory_update(
                 "memory: stored {accepted_count} fact{}",
                 if accepted_count == 1 { "" } else { "s" }
             ),
-            true,
+            false,
         );
     } else if skipped_count > 0 || update.duplicate_count > 0 {
         emit_trace(
@@ -179,7 +179,7 @@ fn apply_memory_update(
                     "s"
                 }
             ),
-            true,
+            false,
         );
     }
 }
@@ -625,6 +625,100 @@ pub fn model_thread_with_options(
                 }
                 continue;
             }
+            SessionCommand::DeleteSession(selector) => {
+                match (session_store.as_ref(), active_session.as_ref()) {
+                    (Some(store), Some(current_active)) => match store.resolve_session(&selector) {
+                        Ok(summary) => {
+                            let was_active = summary.id == current_active.id;
+                            let deleted_label = display_name(&summary);
+                            if let Err(e) = store.delete_session(&summary.id) {
+                                let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                                continue;
+                            }
+                            hooks.dispatch(HookEvent::SessionDeleted {
+                                session_id: summary.id.clone(),
+                                was_active,
+                            });
+
+                            if was_active {
+                                reset_session_runtime(
+                                    &mut session_messages,
+                                    &tools,
+                                    &session_facts,
+                                    eco_enabled,
+                                    &mut budget,
+                                    &mut cache_stats,
+                                    &cfg.backend,
+                                    &token_tx,
+                                );
+                                memory_state.last_summary_paths.clear();
+                                memory_state.last_update = None;
+                                emit_memory_state(&token_tx, &memory_state);
+                                match store.create_session(None, &backend.name()) {
+                                    Ok(replacement) => {
+                                        hooks.dispatch(HookEvent::SessionCreated {
+                                            session_id: replacement.id.clone(),
+                                            named: false,
+                                        });
+                                        active_session = Some(replacement.clone());
+                                        let _ = token_tx.send(InferenceEvent::SessionLoaded {
+                                            session: session_info(&replacement),
+                                            display_messages: Vec::new(),
+                                            saved_at: None,
+                                        });
+                                        let _ = token_tx.send(InferenceEvent::SystemMessage(
+                                            format!(
+                                                "deleted session: {deleted_label}; started fresh unnamed session"
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        active_session = None;
+                                        let _ = token_tx.send(InferenceEvent::Error(format!(
+                                            "deleted session {deleted_label}, but failed to create replacement session: {e}"
+                                        )));
+                                    }
+                                }
+                            } else {
+                                let _ = token_tx.send(InferenceEvent::SystemMessage(format!(
+                                    "deleted session: {deleted_label}"
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                        }
+                    },
+                    (Some(store), None) => match store.resolve_session(&selector) {
+                        Ok(summary) => {
+                            let deleted_label = display_name(&summary);
+                            match store.delete_session(&summary.id) {
+                                Ok(()) => {
+                                    hooks.dispatch(HookEvent::SessionDeleted {
+                                        session_id: summary.id.clone(),
+                                        was_active: false,
+                                    });
+                                    let _ = token_tx.send(InferenceEvent::SystemMessage(format!(
+                                        "deleted session: {deleted_label}"
+                                    )));
+                                }
+                                Err(e) => {
+                                    let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                        }
+                    },
+                    (None, _) => {
+                        let _ = token_tx.send(InferenceEvent::Error(
+                            "Session store is unavailable".to_string(),
+                        ));
+                    }
+                }
+                continue;
+            }
             SessionCommand::ExportSession { selector, format } => {
                 match session_store.as_ref().map(|store| {
                     parse_export_format(format).and_then(|fmt| store.export_session(&selector, fmt))
@@ -914,7 +1008,7 @@ pub fn model_thread_with_options(
                                 "ies"
                             }
                         ),
-                        true,
+                        false,
                     );
                 }
 
