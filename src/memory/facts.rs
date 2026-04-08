@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
+use super::retrieval::{query_terms, score_text};
 use super::run_prompt_sync;
 use crate::config::{self, MemoryConfig};
 use crate::error::Result;
@@ -192,19 +193,15 @@ impl FactStore {
             return Ok(all.into_iter().take(limit).collect());
         }
 
-        let query_lower = query.to_lowercase();
-        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+        let query_terms = query_terms(query);
 
         let mut scored: Vec<(usize, StoredFact)> = all
             .into_iter()
             .map(|fact| {
-                let fact_lower = fact.content.to_lowercase();
-                let score = keywords
-                    .iter()
-                    .filter(|kw| fact_lower.contains(*kw))
-                    .count();
+                let score = score_text(&query_terms, &fact.content);
                 (score, fact)
             })
+            .filter(|(score, _)| *score > 0)
             .collect();
 
         scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -868,6 +865,37 @@ mod tests {
             .expect("load facts");
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].provenance, FactProvenance::Legacy);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn relevant_facts_are_ranked_by_prompt_match() {
+        let path = temp_db_path("ranking");
+        let store = FactStore::open_at(&path).expect("open fact store");
+        store
+            .try_store_fact_deduped(
+                "project",
+                "src/session/mod.rs resolves session selectors by unique id prefix",
+                FactProvenance::Verified,
+            )
+            .expect("store first fact");
+        store
+            .try_store_fact_deduped(
+                "project",
+                "Cache stats are shown in the runtime header",
+                FactProvenance::Verified,
+            )
+            .expect("store second fact");
+
+        let facts = store
+            .get_relevant_facts("project", "src/session/mod.rs selector", 5)
+            .expect("load ranked facts");
+
+        assert_eq!(
+            facts.first().map(|fact| fact.content.as_str()),
+            Some("src/session/mod.rs resolves session selectors by unique id prefix")
+        );
 
         let _ = fs::remove_file(path);
     }

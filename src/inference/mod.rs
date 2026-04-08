@@ -29,7 +29,7 @@ use std::sync::mpsc::Sender;
 
 use crate::config;
 use crate::error::{ParamsError, Result};
-use crate::events::InferenceEvent;
+use crate::events::{InferenceEvent, MemorySessionExcerptView};
 use crate::tools::ToolRegistry;
 
 use runtime::summary_limit;
@@ -55,6 +55,7 @@ pub enum SessionCommand {
         selector: String,
         format: Option<String>,
     },
+    RecallMemory(String),
     SetReflection(bool),
     SetEco(bool),
     SetDebugLogging(bool),
@@ -127,6 +128,7 @@ pub(super) fn build_system_prompt(
     tools: &ToolRegistry,
     facts: &[String],
     summaries: &[(String, String)],
+    session_excerpts: &[MemorySessionExcerptView],
     eco_enabled: bool,
 ) -> String {
     let mut prompt = if eco_enabled {
@@ -160,6 +162,22 @@ pub(super) fn build_system_prompt(
         }
     }
 
+    if !session_excerpts.is_empty() {
+        prompt.push_str("\nRelevant prior session excerpts:\n");
+        for excerpt in session_excerpts
+            .iter()
+            .take(if eco_enabled { 1 } else { 2 })
+        {
+            prompt.push_str("- ");
+            prompt.push_str(&excerpt.session_label);
+            prompt.push_str(" · ");
+            prompt.push_str(&excerpt.role);
+            prompt.push_str(": ");
+            prompt.push_str(&excerpt.excerpt);
+            prompt.push('\n');
+        }
+    }
+
     prompt
 }
 
@@ -181,8 +199,20 @@ mod tests {
             ("b.rs".to_string(), "summary b".to_string()),
             ("c.rs".to_string(), "summary c".to_string()),
         ];
+        let excerpts = vec![
+            MemorySessionExcerptView {
+                session_label: "alpha".to_string(),
+                role: "assistant".to_string(),
+                excerpt: "excerpt a".to_string(),
+            },
+            MemorySessionExcerptView {
+                session_label: "beta".to_string(),
+                role: "user".to_string(),
+                excerpt: "excerpt b".to_string(),
+            },
+        ];
 
-        let prompt = build_system_prompt(&tools, &facts, &summaries, true);
+        let prompt = build_system_prompt(&tools, &facts, &summaries, &excerpts, true);
 
         assert!(prompt.contains("Eco mode is active"));
         assert!(prompt.contains("fact one"));
@@ -191,5 +221,27 @@ mod tests {
         assert!(prompt.contains("a.rs: summary a"));
         assert!(prompt.contains("b.rs: summary b"));
         assert!(!prompt.contains("c.rs: summary c"));
+        assert!(prompt.contains("alpha · assistant: excerpt a"));
+        assert!(!prompt.contains("beta · user: excerpt b"));
+    }
+
+    #[test]
+    fn system_prompt_includes_prior_session_excerpts() {
+        let tools = ToolRegistry::default();
+        let prompt = build_system_prompt(
+            &tools,
+            &[],
+            &[],
+            &[MemorySessionExcerptView {
+                session_label: "review".to_string(),
+                role: "assistant".to_string(),
+                excerpt: "src/session/mod.rs resolves unique id prefixes".to_string(),
+            }],
+            false,
+        );
+
+        assert!(prompt.contains("Relevant prior session excerpts"));
+        assert!(prompt.contains("review · assistant"));
+        assert!(prompt.contains("src/session/mod.rs resolves unique id prefixes"));
     }
 }

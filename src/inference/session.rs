@@ -8,8 +8,8 @@ use crate::config;
 use crate::debug_log;
 use crate::error::Result;
 use crate::events::{
-    InferenceEvent, MemoryConsolidationView, MemoryFactView, MemorySnapshot, MemoryUpdateReport,
-    ProgressStatus, SessionInfo,
+    InferenceEvent, MemoryConsolidationView, MemoryFactView, MemorySessionExcerptView,
+    MemorySnapshot, MemoryUpdateReport, ProgressStatus, SessionInfo,
 };
 use crate::hooks::{HookEvent, Hooks};
 use crate::memory::{
@@ -18,7 +18,8 @@ use crate::memory::{
     index::ProjectIndex,
 };
 use crate::session::{
-    display_name, list_label, short_id, SessionExportFormat, SessionStore, SessionSummary,
+    display_name, list_label, short_id, SessionExcerptMatch, SessionExportFormat, SessionStore,
+    SessionSummary,
 };
 use crate::tools::{BashTool, Tool, ToolRegistry};
 
@@ -53,6 +54,9 @@ fn session_info(summary: &SessionSummary) -> SessionInfo {
 struct RuntimeMemoryState {
     loaded_facts: Vec<MemoryFactView>,
     last_summary_paths: Vec<String>,
+    last_retrieval_query: Option<String>,
+    last_selected_facts: Vec<MemoryFactView>,
+    last_selected_session_excerpts: Vec<MemorySessionExcerptView>,
     last_update: Option<MemoryUpdateReport>,
     last_consolidation: Option<MemoryConsolidationView>,
 }
@@ -62,6 +66,9 @@ impl RuntimeMemoryState {
         MemorySnapshot {
             loaded_facts: self.loaded_facts.clone(),
             last_summary_paths: self.last_summary_paths.clone(),
+            last_retrieval_query: self.last_retrieval_query.clone(),
+            last_selected_facts: self.last_selected_facts.clone(),
+            last_selected_session_excerpts: self.last_selected_session_excerpts.clone(),
             last_update: self.last_update.clone(),
             last_consolidation: self.last_consolidation.clone(),
         }
@@ -70,6 +77,193 @@ impl RuntimeMemoryState {
 
 fn emit_memory_state(token_tx: &Sender<InferenceEvent>, memory_state: &RuntimeMemoryState) {
     let _ = token_tx.send(InferenceEvent::MemoryState(memory_state.snapshot()));
+}
+
+#[derive(Default)]
+struct RetrievalBundle {
+    summaries: Vec<(String, String)>,
+    facts: Vec<MemoryFactView>,
+    session_excerpts: Vec<MemorySessionExcerptView>,
+}
+
+fn memory_fact_lines(facts: &[MemoryFactView]) -> Vec<String> {
+    facts.iter().map(|fact| fact.content.clone()).collect()
+}
+
+fn map_session_excerpt(match_: SessionExcerptMatch) -> MemorySessionExcerptView {
+    MemorySessionExcerptView {
+        session_label: match_.session_label,
+        role: match_.role,
+        excerpt: match_.excerpt,
+    }
+}
+
+fn clear_memory_retrieval(memory_state: &mut RuntimeMemoryState) {
+    memory_state.last_summary_paths.clear();
+    memory_state.last_retrieval_query = None;
+    memory_state.last_selected_facts.clear();
+    memory_state.last_selected_session_excerpts.clear();
+}
+
+fn set_memory_retrieval(
+    memory_state: &mut RuntimeMemoryState,
+    query: &str,
+    bundle: &RetrievalBundle,
+) {
+    memory_state.last_summary_paths = bundle
+        .summaries
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
+    memory_state.last_retrieval_query = Some(query.to_string());
+    memory_state.last_selected_facts = bundle.facts.clone();
+    memory_state.last_selected_session_excerpts = bundle.session_excerpts.clone();
+}
+
+fn collect_retrieval_bundle(
+    prompt: &str,
+    eco_enabled: bool,
+    project_name: &str,
+    project_index: Option<&ProjectIndex>,
+    fact_store: Option<&FactStore>,
+    session_store: Option<&SessionStore>,
+    active_session_id: Option<&str>,
+    loaded_facts: &[MemoryFactView],
+) -> RetrievalBundle {
+    let fact_limit = if eco_enabled { 2 } else { 4 };
+    let session_limit = if eco_enabled { 1 } else { 2 };
+
+    let summaries = project_index
+        .and_then(|index| index.find_relevant(prompt, summary_limit(eco_enabled)).ok())
+        .unwrap_or_default();
+
+    let facts = if let Some(store) = fact_store {
+        store
+            .get_relevant_facts(project_name, prompt, fact_limit)
+            .map(|facts| {
+                facts
+                    .into_iter()
+                    .map(|fact| MemoryFactView {
+                        content: fact.content,
+                        provenance: fact.provenance,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        let query = crate::memory::retrieval::query_terms(prompt);
+        let mut scored = loaded_facts
+            .iter()
+            .cloned()
+            .filter_map(|fact| {
+                let score = crate::memory::retrieval::score_text(&query, &fact.content);
+                if score == 0 {
+                    None
+                } else {
+                    Some((score, fact))
+                }
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.truncate(fact_limit);
+        scored.into_iter().map(|(_, fact)| fact).collect()
+    };
+
+    let session_excerpts = session_store
+        .and_then(|store| {
+            store
+                .search_session_excerpts(prompt, active_session_id, session_limit)
+                .ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(map_session_excerpt)
+        .collect::<Vec<_>>();
+
+    RetrievalBundle {
+        summaries,
+        facts,
+        session_excerpts,
+    }
+}
+
+fn retrieval_trace_label(bundle: &RetrievalBundle) -> Option<String> {
+    let mut parts = Vec::new();
+    if !bundle.summaries.is_empty() {
+        parts.push(format!(
+            "{} summar{}",
+            bundle.summaries.len(),
+            if bundle.summaries.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        ));
+    }
+    if !bundle.facts.is_empty() {
+        parts.push(format!(
+            "{} fact{}",
+            bundle.facts.len(),
+            if bundle.facts.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if !bundle.session_excerpts.is_empty() {
+        parts.push(format!(
+            "{} session excerpt{}",
+            bundle.session_excerpts.len(),
+            if bundle.session_excerpts.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("memory: selected {}", parts.join(", ")))
+    }
+}
+
+fn format_memory_recall(query: &str, bundle: &RetrievalBundle) -> String {
+    let mut lines = vec![format!("memory recall for `{query}`:")];
+
+    if bundle.summaries.is_empty() {
+        lines.push("  summaries: (none)".to_string());
+    } else {
+        lines.push("  summaries:".to_string());
+        for (path, summary) in &bundle.summaries {
+            lines.push(format!("    - {}: {}", path, summary));
+        }
+    }
+
+    if bundle.facts.is_empty() {
+        lines.push("  facts: (none)".to_string());
+    } else {
+        lines.push("  facts:".to_string());
+        for fact in &bundle.facts {
+            let label = match fact.provenance {
+                crate::events::FactProvenance::Legacy => "legacy",
+                crate::events::FactProvenance::Verified => "verified",
+            };
+            lines.push(format!("    - [{label}] {}", fact.content));
+        }
+    }
+
+    if bundle.session_excerpts.is_empty() {
+        lines.push("  prior sessions: (none)".to_string());
+    } else {
+        lines.push("  prior sessions:".to_string());
+        for excerpt in &bundle.session_excerpts {
+            lines.push(format!(
+                "    - {} · {}: {}",
+                excerpt.session_label, excerpt.role, excerpt.excerpt
+            ));
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn save_session(
@@ -93,7 +287,6 @@ fn save_session(
 fn reset_session_runtime(
     session_messages: &mut Vec<Message>,
     tools: &ToolRegistry,
-    session_facts: &[String],
     eco_enabled: bool,
     budget: &mut SessionBudget,
     cache_stats: &mut SessionCacheStats,
@@ -103,7 +296,8 @@ fn reset_session_runtime(
     session_messages.clear();
     session_messages.push(Message::system(&build_system_prompt(
         tools,
-        session_facts,
+        &[],
+        &[],
         &[],
         eco_enabled,
     )));
@@ -128,19 +322,12 @@ fn apply_memory_update(
     token_tx: &Sender<InferenceEvent>,
     hooks: &Hooks,
     memory_state: &mut RuntimeMemoryState,
-    session_facts: &mut Vec<String>,
     update: MemoryUpdateReport,
 ) {
     let accepted_count = update.accepted_facts.len();
     let skipped_count = skipped_fact_count(&update);
 
     for fact in &update.accepted_facts {
-        if !session_facts
-            .iter()
-            .any(|existing| existing == &fact.content)
-        {
-            session_facts.push(fact.content.clone());
-        }
         if !memory_state
             .loaded_facts
             .iter()
@@ -187,7 +374,7 @@ fn apply_memory_update(
 }
 
 fn format_sessions_list(sessions: &[SessionSummary], active_session_id: Option<&str>) -> String {
-    let mut lines = vec![format!("sessions • {} saved • ● current", sessions.len())];
+    let mut lines = vec![format!("sessions · {}", sessions.len())];
     if sessions.is_empty() {
         lines.push("  (none saved for this project)".to_string());
         return lines.join("\n");
@@ -209,7 +396,7 @@ fn format_sessions_list(sessions: &[SessionSummary], active_session_id: Option<&
             )
         };
         lines.push(format!(
-            "  {marker} {} · {} · {} · id {}",
+            "  {marker} {} · {} · {} · #{}",
             list_label(session),
             message_label,
             crate::session::describe_session_age(session.updated_at),
@@ -217,13 +404,13 @@ fn format_sessions_list(sessions: &[SessionSummary], active_session_id: Option<&
         ));
     }
 
-    lines.push("  resume/delete/export with exact name or unique id prefix".to_string());
+    lines.push("  /sessions resume|delete|export <name-or-id>".to_string());
 
     lines.join("\n")
 }
 
 #[cfg(test)]
-mod tests {
+mod format_tests {
     use super::format_sessions_list;
     use crate::session::SessionSummary;
 
@@ -255,11 +442,13 @@ mod tests {
             Some("7353e9a31234"),
         );
 
-        assert!(output.contains("sessions • 2 saved • ● current"));
+        assert!(output.contains("sessions · 2"));
         assert!(output.contains("● b · 2 msgs"));
         assert!(output.contains("· unnamed · empty"));
-        assert!(output.contains("id 7353e9a3"));
-        assert!(output.contains("resume/delete/export with exact name or unique id prefix"));
+        // short id shown with # prefix, no "id " keyword
+        assert!(output.contains("#7353e9a3"));
+        assert!(!output.contains("id 7353e9a3"));
+        assert!(output.contains("/sessions resume|delete|export <name-or-id>"));
     }
 }
 
@@ -350,10 +539,6 @@ pub fn model_thread_with_options(
         .as_ref()
         .and_then(|store| store.get_relevant_facts(&project_name, "", 5).ok())
         .unwrap_or_default();
-    let mut session_facts = loaded_fact_entries
-        .iter()
-        .map(|fact| fact.content.clone())
-        .collect::<Vec<_>>();
     let mut memory_state = RuntimeMemoryState {
         loaded_facts: loaded_fact_entries
             .into_iter()
@@ -369,7 +554,8 @@ pub fn model_thread_with_options(
     });
     let mut session_messages = vec![Message::system(&build_system_prompt(
         &tools,
-        &session_facts,
+        &[],
+        &[],
         &[],
         eco_enabled,
     ))];
@@ -485,14 +671,13 @@ pub fn model_thread_with_options(
                 reset_session_runtime(
                     &mut session_messages,
                     &tools,
-                    &session_facts,
                     eco_enabled,
                     &mut budget,
                     &mut cache_stats,
                     &cfg.backend,
                     &token_tx,
                 );
-                memory_state.last_summary_paths.clear();
+                clear_memory_retrieval(&mut memory_state);
                 memory_state.last_update = None;
                 emit_memory_state(&token_tx, &memory_state);
                 if let Some(ref store) = session_store {
@@ -553,14 +738,13 @@ pub fn model_thread_with_options(
                 reset_session_runtime(
                     &mut session_messages,
                     &tools,
-                    &session_facts,
                     eco_enabled,
                     &mut budget,
                     &mut cache_stats,
                     &cfg.backend,
                     &token_tx,
                 );
-                memory_state.last_summary_paths.clear();
+                clear_memory_retrieval(&mut memory_state);
                 memory_state.last_update = None;
                 emit_memory_state(&token_tx, &memory_state);
                 match session_store
@@ -640,14 +824,13 @@ pub fn model_thread_with_options(
                         reset_session_runtime(
                             &mut session_messages,
                             &tools,
-                            &session_facts,
                             eco_enabled,
                             &mut budget,
                             &mut cache_stats,
                             &cfg.backend,
                             &token_tx,
                         );
-                        memory_state.last_summary_paths.clear();
+                        clear_memory_retrieval(&mut memory_state);
                         memory_state.last_update = None;
                         emit_memory_state(&token_tx, &memory_state);
                         let display_messages = saved
@@ -698,14 +881,13 @@ pub fn model_thread_with_options(
                                 reset_session_runtime(
                                     &mut session_messages,
                                     &tools,
-                                    &session_facts,
                                     eco_enabled,
                                     &mut budget,
                                     &mut cache_stats,
                                     &cfg.backend,
                                     &token_tx,
                                 );
-                                memory_state.last_summary_paths.clear();
+                                clear_memory_retrieval(&mut memory_state);
                                 memory_state.last_update = None;
                                 emit_memory_state(&token_tx, &memory_state);
                                 match store.create_session(None, &backend.name()) {
@@ -970,8 +1152,13 @@ pub fn model_thread_with_options(
                 );
                 if let Some(first) = session_messages.first_mut() {
                     if first.role == "system" {
-                        first.content =
-                            build_system_prompt(&tools, &session_facts, &[], eco_enabled);
+                        first.content = build_system_prompt(
+                            &tools,
+                            &memory_fact_lines(&memory_state.last_selected_facts),
+                            &[],
+                            &memory_state.last_selected_session_excerpts,
+                            eco_enabled,
+                        );
                     }
                 }
                 let _ = token_tx.send(InferenceEvent::EcoEnabled(eco_enabled));
@@ -1010,6 +1197,22 @@ pub fn model_thread_with_options(
                 }
                 continue;
             }
+            SessionCommand::RecallMemory(query) => {
+                let bundle = collect_retrieval_bundle(
+                    &query,
+                    eco_enabled,
+                    &project_name,
+                    project_index.as_ref(),
+                    fact_store.as_ref(),
+                    session_store.as_ref(),
+                    active_session.as_ref().map(|session| session.id.as_str()),
+                    &memory_state.loaded_facts,
+                );
+                let _ = token_tx.send(InferenceEvent::SystemMessage(format_memory_recall(
+                    &query, &bundle,
+                )));
+                continue;
+            }
             SessionCommand::ApproveAction(_) | SessionCommand::RejectAction(_) => {
                 warn!("approval command received with no pending action");
                 let _ = token_tx.send(InferenceEvent::Error(
@@ -1030,48 +1233,35 @@ pub fn model_thread_with_options(
                 }
                 session_messages.push(Message::user(&prompt));
 
-                let relevant_summaries = project_index
-                    .as_ref()
-                    .and_then(|index| {
-                        index
-                            .find_relevant(&prompt, summary_limit(eco_enabled))
-                            .ok()
-                    })
-                    .unwrap_or_default();
+                let retrieval = collect_retrieval_bundle(
+                    &prompt,
+                    eco_enabled,
+                    &project_name,
+                    project_index.as_ref(),
+                    fact_store.as_ref(),
+                    session_store.as_ref(),
+                    active_session.as_ref().map(|session| session.id.as_str()),
+                    &memory_state.loaded_facts,
+                );
                 let mut turn_memory =
-                    TurnMemoryEvidence::new(prompt.clone(), relevant_summaries.clone());
-                memory_state.last_summary_paths = relevant_summaries
-                    .iter()
-                    .map(|(path, _)| path.clone())
-                    .collect();
+                    TurnMemoryEvidence::new(prompt.clone(), retrieval.summaries.clone());
+                set_memory_retrieval(&mut memory_state, &prompt, &retrieval);
                 memory_state.last_update = None;
                 emit_memory_state(&token_tx, &memory_state);
                 hooks.dispatch(HookEvent::MemorySummariesSelected {
-                    summary_count: relevant_summaries.len(),
+                    summary_count: retrieval.summaries.len(),
                 });
-                if !relevant_summaries.is_empty() {
-                    emit_trace(
-                        &token_tx,
-                        ProgressStatus::Finished,
-                        &format!(
-                            "memory: selected {} summar{}",
-                            relevant_summaries.len(),
-                            if relevant_summaries.len() == 1 {
-                                "y"
-                            } else {
-                                "ies"
-                            }
-                        ),
-                        false,
-                    );
+                if let Some(label) = retrieval_trace_label(&retrieval) {
+                    emit_trace(&token_tx, ProgressStatus::Finished, &label, false);
                 }
 
                 if let Some(first) = session_messages.first_mut() {
                     if first.role == "system" {
                         first.content = build_system_prompt(
                             &tools,
-                            &session_facts,
-                            &relevant_summaries,
+                            &memory_fact_lines(&retrieval.facts),
+                            &retrieval.summaries,
+                            &retrieval.session_excerpts,
                             eco_enabled,
                         );
                     }
@@ -1220,13 +1410,7 @@ pub fn model_thread_with_options(
                                     &turn_memory,
                                     &*backend,
                                 );
-                                apply_memory_update(
-                                    &token_tx,
-                                    &hooks,
-                                    &mut memory_state,
-                                    &mut session_facts,
-                                    update,
-                                );
+                                apply_memory_update(&token_tx, &hooks, &mut memory_state, update);
                             }
                             next_action_id = next_action_id.saturating_add(1);
                         } else if let Some(result_msg) = ToolRegistry::format_results_with_limit(
@@ -1336,7 +1520,6 @@ pub fn model_thread_with_options(
                                                     &token_tx,
                                                     &hooks,
                                                     &mut memory_state,
-                                                    &mut session_facts,
                                                     update,
                                                 );
                                             }
@@ -1435,7 +1618,6 @@ pub fn model_thread_with_options(
                                             &token_tx,
                                             &hooks,
                                             &mut memory_state,
-                                            &mut session_facts,
                                             update,
                                         );
                                     }
@@ -1514,5 +1696,85 @@ pub fn model_thread_with_options(
             }
             Err(e) => warn!(error = %e, "memory consolidation failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::FactProvenance;
+
+    #[test]
+    fn set_memory_retrieval_updates_snapshot_fields() {
+        let mut state = RuntimeMemoryState::default();
+        let bundle = RetrievalBundle {
+            summaries: vec![("src/main.rs".to_string(), "main entrypoint".to_string())],
+            facts: vec![MemoryFactView {
+                content: "src/main.rs updates cache stats".to_string(),
+                provenance: FactProvenance::Verified,
+            }],
+            session_excerpts: vec![MemorySessionExcerptView {
+                session_label: "review".to_string(),
+                role: "assistant".to_string(),
+                excerpt: "cache stats are shown in the runtime bar".to_string(),
+            }],
+        };
+
+        set_memory_retrieval(&mut state, "cache stats", &bundle);
+        let snapshot = state.snapshot();
+
+        assert_eq!(
+            snapshot.last_retrieval_query.as_deref(),
+            Some("cache stats")
+        );
+        assert_eq!(snapshot.last_summary_paths, vec!["src/main.rs".to_string()]);
+        assert_eq!(snapshot.last_selected_facts.len(), 1);
+        assert_eq!(snapshot.last_selected_session_excerpts.len(), 1);
+    }
+
+    #[test]
+    fn retrieval_trace_label_summarizes_selected_sources() {
+        let label = retrieval_trace_label(&RetrievalBundle {
+            summaries: vec![("a.rs".to_string(), "summary".to_string())],
+            facts: vec![MemoryFactView {
+                content: "fact".to_string(),
+                provenance: FactProvenance::Verified,
+            }],
+            session_excerpts: vec![MemorySessionExcerptView {
+                session_label: "review".to_string(),
+                role: "assistant".to_string(),
+                excerpt: "excerpt".to_string(),
+            }],
+        });
+
+        assert_eq!(
+            label.as_deref(),
+            Some("memory: selected 1 summary, 1 fact, 1 session excerpt")
+        );
+    }
+
+    #[test]
+    fn memory_recall_format_groups_summaries_facts_and_sessions() {
+        let output = format_memory_recall(
+            "cache stats",
+            &RetrievalBundle {
+                summaries: vec![("src/main.rs".to_string(), "entrypoint".to_string())],
+                facts: vec![MemoryFactView {
+                    content: "src/main.rs updates cache stats".to_string(),
+                    provenance: FactProvenance::Verified,
+                }],
+                session_excerpts: vec![MemorySessionExcerptView {
+                    session_label: "review".to_string(),
+                    role: "assistant".to_string(),
+                    excerpt: "cache stats are shown in the runtime bar".to_string(),
+                }],
+            },
+        );
+
+        assert!(output.contains("memory recall for `cache stats`:"));
+        assert!(output.contains("summaries:"));
+        assert!(output.contains("[verified]"));
+        assert!(output.contains("prior sessions:"));
+        assert!(output.contains("review · assistant"));
     }
 }

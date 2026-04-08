@@ -20,6 +20,7 @@ use tracing::info;
 use crate::config;
 use crate::error::{ParamsError, Result};
 use crate::inference::Message;
+use crate::memory::retrieval::{clip_excerpt, query_terms, score_text};
 
 const SCHEMA_VERSION: i64 = 2;
 
@@ -46,6 +47,14 @@ pub struct SavedSession {
     pub summary: SessionSummary,
     pub messages: Vec<Message>,
     pub saved_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionExcerptMatch {
+    pub session_id: String,
+    pub session_label: String,
+    pub role: String,
+    pub excerpt: String,
 }
 
 pub struct SessionStore {
@@ -320,6 +329,71 @@ impl SessionStore {
         let rows = stmt.query_map(params![self.project_root.as_str()], map_session_summary)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn search_session_excerpts(
+        &self,
+        query: &str,
+        exclude_session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionExcerptMatch>> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query_terms = query_terms(query);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.name, r.updated_at, m.role, m.content
+             FROM session_records r
+             JOIN session_messages m ON m.session_id = r.id
+             WHERE r.project_root = ?1
+             ORDER BY r.updated_at DESC, m.seq DESC",
+        )?;
+
+        let mut scored = stmt
+            .query_map(params![self.project_root.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .flatten()
+            .filter(|(session_id, _, _, role, content)| {
+                !matches!(exclude_session_id, Some(excluded) if excluded == session_id)
+                    && role != "system"
+                    && !content.trim().is_empty()
+            })
+            .filter_map(|(session_id, name, updated_at, role, content)| {
+                let label = name.unwrap_or_else(|| short_id(&session_id));
+                let score = score_text(&query_terms, &format!("{label} {role} {content}"));
+                if score == 0 {
+                    None
+                } else {
+                    Some((
+                        score,
+                        updated_at,
+                        SessionExcerptMatch {
+                            session_id,
+                            session_label: label,
+                            role,
+                            excerpt: clip_excerpt(&content, 160),
+                        },
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        scored.truncate(limit);
+
+        Ok(scored.into_iter().map(|(_, _, item)| item).collect())
     }
 
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<SessionSummary> {
@@ -770,5 +844,55 @@ mod tests {
         let loaded = store.load_most_recent().unwrap().unwrap();
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.summary.message_count, 1);
+    }
+
+    #[test]
+    fn search_session_excerpts_excludes_active_session_and_other_projects() {
+        let path = temp_db_path("search");
+        let store = SessionStore::open_at(&path, "/tmp/project").unwrap();
+        let other_store = SessionStore::open_at(&path, "/tmp/other-project").unwrap();
+
+        let active = store.create_session(Some("active"), "llama.cpp").unwrap();
+        let archived = store.create_session(Some("archived"), "llama.cpp").unwrap();
+        let other = other_store
+            .create_session(Some("other"), "llama.cpp")
+            .unwrap();
+
+        let _ = store
+            .save_messages(
+                &active.id,
+                &[Message::assistant(
+                    "session selector lives in the active session",
+                )],
+                "llama.cpp",
+            )
+            .unwrap();
+        let _ = store
+            .save_messages(
+                &archived.id,
+                &[Message::assistant(
+                    "src/session/mod.rs resolves selectors using a unique id prefix",
+                )],
+                "llama.cpp",
+            )
+            .unwrap();
+        let _ = other_store
+            .save_messages(
+                &other.id,
+                &[Message::assistant(
+                    "src/session/mod.rs exists in another project",
+                )],
+                "llama.cpp",
+            )
+            .unwrap();
+
+        let matches = store
+            .search_session_excerpts("src/session/mod.rs selector", Some(&active.id), 5)
+            .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].session_id, archived.id);
+        assert_eq!(matches[0].session_label, "archived");
+        assert!(matches[0].excerpt.contains("src/session/mod.rs"));
     }
 }

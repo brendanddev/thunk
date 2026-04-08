@@ -24,6 +24,13 @@ pub struct MemoryFactView {
 }
 
 #[derive(Debug, Clone)]
+pub struct MemorySessionExcerptView {
+    pub session_label: String,
+    pub role: String,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct MemorySkippedReasonCount {
     pub reason: String,
     pub count: usize,
@@ -47,6 +54,9 @@ pub struct MemoryConsolidationView {
 pub struct MemorySnapshot {
     pub loaded_facts: Vec<MemoryFactView>,
     pub last_summary_paths: Vec<String>,
+    pub last_retrieval_query: Option<String>,
+    pub last_selected_facts: Vec<MemoryFactView>,
+    pub last_selected_session_excerpts: Vec<MemorySessionExcerptView>,
     pub last_update: Option<MemoryUpdateReport>,
     pub last_consolidation: Option<MemoryConsolidationView>,
 }

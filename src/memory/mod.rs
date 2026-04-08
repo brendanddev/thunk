@@ -17,6 +17,7 @@
 pub mod compression;
 pub mod facts;
 pub mod index;
+pub mod retrieval;
 
 use std::sync::mpsc;
 

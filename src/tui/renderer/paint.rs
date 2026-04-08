@@ -38,6 +38,9 @@ pub(crate) struct RenderModel {
 const SPINNER_FRAMES: &[&str] = &["·", "•", "◦", "•"];
 const CONVERSATION_GUTTER: &str = "│ ";
 const SYSTEM_GUTTER: &str = "· ";
+/// Fixed display-column width for the command name in the palette.
+/// Commands are padded to this width so descriptions start in the same column.
+const PALETTE_NAME_COL: usize = 14;
 
 pub(crate) fn build_render_model(
     state: &mut AppState,
@@ -74,9 +77,9 @@ fn build_top_bar(state: &AppState, theme: Theme, width: u16) -> Vec<StyledLine> 
         truncate(&runtime_label, 22)
     };
     let segments = vec![
-        TopSegment::new("params", theme.base().with_bold(), 0),
+        TopSegment::new("params", theme.dim(), 2),
         TopSegment::new(&runtime_display, runtime_style, 1),
-        TopSegment::new(&session_label, theme.muted(), 2),
+        TopSegment::new(&session_label, theme.muted(), 0),
     ];
 
     vec![build_segmented_top_line(segments, width, theme)]
@@ -93,7 +96,7 @@ fn build_transcript(
         blocks.push(RenderBlock {
             message_id: None,
             lines: vec![single_span(
-                "ready. ask for code help, run a slash command, or inspect the project.",
+                "type a message, or / for commands.",
                 theme.dim(),
             )],
         });
@@ -281,7 +284,7 @@ fn build_collapsed_context(
                 style: if focused {
                     theme.chip_accent().with_underline()
                 } else {
-                    theme.muted().with_bold()
+                    theme.muted()
                 },
             },
         ],
@@ -451,8 +454,8 @@ fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<Styl
     lines.push(single_span_with_gutter(
         SYSTEM_GUTTER,
         theme.dim(),
-        "^Y approve · ^N reject",
-        theme.dim(),
+        "^Y approve  ^N reject",
+        theme.muted(),
     ));
     Some(lines)
 }
@@ -511,7 +514,7 @@ fn build_composer(
                 StyledSpan {
                     text: row.clone(),
                     style: if state.is_generating {
-                        theme.base()
+                        theme.muted()
                     } else {
                         theme.base()
                     },
@@ -525,17 +528,18 @@ fn build_composer(
             .iter()
             .find(|(_, selected)| *selected)
             .map(|(entry, _)| entry.clone());
-        lines.push(StyledLine {
-            spans: vec![StyledSpan {
-                text: if query.is_empty() {
-                    "commands".to_string()
-                } else {
-                    format!("/ {query}")
-                },
-                style: theme.dim(),
-            }],
-        });
+        if !query.is_empty() {
+            lines.push(StyledLine {
+                spans: vec![StyledSpan {
+                    text: format!("/ {query}"),
+                    style: theme.dim(),
+                }],
+            });
+        }
         for (entry, selected) in entries {
+            let name = truncate(&entry.name, PALETTE_NAME_COL);
+            let pad = PALETTE_NAME_COL.saturating_sub(name.chars().count());
+            let padded_name = format!("{}{}", name, " ".repeat(pad));
             lines.push(StyledLine {
                 spans: vec![
                     StyledSpan {
@@ -551,7 +555,7 @@ fn build_composer(
                         },
                     },
                     StyledSpan {
-                        text: truncate(&entry.name, 18),
+                        text: padded_name,
                         style: if selected {
                             theme.chip_accent()
                         } else {
@@ -563,7 +567,10 @@ fn build_composer(
                         style: theme.dim(),
                     },
                     StyledSpan {
-                        text: truncate(&entry.description, width.saturating_sub(22) as usize),
+                        text: truncate(
+                            &entry.description,
+                            width.saturating_sub(PALETTE_NAME_COL as u16 + 4) as usize,
+                        ),
                         style: theme.muted(),
                     },
                 ],
@@ -572,41 +579,43 @@ fn build_composer(
         if let Some(selected) = selected_entry {
             lines.push(single_span(
                 &format!(
-                    "usage: {}",
-                    truncate(&selected.usage, width.saturating_sub(7) as usize)
+                    "  {}",
+                    truncate(&selected.usage, width.saturating_sub(2) as usize)
                 ),
                 theme.dim(),
             ));
             if !selected.aliases.is_empty() {
                 lines.push(single_span(
                     &format!(
-                        "aliases: {}",
+                        "  aka {}",
                         truncate(
                             &selected.aliases.join(", "),
-                            width.saturating_sub(9) as usize
+                            width.saturating_sub(6) as usize
                         )
                     ),
                     theme.dim(),
                 ));
             }
-            lines.push(single_span(
-                &format!("group: {} • source: {}", selected.group, selected.source),
-                theme.dim(),
-            ));
         }
     } else if let Some((query, current)) = state.reverse_search_view() {
+        let query_display = if query.is_empty() {
+            "·".to_string()
+        } else {
+            truncate(&query, 20)
+        };
+        let match_width = width.saturating_sub(query_display.chars().count() as u16 + 4) as usize;
         lines.push(StyledLine {
             spans: vec![
                 StyledSpan {
-                    text: format!("search: {}", query),
-                    style: theme.chip_warning(),
+                    text: query_display,
+                    style: theme.dim(),
                 },
                 StyledSpan {
                     text: "  ".to_string(),
                     style: theme.dim(),
                 },
                 StyledSpan {
-                    text: truncate(&current, width.saturating_sub(12) as usize),
+                    text: truncate(&current, match_width),
                     style: theme.muted(),
                 },
             ],
@@ -1073,7 +1082,7 @@ fn session_label(state: &AppState, width: u16) -> String {
         .unwrap_or_else(|| "fresh".to_string());
 
     if width >= 72 && state.backend_name != "..." {
-        format!("{base} ({})", truncate(&state.backend_name, 16))
+        format!("{base} · {}", truncate(&state.backend_name, 16))
     } else {
         truncate(&base, 22)
     }
@@ -1085,7 +1094,7 @@ fn persistent_runtime_label(state: &AppState) -> String {
     } else if state.status.starts_with("error") {
         "error".to_string()
     } else if state.is_generating {
-        "streaming".to_string()
+        "generating".to_string()
     } else if state.is_ready() {
         "ready".to_string()
     } else {
@@ -1095,12 +1104,19 @@ fn persistent_runtime_label(state: &AppState) -> String {
 
 fn build_activity_line(state: &AppState, theme: Theme, width: u16) -> Option<StyledLine> {
     let label = state.current_trace.as_deref()?;
-    Some(single_span_with_gutter(
-        SYSTEM_GUTTER,
-        theme.dim(),
-        &truncate(label, width.saturating_sub(2) as usize),
-        theme.dim(),
-    ))
+    let glyph = spinner_frame(state.tick);
+    Some(StyledLine {
+        spans: vec![
+            StyledSpan {
+                text: format!("{glyph} "),
+                style: theme.dim(),
+            },
+            StyledSpan {
+                text: truncate(label, width.saturating_sub(3) as usize),
+                style: theme.dim(),
+            },
+        ],
+    })
 }
 
 fn runtime_style(state: &AppState, theme: Theme) -> PackedStyle {
@@ -1307,15 +1323,15 @@ mod tests {
             .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
             .collect::<String>();
 
-        // Per-row group/source metadata is no longer shown on individual rows.
-        // Group and source are surfaced only in the selected-item detail block.
+        // Per-row group/source labels are not shown (not useful to users).
         assert!(!text.contains("[context]"));
         assert!(!text.contains("[context · builtin]"));
+        // group/source metadata removed from detail block to reduce palette noise.
+        assert!(!text.contains("group:"));
+        assert!(!text.contains("source:"));
         // The entry name and description should still appear.
         assert!(text.contains("/read"));
         assert!(text.contains("load a file"));
-        // The detail block for the selected entry should still show group/source.
-        assert!(text.contains("context"));
     }
 
     #[test]
@@ -1345,7 +1361,7 @@ mod tests {
             .collect::<String>();
         assert!(joined.contains("shell"));
         assert!(joined.contains("│ cargo check"));
-        assert!(joined.contains("^Y approve · ^N reject"));
+        assert!(joined.contains("^Y approve  ^N reject"));
         assert!(!joined.contains("/approve"));
     }
 
@@ -1561,7 +1577,7 @@ mod tests {
             .iter()
             .map(|span| span.text.as_str())
             .collect::<String>();
-        assert!(streaming_text.contains("streaming"));
+        assert!(streaming_text.contains("generating"));
         // Activity trace must NOT appear in the top bar.
         assert!(!streaming_text.contains("indexing summaries"));
         assert!(streaming[0]
@@ -1656,7 +1672,7 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<String>();
 
-        assert!(text.contains("streaming"));
+        assert!(text.contains("generating"));
         assert!(!text.contains("cache"));
         assert!(!text.contains("msgs"));
     }
@@ -1746,5 +1762,116 @@ mod tests {
 
         assert!(text.contains("params"));
         assert_eq!(text.matches('▍').count() + text.matches('▌').count(), 1);
+    }
+
+    #[test]
+    fn palette_command_names_are_padded_to_fixed_column() {
+        let mut state = AppState::new();
+        assert!(state.activate_command_launcher(vec![
+            CommandSuggestion {
+                name: "/read".to_string(),
+                usage: "/read <path>".to_string(),
+                description: "load a file".to_string(),
+                source: "builtin",
+                group: "context",
+                aliases: vec![],
+            },
+            CommandSuggestion {
+                name: "/sessions".to_string(),
+                usage: "/sessions list".to_string(),
+                description: "manage sessions".to_string(),
+                source: "builtin",
+                group: "session",
+                aliases: vec![],
+            },
+        ]));
+
+        let (lines, _) = build_composer(&state, Theme::default(), 80, None, None);
+
+        // Entry rows have 4 spans: marker, name, separator, description.
+        // Identify them by checking that the second span (index 1) contains a padded name.
+        let entry_rows: Vec<&StyledLine> = lines
+            .iter()
+            .filter(|line| {
+                // Entry rows: marker span + name span + sep span + description span = 4 spans
+                if line.spans.len() != 4 {
+                    return false;
+                }
+                let marker = &line.spans[0].text;
+                (marker == "→ " || marker == "  ")
+                    && (line.spans[1].text.contains("/read")
+                        || line.spans[1].text.contains("/sessions"))
+            })
+            .collect();
+
+        assert_eq!(
+            entry_rows.len(),
+            2,
+            "both entries should appear as 4-span rows"
+        );
+        // The name spans must be the same display width (PALETTE_NAME_COL),
+        // so descriptions (4th span) start at the same column.
+        let name_widths: Vec<usize> = entry_rows
+            .iter()
+            .map(|line| line.spans[1].text.chars().count())
+            .collect();
+        assert_eq!(
+            name_widths[0], name_widths[1],
+            "name spans must have equal display width"
+        );
+        assert_eq!(
+            name_widths[0], PALETTE_NAME_COL,
+            "name spans must be padded to PALETTE_NAME_COL"
+        );
+    }
+
+    #[test]
+    fn palette_usage_line_has_no_usage_prefix() {
+        let mut state = AppState::new();
+        assert!(state.activate_command_launcher(vec![CommandSuggestion {
+            name: "/read".to_string(),
+            usage: "/read <path>".to_string(),
+            description: "load a file".to_string(),
+            source: "builtin",
+            group: "context",
+            aliases: vec!["/r".to_string()],
+        }]));
+
+        let (lines, _) = build_composer(&state, Theme::default(), 80, None, None);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+
+        // Usage shown without "usage:" label.
+        assert!(!text.contains("usage:"));
+        assert!(text.contains("/read <path>"));
+        // Alias shown with "aka" prefix (shorter than "aliases:").
+        assert!(!text.contains("aliases:"));
+        assert!(text.contains("aka /r"));
+    }
+
+    #[test]
+    fn composer_dims_input_text_while_generating() {
+        let mut state = AppState::new();
+        state.input = "draft while busy".to_string();
+        state.cursor = state.input.len();
+
+        state.is_generating = false;
+        let (idle_lines, _) = build_composer(&state, Theme::default(), 80, None, None);
+        state.is_generating = true;
+        let (busy_lines, _) = build_composer(&state, Theme::default(), 80, None, None);
+
+        // Find the input text span in each case (second span of the prompt row).
+        let idle_text_style = idle_lines[1].spans[1].style;
+        let busy_text_style = busy_lines[1].spans[1].style;
+
+        let theme = Theme::default();
+        assert_eq!(idle_text_style, theme.base(), "idle input uses base style");
+        assert_eq!(
+            busy_text_style,
+            theme.muted(),
+            "input dims to muted while generating"
+        );
     }
 }

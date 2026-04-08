@@ -19,7 +19,7 @@ Switch backends by editing `.local/config.toml`.
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands, targeted file edits, and whole-file writes with diff preview
 - Policy sandbox and inspection: project-only read scope, richer approval previews, destructive shell blocking, and private-network fetch blocking
-- Three-level memory: session compression, incremental project index maintenance, and cross-session facts with verified per-turn promotion, provenance tags, observability, deduplication, TTL pruning, and per-project cap
+- Three-level memory: session compression, incremental project index maintenance, prompt-aware fact retrieval, selective prior-session recall, and cross-session facts with verified per-turn promotion, provenance tags, observability, deduplication, TTL pruning, and per-project cap
 - Budget tracking, per-turn timing in the sidebar, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, with TTL + project-change invalidation and `/clear-cache`
@@ -233,7 +233,7 @@ params "explain what this function does"
 - `/sessions resume <name-or-id>`
 - `/sessions delete <name-or-id>`
 - `/sessions export <name-or-id> [markdown|json]`
-- `/memory [status|facts|last]`
+- `/memory [status|facts|last|recall <query>]`
 - `/transcript [status|collapse|expand|toggle]`
 - `/clear-cache`
 
@@ -255,9 +255,11 @@ Session behavior:
 
 Memory behavior:
 - durable facts are promoted per turn from strict evidence instead of raw end-of-session transcript extraction
-- `/memory status` shows loaded fact count and the most recent summary paths used for retrieval
+- each user turn now builds a retrieval bundle from indexed file summaries, prompt-relevant durable facts, and selective prior-session excerpts from saved sessions in the current project
+- `/memory status` shows loaded fact count plus the most recent retrieval query and the last selected summaries, fact matches, and session excerpts
 - `/memory facts` lists the currently loaded durable facts with `legacy` vs `verified` tags
-- `/memory last` shows the latest accepted/skipped memory update plus the most recent consolidation stats
+- `/memory last` shows the latest accepted/skipped memory update, retrieval summary, and the most recent consolidation stats
+- `/memory recall <query>` runs an explicit retrieval-only lookup across summaries, facts, and prior sessions without mutating the conversation
 - routine memory activity stays in runtime/status telemetry instead of injecting extra transcript breaks into assistant replies
 
 Transcript behavior:
@@ -364,7 +366,11 @@ src/
     openai_compat.rs — OpenAI-compatible API implementation
   tools/             — tool registry and built-in tools
   tools/lsp/         — rust-analyzer probing, transport, parsing, and formatting helpers
-  memory/            — compression, project index, cross-session facts
+  memory/
+    compression.rs   — session compression for long histories
+    retrieval.rs     — shared retrieval scoring/normalization helpers
+    index.rs         — project file summary index
+    facts.rs         — cross-session fact store and consolidation
   tui/
     mod.rs           — terminal setup/cleanup and public TUI entrypoints
     app.rs           — event loop and keyboard handling

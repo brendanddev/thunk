@@ -395,8 +395,18 @@ fn format_memory_status(snapshot: &MemorySnapshot) -> String {
     let mut lines = vec![
         format!("loaded facts: {}", snapshot.loaded_facts.len()),
         format!("last summaries: {}", snapshot.last_summary_paths.len()),
+        format!("last fact matches: {}", snapshot.last_selected_facts.len()),
+        format!(
+            "last session excerpts: {}",
+            snapshot.last_selected_session_excerpts.len()
+        ),
         format!("last update: +{accepted} / -{skipped}"),
     ];
+    if let Some(query) = &snapshot.last_retrieval_query {
+        lines.push(format!("last retrieval query: {query}"));
+    } else {
+        lines.push("last retrieval query: (none)".to_string());
+    }
     if snapshot.last_summary_paths.is_empty() {
         lines.push("recent summary paths: (none)".to_string());
     } else {
@@ -448,6 +458,27 @@ fn format_memory_last(snapshot: &MemorySnapshot) -> String {
             }
         }
         None => lines.push("  (no verified update yet)".to_string()),
+    }
+
+    lines.push(String::new());
+    lines.push("last retrieval:".to_string());
+    match &snapshot.last_retrieval_query {
+        Some(query) => {
+            lines.push(format!("  query: {query}"));
+            lines.push(format!(
+                "  summaries: {}",
+                snapshot.last_summary_paths.len()
+            ));
+            lines.push(format!(
+                "  fact matches: {}",
+                snapshot.last_selected_facts.len()
+            ));
+            lines.push(format!(
+                "  session excerpts: {}",
+                snapshot.last_selected_session_excerpts.len()
+            ));
+        }
+        None => lines.push("  (no retrieval yet)".to_string()),
     }
 
     lines.push(String::new());
@@ -974,12 +1005,25 @@ fn handle_builtin_slash_command(
             }
         }
         "/memory" => {
-            let subcommand = if arg.is_empty() { "status" } else { arg.trim() };
+            let trimmed = arg.trim();
+            let subcommand = if trimmed.is_empty() {
+                "status"
+            } else {
+                trimmed
+            };
             match subcommand {
                 "status" => state.add_system_message(&format_memory_status(&state.memory_snapshot)),
                 "facts" => state.add_system_message(&format_memory_facts(&state.memory_snapshot)),
                 "last" => state.add_system_message(&format_memory_last(&state.memory_snapshot)),
-                _ => state.add_system_message("Usage: /memory [status|facts|last]"),
+                _ if subcommand.starts_with("recall ") => {
+                    let query = subcommand["recall ".len()..].trim();
+                    if query.is_empty() {
+                        state.add_system_message("Usage: /memory recall <query>");
+                    } else {
+                        let _ = prompt_tx.send(SessionCommand::RecallMemory(query.to_string()));
+                    }
+                }
+                _ => state.add_system_message("Usage: /memory [status|facts|last|recall <query>]"),
             }
         }
         "/transcript" => {
@@ -1041,8 +1085,8 @@ mod tests {
         format_transcript_status, parse_sessions_export_args, parse_slash_edit_body,
     };
     use crate::events::{
-        FactProvenance, MemoryConsolidationView, MemoryFactView, MemorySkippedReasonCount,
-        MemorySnapshot, MemoryUpdateReport,
+        FactProvenance, MemoryConsolidationView, MemoryFactView, MemorySessionExcerptView,
+        MemorySkippedReasonCount, MemorySnapshot, MemoryUpdateReport,
     };
 
     #[test]
@@ -1088,6 +1132,16 @@ mod tests {
                 },
             ],
             last_summary_paths: vec!["src/main.rs".to_string()],
+            last_retrieval_query: Some("cache stats".to_string()),
+            last_selected_facts: vec![MemoryFactView {
+                content: "src/main.rs updates cache stats".to_string(),
+                provenance: FactProvenance::Verified,
+            }],
+            last_selected_session_excerpts: vec![MemorySessionExcerptView {
+                session_label: "alpha".to_string(),
+                role: "assistant".to_string(),
+                excerpt: "cache stats are reported in the status line".to_string(),
+            }],
             last_update: Some(MemoryUpdateReport {
                 accepted_facts: vec![MemoryFactView {
                     content: "src/main.rs updates cache stats".to_string(),
@@ -1111,10 +1165,14 @@ mod tests {
         let last = format_memory_last(&snapshot);
 
         assert!(status.contains("loaded facts: 2"));
+        assert!(status.contains("last fact matches: 1"));
+        assert!(status.contains("last session excerpts: 1"));
+        assert!(status.contains("last retrieval query: cache stats"));
         assert!(status.contains("src/main.rs"));
         assert!(facts.contains("[verified]"));
         assert!(facts.contains("[legacy]"));
         assert!(last.contains("duplicates: 1"));
+        assert!(last.contains("query: cache stats"));
         assert!(last.contains("dedup removed: 2"));
     }
 

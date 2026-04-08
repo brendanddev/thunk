@@ -20,6 +20,7 @@ use std::time::UNIX_EPOCH;
 use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
+use super::retrieval::{query_terms, score_text};
 use super::run_prompt_sync;
 use crate::config;
 use crate::error::Result;
@@ -115,9 +116,7 @@ impl ProjectIndex {
     /// broken by match count descending.
     pub fn find_relevant(&self, query: &str, limit: usize) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare("SELECT path, summary FROM files")?;
-
-        let query_lower = query.to_lowercase();
-        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+        let query_terms = query_terms(query);
 
         let mut scored: Vec<(usize, String, String)> = stmt
             .query_map([], |row| {
@@ -125,11 +124,7 @@ impl ProjectIndex {
             })?
             .flatten()
             .filter_map(|(path, summary)| {
-                let summary_lower = summary.to_lowercase();
-                let score = keywords
-                    .iter()
-                    .filter(|kw| summary_lower.contains(*kw))
-                    .count();
+                let score = score_text(&query_terms, &format!("{path} {summary}"));
                 if score > 0 {
                     Some((score, path, summary))
                 } else {
@@ -370,5 +365,39 @@ mod tests {
 
         let _ = fs::remove_file(file);
         let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn find_relevant_prefers_path_like_query_matches() {
+        let root = temp_project_dir("relevance");
+        let index = test_index(&root);
+        index
+            .conn
+            .execute(
+                "INSERT INTO files (path, summary, embedding_json, last_modified) VALUES (?1, ?2, NULL, 1)",
+                params![
+                    "src/session/mod.rs",
+                    "SessionStore manages session resume and export."
+                ],
+            )
+            .expect("seed first row");
+        index
+            .conn
+            .execute(
+                "INSERT INTO files (path, summary, embedding_json, last_modified) VALUES (?1, ?2, NULL, 1)",
+                params![
+                    "src/ui/mod.rs",
+                    "UI rendering mentions session state in passing."
+                ],
+            )
+            .expect("seed second row");
+
+        let results = index
+            .find_relevant("src/session/mod.rs resume", 5)
+            .expect("find relevant");
+
+        assert_eq!(results[0].0, "src/session/mod.rs");
+
+        let _ = fs::remove_dir_all(root);
     }
 }
