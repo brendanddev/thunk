@@ -255,16 +255,18 @@ Session behavior:
 
 Memory behavior:
 - durable facts are promoted per turn from strict evidence instead of raw end-of-session transcript extraction
-- verified facts now need a concrete project/workspace anchor (files, symbols, config values, commands, URLs/hosts, or approved tool evidence), and generic educational answer content or proposal-style lines are filtered out instead of being stored as durable memory
+- verified facts now need a concrete project/workspace anchor (files, symbols, config values, commands, URLs/hosts, or approved tool evidence), and generic educational answer content, proposal-style lines, trivial code snippets, summary-style document boilerplate, or boilerplate file-description text are filtered out instead of being stored as durable memory
 - each user turn now builds a retrieval bundle from indexed file summaries, prompt-relevant durable facts, and selective prior-session excerpts from saved sessions in the current project
 - `/memory status` shows loaded fact count plus the most recent retrieval query and the last selected summaries, fact matches, and session excerpts
 - `/memory facts` lists the currently loaded durable facts with `legacy` vs `verified` tags
 - `/memory last` shows the latest accepted/skipped memory update, retrieval summary, and the most recent consolidation stats
 - `/memory recall <query>` runs an explicit retrieval-only lookup across summaries, facts, and prior sessions without mutating the conversation
-- `/memory prune` removes currently stored facts that no longer pass the project-specific durability filter
+- `/memory prune` removes currently stored facts that no longer pass the project-specific durability filter, including stale generic explanations and low-value snippet/summary/boilerplate facts
 - routine memory activity stays in runtime/status telemetry instead of injecting extra transcript breaks into assistant replies
 
 Transcript behavior:
+- obvious natural-language repo/directory summary prompts like “what’s in this repo?” and “what’s in this directory?” now trigger a bounded read-only auto-inspection workflow before the answer
+- auto-inspection shows one concise `Thinking:` system note plus short step traces like `List .` and `Read README.md`, then injects the gathered context internally instead of dumping raw tool output into the transcript
 - injected tool results and slash-loaded context blocks auto-collapse into compact transcript cards
 - `Ctrl+O` toggles the focused collapsed/expanded context block
 - `Alt+Up` recalls the previous submitted prompt or slash command into the composer for editing, and `Alt+Down` moves forward through recall history back to your unsent draft

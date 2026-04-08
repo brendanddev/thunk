@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 
 use tracing::{debug, info, warn};
@@ -21,7 +21,7 @@ use crate::session::{
     display_name, list_label, short_id, SessionExcerptMatch, SessionExportFormat, SessionStore,
     SessionSummary,
 };
-use crate::tools::{BashTool, Tool, ToolRegistry};
+use crate::tools::{BashTool, ListDir, ReadFile, Tool, ToolRegistry, ToolResult, ToolRunResult};
 
 use super::approval::{handle_pending_action, ApprovalContext};
 use super::budget::{
@@ -77,6 +77,194 @@ impl RuntimeMemoryState {
 
 fn emit_memory_state(token_tx: &Sender<InferenceEvent>, memory_state: &RuntimeMemoryState) {
     let _ = token_tx.send(InferenceEvent::MemoryState(memory_state.snapshot()));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoInspectIntent {
+    RepoOverview,
+    DirectoryOverview,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutoInspectStep {
+    label: String,
+    tool_name: &'static str,
+    argument: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutoInspectPlan {
+    thinking: &'static str,
+    status_label: &'static str,
+    context_label: &'static str,
+    steps: Vec<AutoInspectStep>,
+}
+
+struct AutoInspectOutcome {
+    hidden_context: Option<String>,
+    tool_results: Vec<ToolResult>,
+}
+
+fn detect_auto_inspect_intent(prompt: &str) -> Option<AutoInspectIntent> {
+    let normalized = normalize_intent_text(prompt);
+    if normalized.starts_with('/') {
+        return None;
+    }
+
+    if [
+        "whats in this repo",
+        "what is in this repo",
+        "whats in this project",
+        "what is in this project",
+        "summarize this repo",
+        "summarize this project",
+        "summarize this codebase",
+        "what does this repo do",
+        "what does this project do",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        return Some(AutoInspectIntent::RepoOverview);
+    }
+
+    if [
+        "whats in this directory",
+        "what is in this directory",
+        "whats in this folder",
+        "what is in this folder",
+        "whats here",
+        "what is here",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        return Some(AutoInspectIntent::DirectoryOverview);
+    }
+
+    None
+}
+
+fn normalize_intent_text(text: &str) -> String {
+    let stripped = text.to_ascii_lowercase().replace(['\'', '’'], "");
+    stripped
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '/' {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn plan_auto_inspection(intent: AutoInspectIntent, project_root: &Path) -> AutoInspectPlan {
+    let mut steps = vec![AutoInspectStep {
+        label: "List .".to_string(),
+        tool_name: "list_dir",
+        argument: ".".to_string(),
+    }];
+
+    let mut push_read = |rel: &str| {
+        if project_root.join(rel).is_file() {
+            steps.push(AutoInspectStep {
+                label: format!("Read {rel}"),
+                tool_name: "read_file",
+                argument: rel.to_string(),
+            });
+        }
+    };
+
+    match intent {
+        AutoInspectIntent::RepoOverview => {
+            push_read("README.md");
+            push_read("Cargo.toml");
+            if project_root.join("src/main.rs").is_file() {
+                push_read("src/main.rs");
+            } else {
+                push_read("src/lib.rs");
+            }
+
+            AutoInspectPlan {
+                thinking: "Thinking: exploring the repo structure and key project docs.",
+                status_label: "inspecting repo...",
+                context_label: "this repo summary request",
+                steps,
+            }
+        }
+        AutoInspectIntent::DirectoryOverview => {
+            push_read("README.md");
+            for manifest in ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"] {
+                if project_root.join(manifest).is_file() {
+                    push_read(manifest);
+                    break;
+                }
+            }
+
+            AutoInspectPlan {
+                thinking: "Thinking: checking the current directory and its key files.",
+                status_label: "inspecting directory...",
+                context_label: "this directory summary request",
+                steps,
+            }
+        }
+    }
+}
+
+fn run_auto_inspection(
+    plan: &AutoInspectPlan,
+    token_tx: &Sender<InferenceEvent>,
+    eco_enabled: bool,
+) -> AutoInspectOutcome {
+    let _ = token_tx.send(InferenceEvent::SystemMessage(plan.thinking.to_string()));
+
+    let mut results = Vec::new();
+
+    for step in &plan.steps {
+        emit_trace(token_tx, ProgressStatus::Started, &step.label, false);
+        let run_result = match step.tool_name {
+            "list_dir" => ListDir.run(&step.argument),
+            "read_file" => ReadFile.run(&step.argument),
+            _ => continue,
+        };
+
+        match run_result {
+            Ok(ToolRunResult::Immediate(output)) => {
+                emit_trace(token_tx, ProgressStatus::Finished, &step.label, false);
+                results.push(ToolResult {
+                    tool_name: step.tool_name.to_string(),
+                    argument: step.argument.clone(),
+                    output,
+                });
+            }
+            Ok(ToolRunResult::RequiresApproval(_)) => {
+                emit_trace(token_tx, ProgressStatus::Failed, &step.label, false);
+            }
+            Err(error) => {
+                warn!(label = step.label.as_str(), error = %error, "auto inspection step failed");
+                emit_trace(token_tx, ProgressStatus::Failed, &step.label, false);
+            }
+        }
+    }
+
+    let hidden_context =
+        ToolRegistry::format_results_with_limit(&results, eco_tool_result_limit(eco_enabled)).map(
+            |formatted| {
+                format!(
+                    "Automatic inspection context for {}:\n\n{}",
+                    plan.context_label, formatted
+                )
+            },
+        );
+
+    AutoInspectOutcome {
+        hidden_context,
+        tool_results: results,
+    }
 }
 
 fn refresh_loaded_facts(
@@ -1272,6 +1460,18 @@ pub fn model_thread_with_options(
                 }
                 session_messages.push(Message::user(&prompt));
 
+                let auto_inspection = detect_auto_inspect_intent(&prompt)
+                    .map(|intent| plan_auto_inspection(intent, &project_root));
+                let auto_inspection_outcome = auto_inspection.as_ref().map(|plan| {
+                    emit_generation_started(&token_tx, plan.status_label, false);
+                    run_auto_inspection(plan, &token_tx, eco_enabled)
+                });
+                if let Some(outcome) = auto_inspection_outcome.as_ref() {
+                    if let Some(hidden_context) = &outcome.hidden_context {
+                        session_messages.push(Message::user(hidden_context));
+                    }
+                }
+
                 let retrieval = collect_retrieval_bundle(
                     &prompt,
                     eco_enabled,
@@ -1284,6 +1484,16 @@ pub fn model_thread_with_options(
                 );
                 let mut turn_memory =
                     TurnMemoryEvidence::new(prompt.clone(), retrieval.summaries.clone());
+                if let Some(outcome) = auto_inspection_outcome {
+                    for result in outcome.tool_results {
+                        turn_memory.record_tool_result(
+                            result.tool_name,
+                            result.argument,
+                            result.output,
+                            false,
+                        );
+                    }
+                }
                 set_memory_retrieval(&mut memory_state, &prompt, &retrieval);
                 memory_state.last_update = None;
                 emit_memory_state(&token_tx, &memory_state);
@@ -1742,6 +1952,16 @@ pub fn model_thread_with_options(
 mod tests {
     use super::*;
     use crate::events::FactProvenance;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("params-auto-inspect-{label}-{nonce}"))
+    }
 
     #[test]
     fn set_memory_retrieval_updates_snapshot_fields() {
@@ -1815,5 +2035,116 @@ mod tests {
         assert!(output.contains("[verified]"));
         assert!(output.contains("prior sessions:"));
         assert!(output.contains("review · assistant"));
+    }
+
+    #[test]
+    fn detect_auto_inspect_intent_matches_repo_prompts() {
+        assert_eq!(
+            detect_auto_inspect_intent("What's in this repo?"),
+            Some(AutoInspectIntent::RepoOverview)
+        );
+        assert_eq!(
+            detect_auto_inspect_intent("Summarize this codebase"),
+            Some(AutoInspectIntent::RepoOverview)
+        );
+    }
+
+    #[test]
+    fn detect_auto_inspect_intent_matches_directory_prompts() {
+        assert_eq!(
+            detect_auto_inspect_intent("What's in this directory?"),
+            Some(AutoInspectIntent::DirectoryOverview)
+        );
+        assert_eq!(
+            detect_auto_inspect_intent("What's here"),
+            Some(AutoInspectIntent::DirectoryOverview)
+        );
+    }
+
+    #[test]
+    fn detect_auto_inspect_intent_skips_unrelated_prompts() {
+        assert_eq!(
+            detect_auto_inspect_intent("Where is the cache implemented?"),
+            None
+        );
+        assert_eq!(detect_auto_inspect_intent("/read README.md"), None);
+    }
+
+    #[test]
+    fn repo_auto_inspection_prefers_main_over_lib() {
+        let root = temp_project_root("repo-main");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("README.md"), "# params").expect("write readme");
+        fs::write(root.join("Cargo.toml"), "[package]").expect("write cargo");
+        fs::write(root.join("src/main.rs"), "fn main() {}").expect("write main");
+        fs::write(root.join("src/lib.rs"), "pub fn lib() {}").expect("write lib");
+
+        let plan = plan_auto_inspection(AutoInspectIntent::RepoOverview, &root);
+        let labels = plan
+            .steps
+            .iter()
+            .map(|step| step.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                "List .",
+                "Read README.md",
+                "Read Cargo.toml",
+                "Read src/main.rs"
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_auto_inspection_is_bounded_and_chooses_single_manifest() {
+        let root = temp_project_root("directory");
+        fs::create_dir_all(&root).expect("create dir");
+        fs::write(root.join("README.md"), "# params").expect("write readme");
+        fs::write(root.join("Cargo.toml"), "[package]").expect("write cargo");
+        fs::write(root.join("package.json"), "{}").expect("write package");
+
+        let plan = plan_auto_inspection(AutoInspectIntent::DirectoryOverview, &root);
+        let labels = plan
+            .steps
+            .iter()
+            .map(|step| step.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["List .", "Read README.md", "Read Cargo.toml"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_inspection_hidden_context_has_expected_heading() {
+        let plan = AutoInspectPlan {
+            thinking: "Thinking: exploring the repo structure and key project docs.",
+            status_label: "inspecting repo...",
+            context_label: "this repo summary request",
+            steps: vec![],
+        };
+
+        let hidden = ToolRegistry::format_results_with_limit(
+            &[ToolResult {
+                tool_name: "list_dir".to_string(),
+                argument: ".".to_string(),
+                output: "Directory: .\n\nsrc/\nREADME.md".to_string(),
+            }],
+            eco_tool_result_limit(false),
+        )
+        .map(|formatted| {
+            format!(
+                "Automatic inspection context for {}:\n\n{}",
+                plan.context_label, formatted
+            )
+        })
+        .expect("hidden context");
+
+        assert!(hidden.starts_with("Automatic inspection context for this repo summary request:"));
+        assert!(hidden.contains("--- list_dir(.) ---"));
     }
 }

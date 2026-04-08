@@ -752,11 +752,20 @@ fn is_quality_fact(fact: &str) -> bool {
             return false;
         }
     }
+    if looks_like_code_snippet(fact) {
+        return false;
+    }
+    if looks_like_summary_boilerplate(fact) {
+        return false;
+    }
     let low_value_phrases = [
         "the contents of ",
         " are as follows",
         "typically contains",
         "for a rust project",
+        "this file (`",
+        "is the entry point of the rust project",
+        "defines the main behavior of the cli tool",
         "smart pointers like",
         "other languages also have pointers",
         "managed by the rust compiler and runtime",
@@ -767,6 +776,47 @@ fn is_quality_fact(fact: &str) -> bool {
         }
     }
     true
+}
+
+fn looks_like_code_snippet(fact: &str) -> bool {
+    let trimmed = fact.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.starts_with("let ")
+        || lower.starts_with("const ")
+        || lower.starts_with("var ")
+        || lower.starts_with("fn ")
+    {
+        return true;
+    }
+
+    let has_assignment = trimmed.contains('=');
+    let has_semicolon = trimmed.contains(';');
+    let has_comment = trimmed.contains("//");
+    let has_slice = trimmed.contains("&") || trimmed.contains("::");
+    let token_count = trimmed.split_whitespace().count();
+
+    (has_assignment && has_semicolon && token_count <= 16)
+        || (has_comment && has_assignment)
+        || (has_slice && has_semicolon && token_count <= 12)
+}
+
+fn looks_like_summary_boilerplate(fact: &str) -> bool {
+    let trimmed = fact.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if !(lower.contains(": describes ")
+        || lower.starts_with("this document ")
+        || lower.starts_with("this doc ")
+        || lower.starts_with("this file "))
+    {
+        return false;
+    }
+
+    lower.contains("describes ")
+        || lower.contains("documents ")
+        || lower.contains("outlines ")
+        || lower.contains("covers ")
 }
 
 fn contains_hedged_language(fact: &str) -> bool {
@@ -869,6 +919,31 @@ mod tests {
     fn quality_fact_rejects_bullet_style_lines() {
         assert!(!is_quality_fact(
             "- C/C++ uses raw pointers directly in the language"
+        ));
+    }
+
+    #[test]
+    fn quality_fact_rejects_code_snippet_lines() {
+        assert!(!is_quality_fact(
+            "let s = String::from(\"rust pointer example\");"
+        ));
+        assert!(!is_quality_fact(
+            "pointer = &s[3..6]; // Raw pointer to a string slice"
+        ));
+        assert!(!is_quality_fact("let part = &s[3..6];"));
+    }
+
+    #[test]
+    fn quality_fact_rejects_file_boilerplate_lines() {
+        assert!(!is_quality_fact(
+            "This file (`src/main.rs`) is the entry point of the Rust project `params-cli`."
+        ));
+    }
+
+    #[test]
+    fn quality_fact_rejects_summary_boilerplate_lines() {
+        assert!(!is_quality_fact(
+            "/Users/brendandileo/Desktop/BDrive/params-cli/docs/context/PLANS.md: Describes project profiles, cache invalidation techniques, memory consolidation methods, and lifecycle hooks for the params-cli project."
         ));
     }
 
@@ -1123,6 +1198,19 @@ mod tests {
     fn factstore_behavior_fact_remains_retrievable() {
         assert!(is_retrievable_project_fact(
             "FactStore uses Jaccard similarity to deduplicate near-duplicate verified memory facts."
+        ));
+    }
+
+    #[test]
+    fn snippet_and_boilerplate_facts_are_not_retrievable() {
+        assert!(!is_retrievable_project_fact(
+            "let s = String::from(\"rust pointer example\");"
+        ));
+        assert!(!is_retrievable_project_fact(
+            "This file (`src/main.rs`) is the entry point of the Rust project `params-cli`."
+        ));
+        assert!(!is_retrievable_project_fact(
+            "/Users/brendandileo/Desktop/BDrive/params-cli/docs/context/PLANS.md: Describes project profiles, cache invalidation techniques, memory consolidation methods, and lifecycle hooks for the params-cli project."
         ));
     }
 }
