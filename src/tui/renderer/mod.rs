@@ -15,7 +15,9 @@ use crate::tui::state::ChatMessage;
 use self::buffer::{Cell, CellBuffer};
 use self::diff::PatchWriter;
 use self::layout::layout_for;
-use self::paint::{build_render_model, build_transcript_block, paint_model, StyledLine};
+use self::paint::{
+    build_render_model, build_transcript_block, estimated_approval_rows, paint_model, StyledLine,
+};
 use self::style::{PackedStyle, Theme};
 use self::symbols::SymbolPool;
 
@@ -158,12 +160,17 @@ impl Renderer {
         let content_rows = state.input_content_rows(inner_width).min(8) as u16;
         let hint_rows = 2u16;
         let divider_rows = 1u16;
-        let approval_rows = if state.has_pending_action() {
-            (width / 12).clamp(5, 9)
+        let activity_rows = if state.current_trace.is_some() { 1 } else { 0 };
+        let approval_rows = if let Some(action) = state.pending_action.as_ref() {
+            estimated_approval_rows(
+                action.kind.clone(),
+                width,
+                Some(self.frames.current.height()),
+            )
         } else {
             0
         };
-        content_rows + hint_rows + divider_rows + approval_rows
+        content_rows + hint_rows + divider_rows + activity_rows + approval_rows
     }
 
     fn poison_previous_frame(&mut self) {

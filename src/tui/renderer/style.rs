@@ -112,8 +112,6 @@ const fn unpack_rgb(bits: u64, shift: u64) -> Rgb {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Theme {
     pub background: Rgb,
-    pub panel: Rgb,
-    pub panel_alt: Rgb,
     pub border: Rgb,
     pub border_active: Rgb,
     pub text: Rgb,
@@ -123,15 +121,12 @@ pub(crate) struct Theme {
     pub assistant: Rgb,
     pub warning: Rgb,
     pub danger: Rgb,
-    pub success: Rgb,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
             background: Rgb::new(13, 16, 20),
-            panel: Rgb::new(13, 16, 20),
-            panel_alt: Rgb::new(17, 22, 28),
             border: Rgb::new(56, 63, 72),
             border_active: Rgb::new(102, 214, 255),
             text: Rgb::new(234, 239, 244),
@@ -141,7 +136,6 @@ impl Default for Theme {
             assistant: Rgb::new(223, 104, 184),
             warning: Rgb::new(242, 179, 86),
             danger: Rgb::new(237, 104, 109),
-            success: Rgb::new(99, 211, 139),
         }
     }
 }
@@ -167,14 +161,6 @@ impl Theme {
         PackedStyle::new(self.assistant, self.background).with_bold()
     }
 
-    pub fn badge_muted(self) -> PackedStyle {
-        PackedStyle::new(self.text_muted, self.background).with_bold()
-    }
-
-    pub fn chip_neutral(self) -> PackedStyle {
-        PackedStyle::new(self.text_muted, self.background).with_bold()
-    }
-
     pub fn chip_accent(self) -> PackedStyle {
         PackedStyle::new(self.accent, self.background).with_bold()
     }
@@ -185,10 +171,6 @@ impl Theme {
 
     pub fn chip_danger(self) -> PackedStyle {
         PackedStyle::new(self.danger, self.background).with_bold()
-    }
-
-    pub fn chip_success(self) -> PackedStyle {
-        PackedStyle::new(self.success, self.background).with_bold()
     }
 
     pub fn border(self) -> PackedStyle {

@@ -48,7 +48,9 @@ pub(crate) fn build_render_model(
     let _ = layout_mode;
     let transcript = build_transcript(state, theme, width, cached_block);
     let approval = build_approval(state, theme, width);
-    let (composer, composer_cursor) = build_composer(state, theme, width, approval.as_deref());
+    let activity = build_activity_line(state, theme, width);
+    let (composer, composer_cursor) =
+        build_composer(state, theme, width, approval.as_deref(), activity);
 
     RenderModel {
         top_bar,
@@ -77,11 +79,7 @@ fn build_top_bar(state: &AppState, theme: Theme, width: u16) -> Vec<StyledLine> 
         TopSegment::new(&session_label, theme.muted(), 2),
     ];
 
-    let mut lines = vec![build_segmented_top_line(segments, width, theme)];
-    if let Some(activity_line) = build_activity_line(state, theme, width) {
-        lines.push(activity_line);
-    }
-    lines
+    vec![build_segmented_top_line(segments, width, theme)]
 }
 
 fn build_transcript(
@@ -164,7 +162,7 @@ fn build_standard_message(
         Role::Assistant => build_badged_message(
             "params",
             theme.badge_assistant(),
-            if message.content.is_empty() {
+            if message.content.is_empty() && !is_active_assistant {
                 "▍"
             } else {
                 &message.content
@@ -300,7 +298,7 @@ fn build_collapsed_context(
                     style: edge_style,
                 },
                 StyledSpan {
-                    text: " Ctrl+O • [ ]".to_string(),
+                    text: " Ctrl+O".to_string(),
                     style: theme.dim(),
                 },
             ],
@@ -383,11 +381,6 @@ fn build_expanded_context(
 
 fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<StyledLine>> {
     let pending = state.pending_action.as_ref()?;
-    let risk_chip = match pending.inspection.risk {
-        RiskLevel::Low => theme.chip_accent(),
-        RiskLevel::Medium => theme.chip_warning(),
-        RiskLevel::High => theme.chip_danger(),
-    };
     let approval_style = match pending.inspection.risk {
         RiskLevel::Low => theme.chip_accent(),
         RiskLevel::Medium => theme.chip_warning(),
@@ -402,30 +395,18 @@ fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<Styl
             StyledSpan {
                 text: format!(
                     "  {}",
-                    truncate(&pending.title, width.saturating_sub(16) as usize)
+                    truncate(&pending.title, width.saturating_sub(10) as usize)
                 ),
                 style: theme.base(),
             },
-            StyledSpan {
-                text: format!("  [{} risk]", pending.inspection.risk),
-                style: risk_chip,
-            },
         ],
     }];
-    let summary = approval_summary_line(pending, width);
-    lines.extend(wrap_plain_to_lines(&summary, theme.muted(), width));
+    lines.push(single_span(
+        &approval_summary_line(pending, width),
+        theme.muted(),
+    ));
 
-    if let Some(reason) = pending.inspection.reasons.first() {
-        lines.extend(wrap_plain_to_lines(
-            &format!("· {reason}"),
-            theme.dim(),
-            width,
-        ));
-    }
-    let preview_lines = match pending.kind {
-        PendingActionKind::ShellCommand => 2,
-        PendingActionKind::FileWrite | PendingActionKind::FileEdit => 4,
-    };
+    let preview_lines = approval_preview_line_cap(pending.kind.clone(), width, None);
     for line in preview_snippet(&pending.preview, width.saturating_sub(2), preview_lines) {
         lines.push(StyledLine {
             spans: vec![
@@ -440,7 +421,7 @@ fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<Styl
             ],
         });
     }
-    lines.push(single_span("Ctrl+Y approve  Ctrl+N reject", theme.dim()));
+    lines.push(single_span("^Y approve · ^N reject", theme.dim()));
     Some(lines)
 }
 
@@ -449,20 +430,23 @@ fn build_composer(
     theme: Theme,
     width: u16,
     approval: Option<&[StyledLine]>,
+    activity: Option<StyledLine>,
 ) -> (Vec<StyledLine>, (u16, u16)) {
     let inner_width = width.saturating_sub(2).max(8) as usize;
     let max_visible_rows = 8usize;
     let (visible_rows, cursor_row, cursor_col) =
         state.input_display_lines(inner_width, max_visible_rows);
     let mut lines = Vec::new();
-    let mut prompt_offset = 0u16;
 
+    if let Some(activity_line) = activity {
+        lines.push(activity_line);
+    }
     if let Some(approval_lines) = approval {
         for line in approval_lines {
             lines.push(line.clone());
         }
-        prompt_offset = lines.len() as u16;
     }
+    let prompt_offset = lines.len() as u16;
 
     let prompt_marker = if state.is_reverse_search_active() {
         "? "
@@ -505,29 +489,19 @@ fn build_composer(
     }
 
     if let Some((query, entries)) = state.command_launcher_view(5) {
-        let searching = !query.is_empty();
         let selected_entry = entries
             .iter()
             .find(|(_, selected)| *selected)
             .map(|(entry, _)| entry.clone());
         lines.push(StyledLine {
-            spans: vec![
-                StyledSpan {
-                    text: format!(
-                        "commands: {}",
-                        if query.is_empty() {
-                            "all commands"
-                        } else {
-                            &query
-                        }
-                    ),
-                    style: theme.base().with_bold(),
+            spans: vec![StyledSpan {
+                text: if query.is_empty() {
+                    "commands".to_string()
+                } else {
+                    format!("/ {query}")
                 },
-                StyledSpan {
-                    text: "  ↑↓ move  Enter choose  Esc close".to_string(),
-                    style: theme.dim(),
-                },
-            ],
+                style: theme.dim(),
+            }],
         });
         for (entry, selected) in entries {
             lines.push(StyledLine {
@@ -557,16 +531,8 @@ fn build_composer(
                         style: theme.dim(),
                     },
                     StyledSpan {
-                        text: truncate(&entry.description, width.saturating_sub(26) as usize),
+                        text: truncate(&entry.description, width.saturating_sub(22) as usize),
                         style: theme.muted(),
-                    },
-                    StyledSpan {
-                        text: if searching {
-                            format!("  [{}]", entry.group)
-                        } else {
-                            format!("  [{} · {}]", entry.group, entry.source)
-                        },
-                        style: theme.dim(),
                     },
                 ],
             });
@@ -614,7 +580,6 @@ fn build_composer(
             ],
         });
     } else if !state.autocomplete_preview_items(4).is_empty() {
-        lines.push(single_span("suggestions", theme.dim()));
         for (item, selected) in state.autocomplete_preview_items(4) {
             lines.push(StyledLine {
                 spans: vec![
@@ -641,8 +606,6 @@ fn build_composer(
                 ],
             });
         }
-    } else if state.input.trim().is_empty() && approval.is_none() {
-        lines.push(single_span("ask about the code…", theme.dim()));
     }
 
     let cursor_x = 2 + cursor_col as u16;
@@ -666,17 +629,6 @@ pub(crate) fn paint_model(
     buffer.fill_rect(0, 0, buffer.width(), buffer.height(), background);
 
     paint_lines(buffer, symbols, &layout.top_bar, &model.top_bar);
-    paint_divider(
-        buffer,
-        symbols,
-        layout.top_bar.x,
-        layout
-            .top_bar
-            .y
-            .saturating_add(layout.top_bar.height.saturating_sub(1)),
-        layout.top_bar.width,
-        theme,
-    );
 
     paint_transcript(
         buffer,
@@ -792,26 +744,6 @@ fn paint_sheet(
     } else {
         paint_lines(buffer, symbols, rect, lines);
         0
-    }
-}
-
-fn paint_divider(
-    buffer: &mut CellBuffer,
-    symbols: &mut SymbolPool,
-    x: u16,
-    y: u16,
-    width: u16,
-    theme: Theme,
-) {
-    if y >= buffer.height() || width == 0 {
-        return;
-    }
-    let divider = Cell {
-        symbol_id: symbols.intern("─"),
-        style: theme.border(),
-    };
-    for col in x..x.saturating_add(width).min(buffer.width()) {
-        buffer.set(col, y, divider);
     }
 }
 
@@ -959,19 +891,51 @@ fn approval_kind_label(kind: PendingActionKind) -> &'static str {
 }
 
 fn approval_summary_line(pending: &crate::events::PendingAction, width: u16) -> String {
-    let mut summary = pending.inspection.summary.clone();
-    if pending.inspection.reasons.len() > 1 {
-        let extra = pending.inspection.reasons[1..]
-            .iter()
-            .take(1)
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(reason) = extra.first() {
-            summary.push_str(" · ");
-            summary.push_str(reason);
+    let detail = pending
+        .inspection
+        .reasons
+        .first()
+        .map(String::as_str)
+        .unwrap_or(&pending.inspection.summary);
+    let text = format!("· {detail}");
+    truncate(&text, width.saturating_sub(2) as usize)
+}
+
+pub(crate) fn approval_preview_line_cap(
+    kind: PendingActionKind,
+    width: u16,
+    terminal_height: Option<u16>,
+) -> usize {
+    let base = match kind {
+        PendingActionKind::ShellCommand => 1,
+        PendingActionKind::FileWrite | PendingActionKind::FileEdit => {
+            if width < 72 {
+                2
+            } else {
+                3
+            }
         }
+    };
+    match terminal_height {
+        Some(height) if height < 22 => base,
+        Some(height) if height < 30 => match kind {
+            PendingActionKind::ShellCommand => base.min(2),
+            PendingActionKind::FileWrite | PendingActionKind::FileEdit => (base + 1).min(3),
+        },
+        Some(_) | None => match kind {
+            PendingActionKind::ShellCommand => 2,
+            PendingActionKind::FileWrite | PendingActionKind::FileEdit => (base + 1).min(4),
+        },
     }
-    truncate(&summary, width.saturating_sub(2) as usize)
+}
+
+pub(crate) fn estimated_approval_rows(
+    kind: PendingActionKind,
+    width: u16,
+    terminal_height: Option<u16>,
+) -> u16 {
+    let preview_rows = approval_preview_line_cap(kind, width, terminal_height) as u16;
+    3 + preview_rows
 }
 
 #[derive(Debug, Clone)]
@@ -1158,6 +1122,8 @@ mod tests {
 
         assert!(!unfocused_text.contains("Ctrl+O"));
         assert!(focused_text.contains("Ctrl+O"));
+        // Navigation noise [ ] removed from hint line.
+        assert!(!focused_text.contains("[ ]"));
     }
 
     #[test]
@@ -1170,7 +1136,7 @@ mod tests {
         state.cursor = state.input.len();
         assert!(state.activate_reverse_search());
 
-        let (lines, _) = build_composer(&state, Theme::default(), 80, None);
+        let (lines, _) = build_composer(&state, Theme::default(), 80, None, None);
         assert_eq!(lines[0].spans[0].text, "? ");
     }
 
@@ -1186,25 +1152,27 @@ mod tests {
             aliases: vec!["/r".to_string()],
         }]));
 
-        let (lines, _) = build_composer(&state, Theme::default(), 80, None);
+        let (lines, _) = build_composer(&state, Theme::default(), 80, None, None);
         assert_eq!(lines[0].spans[0].text, ": ");
     }
 
     #[test]
-    fn idle_empty_composer_uses_placeholder_instead_of_long_hint_line() {
+    fn idle_empty_composer_renders_bare_prompt_without_placeholder() {
         let state = AppState::new();
-        let (lines, _) = build_composer(&state, Theme::default(), 80, None);
+        let (lines, _) = build_composer(&state, Theme::default(), 80, None, None);
         let text = lines
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
             .collect::<String>();
 
-        assert!(text.contains("ask about the code"));
+        // No placeholder text, no tutorial hints — just the prompt marker.
+        assert!(!text.contains("ask about the code"));
         assert!(!text.contains("Enter send"));
+        assert!(text.contains("› "));
     }
 
     #[test]
-    fn active_command_launcher_search_flattens_group_headers() {
+    fn active_command_launcher_rows_omit_per_row_group_metadata() {
         let mut state = AppState::new();
         assert!(state.activate_command_launcher(vec![
             CommandSuggestion {
@@ -1226,14 +1194,21 @@ mod tests {
         ]));
         state.command_launcher_push_char('r');
 
-        let (lines, _) = build_composer(&state, Theme::default(), 80, None);
+        let (lines, _) = build_composer(&state, Theme::default(), 80, None, None);
         let text = lines
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
             .collect::<String>();
 
-        assert!(text.contains("[context]"));
-        assert!(!text.contains("context:"));
+        // Per-row group/source metadata is no longer shown on individual rows.
+        // Group and source are surfaced only in the selected-item detail block.
+        assert!(!text.contains("[context]"));
+        assert!(!text.contains("[context · builtin]"));
+        // The entry name and description should still appear.
+        assert!(text.contains("/read"));
+        assert!(text.contains("load a file"));
+        // The detail block for the selected entry should still show group/source.
+        assert!(text.contains("context"));
     }
 
     #[test]
@@ -1263,8 +1238,78 @@ mod tests {
             .collect::<String>();
         assert!(joined.contains("shell"));
         assert!(joined.contains("│ cargo check"));
-        assert!(joined.contains("Ctrl+Y approve  Ctrl+N reject"));
+        assert!(joined.contains("^Y approve · ^N reject"));
         assert!(!joined.contains("/approve"));
+    }
+
+    #[test]
+    fn approval_uses_first_reason_instead_of_duplicate_summary_block() {
+        let mut state = AppState::new();
+        state.set_pending_action(PendingAction {
+            id: 1,
+            kind: PendingActionKind::ShellCommand,
+            title: "Approve shell command".to_string(),
+            preview: "cargo check".to_string(),
+            inspection: InspectionReport {
+                operation: "bash".to_string(),
+                decision: InspectionDecision::NeedsApproval,
+                risk: RiskLevel::Low,
+                summary: "Shell command requires approval before execution".to_string(),
+                reasons: vec!["runs build in current dir".to_string()],
+                targets: Vec::new(),
+                segments: vec!["cargo check".to_string()],
+                network_targets: Vec::new(),
+            },
+        });
+
+        let approval = build_approval(&state, Theme::default(), 80).expect("approval");
+        let text = approval
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+
+        assert!(text.contains("· runs build in current dir"));
+        assert!(!text.contains("Shell command requires approval before execution"));
+    }
+
+    #[test]
+    fn approval_preview_caps_match_kind_and_terminal_budget() {
+        assert_eq!(
+            approval_preview_line_cap(PendingActionKind::ShellCommand, 80, Some(20)),
+            1
+        );
+        assert_eq!(
+            approval_preview_line_cap(PendingActionKind::ShellCommand, 80, Some(36)),
+            2
+        );
+        assert_eq!(
+            approval_preview_line_cap(PendingActionKind::FileEdit, 68, Some(20)),
+            2
+        );
+        assert_eq!(
+            approval_preview_line_cap(PendingActionKind::FileWrite, 96, Some(36)),
+            4
+        );
+    }
+
+    #[test]
+    fn estimated_approval_rows_follow_compact_interrupt_shape() {
+        assert_eq!(
+            estimated_approval_rows(PendingActionKind::ShellCommand, 80, Some(20)),
+            4
+        );
+        assert_eq!(
+            estimated_approval_rows(PendingActionKind::ShellCommand, 80, Some(36)),
+            5
+        );
+        assert_eq!(
+            estimated_approval_rows(PendingActionKind::FileEdit, 68, Some(20)),
+            5
+        );
+        assert_eq!(
+            estimated_approval_rows(PendingActionKind::FileWrite, 96, Some(36)),
+            7
+        );
     }
 
     #[test]
@@ -1340,14 +1385,14 @@ mod tests {
     }
 
     #[test]
-    fn top_bar_divider_renders_on_reserved_separator_row() {
+    fn top_bar_is_one_row_and_has_no_full_width_divider() {
         let theme = Theme::default();
         let mut symbols = SymbolPool::new();
         let blank = Cell {
             symbol_id: symbols.blank_id(),
             style: PackedStyle::new(theme.text, theme.background),
         };
-        let mut buffer = CellBuffer::new(20, 8, blank);
+        let mut buffer = CellBuffer::new(20, 6, blank);
         let mut state = AppState::new();
         let model = RenderModel {
             top_bar: vec![single_span("params · ready · fresh", theme.base())],
@@ -1357,62 +1402,70 @@ mod tests {
         };
         let layout = LayoutPlan {
             mode: RootLayoutMode::Compact,
-            top_bar: Rect::new(0, 0, 20, 3),
-            transcript: Rect::new(0, 3, 20, 3),
-            composer: Rect::new(0, 6, 20, 2),
+            top_bar: Rect::new(0, 0, 20, 1),
+            transcript: Rect::new(0, 1, 20, 3),
+            composer: Rect::new(0, 4, 20, 2),
         };
 
         let _ = paint_model(&mut buffer, &mut symbols, &model, layout, theme, &mut state);
 
+        // No row should be fully covered by the horizontal divider glyph.
         let divider = symbols.intern("─");
-        let row_has_divider = (0..buffer.width()).all(|x| buffer.get(x, 2).symbol_id == divider);
-        assert!(row_has_divider);
+        for row in 0..buffer.height() {
+            let row_all_divider =
+                (0..buffer.width()).all(|x| buffer.get(x, row).symbol_id == divider);
+            assert!(
+                !row_all_divider,
+                "unexpected full-width divider on row {row}"
+            );
+        }
     }
 
     #[test]
-    fn top_bar_reacts_to_loading_streaming_and_approval_states() {
+    fn top_bar_is_always_one_line_and_reacts_to_states() {
         let mut state = AppState::new();
 
+        // Loading state: 1 line, accent color.
         let loading = build_top_bar(&state, Theme::default(), 120);
+        assert_eq!(loading.len(), 1, "top bar must always be 1 line");
         let loading_text = loading[0]
             .spans
             .iter()
             .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(loading_text.contains("loading"));
-        assert!(!loading_text.contains("msgs"));
-        assert!(!loading_text.contains("cache"));
-        assert!(!loading_text.contains("mem"));
-        assert_eq!(loading.len(), 1);
         assert!(loading[0]
             .spans
             .iter()
             .any(|span| span.style == Theme::default().chip_accent()));
 
+        // Streaming with active trace: still 1 line — activity trace moved to composer.
         state.model_ready = true;
         state.is_generating = true;
         state.tick = 5;
         state.current_trace = Some("indexing summaries".to_string());
         let streaming = build_top_bar(&state, Theme::default(), 120);
+        assert_eq!(
+            streaming.len(),
+            1,
+            "top bar stays 1 line even with active trace"
+        );
         let streaming_text = streaming[0]
             .spans
             .iter()
             .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(streaming_text.contains("streaming"));
-        assert_eq!(streaming.len(), 2);
-        let activity_text = streaming[1]
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert!(activity_text.contains("indexing summaries"));
+        // Activity trace must NOT appear in the top bar.
+        assert!(!streaming_text.contains("indexing summaries"));
         assert!(streaming[0]
             .spans
             .iter()
             .any(|span| span.style == Theme::default().badge_assistant()));
 
+        // Approval state: 1 line, warning color.
         state.is_generating = false;
+        state.current_trace = None;
         state.set_pending_action(PendingAction {
             id: 1,
             kind: PendingActionKind::ShellCommand,
@@ -1430,6 +1483,7 @@ mod tests {
             },
         });
         let approval = build_top_bar(&state, Theme::default(), 120);
+        assert_eq!(approval.len(), 1, "top bar stays 1 line during approval");
         let approval_text = approval[0]
             .spans
             .iter()
@@ -1440,6 +1494,37 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.style == Theme::default().chip_warning()));
+    }
+
+    #[test]
+    fn activity_trace_renders_in_composer_not_top_bar() {
+        let mut state = AppState::new();
+        state.model_ready = true;
+        state.is_generating = true;
+        state.current_trace = Some("indexing summaries".to_string());
+
+        let activity = build_activity_line(&state, Theme::default(), 80);
+        assert!(
+            activity.is_some(),
+            "active trace should produce an activity line"
+        );
+        let activity_text = activity
+            .as_ref()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(activity_text.contains("indexing summaries"));
+
+        // Activity line is the first line in the composer content when present.
+        let (lines, _cursor) = build_composer(&state, Theme::default(), 80, None, activity);
+        let first_line_text = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(first_line_text.contains("indexing summaries"));
     }
 
     #[test]
@@ -1528,5 +1613,30 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(text.contains("▍") || text.contains("▌"));
+    }
+
+    #[test]
+    fn active_empty_assistant_message_only_shows_one_cursor_marker() {
+        let message = ChatMessage {
+            id: 1,
+            role: Role::Assistant,
+            content: String::new(),
+            transcript: crate::tui::state::TranscriptPresentation {
+                collapsible: false,
+                collapsed: false,
+                summary: None,
+                preview_lines: Vec::new(),
+            },
+        };
+
+        let lines = build_standard_message(&message, Theme::default(), 80, true, 0);
+        let text = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(text.contains("params"));
+        assert_eq!(text.matches('▍').count() + text.matches('▌').count(), 1);
     }
 }
