@@ -137,6 +137,18 @@ fn parse_sessions_export_args(arg: &str) -> Option<(String, Option<String>)> {
     Some((trimmed.to_string(), None))
 }
 
+fn format_display_status(state: &AppState) -> String {
+    format!(
+        "display:\n  tokens: {}\n  time: {}",
+        if state.show_top_bar_tokens {
+            "on"
+        } else {
+            "off"
+        },
+        if state.show_top_bar_time { "on" } else { "off" }
+    )
+}
+
 fn run_tool_immediate<T: crate::tools::Tool>(
     tool: T,
     arg: &str,
@@ -1052,6 +1064,30 @@ fn handle_builtin_slash_command(
                 _ => state.add_system_message("Usage: /transcript [status|collapse|expand|toggle]"),
             }
         }
+        "/display" => {
+            let subcommand = if arg.is_empty() { "status" } else { arg.trim() };
+            match subcommand {
+                "status" => state.add_system_message(&format_display_status(state)),
+                "tokens on" => {
+                    state.set_show_top_bar_tokens(true);
+                    state.add_system_message("display: tokens on");
+                }
+                "tokens off" => {
+                    state.set_show_top_bar_tokens(false);
+                    state.add_system_message("display: tokens off");
+                }
+                "time on" => {
+                    state.set_show_top_bar_time(true);
+                    state.add_system_message("display: time on");
+                }
+                "time off" => {
+                    state.set_show_top_bar_time(false);
+                    state.add_system_message("display: time off");
+                }
+                _ => state
+                    .add_system_message("Usage: /display [status|tokens <on|off>|time <on|off>]"),
+            }
+        }
         "/help" => {
             state.add_system_message(&custom_help_text());
         }
@@ -1085,13 +1121,15 @@ fn handle_builtin_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_slash_write_content, format_memory_facts, format_memory_last, format_memory_status,
-        format_transcript_status, parse_sessions_export_args, parse_slash_edit_body,
+        decode_slash_write_content, format_display_status, format_memory_facts, format_memory_last,
+        format_memory_status, format_transcript_status, parse_sessions_export_args,
+        parse_slash_edit_body,
     };
     use crate::events::{
         FactProvenance, MemoryConsolidationView, MemoryFactView, MemorySessionExcerptView,
         MemorySkippedReasonCount, MemorySnapshot, MemoryUpdateReport,
     };
+    use crate::tui::state::AppState;
 
     #[test]
     fn decode_slash_write_content_expands_common_escapes() {
@@ -1187,5 +1225,17 @@ mod tests {
         assert!(format_transcript_status(3, 0).contains("fully expanded"));
         assert!(format_transcript_status(4, 3).contains("mostly collapsed"));
         assert!(format_transcript_status(4, 1).contains("mostly expanded"));
+    }
+
+    #[test]
+    fn display_status_reports_toggle_state() {
+        let mut state = AppState::new();
+        state.set_show_top_bar_tokens(false);
+        state.set_show_top_bar_time(true);
+
+        let output = format_display_status(&state);
+
+        assert!(output.contains("tokens: off"));
+        assert!(output.contains("time: on"));
     }
 }

@@ -130,6 +130,12 @@ pub struct AppState {
     pub total_tokens: usize,
     pub estimated_cost_usd: Option<f64>,
 
+    /// Whether to show total token count in the top bar.
+    pub show_top_bar_tokens: bool,
+
+    /// Whether to show work timing in the top bar.
+    pub show_top_bar_time: bool,
+
     /// Session cache tracking
     pub cache_hits: usize,
     pub cache_misses: usize,
@@ -239,6 +245,8 @@ impl AppState {
             completion_tokens: 0,
             total_tokens: 0,
             estimated_cost_usd: None,
+            show_top_bar_tokens: true,
+            show_top_bar_time: true,
             cache_hits: 0,
             cache_misses: 0,
             tokens_saved: 0,
@@ -1160,6 +1168,16 @@ impl AppState {
 
     pub fn last_work_duration(&self) -> Option<Duration> {
         self.last_work_duration
+    }
+
+    pub fn set_show_top_bar_tokens(&mut self, show: bool) {
+        self.show_top_bar_tokens = show;
+        self.mark_dirty(DirtySections::HEADER);
+    }
+
+    pub fn set_show_top_bar_time(&mut self, show: bool) {
+        self.show_top_bar_time = show;
+        self.mark_dirty(DirtySections::HEADER);
     }
 
     pub fn autocomplete_hint(&self) -> Option<String> {

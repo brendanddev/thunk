@@ -234,6 +234,7 @@ params "explain what this function does"
 - `/sessions delete <name-or-id>`
 - `/sessions export <name-or-id> [markdown|json]`
 - `/memory [status|facts|last|recall <query>|prune]`
+- `/display [status|tokens <on|off>|time <on|off>]`
 - `/transcript [status|collapse|expand|toggle]`
 - `/clear-cache`
 
@@ -282,7 +283,7 @@ Rendering behavior:
 - the visible UI is now painted by a custom framebuffer renderer on top of Crossterm rather than Ratatui widgets
 - each frame renders into an off-screen cell buffer, diffs against the previous frame, and writes only changed runs back to the terminal
 - packed styles, symbol interning, transcript fragment caching, paced redraw scheduling, and explicit resize invalidation keep streaming smoother and reduce flicker
-- status and telemetry are folded into a single-row top strip with no horizontal divider; only identity and runtime state are always visible; transient activity appears near the prompt when active rather than in the header
+- status and telemetry are folded into a single-row top strip with no horizontal divider; identity, runtime state, and optional compact token/time readouts live together in the header, while transient activity appears near the prompt when active rather than in the header
 - the renderer now uses a single layout model for the terminal surface; the old unused wide/compact distinction has been removed until a real visual split exists
 - the terminal title and cursor shape now reflect the current mode more directly: normal compose, reverse search, command launcher, pending approval, and active generation each use distinct native terminal affordances
 

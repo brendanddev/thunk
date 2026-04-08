@@ -18,6 +18,9 @@ use super::backend::{InferenceBackend, Message};
 use crate::error::{ParamsError, Result};
 use crate::events::InferenceEvent;
 
+const LLAMA_CONTEXT_TOKENS: u32 = 8192;
+const LLAMA_BATCH_TOKENS: u32 = 2048;
+
 /// Formats a conversation into a ChatML prompt string.
 /// Qwen uses ChatML format — we build it manually.
 pub fn format_messages(messages: &[Message]) -> String {
@@ -82,8 +85,8 @@ impl InferenceBackend for LlamaCppBackend {
         // The model weights stay loaded — only the KV cache is reset.
         // This is much cheaper than reloading the model.
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(8192))
-            .with_n_batch(8192);
+            .with_n_ctx(NonZeroU32::new(LLAMA_CONTEXT_TOKENS))
+            .with_n_batch(LLAMA_BATCH_TOKENS);
 
         let mut ctx = self
             .model
@@ -97,16 +100,33 @@ impl InferenceBackend for LlamaCppBackend {
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| ParamsError::Inference(e.to_string()))?;
 
-        let mut batch = LlamaBatch::new(tokens.len().max(2048), 1);
-        let last_idx = (tokens.len() - 1) as i32;
-        for (i, token) in tokens.iter().enumerate() {
-            batch
-                .add(*token, i as i32, &[0], i as i32 == last_idx)
-                .map_err(|e| ParamsError::Inference(e.to_string()))?;
+        let context_limit = LLAMA_CONTEXT_TOKENS as usize;
+        if tokens.len() >= context_limit {
+            return Err(ParamsError::Inference(format!(
+                "Prompt exceeds llama.cpp context window ({} tokens >= {}). Try a shorter question, enable eco mode, or reduce auto-loaded context.",
+                tokens.len(),
+                context_limit
+            )));
         }
 
-        ctx.decode(&mut batch)
-            .map_err(|e| ParamsError::Inference(e.to_string()))?;
+        let mut batch = LlamaBatch::new(LLAMA_BATCH_TOKENS as usize, 1);
+        let mut consumed = 0usize;
+        while consumed < tokens.len() {
+            batch.clear();
+            let end = (consumed + LLAMA_BATCH_TOKENS as usize).min(tokens.len());
+            let last_prompt_idx = tokens.len() - 1;
+
+            for (i, token) in tokens[consumed..end].iter().enumerate() {
+                let pos = (consumed + i) as i32;
+                batch
+                    .add(*token, pos, &[0], consumed + i == last_prompt_idx)
+                    .map_err(|e| ParamsError::Inference(e.to_string()))?;
+            }
+
+            ctx.decode(&mut batch)
+                .map_err(|e| ParamsError::Inference(e.to_string()))?;
+            consumed = end;
+        }
 
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::temp(self.temperature),
@@ -146,6 +166,10 @@ impl InferenceBackend for LlamaCppBackend {
                 .add(next_token, current_pos, &[0], true)
                 .map_err(|e| ParamsError::Inference(e.to_string()))?;
             current_pos += 1;
+
+            if current_pos as usize >= context_limit {
+                break;
+            }
 
             ctx.decode(&mut batch)
                 .map_err(|e| ParamsError::Inference(e.to_string()))?;

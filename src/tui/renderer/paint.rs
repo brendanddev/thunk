@@ -76,13 +76,52 @@ fn build_top_bar(state: &AppState, theme: Theme, width: u16) -> Vec<StyledLine> 
     } else {
         truncate(&runtime_label, 22)
     };
-    let segments = vec![
-        TopSegment::new("params", theme.dim(), 2),
+    let mut segments = vec![
+        TopSegment::new("params", theme.dim(), 4),
         TopSegment::new(&runtime_display, runtime_style, 1),
         TopSegment::new(&session_label, theme.muted(), 0),
     ];
 
+    if state.show_top_bar_tokens {
+        segments.push(TopSegment::new(
+            &format_token_display(state.total_tokens),
+            theme.dim(),
+            2,
+        ));
+    }
+
+    if state.show_top_bar_time {
+        if let Some(duration) = state
+            .current_turn_duration()
+            .or_else(|| state.last_work_duration())
+        {
+            segments.push(TopSegment::new(
+                &format_duration_display(duration),
+                theme.dim(),
+                3,
+            ));
+        }
+    }
+
     vec![build_segmented_top_line(segments, width, theme)]
+}
+
+fn format_token_display(total_tokens: usize) -> String {
+    if total_tokens >= 10_000 {
+        format!("{:.1}k tok", total_tokens as f64 / 1000.0)
+    } else {
+        format!("{total_tokens} tok")
+    }
+}
+
+fn format_duration_display(duration: std::time::Duration) -> String {
+    if duration.as_secs() >= 60 {
+        let minutes = duration.as_secs() / 60;
+        let seconds = duration.as_secs() % 60;
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{:.1}s", duration.as_secs_f32())
+    }
 }
 
 fn build_transcript(
@@ -1675,6 +1714,46 @@ mod tests {
         assert!(text.contains("generating"));
         assert!(!text.contains("cache"));
         assert!(!text.contains("msgs"));
+    }
+
+    #[test]
+    fn top_bar_can_show_tokens_and_time() {
+        let mut state = AppState::new();
+        state.model_ready = true;
+        state.update_budget(512, 722, 1234, Some(0.0));
+        state.start_generation("generating...", false);
+
+        let expected_time = format_duration_display(
+            state
+                .current_turn_duration()
+                .expect("active generation should expose a duration"),
+        );
+        let line = build_top_bar(&state, Theme::default(), 120);
+        let spans = &line[0].spans;
+
+        assert!(spans.iter().any(|span| span.text == "1234 tok"));
+        assert!(spans.iter().any(|span| span.text == expected_time));
+    }
+
+    #[test]
+    fn top_bar_hides_tokens_and_time_when_disabled() {
+        let mut state = AppState::new();
+        state.model_ready = true;
+        state.update_budget(128, 128, 256, Some(0.0));
+        state.start_generation("generating...", false);
+        let hidden_time = format_duration_display(
+            state
+                .current_turn_duration()
+                .expect("active generation should expose a duration"),
+        );
+        state.set_show_top_bar_tokens(false);
+        state.set_show_top_bar_time(false);
+
+        let line = build_top_bar(&state, Theme::default(), 120);
+        let spans = &line[0].spans;
+
+        assert!(!spans.iter().any(|span| span.text == "256 tok"));
+        assert!(!spans.iter().any(|span| span.text == hidden_time));
     }
 
     #[test]

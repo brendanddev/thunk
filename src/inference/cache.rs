@@ -58,6 +58,7 @@ fn prompt_level_cache_key<'a>(messages: &'a [Message]) -> Option<(&'a str, &'a s
 
 fn is_injected_context_message(content: &str) -> bool {
     let prefixes = [
+        "Automatic inspection context for ",
         "Tool results:\n",
         "I've loaded this file for context:",
         "Directory listing:\n",
@@ -274,6 +275,19 @@ mod tests {
             Message::user("I've loaded this file for context:\n\nfn main() {}"),
             Message::assistant("Looks good."),
             Message::user("What does it do?"),
+        ];
+
+        assert!(prompt_level_cache_key(&messages).is_none());
+    }
+
+    #[test]
+    fn prompt_level_cache_key_rejects_auto_inspection_context() {
+        let messages = vec![
+            Message::system("system"),
+            Message::user("What is in this repo?"),
+            Message::user(
+                "Automatic inspection context for this repo summary request:\n\n--- list_dir(.) ---\nDirectory: .",
+            ),
         ];
 
         assert!(prompt_level_cache_key(&messages).is_none());

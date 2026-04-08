@@ -1466,11 +1466,9 @@ pub fn model_thread_with_options(
                     emit_generation_started(&token_tx, plan.status_label, false);
                     run_auto_inspection(plan, &token_tx, eco_enabled)
                 });
-                if let Some(outcome) = auto_inspection_outcome.as_ref() {
-                    if let Some(hidden_context) = &outcome.hidden_context {
-                        session_messages.push(Message::user(hidden_context));
-                    }
-                }
+                let hidden_inspection_context = auto_inspection_outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.hidden_context.clone());
 
                 let retrieval = collect_retrieval_bundle(
                     &prompt,
@@ -1518,6 +1516,11 @@ pub fn model_thread_with_options(
 
                 compression::compress_history(&mut session_messages, &*backend, eco_enabled);
 
+                let mut generation_messages = session_messages.clone();
+                if let Some(hidden_context) = hidden_inspection_context.as_ref() {
+                    generation_messages.push(Message::user(hidden_context));
+                }
+
                 emit_generation_started(&token_tx, "generating...", false);
                 emit_trace(
                     &token_tx,
@@ -1527,13 +1530,13 @@ pub fn model_thread_with_options(
                 );
                 hooks.dispatch(HookEvent::BeforeGeneration {
                     backend: backend.name(),
-                    message_count: session_messages.len(),
+                    message_count: generation_messages.len(),
                     eco: eco_enabled,
                     reflection: reflection_enabled,
                 });
                 let response = generate_with_cache(
                     &*backend,
-                    &session_messages,
+                    &generation_messages,
                     &cfg,
                     &project_root,
                     token_tx.clone(),
@@ -1544,10 +1547,10 @@ pub fn model_thread_with_options(
                 );
                 debug!(
                     reflection_enabled,
-                    message_count = session_messages.len(),
+                    message_count = generation_messages.len(),
                     "generation started"
                 );
-                let prompt_tokens = estimate_message_tokens(&session_messages);
+                let prompt_tokens = estimate_message_tokens(&generation_messages);
 
                 match response {
                     Err(e) => {
