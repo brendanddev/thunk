@@ -801,6 +801,46 @@ fn match_lines_with_numbers(
         .collect()
 }
 
+fn definition_match_lines_with_numbers(
+    content: &str,
+    query_terms: &[crate::memory::retrieval::QueryTerm],
+    limit: usize,
+) -> Vec<(usize, String)> {
+    content
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| (idx + 1, line.trim()))
+        .filter(|(_, line)| !line.is_empty())
+        .filter(|(_, line)| score_text(query_terms, line) > 0)
+        .filter(|(_, line)| is_implementation_definition_line(line))
+        .take(limit)
+        .map(|(line_number, line)| (line_number, line.to_string()))
+        .collect()
+}
+
+fn primary_definition_location(
+    path: &str,
+    content: &str,
+    query: &str,
+    max_chars: usize,
+) -> Option<String> {
+    let terms = query_terms(query);
+    let mut matches = definition_match_lines_with_numbers(content, &terms, 1);
+    if matches.is_empty() {
+        matches = declaration_lines_with_numbers(content)
+            .into_iter()
+            .take(1)
+            .collect();
+    }
+    let (line_number, line) = matches.into_iter().next()?;
+    Some(format!(
+        "{}:{} `{}`",
+        path,
+        line_number,
+        clip_inline(&line, max_chars)
+    ))
+}
+
 fn format_numbered_hits(hits: &[(usize, String)], clip_chars: usize) -> String {
     hits.iter()
         .map(|(line_number, line)| format!("{line_number} `{}`", clip_inline(line, clip_chars)))
@@ -820,6 +860,17 @@ fn is_definition_like_line(line: &str) -> bool {
         || trimmed.starts_with("pub mod ")
         || trimmed.starts_with("mod ")
         || trimmed.starts_with("pub use ")
+}
+
+fn is_implementation_definition_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub struct ")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("pub enum ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("impl ")
 }
 
 fn config_scope_label(path: &str) -> &'static str {
@@ -1057,11 +1108,11 @@ fn summarize_workflow_read(
     max_chars: usize,
 ) -> Option<String> {
     let terms = query_terms(query);
-    let matches = match_lines_with_numbers(content, &terms, 2);
     let declarations = declaration_lines_with_numbers(content);
 
     match intent {
         AutoInspectIntent::ConfigLocate => {
+            let matches = match_lines_with_numbers(content, &terms, 2);
             let mut parts = vec![format!(
                 "{} ({})",
                 file_display_name(path),
@@ -1081,6 +1132,16 @@ fn summarize_workflow_read(
             Some(clip_inline(&parts.join("; "), max_chars))
         }
         AutoInspectIntent::WhereIsImplementation | AutoInspectIntent::FeatureTrace => {
+            let matches = if intent == AutoInspectIntent::WhereIsImplementation {
+                let preferred = definition_match_lines_with_numbers(content, &terms, 2);
+                if preferred.is_empty() {
+                    match_lines_with_numbers(content, &terms, 2)
+                } else {
+                    preferred
+                }
+            } else {
+                match_lines_with_numbers(content, &terms, 2)
+            };
             let mut parts = vec![file_display_name(path)];
             if !matches.is_empty() {
                 parts.push(format!(
@@ -1262,6 +1323,7 @@ fn synthesize_auto_inspection_context(
         let mut search_hits = Vec::new();
         let mut read_summaries = Vec::new();
         let mut read_paths = Vec::new();
+        let mut primary_locations = Vec::new();
 
         for result in results {
             match result.tool_name.as_str() {
@@ -1269,6 +1331,13 @@ fn synthesize_auto_inspection_context(
                 "read_file" => {
                     if let Some((path, content)) = parse_read_file_output(&result.output) {
                         read_paths.push(path.clone());
+                        if plan.intent == AutoInspectIntent::WhereIsImplementation {
+                            if let Some(location) =
+                                primary_definition_location(&path, &content, query, 72)
+                            {
+                                primary_locations.push(location);
+                            }
+                        }
                         if let Some(summary) = summarize_workflow_read(
                             &path,
                             &content,
@@ -1335,10 +1404,22 @@ fn synthesize_auto_inspection_context(
             "Automatic inspection context for {}:",
             plan.context_label
         )];
-        sections.push(
-            "Instruction: answer directly from this evidence. Prefer exact inspected-file evidence over supporting search hits. Do not ask for more inspection unless the evidence is clearly insufficient. Do not emit tool calls or fenced code blocks. If exact code is not included below, answer in prose with file paths and line references only.".to_string(),
-        );
+        let instruction = match plan.intent {
+            AutoInspectIntent::WhereIsImplementation => {
+                "Instruction: answer directly from this evidence. Prefer exact inspected-file evidence over supporting search hits. Report definition or implementation locations only, not use-sites, call-sites, tests, or later references. If multiple line numbers appear, cite the primary definition line and omit usage lines. Do not ask for more inspection unless the evidence is clearly insufficient. Do not emit tool calls or fenced code blocks. If exact code is not included below, answer in prose with file paths and line references only."
+            }
+            _ => {
+                "Instruction: answer directly from this evidence. Prefer exact inspected-file evidence over supporting search hits. Do not ask for more inspection unless the evidence is clearly insufficient. Do not emit tool calls or fenced code blocks. If exact code is not included below, answer in prose with file paths and line references only."
+            }
+        };
+        sections.push(instruction.to_string());
         sections.push(format!("Query: {query}"));
+        if !primary_locations.is_empty() {
+            sections.push(format!(
+                "Primary definition: {}",
+                primary_locations.join(", ")
+            ));
+        }
         if !likely_files.is_empty() {
             sections.push(format!("Likely files: {}", likely_files.join(", ")));
         }
@@ -1608,6 +1689,15 @@ fn set_memory_retrieval(
     memory_state.last_retrieval_query = Some(query.to_string());
     memory_state.last_selected_facts = bundle.facts.clone();
     memory_state.last_selected_session_excerpts = bundle.session_excerpts.clone();
+}
+
+fn suppress_retrieval_for_auto_inspection(intent: AutoInspectIntent) -> bool {
+    matches!(
+        intent,
+        AutoInspectIntent::WhereIsImplementation
+            | AutoInspectIntent::FeatureTrace
+            | AutoInspectIntent::ConfigLocate
+    )
 }
 
 fn collect_retrieval_bundle(
@@ -2762,16 +2852,24 @@ pub fn model_thread_with_options(
                     .as_ref()
                     .and_then(|outcome| outcome.hidden_context.clone());
 
-                let retrieval = collect_retrieval_bundle(
-                    &prompt,
-                    eco_enabled,
-                    &project_name,
-                    project_index.as_ref(),
-                    fact_store.as_ref(),
-                    session_store.as_ref(),
-                    active_session.as_ref().map(|session| session.id.as_str()),
-                    &memory_state.loaded_facts,
-                );
+                let retrieval = if auto_inspection
+                    .as_ref()
+                    .map(|plan| suppress_retrieval_for_auto_inspection(plan.intent))
+                    .unwrap_or(false)
+                {
+                    RetrievalBundle::default()
+                } else {
+                    collect_retrieval_bundle(
+                        &prompt,
+                        eco_enabled,
+                        &project_name,
+                        project_index.as_ref(),
+                        fact_store.as_ref(),
+                        session_store.as_ref(),
+                        active_session.as_ref().map(|session| session.id.as_str()),
+                        &memory_state.loaded_facts,
+                    )
+                };
                 let mut turn_memory =
                     TurnMemoryEvidence::new(prompt.clone(), retrieval.summaries.clone());
                 if let Some(outcome) = auto_inspection_outcome {
@@ -2812,6 +2910,11 @@ pub fn model_thread_with_options(
                 if let Some(hidden_context) = hidden_inspection_context.as_ref() {
                     generation_messages.push(Message::user(hidden_context));
                 }
+                let generation_exact_cache = if auto_inspection.is_some() {
+                    None
+                } else {
+                    exact_cache.as_ref()
+                };
 
                 emit_generation_started(&token_tx, "generating...", false);
                 emit_trace(
@@ -2833,7 +2936,7 @@ pub fn model_thread_with_options(
                     &project_root,
                     token_tx.clone(),
                     !reflection_enabled,
-                    exact_cache.as_ref(),
+                    generation_exact_cache,
                     &mut cache_stats,
                     CacheMode::PreferPromptLevel,
                 );
@@ -3771,11 +3874,85 @@ mod tests {
         .expect("workflow context");
 
         assert!(hidden.contains("Likely files: `src/session/mod.rs`"));
-        assert!(hidden.contains(
-            "Implementation hints: `src/session/mod.rs`; exact lines: 1 `pub fn load_most_recent"
-        ));
+        assert!(
+            hidden.contains("Primary definition: src/session/mod.rs:1 `pub fn load_most_recent")
+        );
         assert!(!hidden.contains("Supporting search hits:"));
         assert!(!hidden.contains("src/session/mod.rs:844"));
         assert!(!hidden.contains("docs/context/PLANS.md:3189"));
+    }
+
+    #[test]
+    fn implementation_summary_prefers_definition_matches_over_use_sites() {
+        let summary = summarize_workflow_read(
+            "src/session/mod.rs",
+            "fn unrelated() {}\n\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n\nfn later() {\n    let loaded = store.load_most_recent().unwrap().unwrap();\n}\n",
+            "load_most_recent",
+            AutoInspectIntent::WhereIsImplementation,
+            260,
+        )
+        .expect("summary");
+
+        assert!(summary.contains("exact lines: 3 `pub fn load_most_recent"));
+        assert!(!summary.contains("7 `let loaded = store.load_most_recent().unwrap().unwrap();`"));
+    }
+
+    #[test]
+    fn primary_definition_location_uses_definition_line() {
+        let location = primary_definition_location(
+            "src/session/mod.rs",
+            "pub use self::session::load_most_recent;\n\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+            "load_most_recent",
+            72,
+        )
+        .expect("location");
+
+        assert_eq!(
+            location,
+            "src/session/mod.rs:3 `pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {`"
+        );
+    }
+
+    #[test]
+    fn implementation_workflows_suppress_general_retrieval_and_instruct_definition_only() {
+        assert!(suppress_retrieval_for_auto_inspection(
+            AutoInspectIntent::WhereIsImplementation
+        ));
+        assert!(suppress_retrieval_for_auto_inspection(
+            AutoInspectIntent::FeatureTrace
+        ));
+        assert!(suppress_retrieval_for_auto_inspection(
+            AutoInspectIntent::ConfigLocate
+        ));
+        assert!(!suppress_retrieval_for_auto_inspection(
+            AutoInspectIntent::RepoOverview
+        ));
+
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::WhereIsImplementation,
+            thinking: "Thinking: locating the most likely implementation files.",
+            status_label: "locating implementation...",
+            context_label: "this implementation lookup request",
+            query: Some("load_most_recent".to_string()),
+            steps: vec![],
+        };
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: "File: src/session/mod.rs\nLines: 5\n\n```\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n```\n".to_string(),
+            }],
+            auto_inspection_budget(
+                AutoInspectIntent::WhereIsImplementation,
+                "llama.cpp · qwen",
+                false,
+            ),
+        )
+        .expect("workflow context");
+
+        assert!(hidden.contains("Report definition or implementation locations only"));
+        assert!(hidden.contains("omit usage lines"));
     }
 }
