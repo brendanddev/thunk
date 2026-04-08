@@ -17,7 +17,9 @@ use crate::memory::{
     facts::{FactStore, TurnMemoryEvidence},
     index::ProjectIndex,
 };
-use crate::session::{display_name, short_id, SessionExportFormat, SessionStore, SessionSummary};
+use crate::session::{
+    display_name, list_label, short_id, SessionExportFormat, SessionStore, SessionSummary,
+};
 use crate::tools::{BashTool, Tool, ToolRegistry};
 
 use super::approval::{handle_pending_action, ApprovalContext};
@@ -185,7 +187,7 @@ fn apply_memory_update(
 }
 
 fn format_sessions_list(sessions: &[SessionSummary], active_session_id: Option<&str>) -> String {
-    let mut lines = vec!["sessions:".to_string()];
+    let mut lines = vec![format!("sessions • {} saved • ● current", sessions.len())];
     if sessions.is_empty() {
         lines.push("  (none saved for this project)".to_string());
         return lines.join("\n");
@@ -193,20 +195,72 @@ fn format_sessions_list(sessions: &[SessionSummary], active_session_id: Option<&
 
     for session in sessions {
         let marker = if Some(session.id.as_str()) == active_session_id {
-            "*"
+            "●"
         } else {
-            "-"
+            "·"
+        };
+        let message_label = if session.message_count == 0 {
+            "empty".to_string()
+        } else {
+            format!(
+                "{} msg{}",
+                session.message_count,
+                if session.message_count == 1 { "" } else { "s" }
+            )
         };
         lines.push(format!(
-            "  {marker} {} — {} msg — updated {} — id {}",
-            display_name(session),
-            session.message_count,
+            "  {marker} {} · {} · {} · id {}",
+            list_label(session),
+            message_label,
             crate::session::describe_session_age(session.updated_at),
             short_id(&session.id)
         ));
     }
 
+    lines.push("  resume/delete/export with exact name or unique id prefix".to_string());
+
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_sessions_list;
+    use crate::session::SessionSummary;
+
+    fn summary(
+        id: &str,
+        name: Option<&str>,
+        updated_at: u64,
+        message_count: usize,
+    ) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            project_root: "/tmp/project".to_string(),
+            name: name.map(str::to_string),
+            backend: "llama.cpp".to_string(),
+            created_at: updated_at,
+            updated_at,
+            last_opened_at: updated_at,
+            message_count,
+        }
+    }
+
+    #[test]
+    fn sessions_list_marks_current_and_shows_selector_hint() {
+        let output = format_sessions_list(
+            &[
+                summary("7353e9a31234", Some("b"), 0, 2),
+                summary("cbc8da921234", None, 0, 0),
+            ],
+            Some("7353e9a31234"),
+        );
+
+        assert!(output.contains("sessions • 2 saved • ● current"));
+        assert!(output.contains("● b · 2 msgs"));
+        assert!(output.contains("· unnamed · empty"));
+        assert!(output.contains("id 7353e9a3"));
+        assert!(output.contains("resume/delete/export with exact name or unique id prefix"));
+    }
 }
 
 fn parse_export_format(raw: Option<String>) -> Result<SessionExportFormat> {

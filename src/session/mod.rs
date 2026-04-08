@@ -417,7 +417,7 @@ impl SessionStore {
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(ParamsError::Config(format!(
-                    "Multiple sessions matched id prefix `{selector}`: {options}"
+                    "Multiple sessions matched id prefix `{selector}`: {options}. Use a longer id prefix from /sessions list."
                 )));
             }
             _ => {}
@@ -431,7 +431,7 @@ impl SessionStore {
 
         match matches.len() {
             0 => Err(ParamsError::Config(format!(
-                "No session matched `{selector}`"
+                "No session matched `{selector}`. Use /sessions list and pass an exact name or unique id prefix."
             ))),
             1 => Ok(matches.into_iter().next().unwrap()),
             _ => {
@@ -447,7 +447,7 @@ impl SessionStore {
                     .collect::<Vec<_>>()
                     .join(", ");
                 Err(ParamsError::Config(format!(
-                    "Multiple sessions matched `{selector}`: {options}"
+                    "Multiple sessions matched `{selector}`: {options}. Use a longer id prefix from /sessions list."
                 )))
             }
         }
@@ -622,6 +622,13 @@ pub fn display_name(summary: &SessionSummary) -> String {
         .unwrap_or_else(|| format!("unnamed · {}", describe_session_age(summary.updated_at)))
 }
 
+pub fn list_label(summary: &SessionSummary) -> String {
+    summary
+        .name
+        .clone()
+        .unwrap_or_else(|| "unnamed".to_string())
+}
+
 pub fn short_id(session_id: &str) -> String {
     session_id.chars().take(8).collect()
 }
@@ -705,6 +712,15 @@ mod tests {
         let resolved = store.resolve_session(&short_id(&session.id)).unwrap();
 
         assert_eq!(resolved.id, session.id);
+    }
+
+    #[test]
+    fn missing_selector_error_points_back_to_sessions_list() {
+        let store = open_store("missing-selector");
+        let err = store.resolve_session("unknown").unwrap_err().to_string();
+
+        assert!(err.contains("/sessions list"));
+        assert!(err.contains("unique id prefix"));
     }
 
     #[test]

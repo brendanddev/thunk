@@ -14,7 +14,7 @@ Switch backends by editing `.local/config.toml`.
 
 ## What Works Today
 
-- Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a single-row runtime status bar with no divider chrome, a transient activity trace that appears near the prompt when the model is working, transcript-first single-column flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript rows, reverse history search, and inline prompt-adjacent approvals
+- Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a single-row runtime status bar with no divider chrome, a transient activity trace that appears near the prompt when the model is working, a shared left-margin transcript gutter that anchors conversation flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript rows, reverse history search, and inline prompt-adjacent approvals
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
 - Mutating tools with approval: shell commands, targeted file edits, and whole-file writes with diff preview
@@ -250,6 +250,7 @@ Session behavior:
 - params resumes the most recently opened session for the current project by default
 - `params --no-resume` starts a fresh unnamed session without deleting saved sessions
 - session selectors accept either an exact real session name or a unique id prefix from `/sessions list`
+- `/sessions list` now marks the current session clearly and shows compact selector-friendly ids inline
 - exported session transcripts are written under `.local/exports/sessions/`
 
 Memory behavior:
@@ -269,12 +270,14 @@ Transcript behavior:
 - the composer is bare and prompt-native: a mode-sensitive marker (`›`, `?`, `:`, `!`) with no idle placeholder or tutorial footer, so the transcript stays primary
 - the runtime strip is a single status line; a transient activity trace appears just above the prompt (near the composer) while the model is working, so live status stays near where your eyes are
 - transcript spacing is less uniform now: same-kind message runs stay tighter, while conversation shifts still breathe so the terminal reads more like a flowing transcript than stacked cards
+- the transcript, system lines, activity trace, approvals, and prompt now share a left-margin gutter language (`│`, `·`, `!`, `›`) so the whole screen reads like one terminal conversation spine instead of separate rendered regions
 
 Rendering behavior:
 - the visible UI is now painted by a custom framebuffer renderer on top of Crossterm rather than Ratatui widgets
 - each frame renders into an off-screen cell buffer, diffs against the previous frame, and writes only changed runs back to the terminal
 - packed styles, symbol interning, transcript fragment caching, paced redraw scheduling, and explicit resize invalidation keep streaming smoother and reduce flicker
 - status and telemetry are folded into a single-row top strip with no horizontal divider; only identity and runtime state are always visible; transient activity appears near the prompt when active rather than in the header
+- the renderer now uses a single layout model for the terminal surface; the old unused wide/compact distinction has been removed until a real visual split exists
 - the terminal title and cursor shape now reflect the current mode more directly: normal compose, reverse search, command launcher, pending approval, and active generation each use distinct native terminal affordances
 
 ## Custom Slash Commands

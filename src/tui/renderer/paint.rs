@@ -6,7 +6,7 @@ use crate::session::short_id;
 use crate::tui::state::{AppState, ChatMessage, Role};
 
 use super::buffer::{Cell, CellBuffer};
-use super::layout::{LayoutPlan, Rect, RootLayoutMode};
+use super::layout::{LayoutPlan, Rect};
 use super::style::{PackedStyle, Theme};
 use super::symbols::SymbolPool;
 
@@ -36,16 +36,16 @@ pub(crate) struct RenderModel {
 }
 
 const SPINNER_FRAMES: &[&str] = &["·", "•", "◦", "•"];
+const CONVERSATION_GUTTER: &str = "│ ";
+const SYSTEM_GUTTER: &str = "· ";
 
 pub(crate) fn build_render_model(
     state: &mut AppState,
     theme: Theme,
     width: u16,
-    layout_mode: RootLayoutMode,
     cached_block: impl FnMut(&ChatMessage, bool, u16) -> Vec<StyledLine>,
 ) -> RenderModel {
     let top_bar = build_top_bar(state, theme, width);
-    let _ = layout_mode;
     let transcript = build_transcript(state, theme, width, cached_block);
     let approval = build_approval(state, theme, width);
     let activity = build_activity_line(state, theme, width);
@@ -171,7 +171,7 @@ fn build_standard_message(
             width,
             is_active_assistant.then(|| active_cursor_span(theme, tick)),
         ),
-        Role::System => wrap_plain_to_lines(&format!("• {}", message.content), theme.dim(), width),
+        Role::System => build_gutter_lines(SYSTEM_GUTTER, theme.dim(), &message.content, width),
     }
 }
 
@@ -184,22 +184,33 @@ fn build_badged_message(
     active_cursor: Option<StyledSpan>,
 ) -> Vec<StyledLine> {
     let mut lines = Vec::new();
+    let continuation_indent = " ".repeat(label_width(label) + 2);
     let body_width = width
-        .saturating_sub((label_width(label) + 3).min(u16::MAX as usize) as u16)
+        .saturating_sub((label_width(label) + 5).min(u16::MAX as usize) as u16)
         .max(8);
     let wrapped = wrap_text(body, body_width);
     if wrapped.is_empty() {
         lines.push(StyledLine {
-            spans: vec![StyledSpan {
-                text: format!("{label} "),
-                style: badge_style,
-            }],
+            spans: vec![
+                StyledSpan {
+                    text: CONVERSATION_GUTTER.to_string(),
+                    style: theme.border(),
+                },
+                StyledSpan {
+                    text: label.to_string(),
+                    style: badge_style,
+                },
+            ],
         });
         return lines;
     }
 
     lines.push(StyledLine {
         spans: vec![
+            StyledSpan {
+                text: CONVERSATION_GUTTER.to_string(),
+                style: theme.border(),
+            },
             StyledSpan {
                 text: label.to_string(),
                 style: badge_style,
@@ -217,10 +228,20 @@ fn build_badged_message(
 
     for line in wrapped.into_iter().skip(1) {
         lines.push(StyledLine {
-            spans: vec![StyledSpan {
-                text: format!("{:width$}{}", "", line, width = label_width(label) + 2),
-                style: theme.base(),
-            }],
+            spans: vec![
+                StyledSpan {
+                    text: CONVERSATION_GUTTER.to_string(),
+                    style: theme.border(),
+                },
+                StyledSpan {
+                    text: continuation_indent.clone(),
+                    style: theme.base(),
+                },
+                StyledSpan {
+                    text: line,
+                    style: theme.base(),
+                },
+            ],
         });
     }
     if let Some(cursor_span) = active_cursor {
@@ -389,6 +410,10 @@ fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<Styl
     let mut lines = vec![StyledLine {
         spans: vec![
             StyledSpan {
+                text: "! ".to_string(),
+                style: approval_style,
+            },
+            StyledSpan {
                 text: approval_kind_label(pending.kind.clone()).to_string(),
                 style: approval_style,
             },
@@ -401,7 +426,9 @@ fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<Styl
             },
         ],
     }];
-    lines.push(single_span(
+    lines.push(single_span_with_gutter(
+        SYSTEM_GUTTER,
+        theme.dim(),
         &approval_summary_line(pending, width),
         theme.muted(),
     ));
@@ -421,7 +448,12 @@ fn build_approval(state: &AppState, theme: Theme, width: u16) -> Option<Vec<Styl
             ],
         });
     }
-    lines.push(single_span("^Y approve · ^N reject", theme.dim()));
+    lines.push(single_span_with_gutter(
+        SYSTEM_GUTTER,
+        theme.dim(),
+        "^Y approve · ^N reject",
+        theme.dim(),
+    ));
     Some(lines)
 }
 
@@ -436,7 +468,7 @@ fn build_composer(
     let max_visible_rows = 8usize;
     let (visible_rows, cursor_row, cursor_col) =
         state.input_display_lines(inner_width, max_visible_rows);
-    let mut lines = Vec::new();
+    let mut lines = vec![blank_line()];
 
     if let Some(activity_line) = activity {
         lines.push(activity_line);
@@ -686,7 +718,12 @@ fn paint_transcript(
     let mut y = rect.y;
     let show_jump_indicator = state.scroll_offset > 0 && rect.height >= 2;
     if show_jump_indicator && y < rect.y.saturating_add(rect.height) {
-        let indicator = single_span(&format!("↑ {} above", state.scroll_offset), theme.dim());
+        let indicator = single_span_with_gutter(
+            SYSTEM_GUTTER,
+            theme.dim(),
+            &format!("↑ {} above", state.scroll_offset),
+            theme.dim(),
+        );
         paint_line(buffer, symbols, rect.x, y, rect.width, &indicator);
         y += 1;
     }
@@ -705,7 +742,8 @@ fn paint_transcript(
     }
 
     if show_jump_indicator && y < rect.y.saturating_add(rect.height) {
-        let indicator = single_span("↓ jump to latest", theme.dim());
+        let indicator =
+            single_span_with_gutter(SYSTEM_GUTTER, theme.dim(), "↓ jump to latest", theme.dim());
         paint_line(buffer, symbols, rect.x, y, rect.width, &indicator);
     }
 
@@ -791,14 +829,39 @@ fn single_span(text: &str, style: PackedStyle) -> StyledLine {
     }
 }
 
+fn single_span_with_gutter(
+    gutter: &str,
+    gutter_style: PackedStyle,
+    text: &str,
+    style: PackedStyle,
+) -> StyledLine {
+    StyledLine {
+        spans: vec![
+            StyledSpan {
+                text: gutter.to_string(),
+                style: gutter_style,
+            },
+            StyledSpan {
+                text: text.to_string(),
+                style,
+            },
+        ],
+    }
+}
+
 fn blank_line() -> StyledLine {
     StyledLine { spans: Vec::new() }
 }
 
-fn wrap_plain_to_lines(text: &str, style: PackedStyle, width: u16) -> Vec<StyledLine> {
-    wrap_text(text, width)
+fn build_gutter_lines(
+    gutter: &str,
+    gutter_style: PackedStyle,
+    text: &str,
+    width: u16,
+) -> Vec<StyledLine> {
+    wrap_text(text, width.saturating_sub(gutter.len() as u16))
         .into_iter()
-        .map(|line| single_span(&line, style))
+        .map(|line| single_span_with_gutter(gutter, gutter_style, &line, gutter_style))
         .collect()
 }
 
@@ -897,8 +960,7 @@ fn approval_summary_line(pending: &crate::events::PendingAction, width: u16) -> 
         .first()
         .map(String::as_str)
         .unwrap_or(&pending.inspection.summary);
-    let text = format!("· {detail}");
-    truncate(&text, width.saturating_sub(2) as usize)
+    truncate(detail, width.saturating_sub(4) as usize)
 }
 
 pub(crate) fn approval_preview_line_cap(
@@ -1033,18 +1095,12 @@ fn persistent_runtime_label(state: &AppState) -> String {
 
 fn build_activity_line(state: &AppState, theme: Theme, width: u16) -> Option<StyledLine> {
     let label = state.current_trace.as_deref()?;
-    Some(StyledLine {
-        spans: vec![
-            StyledSpan {
-                text: "· ".to_string(),
-                style: theme.dim(),
-            },
-            StyledSpan {
-                text: truncate(label, width.saturating_sub(2) as usize),
-                style: theme.dim(),
-            },
-        ],
-    })
+    Some(single_span_with_gutter(
+        SYSTEM_GUTTER,
+        theme.dim(),
+        &truncate(label, width.saturating_sub(2) as usize),
+        theme.dim(),
+    ))
 }
 
 fn runtime_style(state: &AppState, theme: Theme) -> PackedStyle {
@@ -1137,7 +1193,46 @@ mod tests {
         assert!(state.activate_reverse_search());
 
         let (lines, _) = build_composer(&state, Theme::default(), 80, None, None);
-        assert_eq!(lines[0].spans[0].text, "? ");
+        assert!(lines[0].spans.is_empty());
+        assert_eq!(lines[1].spans[0].text, "? ");
+    }
+
+    #[test]
+    fn user_messages_render_with_conversation_gutter() {
+        let message = ChatMessage {
+            id: 1,
+            role: Role::User,
+            content: "hello".to_string(),
+            transcript: crate::tui::state::TranscriptPresentation {
+                collapsible: false,
+                collapsed: false,
+                summary: None,
+                preview_lines: Vec::new(),
+            },
+        };
+
+        let lines = build_standard_message(&message, Theme::default(), 80, false, 0);
+        assert_eq!(lines[0].spans[0].text, CONVERSATION_GUTTER);
+        assert_eq!(lines[0].spans[1].text, "you");
+    }
+
+    #[test]
+    fn system_messages_render_with_dim_gutter() {
+        let message = ChatMessage {
+            id: 1,
+            role: Role::System,
+            content: "memory: loaded 2 facts".to_string(),
+            transcript: crate::tui::state::TranscriptPresentation {
+                collapsible: false,
+                collapsed: false,
+                summary: None,
+                preview_lines: Vec::new(),
+            },
+        };
+
+        let lines = build_standard_message(&message, Theme::default(), 80, false, 0);
+        assert_eq!(lines[0].spans[0].text, SYSTEM_GUTTER);
+        assert!(lines[0].spans[1].text.contains("memory: loaded"));
     }
 
     #[test]
@@ -1153,7 +1248,8 @@ mod tests {
         }]));
 
         let (lines, _) = build_composer(&state, Theme::default(), 80, None, None);
-        assert_eq!(lines[0].spans[0].text, ": ");
+        assert!(lines[0].spans.is_empty());
+        assert_eq!(lines[1].spans[0].text, ": ");
     }
 
     #[test]
@@ -1169,6 +1265,17 @@ mod tests {
         assert!(!text.contains("ask about the code"));
         assert!(!text.contains("Enter send"));
         assert!(text.contains("› "));
+    }
+
+    #[test]
+    fn composer_reserves_a_spacer_row_above_prompt() {
+        let state = AppState::new();
+        let (lines, cursor) = build_composer(&state, Theme::default(), 80, None, None);
+
+        assert!(!lines.is_empty());
+        assert!(lines[0].spans.is_empty());
+        assert_eq!(lines[1].spans[0].text, "› ");
+        assert_eq!(cursor, (2, 1));
     }
 
     #[test]
@@ -1401,7 +1508,6 @@ mod tests {
             composer_cursor: (2, 0),
         };
         let layout = LayoutPlan {
-            mode: RootLayoutMode::Compact,
             top_bar: Rect::new(0, 0, 20, 1),
             transcript: Rect::new(0, 1, 20, 3),
             composer: Rect::new(0, 4, 20, 2),
@@ -1515,11 +1621,13 @@ mod tests {
             .iter()
             .map(|span| span.text.as_str())
             .collect::<String>();
+        assert_eq!(activity.as_ref().unwrap().spans[0].text, SYSTEM_GUTTER);
         assert!(activity_text.contains("indexing summaries"));
 
         // Activity line is the first line in the composer content when present.
         let (lines, _cursor) = build_composer(&state, Theme::default(), 80, None, activity);
-        let first_line_text = lines[0]
+        assert!(lines[0].spans.is_empty());
+        let first_line_text = lines[1]
             .spans
             .iter()
             .map(|span| span.text.as_str())

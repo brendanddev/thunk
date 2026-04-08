@@ -106,7 +106,6 @@ impl Renderer {
             state,
             theme,
             transcript_width,
-            layout.mode,
             |message, focused, message_width| {
                 let key = TranscriptCacheKey::from_message(message, message_width, focused);
                 if let Some(lines) = self.transcript_cache.get(&key) {
@@ -156,10 +155,9 @@ impl Renderer {
     }
 
     fn estimate_composer_height(&self, state: &AppState, width: u16) -> u16 {
+        let top_padding_rows = 1u16;
         let inner_width = width.saturating_sub(4).max(8) as usize;
         let content_rows = state.input_content_rows(inner_width).min(8) as u16;
-        let hint_rows = 2u16;
-        let divider_rows = 1u16;
         let activity_rows = if state.current_trace.is_some() { 1 } else { 0 };
         let approval_rows = if let Some(action) = state.pending_action.as_ref() {
             estimated_approval_rows(
@@ -170,7 +168,22 @@ impl Renderer {
         } else {
             0
         };
-        content_rows + hint_rows + divider_rows + activity_rows + approval_rows
+        let composer_overlay_rows = if let Some((_, entries)) = state.command_launcher_view(5) {
+            let selected = entries
+                .iter()
+                .find(|(_, selected)| *selected)
+                .map(|(entry, _)| entry);
+            let alias_rows = selected
+                .map(|entry| usize::from(!entry.aliases.is_empty()))
+                .unwrap_or(0);
+            1 + entries.len() as u16 + 2 + alias_rows as u16
+        } else if state.reverse_search_view().is_some() {
+            1
+        } else {
+            let autocomplete_rows = state.autocomplete_preview_items(4).len() as u16;
+            autocomplete_rows
+        };
+        top_padding_rows + content_rows + activity_rows + approval_rows + composer_overlay_rows
     }
 
     fn poison_previous_frame(&mut self) {
