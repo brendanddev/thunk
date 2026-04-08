@@ -79,6 +79,22 @@ fn emit_memory_state(token_tx: &Sender<InferenceEvent>, memory_state: &RuntimeMe
     let _ = token_tx.send(InferenceEvent::MemoryState(memory_state.snapshot()));
 }
 
+fn refresh_loaded_facts(
+    memory_state: &mut RuntimeMemoryState,
+    fact_store: Option<&FactStore>,
+    project_name: &str,
+) {
+    memory_state.loaded_facts = fact_store
+        .and_then(|store| store.get_relevant_facts(project_name, "", 5).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|fact| MemoryFactView {
+            content: fact.content,
+            provenance: fact.provenance,
+        })
+        .collect();
+}
+
 #[derive(Default)]
 struct RetrievalBundle {
     summaries: Vec<(String, String)>,
@@ -535,20 +551,8 @@ pub fn model_thread_with_options(
     } else {
         project_index.as_ref().map(|_| IncrementalIndexState::new())
     };
-    let loaded_fact_entries = fact_store
-        .as_ref()
-        .and_then(|store| store.get_relevant_facts(&project_name, "", 5).ok())
-        .unwrap_or_default();
-    let mut memory_state = RuntimeMemoryState {
-        loaded_facts: loaded_fact_entries
-            .into_iter()
-            .map(|fact| MemoryFactView {
-                content: fact.content,
-                provenance: fact.provenance,
-            })
-            .collect(),
-        ..RuntimeMemoryState::default()
-    };
+    let mut memory_state = RuntimeMemoryState::default();
+    refresh_loaded_facts(&mut memory_state, fact_store.as_ref(), &project_name);
     hooks.dispatch(HookEvent::MemoryFactsLoaded {
         fact_count: memory_state.loaded_facts.len(),
     });
@@ -1211,6 +1215,41 @@ pub fn model_thread_with_options(
                 let _ = token_tx.send(InferenceEvent::SystemMessage(format_memory_recall(
                     &query, &bundle,
                 )));
+                continue;
+            }
+            SessionCommand::PruneMemory => {
+                match fact_store
+                    .as_ref()
+                    .map(|store| store.prune_irrelevant_facts(&project_name))
+                {
+                    Some(Ok(removed)) => {
+                        refresh_loaded_facts(&mut memory_state, fact_store.as_ref(), &project_name);
+                        clear_memory_retrieval(&mut memory_state);
+                        emit_memory_state(&token_tx, &memory_state);
+                        emit_trace(
+                            &token_tx,
+                            ProgressStatus::Finished,
+                            &format!(
+                                "memory: pruned {} fact{}",
+                                removed,
+                                if removed == 1 { "" } else { "s" }
+                            ),
+                            true,
+                        );
+                        let _ = token_tx.send(InferenceEvent::SystemMessage(format!(
+                            "memory prune removed {removed} irrelevant fact{}",
+                            if removed == 1 { "" } else { "s" }
+                        )));
+                    }
+                    Some(Err(e)) => {
+                        let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                    }
+                    None => {
+                        let _ = token_tx.send(InferenceEvent::Error(
+                            "Memory store is unavailable".to_string(),
+                        ));
+                    }
+                }
                 continue;
             }
             SessionCommand::ApproveAction(_) | SessionCommand::RejectAction(_) => {

@@ -208,8 +208,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
     BuiltinCommandSpec {
         canonical: "/memory",
         aliases: &[],
-        usage: "/memory [status|facts|last|recall <query>]",
-        description: "inspect loaded memory, retrieval, and the latest memory update",
+        usage: "/memory [status|facts|last|recall <query>|prune]",
+        description: "inspect memory, debug retrieval, or prune irrelevant stored facts",
         kind: BuiltinKind::Session,
     },
     BuiltinCommandSpec {

@@ -56,6 +56,7 @@ pub enum SessionCommand {
         format: Option<String>,
     },
     RecallMemory(String),
+    PruneMemory,
     SetReflection(bool),
     SetEco(bool),
     SetDebugLogging(bool),

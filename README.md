@@ -233,7 +233,7 @@ params "explain what this function does"
 - `/sessions resume <name-or-id>`
 - `/sessions delete <name-or-id>`
 - `/sessions export <name-or-id> [markdown|json]`
-- `/memory [status|facts|last|recall <query>]`
+- `/memory [status|facts|last|recall <query>|prune]`
 - `/transcript [status|collapse|expand|toggle]`
 - `/clear-cache`
 
@@ -255,12 +255,13 @@ Session behavior:
 
 Memory behavior:
 - durable facts are promoted per turn from strict evidence instead of raw end-of-session transcript extraction
-- verified facts now need a concrete project/workspace anchor (files, symbols, config values, commands, URLs/hosts, or approved tool evidence), so generic educational answer content is filtered out instead of being stored as durable memory
+- verified facts now need a concrete project/workspace anchor (files, symbols, config values, commands, URLs/hosts, or approved tool evidence), and generic educational answer content or proposal-style lines are filtered out instead of being stored as durable memory
 - each user turn now builds a retrieval bundle from indexed file summaries, prompt-relevant durable facts, and selective prior-session excerpts from saved sessions in the current project
 - `/memory status` shows loaded fact count plus the most recent retrieval query and the last selected summaries, fact matches, and session excerpts
 - `/memory facts` lists the currently loaded durable facts with `legacy` vs `verified` tags
 - `/memory last` shows the latest accepted/skipped memory update, retrieval summary, and the most recent consolidation stats
 - `/memory recall <query>` runs an explicit retrieval-only lookup across summaries, facts, and prior sessions without mutating the conversation
+- `/memory prune` removes currently stored facts that no longer pass the project-specific durability filter
 - routine memory activity stays in runtime/status telemetry instead of injecting extra transcript breaks into assistant replies
 
 Transcript behavior:

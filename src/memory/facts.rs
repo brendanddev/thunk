@@ -29,6 +29,30 @@ const MAX_FACT_LEN: usize = 300;
 const MIN_FACT_LEN: usize = 20;
 const MAX_TOOL_EVIDENCE_CHARS: usize = 600;
 const MAX_REPLY_EVIDENCE_CHARS: usize = 1200;
+const GENERIC_ANCHOR_TOKENS: &[&str] = &[
+    "rust",
+    "cargo",
+    "box",
+    "rc",
+    "refcell",
+    "unsafecell",
+    "hashmap",
+    "sqlite",
+    "java",
+    "jvm",
+    "python",
+    "go",
+    "javascript",
+    "typescript",
+    "serde",
+    "toml",
+    "ratatui",
+    "crossterm",
+    "clap",
+    "tracing",
+    "sha2",
+    "ureq",
+];
 
 pub struct FactStore {
     conn: Connection,
@@ -189,6 +213,11 @@ impl FactStore {
             .flatten()
             .collect();
 
+        let all: Vec<StoredFact> = all
+            .into_iter()
+            .filter(|fact| is_retrievable_project_fact(&fact.content))
+            .collect();
+
         if query.is_empty() {
             return Ok(all.into_iter().take(limit).collect());
         }
@@ -211,6 +240,43 @@ impl FactStore {
             .map(|(_, fact)| fact)
             .take(limit)
             .collect())
+    }
+
+    pub fn prune_irrelevant_facts(&self, project: &str) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content FROM facts WHERE project = ?1 ORDER BY last_seen DESC")?;
+
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![project], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .flatten()
+            .collect();
+
+        let remove_ids: Vec<i64> = rows
+            .into_iter()
+            .filter_map(|(id, content)| {
+                if is_retrievable_project_fact(&content) {
+                    None
+                } else {
+                    Some(id)
+                }
+            })
+            .collect();
+
+        for id in &remove_ids {
+            self.conn
+                .execute("DELETE FROM facts WHERE id = ?1", params![id])?;
+        }
+
+        if !remove_ids.is_empty() {
+            debug!(
+                project,
+                removed = remove_ids.len(),
+                "irrelevant facts pruned"
+            );
+        }
+
+        Ok(remove_ids.len())
     }
 
     pub fn verify_and_store_turn(
@@ -580,6 +646,11 @@ fn collect_anchor_tokens(text: &str, anchors: &mut HashSet<String>) {
 }
 
 fn is_project_anchor_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if GENERIC_ANCHOR_TOKENS.contains(&lower.as_str()) {
+        return false;
+    }
+
     token.contains('/')
         || token.contains('.')
         || token.contains("::")
@@ -598,6 +669,20 @@ fn contains_anchor(fact: &str, anchors: &HashSet<String>) -> bool {
         let token = token.to_lowercase();
         anchors.contains(&token) || fact_lower.contains(&token) && anchors.contains(&token)
     })
+}
+
+fn contains_project_anchor_text(text: &str) -> bool {
+    tokenize(text)
+        .into_iter()
+        .filter(|token| token.len() >= 4)
+        .any(|token| is_project_anchor_token(&token))
+}
+
+fn is_retrievable_project_fact(fact: &str) -> bool {
+    is_quality_fact(fact)
+        && !contains_hedged_language(fact)
+        && !contains_unresolved_language(fact)
+        && contains_project_anchor_text(fact)
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -667,6 +752,20 @@ fn is_quality_fact(fact: &str) -> bool {
             return false;
         }
     }
+    let low_value_phrases = [
+        "the contents of ",
+        " are as follows",
+        "typically contains",
+        "for a rust project",
+        "smart pointers like",
+        "other languages also have pointers",
+        "managed by the rust compiler and runtime",
+    ];
+    for phrase in low_value_phrases {
+        if lower.contains(phrase) {
+            return false;
+        }
+    }
     true
 }
 
@@ -690,6 +789,9 @@ fn contains_unresolved_language(fact: &str) -> bool {
         "want to",
         "later",
         "next step",
+        "we can ",
+        "can replace",
+        "will allow us to",
     ]
     .iter()
     .any(|word| lower.contains(word))
@@ -842,7 +944,7 @@ mod tests {
                 "No, other languages also have pointers, but they handle them differently.",
                 &anchors
             ),
-            Err(SkippedFactReason::Unanchored)
+            Err(SkippedFactReason::Quality)
         );
     }
 
@@ -933,5 +1035,94 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn retrieval_filters_generic_unanchored_facts() {
+        let path = temp_db_path("filter-generic");
+        let store = FactStore::open_at(&path).expect("open fact store");
+        store
+            .try_store_fact_deduped(
+                "project",
+                "No, other languages also have pointers, but they handle them differently.",
+                FactProvenance::Verified,
+            )
+            .expect("store generic fact");
+        store
+            .try_store_fact_deduped(
+                "project",
+                "src/session/mod.rs resolves session selectors by unique id prefix",
+                FactProvenance::Verified,
+            )
+            .expect("store anchored fact");
+
+        let facts = store
+            .get_relevant_facts("project", "", 10)
+            .expect("load filtered facts");
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].content,
+            "src/session/mod.rs resolves session selectors by unique id prefix"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn prune_irrelevant_facts_removes_generic_entries() {
+        let path = temp_db_path("prune-generic");
+        let store = FactStore::open_at(&path).expect("open fact store");
+        store
+            .try_store_fact_deduped(
+                "project",
+                "No, other languages also have pointers, but they handle them differently.",
+                FactProvenance::Verified,
+            )
+            .expect("store generic fact");
+        store
+            .try_store_fact_deduped(
+                "project",
+                "src/session/mod.rs resolves session selectors by unique id prefix",
+                FactProvenance::Verified,
+            )
+            .expect("store anchored fact");
+
+        let removed = store
+            .prune_irrelevant_facts("project")
+            .expect("prune irrelevant facts");
+        assert_eq!(removed, 1);
+
+        let facts = store
+            .get_relevant_facts("project", "", 10)
+            .expect("load pruned facts");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].content,
+            "src/session/mod.rs resolves session selectors by unique id prefix"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn generic_pointer_fact_is_not_retrievable_project_fact() {
+        assert!(!is_retrievable_project_fact(
+            "Yes, Rust does have pointers, but they are managed by the Rust compiler and runtime and are typically used through smart pointers like Box, Rc, RefCell, and UnsafeCell."
+        ));
+    }
+
+    #[test]
+    fn instructional_proposal_fact_is_not_retrievable_project_fact() {
+        assert!(!is_retrievable_project_fact(
+            "To store cache entries in memory instead of a database, we can replace the database operations with in-memory storage using std::collections::HashMap. This will allow us to cache data in memory without the overhead of a SQLite database."
+        ));
+    }
+
+    #[test]
+    fn factstore_behavior_fact_remains_retrievable() {
+        assert!(is_retrievable_project_fact(
+            "FactStore uses Jaccard similarity to deduplicate near-duplicate verified memory facts."
+        ));
     }
 }

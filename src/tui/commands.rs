@@ -1015,6 +1015,9 @@ fn handle_builtin_slash_command(
                 "status" => state.add_system_message(&format_memory_status(&state.memory_snapshot)),
                 "facts" => state.add_system_message(&format_memory_facts(&state.memory_snapshot)),
                 "last" => state.add_system_message(&format_memory_last(&state.memory_snapshot)),
+                "prune" => {
+                    let _ = prompt_tx.send(SessionCommand::PruneMemory);
+                }
                 _ if subcommand.starts_with("recall ") => {
                     let query = subcommand["recall ".len()..].trim();
                     if query.is_empty() {
@@ -1023,7 +1026,8 @@ fn handle_builtin_slash_command(
                         let _ = prompt_tx.send(SessionCommand::RecallMemory(query.to_string()));
                     }
                 }
-                _ => state.add_system_message("Usage: /memory [status|facts|last|recall <query>]"),
+                _ => state
+                    .add_system_message("Usage: /memory [status|facts|last|recall <query>|prune]"),
             }
         }
         "/transcript" => {
