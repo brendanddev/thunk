@@ -213,6 +213,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         kind: BuiltinKind::Session,
     },
     BuiltinCommandSpec {
+        canonical: "/display",
+        aliases: &[],
+        usage: "/display [status|tokens <on|off>|time <on|off>]",
+        description: "control lightweight top-bar display items",
+        kind: BuiltinKind::Session,
+    },
+    BuiltinCommandSpec {
         canonical: "/transcript",
         aliases: &[],
         usage: "/transcript [status|collapse|expand|toggle]",

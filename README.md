@@ -267,7 +267,12 @@ Memory behavior:
 
 Transcript behavior:
 - obvious natural-language repo/directory summary prompts like “what’s in this repo?” and “what’s in this directory?” now trigger a bounded read-only auto-inspection workflow before the answer
-- auto-inspection shows one concise `Thinking:` system note plus short step traces like `List .` and `Read README.md`, then injects the gathered context internally instead of dumping raw tool output into the transcript
+- auto-inspection shows one concise `Thinking:` system note plus short step traces like `List .`, `List src/`, and `Read README.md`, then injects a compact synthesized context block instead of raw file dumps so local backends stay within context budget
+- broader natural-language code-navigation asks now trigger bounded read-only workflows too:
+  - `where is X implemented/defined/handled?`
+  - `trace how X works`
+  - `where is X configured/set?`
+- those workflows run a single bounded `search`, read only the top candidate files, and inject a compact hidden summary with likely files, key hits, and implementation/flow/config hints instead of raw search/read dumps
 - injected tool results and slash-loaded context blocks auto-collapse into compact transcript cards
 - `Ctrl+O` toggles the focused collapsed/expanded context block
 - `Alt+Up` recalls the previous submitted prompt or slash command into the composer for editing, and `Alt+Down` moves forward through recall history back to your unsent draft

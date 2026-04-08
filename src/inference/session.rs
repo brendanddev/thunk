@@ -16,12 +16,15 @@ use crate::memory::{
     compression,
     facts::{FactStore, TurnMemoryEvidence},
     index::ProjectIndex,
+    retrieval::{query_terms, score_text},
 };
 use crate::session::{
     display_name, list_label, short_id, SessionExcerptMatch, SessionExportFormat, SessionStore,
     SessionSummary,
 };
-use crate::tools::{BashTool, ListDir, ReadFile, Tool, ToolRegistry, ToolResult, ToolRunResult};
+use crate::tools::{
+    BashTool, ListDir, ReadFile, SearchCode, Tool, ToolRegistry, ToolResult, ToolRunResult,
+};
 
 use super::approval::{handle_pending_action, ApprovalContext};
 use super::budget::{
@@ -83,6 +86,9 @@ fn emit_memory_state(token_tx: &Sender<InferenceEvent>, memory_state: &RuntimeMe
 enum AutoInspectIntent {
     RepoOverview,
     DirectoryOverview,
+    WhereIsImplementation,
+    FeatureTrace,
+    ConfigLocate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,10 +100,26 @@ struct AutoInspectStep {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AutoInspectPlan {
+    intent: AutoInspectIntent,
     thinking: &'static str,
     status_label: &'static str,
     context_label: &'static str,
+    query: Option<String>,
     steps: Vec<AutoInspectStep>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutoInspectBudget {
+    total_chars: usize,
+    top_level_entries: usize,
+    code_entries: usize,
+    readme_chars: usize,
+    manifest_chars: usize,
+    entrypoint_chars: usize,
+    search_files: usize,
+    read_files: usize,
+    key_hits_per_file: usize,
+    workflow_summary_chars: usize,
 }
 
 struct AutoInspectOutcome {
@@ -142,6 +164,38 @@ fn detect_auto_inspect_intent(prompt: &str) -> Option<AutoInspectIntent> {
         return Some(AutoInspectIntent::DirectoryOverview);
     }
 
+    if normalized.starts_with("where is ")
+        && [" implemented", " defined", " handled"]
+            .iter()
+            .any(|suffix| normalized.ends_with(suffix))
+    {
+        return Some(AutoInspectIntent::WhereIsImplementation);
+    }
+
+    if normalized.starts_with("find ") || normalized.starts_with("which file has ") {
+        return Some(AutoInspectIntent::WhereIsImplementation);
+    }
+
+    if normalized.starts_with("trace how ")
+        || normalized.starts_with("how does ")
+        || normalized.starts_with("what handles ")
+        || normalized.starts_with("what writes to ")
+    {
+        return Some(AutoInspectIntent::FeatureTrace);
+    }
+
+    if normalized.starts_with("where is ")
+        && [" configured", " set"]
+            .iter()
+            .any(|suffix| normalized.ends_with(suffix))
+    {
+        return Some(AutoInspectIntent::ConfigLocate);
+    }
+
+    if normalized.starts_with("which file configures ") {
+        return Some(AutoInspectIntent::ConfigLocate);
+    }
+
     None
 }
 
@@ -162,56 +216,1258 @@ fn normalize_intent_text(text: &str) -> String {
         .join(" ")
 }
 
-fn plan_auto_inspection(intent: AutoInspectIntent, project_root: &Path) -> AutoInspectPlan {
+fn push_read_step(steps: &mut Vec<AutoInspectStep>, project_root: &Path, rel: &str) {
+    if project_root.join(rel).is_file() {
+        steps.push(AutoInspectStep {
+            label: format!("Read {rel}"),
+            tool_name: "read_file",
+            argument: rel.to_string(),
+        });
+    }
+}
+
+fn trim_query_noise(query: &str) -> String {
+    let mut trimmed = query.trim().to_string();
+    for prefix in ["the ", "a ", "an ", "this ", "that "] {
+        if let Some(stripped) = trimmed.strip_prefix(prefix) {
+            trimmed = stripped.trim().to_string();
+        }
+    }
+    trimmed
+}
+
+fn trim_query_suffix<'a>(query: &'a str, suffixes: &[&str]) -> &'a str {
+    for suffix in suffixes {
+        if let Some(stripped) = query.strip_suffix(suffix) {
+            return stripped.trim();
+        }
+    }
+    query.trim()
+}
+
+fn singularize_token(token: &str) -> String {
+    if token.len() > 4 && token.ends_with('s') {
+        token[..token.len() - 1].to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn salient_search_token(phrase: &str, intent: AutoInspectIntent) -> Option<String> {
+    let stopwords = match intent {
+        AutoInspectIntent::WhereIsImplementation => &[
+            "implemented",
+            "define",
+            "defined",
+            "handle",
+            "handled",
+            "find",
+            "which",
+            "file",
+            "has",
+            "where",
+            "is",
+            "the",
+        ][..],
+        AutoInspectIntent::FeatureTrace => &[
+            "trace", "how", "does", "work", "works", "flow", "what", "handles", "writes", "to",
+            "are", "saved", "save", "restored", "restore", "the",
+        ][..],
+        AutoInspectIntent::ConfigLocate => &[
+            "configured",
+            "configures",
+            "set",
+            "mode",
+            "which",
+            "file",
+            "where",
+            "is",
+            "the",
+        ][..],
+        AutoInspectIntent::RepoOverview | AutoInspectIntent::DirectoryOverview => &[][..],
+    };
+
+    phrase
+        .split_whitespace()
+        .map(trim_query_noise)
+        .map(|token| singularize_token(&token))
+        .find(|token| {
+            !token.is_empty()
+                && !stopwords.iter().any(|stop| stop == token)
+                && token.chars().any(|ch| ch.is_ascii_alphanumeric())
+        })
+}
+
+fn extract_auto_inspect_query(prompt: &str, intent: AutoInspectIntent) -> Option<String> {
+    let normalized = normalize_intent_text(prompt);
+    if normalized.contains("session") {
+        if normalized.contains("save") || normalized.contains("saved") {
+            return Some("save_session".to_string());
+        }
+        if normalized.contains("restore")
+            || normalized.contains("restored")
+            || normalized.contains("resume")
+        {
+            return Some("load_most_recent".to_string());
+        }
+    }
+    if intent == AutoInspectIntent::ConfigLocate && normalized.contains("eco") {
+        return Some("eco.enabled".to_string());
+    }
+
+    let extracted = match intent {
+        AutoInspectIntent::WhereIsImplementation => {
+            if let Some(rest) = normalized.strip_prefix("where is ") {
+                trim_query_suffix(rest, &[" implemented", " defined", " handled"]).to_string()
+            } else if let Some(rest) = normalized.strip_prefix("find ") {
+                rest.trim().to_string()
+            } else if let Some(rest) = normalized.strip_prefix("which file has ") {
+                rest.trim().to_string()
+            } else {
+                String::new()
+            }
+        }
+        AutoInspectIntent::FeatureTrace => {
+            if let Some(rest) = normalized.strip_prefix("trace how ") {
+                trim_query_suffix(rest, &[" works", " work", " flows", " flow"]).to_string()
+            } else if let Some(rest) = normalized.strip_prefix("how does ") {
+                trim_query_suffix(rest, &[" work", " works", " flow", " flow through"]).to_string()
+            } else if let Some(rest) = normalized.strip_prefix("what handles ") {
+                rest.trim().to_string()
+            } else if let Some(rest) = normalized.strip_prefix("what writes to ") {
+                rest.trim().to_string()
+            } else {
+                String::new()
+            }
+        }
+        AutoInspectIntent::ConfigLocate => {
+            if let Some(rest) = normalized.strip_prefix("where is ") {
+                trim_query_suffix(rest, &[" configured", " set"]).to_string()
+            } else if let Some(rest) = normalized.strip_prefix("which file configures ") {
+                rest.trim().to_string()
+            } else {
+                String::new()
+            }
+        }
+        AutoInspectIntent::RepoOverview | AutoInspectIntent::DirectoryOverview => String::new(),
+    };
+
+    let cleaned =
+        salient_search_token(&extracted, intent).unwrap_or_else(|| trim_query_noise(&extracted));
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn plan_auto_inspection(
+    intent: AutoInspectIntent,
+    prompt: &str,
+    project_root: &Path,
+) -> AutoInspectPlan {
     let mut steps = vec![AutoInspectStep {
         label: "List .".to_string(),
         tool_name: "list_dir",
         argument: ".".to_string(),
     }];
 
-    let mut push_read = |rel: &str| {
-        if project_root.join(rel).is_file() {
-            steps.push(AutoInspectStep {
-                label: format!("Read {rel}"),
-                tool_name: "read_file",
-                argument: rel.to_string(),
-            });
-        }
-    };
-
     match intent {
         AutoInspectIntent::RepoOverview => {
-            push_read("README.md");
-            push_read("Cargo.toml");
+            if project_root.join("src").is_dir() {
+                steps.push(AutoInspectStep {
+                    label: "List src/".to_string(),
+                    tool_name: "list_dir",
+                    argument: "src".to_string(),
+                });
+            }
+            push_read_step(&mut steps, project_root, "README.md");
+            push_read_step(&mut steps, project_root, "Cargo.toml");
             if project_root.join("src/main.rs").is_file() {
-                push_read("src/main.rs");
+                push_read_step(&mut steps, project_root, "src/main.rs");
             } else {
-                push_read("src/lib.rs");
+                push_read_step(&mut steps, project_root, "src/lib.rs");
             }
 
             AutoInspectPlan {
+                intent,
                 thinking: "Thinking: exploring the repo structure and key project docs.",
                 status_label: "inspecting repo...",
                 context_label: "this repo summary request",
+                query: None,
                 steps,
             }
         }
         AutoInspectIntent::DirectoryOverview => {
-            push_read("README.md");
+            push_read_step(&mut steps, project_root, "README.md");
             for manifest in ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"] {
                 if project_root.join(manifest).is_file() {
-                    push_read(manifest);
+                    push_read_step(&mut steps, project_root, manifest);
                     break;
                 }
             }
 
             AutoInspectPlan {
+                intent,
                 thinking: "Thinking: checking the current directory and its key files.",
                 status_label: "inspecting directory...",
                 context_label: "this directory summary request",
+                query: None,
                 steps,
             }
         }
+        AutoInspectIntent::WhereIsImplementation => {
+            let query = extract_auto_inspect_query(prompt, intent);
+            let mut steps = Vec::new();
+            if let Some(ref query) = query {
+                steps.push(AutoInspectStep {
+                    label: format!("Search {query}"),
+                    tool_name: "search",
+                    argument: query.clone(),
+                });
+            }
+            AutoInspectPlan {
+                intent,
+                thinking: "Thinking: locating the most likely implementation files.",
+                status_label: "locating implementation...",
+                context_label: "this implementation lookup request",
+                query,
+                steps,
+            }
+        }
+        AutoInspectIntent::FeatureTrace => {
+            let query = extract_auto_inspect_query(prompt, intent);
+            let mut steps = Vec::new();
+            if let Some(ref query) = query {
+                steps.push(AutoInspectStep {
+                    label: format!("Search {query}"),
+                    tool_name: "search",
+                    argument: query.clone(),
+                });
+            }
+            AutoInspectPlan {
+                intent,
+                thinking: "Thinking: tracing the main code path for this feature.",
+                status_label: "tracing feature...",
+                context_label: "this feature trace request",
+                query,
+                steps,
+            }
+        }
+        AutoInspectIntent::ConfigLocate => {
+            let query = extract_auto_inspect_query(prompt, intent);
+            let mut steps = Vec::new();
+            if let Some(ref query) = query {
+                steps.push(AutoInspectStep {
+                    label: format!("Search {query}"),
+                    tool_name: "search",
+                    argument: query.clone(),
+                });
+            }
+            AutoInspectPlan {
+                intent,
+                thinking: "Thinking: checking the files that configure this behavior.",
+                status_label: "locating configuration...",
+                context_label: "this configuration lookup request",
+                query,
+                steps,
+            }
+        }
+    }
+}
+
+fn auto_inspection_budget(
+    intent: AutoInspectIntent,
+    backend_name: &str,
+    eco_enabled: bool,
+) -> AutoInspectBudget {
+    let constrained = backend_name.contains("llama.cpp");
+    match (intent, constrained, eco_enabled) {
+        (AutoInspectIntent::RepoOverview, true, true) => AutoInspectBudget {
+            total_chars: 700,
+            top_level_entries: 6,
+            code_entries: 6,
+            readme_chars: 120,
+            manifest_chars: 160,
+            entrypoint_chars: 160,
+            search_files: 0,
+            read_files: 0,
+            key_hits_per_file: 0,
+            workflow_summary_chars: 0,
+        },
+        (AutoInspectIntent::RepoOverview, true, false) => AutoInspectBudget {
+            total_chars: 1000,
+            top_level_entries: 8,
+            code_entries: 8,
+            readme_chars: 170,
+            manifest_chars: 220,
+            entrypoint_chars: 220,
+            search_files: 0,
+            read_files: 0,
+            key_hits_per_file: 0,
+            workflow_summary_chars: 0,
+        },
+        (AutoInspectIntent::RepoOverview, false, true) => AutoInspectBudget {
+            total_chars: 1200,
+            top_level_entries: 8,
+            code_entries: 8,
+            readme_chars: 180,
+            manifest_chars: 240,
+            entrypoint_chars: 240,
+            search_files: 0,
+            read_files: 0,
+            key_hits_per_file: 0,
+            workflow_summary_chars: 0,
+        },
+        (AutoInspectIntent::RepoOverview, false, false) => AutoInspectBudget {
+            total_chars: 1700,
+            top_level_entries: 10,
+            code_entries: 10,
+            readme_chars: 260,
+            manifest_chars: 320,
+            entrypoint_chars: 320,
+            search_files: 0,
+            read_files: 0,
+            key_hits_per_file: 0,
+            workflow_summary_chars: 0,
+        },
+        (AutoInspectIntent::DirectoryOverview, true, true) => AutoInspectBudget {
+            total_chars: 550,
+            top_level_entries: 6,
+            code_entries: 0,
+            readme_chars: 120,
+            manifest_chars: 160,
+            entrypoint_chars: 0,
+            search_files: 0,
+            read_files: 0,
+            key_hits_per_file: 0,
+            workflow_summary_chars: 0,
+        },
+        (AutoInspectIntent::DirectoryOverview, true, false) => AutoInspectBudget {
+            total_chars: 800,
+            top_level_entries: 8,
+            code_entries: 0,
+            readme_chars: 160,
+            manifest_chars: 220,
+            entrypoint_chars: 0,
+            search_files: 0,
+            read_files: 0,
+            key_hits_per_file: 0,
+            workflow_summary_chars: 0,
+        },
+        (AutoInspectIntent::DirectoryOverview, false, true) => AutoInspectBudget {
+            total_chars: 950,
+            top_level_entries: 8,
+            code_entries: 0,
+            readme_chars: 180,
+            manifest_chars: 240,
+            entrypoint_chars: 0,
+            search_files: 0,
+            read_files: 0,
+            key_hits_per_file: 0,
+            workflow_summary_chars: 0,
+        },
+        (AutoInspectIntent::DirectoryOverview, false, false) => AutoInspectBudget {
+            total_chars: 1300,
+            top_level_entries: 10,
+            code_entries: 0,
+            readme_chars: 240,
+            manifest_chars: 320,
+            entrypoint_chars: 0,
+            search_files: 0,
+            read_files: 0,
+            key_hits_per_file: 0,
+            workflow_summary_chars: 0,
+        },
+        (AutoInspectIntent::WhereIsImplementation, true, true)
+        | (AutoInspectIntent::FeatureTrace, true, true)
+        | (AutoInspectIntent::ConfigLocate, true, true) => AutoInspectBudget {
+            total_chars: 650,
+            top_level_entries: 0,
+            code_entries: 0,
+            readme_chars: 0,
+            manifest_chars: 120,
+            entrypoint_chars: 0,
+            search_files: 3,
+            read_files: 2,
+            key_hits_per_file: 2,
+            workflow_summary_chars: 140,
+        },
+        (AutoInspectIntent::WhereIsImplementation, true, false)
+        | (AutoInspectIntent::FeatureTrace, true, false)
+        | (AutoInspectIntent::ConfigLocate, true, false) => AutoInspectBudget {
+            total_chars: 900,
+            top_level_entries: 0,
+            code_entries: 0,
+            readme_chars: 0,
+            manifest_chars: 160,
+            entrypoint_chars: 0,
+            search_files: 3,
+            read_files: 2,
+            key_hits_per_file: 2,
+            workflow_summary_chars: 180,
+        },
+        (AutoInspectIntent::WhereIsImplementation, false, true)
+        | (AutoInspectIntent::FeatureTrace, false, true)
+        | (AutoInspectIntent::ConfigLocate, false, true) => AutoInspectBudget {
+            total_chars: 1100,
+            top_level_entries: 0,
+            code_entries: 0,
+            readme_chars: 0,
+            manifest_chars: 180,
+            entrypoint_chars: 0,
+            search_files: 4,
+            read_files: 2,
+            key_hits_per_file: 2,
+            workflow_summary_chars: 220,
+        },
+        (AutoInspectIntent::WhereIsImplementation, false, false)
+        | (AutoInspectIntent::FeatureTrace, false, false)
+        | (AutoInspectIntent::ConfigLocate, false, false) => AutoInspectBudget {
+            total_chars: 1400,
+            top_level_entries: 0,
+            code_entries: 0,
+            readme_chars: 0,
+            manifest_chars: 220,
+            entrypoint_chars: 0,
+            search_files: 5,
+            read_files: 3,
+            key_hits_per_file: 2,
+            workflow_summary_chars: 260,
+        },
+    }
+}
+
+fn clip_inline(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.chars().count() <= max_chars {
+        return trimmed;
+    }
+
+    let clipped = trimmed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{}…", clipped.trim_end())
+}
+
+fn parse_list_dir_output(output: &str) -> Vec<String> {
+    let mut lines = output.lines();
+    let _ = lines.next();
+    let body = lines.collect::<Vec<_>>().join("\n");
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_read_file_output(output: &str) -> Option<(String, String)> {
+    let path = output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("File: "))?
+        .trim()
+        .to_string();
+    let start = output.find("```\n")?;
+    let rest = &output[start + 4..];
+    let end = rest.rfind("\n```")?;
+    Some((path, rest[..end].to_string()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchLineHit {
+    line_number: usize,
+    line_content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchFileHit {
+    path: String,
+    hits: Vec<SearchLineHit>,
+}
+
+fn parse_search_output(output: &str) -> Vec<SearchFileHit> {
+    let mut files = Vec::new();
+    let mut current: Option<SearchFileHit> = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() || line.starts_with("Search results for ") {
+            continue;
+        }
+
+        if !raw_line.starts_with(' ') && line.ends_with(':') {
+            if let Some(file) = current.take() {
+                files.push(file);
+            }
+            current = Some(SearchFileHit {
+                path: line.trim_end_matches(':').to_string(),
+                hits: Vec::new(),
+            });
+            continue;
+        }
+
+        if let Some(file) = current.as_mut() {
+            let trimmed = raw_line.trim_start();
+            let Some((line_number, line_content)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let Ok(line_number) = line_number.trim().parse::<usize>() else {
+                continue;
+            };
+            file.hits.push(SearchLineHit {
+                line_number,
+                line_content: line_content.trim().to_string(),
+            });
+        }
+    }
+
+    if let Some(file) = current {
+        files.push(file);
+    }
+
+    files
+}
+
+fn is_config_path(path: &str) -> bool {
+    matches!(
+        path,
+        ".params.toml"
+            | ".local/config.toml"
+            | "Cargo.toml"
+            | "package.json"
+            | "pyproject.toml"
+            | "go.mod"
+    ) || path.contains("config")
+}
+
+fn is_doc_path(path: &str) -> bool {
+    path.ends_with(".md") || path.starts_with("docs/")
+}
+
+fn is_code_path(path: &str) -> bool {
+    [
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".swift", ".rb", ".php",
+        ".cs", ".toml", ".json", ".yaml", ".yml", ".sh",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+}
+
+fn file_display_name(path: &str) -> String {
+    format!("`{path}`")
+}
+
+fn declaration_lines_with_numbers(content: &str) -> Vec<(usize, String)> {
+    content
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| (idx + 1, line.trim()))
+        .filter(|(_, line)| {
+            line.starts_with("pub struct ")
+                || line.starts_with("struct ")
+                || line.starts_with("pub enum ")
+                || line.starts_with("enum ")
+                || line.starts_with("pub fn ")
+                || line.starts_with("fn ")
+                || line.starts_with("impl ")
+                || line.starts_with("mod ")
+                || line.starts_with("pub mod ")
+                || line.starts_with('[')
+        })
+        .take(4)
+        .map(|(line_number, line)| (line_number, line.to_string()))
+        .collect()
+}
+
+fn match_lines_with_numbers(
+    content: &str,
+    query_terms: &[crate::memory::retrieval::QueryTerm],
+    limit: usize,
+) -> Vec<(usize, String)> {
+    content
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| (idx + 1, line.trim()))
+        .filter(|(_, line)| !line.is_empty())
+        .filter(|(_, line)| score_text(query_terms, line) > 0)
+        .take(limit)
+        .map(|(line_number, line)| (line_number, line.to_string()))
+        .collect()
+}
+
+fn format_numbered_hits(hits: &[(usize, String)], clip_chars: usize) -> String {
+    hits.iter()
+        .map(|(line_number, line)| format!("{line_number} `{}`", clip_inline(line, clip_chars)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn is_definition_like_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub struct ")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("pub enum ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("impl ")
+        || trimmed.starts_with("pub mod ")
+        || trimmed.starts_with("mod ")
+        || trimmed.starts_with("pub use ")
+}
+
+fn config_scope_label(path: &str) -> &'static str {
+    match path {
+        ".params.toml" => "project-local",
+        ".local/config.toml" => "global",
+        _ if path.contains("config") => "runtime/config code",
+        _ => "repo config",
+    }
+}
+
+fn score_search_file(intent: AutoInspectIntent, query: &str, file: &SearchFileHit) -> isize {
+    let terms = query_terms(query);
+    let exact = query.to_ascii_lowercase();
+    let path_lower = file.path.to_ascii_lowercase();
+    let path_score = score_text(&terms, &file.path) as isize * 6;
+    let line_score = file
+        .hits
+        .iter()
+        .take(4)
+        .map(|hit| score_text(&terms, &hit.line_content) as isize)
+        .sum::<isize>();
+    let exact_path_bonus = if !exact.is_empty() && path_lower.contains(&exact) {
+        30
+    } else {
+        0
+    };
+    let exact_line_bonus = if !exact.is_empty()
+        && file
+            .hits
+            .iter()
+            .any(|hit| hit.line_content.to_ascii_lowercase().contains(&exact))
+    {
+        16
+    } else {
+        0
+    };
+    let count_bonus = (file.hits.len().min(6) as isize) * 3;
+    let workflow_bonus = match intent {
+        AutoInspectIntent::WhereIsImplementation => {
+            let mut bonus = 0;
+            if is_code_path(&file.path) {
+                bonus += 14;
+            }
+            if file.path.starts_with("src/") {
+                bonus += 10;
+            }
+            if is_doc_path(&file.path) {
+                bonus -= 10;
+            }
+            bonus
+        }
+        AutoInspectIntent::FeatureTrace => {
+            let mut bonus = 0;
+            if is_code_path(&file.path) {
+                bonus += 12;
+            }
+            if file.path.ends_with("main.rs") || file.path.ends_with("mod.rs") {
+                bonus += 8;
+            }
+            if is_doc_path(&file.path) {
+                bonus -= 8;
+            }
+            bonus
+        }
+        AutoInspectIntent::ConfigLocate => {
+            let mut bonus = 0;
+            if is_config_path(&file.path) {
+                bonus += 18;
+            }
+            if path_lower.contains("config") {
+                bonus += 10;
+            }
+            bonus
+        }
+        AutoInspectIntent::RepoOverview | AutoInspectIntent::DirectoryOverview => 0,
+    };
+
+    path_score + line_score + exact_path_bonus + exact_line_bonus + count_bonus + workflow_bonus
+}
+
+fn rank_search_files(
+    intent: AutoInspectIntent,
+    query: &str,
+    files: &[SearchFileHit],
+) -> Vec<SearchFileHit> {
+    let mut ranked = files.to_vec();
+    ranked.sort_by(|a, b| {
+        score_search_file(intent, query, b)
+            .cmp(&score_search_file(intent, query, a))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    ranked
+}
+
+fn preferred_config_paths(project_root: &Path) -> Vec<String> {
+    [
+        ".params.toml",
+        ".local/config.toml",
+        "src/config.rs",
+        "config.rs",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+    ]
+    .iter()
+    .filter(|rel| project_root.join(rel).is_file())
+    .map(|rel| (*rel).to_string())
+    .collect()
+}
+
+fn preferred_workflow_paths(plan: &AutoInspectPlan, project_root: &Path) -> Vec<String> {
+    let mut preferred = match plan.query.as_deref() {
+        Some("load_most_recent") => {
+            vec![
+                "src/session/mod.rs".to_string(),
+                "src/inference/session.rs".to_string(),
+            ]
+        }
+        Some("save_session") => {
+            vec![
+                "src/inference/session.rs".to_string(),
+                "src/session/mod.rs".to_string(),
+            ]
+        }
+        Some("eco.enabled") => vec![
+            "src/config/profile.rs".to_string(),
+            "src/inference/session.rs".to_string(),
+            "src/tui/commands.rs".to_string(),
+            "src/config.rs".to_string(),
+        ],
+        _ => Vec::new(),
+    };
+
+    if plan.intent == AutoInspectIntent::ConfigLocate {
+        preferred.extend(preferred_config_paths(project_root));
+    }
+
+    preferred
+        .into_iter()
+        .filter(|rel| project_root.join(rel).is_file())
+        .collect()
+}
+
+fn choose_followup_read_steps(
+    plan: &AutoInspectPlan,
+    project_root: &Path,
+    search_hits: &[SearchFileHit],
+    budget: AutoInspectBudget,
+) -> Vec<AutoInspectStep> {
+    let Some(query) = plan.query.as_deref() else {
+        return Vec::new();
+    };
+
+    let ranked = rank_search_files(plan.intent, query, search_hits);
+    let code_first_hits = match plan.intent {
+        AutoInspectIntent::WhereIsImplementation | AutoInspectIntent::FeatureTrace => {
+            let code_hits = ranked
+                .iter()
+                .filter(|file| file.path.starts_with("src/") || is_code_path(&file.path))
+                .cloned()
+                .collect::<Vec<_>>();
+            if code_hits.is_empty() {
+                ranked
+            } else {
+                code_hits
+            }
+        }
+        AutoInspectIntent::ConfigLocate => {
+            let config_hits = ranked
+                .iter()
+                .filter(|file| {
+                    is_config_path(&file.path)
+                        || file.path.starts_with("src/")
+                        || file.path.starts_with("config/")
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if config_hits.is_empty() {
+                ranked
+            } else {
+                config_hits
+            }
+        }
+        AutoInspectIntent::RepoOverview | AutoInspectIntent::DirectoryOverview => ranked,
+    };
+
+    let mut selected = code_first_hits
+        .into_iter()
+        .take(budget.search_files)
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
+
+    let mut preferred = preferred_workflow_paths(plan, project_root);
+    preferred.reverse();
+    for path in preferred {
+        if let Some(existing_idx) = selected.iter().position(|existing| existing == &path) {
+            let item = selected.remove(existing_idx);
+            selected.insert(0, item);
+        } else {
+            selected.insert(0, path);
+        }
+    }
+
+    if plan.intent == AutoInspectIntent::ConfigLocate {
+        let mut preferred = preferred_config_paths(project_root);
+        preferred.reverse();
+        for path in preferred {
+            if let Some(existing_idx) = selected.iter().position(|existing| existing == &path) {
+                let item = selected.remove(existing_idx);
+                selected.insert(0, item);
+            } else {
+                selected.insert(0, path);
+            }
+        }
+    }
+
+    selected.truncate(budget.read_files);
+    selected
+        .into_iter()
+        .map(|path| AutoInspectStep {
+            label: format!("Read {path}"),
+            tool_name: "read_file",
+            argument: path,
+        })
+        .collect()
+}
+
+fn summarize_workflow_read(
+    path: &str,
+    content: &str,
+    query: &str,
+    intent: AutoInspectIntent,
+    max_chars: usize,
+) -> Option<String> {
+    let terms = query_terms(query);
+    let matches = match_lines_with_numbers(content, &terms, 2);
+    let declarations = declaration_lines_with_numbers(content);
+
+    match intent {
+        AutoInspectIntent::ConfigLocate => {
+            let mut parts = vec![format!(
+                "{} ({})",
+                file_display_name(path),
+                config_scope_label(path)
+            )];
+            if !matches.is_empty() {
+                parts.push(format!(
+                    "exact lines: {}",
+                    format_numbered_hits(&matches, 48)
+                ));
+            } else if !declarations.is_empty() {
+                parts.push(format!(
+                    "declarations: {}",
+                    format_numbered_hits(&declarations, 40)
+                ));
+            }
+            Some(clip_inline(&parts.join("; "), max_chars))
+        }
+        AutoInspectIntent::WhereIsImplementation | AutoInspectIntent::FeatureTrace => {
+            let mut parts = vec![file_display_name(path)];
+            if !matches.is_empty() {
+                parts.push(format!(
+                    "exact lines: {}",
+                    format_numbered_hits(&matches, 48)
+                ));
+            }
+            if !declarations.is_empty() {
+                parts.push(format!(
+                    "declarations: {}",
+                    format_numbered_hits(&declarations, 36)
+                ));
+            }
+            Some(clip_inline(&parts.join("; "), max_chars))
+        }
+        AutoInspectIntent::RepoOverview | AutoInspectIntent::DirectoryOverview => None,
+    }
+}
+
+fn summarize_readme(content: &str, max_chars: usize) -> Option<String> {
+    let mut focus = Vec::new();
+    for line in content.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(heading) = line.strip_prefix("# ") {
+            focus.push(heading.to_string());
+            continue;
+        }
+        if line.starts_with("- ") || line.starts_with("* ") {
+            focus.push(line[2..].trim().to_string());
+        } else {
+            focus.push(line.to_string());
+        }
+        if focus.len() >= 4 {
+            break;
+        }
+    }
+
+    if focus.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "README focus: {}",
+            clip_inline(&focus.join("; "), max_chars)
+        ))
+    }
+}
+
+fn summarize_cargo_manifest(content: &str, max_chars: usize) -> Option<String> {
+    let value = toml::from_str::<toml::Value>(content).ok()?;
+    let mut parts = Vec::new();
+
+    if let Some(name) = value
+        .get("package")
+        .and_then(|pkg| pkg.get("name"))
+        .and_then(|name| name.as_str())
+    {
+        parts.push(format!("Rust package `{name}`"));
+    } else if value.get("workspace").is_some() {
+        parts.push("Rust workspace manifest".to_string());
+    }
+
+    if let Some(description) = value
+        .get("package")
+        .and_then(|pkg| pkg.get("description"))
+        .and_then(|desc| desc.as_str())
+    {
+        parts.push(clip_inline(description, max_chars / 2));
+    }
+
+    let mut deps = value
+        .get("dependencies")
+        .and_then(|deps| deps.as_table())
+        .map(|table| table.keys().take(6).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    deps.sort();
+    if !deps.is_empty() {
+        parts.push(format!("key deps: {}", deps.join(", ")));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Manifest: {}",
+            clip_inline(&parts.join("; "), max_chars)
+        ))
+    }
+}
+
+fn summarize_entrypoint(path: &str, content: &str, max_chars: usize) -> Option<String> {
+    if !path.ends_with(".rs") {
+        return None;
+    }
+
+    let mut modules = Vec::new();
+    let mut has_main = false;
+    for line in content.lines().map(str::trim) {
+        if let Some(name) = line
+            .strip_prefix("mod ")
+            .or_else(|| line.strip_prefix("pub mod "))
+        {
+            let name = name.trim_end_matches(';').trim();
+            if !name.is_empty() {
+                modules.push(name.to_string());
+            }
+        }
+        if line.starts_with("fn main(") || line.starts_with("pub fn main(") {
+            has_main = true;
+        }
+    }
+
+    let mut parts = vec![format!(
+        "{} `{}`",
+        if has_main { "Entrypoint" } else { "Root file" },
+        path
+    )];
+    if !modules.is_empty() {
+        modules.truncate(8);
+        parts.push(format!("modules: {}", modules.join(", ")));
+    }
+
+    if parts.len() == 1 && !has_main {
+        None
+    } else {
+        Some(clip_inline(&parts.join("; "), max_chars))
+    }
+}
+
+fn top_level_repo_type(entries: &[String]) -> Option<String> {
+    if entries.iter().any(|entry| entry == "Cargo.toml") {
+        Some("Repo type: Rust project".to_string())
+    } else if entries.iter().any(|entry| entry == "package.json") {
+        Some("Repo type: Node project".to_string())
+    } else if entries.iter().any(|entry| entry == "pyproject.toml") {
+        Some("Repo type: Python project".to_string())
+    } else if entries.iter().any(|entry| entry == "go.mod") {
+        Some("Repo type: Go project".to_string())
+    } else {
+        None
+    }
+}
+
+fn format_entry_list(label: &str, entries: &[String], limit: usize) -> Option<String> {
+    if entries.is_empty() || limit == 0 {
+        return None;
+    }
+
+    let shown = entries
+        .iter()
+        .take(limit)
+        .map(|entry| format!("`{entry}`"))
+        .collect::<Vec<_>>();
+    let extra = entries.len().saturating_sub(limit);
+    let mut text = shown.join(", ");
+    if extra > 0 {
+        text.push_str(&format!(", +{extra} more"));
+    }
+    Some(format!("{label}: {text}"))
+}
+
+fn synthesize_auto_inspection_context(
+    plan: &AutoInspectPlan,
+    results: &[ToolResult],
+    budget: AutoInspectBudget,
+) -> Option<String> {
+    if results.is_empty() {
+        return None;
+    }
+
+    if matches!(
+        plan.intent,
+        AutoInspectIntent::WhereIsImplementation
+            | AutoInspectIntent::FeatureTrace
+            | AutoInspectIntent::ConfigLocate
+    ) {
+        let query = plan.query.as_deref()?;
+        let mut search_hits = Vec::new();
+        let mut read_summaries = Vec::new();
+        let mut read_paths = Vec::new();
+
+        for result in results {
+            match result.tool_name.as_str() {
+                "search" => search_hits.extend(parse_search_output(&result.output)),
+                "read_file" => {
+                    if let Some((path, content)) = parse_read_file_output(&result.output) {
+                        read_paths.push(path.clone());
+                        if let Some(summary) = summarize_workflow_read(
+                            &path,
+                            &content,
+                            query,
+                            plan.intent,
+                            budget.workflow_summary_chars,
+                        ) {
+                            read_summaries.push(summary);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ranked = rank_search_files(plan.intent, query, &search_hits);
+        let mut likely_files = read_paths
+            .iter()
+            .map(|path| file_display_name(path))
+            .collect::<Vec<_>>();
+        for file in ranked.iter().take(budget.search_files) {
+            let display = file_display_name(&file.path);
+            if !likely_files.iter().any(|existing| existing == &display) {
+                likely_files.push(display);
+            }
+        }
+        likely_files.truncate(budget.search_files.max(budget.read_files));
+
+        let supporting_hits = if read_paths.is_empty() {
+            ranked.iter().take(budget.search_files).collect::<Vec<_>>()
+        } else {
+            ranked
+                .iter()
+                .filter(|file| read_paths.iter().any(|path| path == &file.path))
+                .take(budget.search_files)
+                .collect::<Vec<_>>()
+        };
+        let has_read_summaries = !read_summaries.is_empty();
+
+        let key_hits = supporting_hits
+            .into_iter()
+            .flat_map(|file| {
+                file.hits
+                    .iter()
+                    .filter(move |hit| {
+                        plan.intent != AutoInspectIntent::WhereIsImplementation
+                            || !has_read_summaries
+                            || is_definition_like_line(&hit.line_content)
+                    })
+                    .take(budget.key_hits_per_file)
+                    .map(move |hit| {
+                        format!(
+                            "{}:{} `{}`",
+                            file.path,
+                            hit.line_number,
+                            clip_inline(&hit.line_content, 56)
+                        )
+                    })
+            })
+            .take(budget.search_files * budget.key_hits_per_file)
+            .collect::<Vec<_>>();
+
+        let mut sections = vec![format!(
+            "Automatic inspection context for {}:",
+            plan.context_label
+        )];
+        sections.push(
+            "Instruction: answer directly from this evidence. Prefer exact inspected-file evidence over supporting search hits. Do not ask for more inspection unless the evidence is clearly insufficient. Do not emit tool calls or fenced code blocks. If exact code is not included below, answer in prose with file paths and line references only.".to_string(),
+        );
+        sections.push(format!("Query: {query}"));
+        if !likely_files.is_empty() {
+            sections.push(format!("Likely files: {}", likely_files.join(", ")));
+        }
+        if !read_summaries.is_empty() {
+            let label = match plan.intent {
+                AutoInspectIntent::WhereIsImplementation => "Implementation hints",
+                AutoInspectIntent::FeatureTrace => "Flow hints",
+                AutoInspectIntent::ConfigLocate => "Config hints",
+                AutoInspectIntent::RepoOverview | AutoInspectIntent::DirectoryOverview => {
+                    unreachable!()
+                }
+            };
+            sections.push(format!("{label}: {}", read_summaries.join(" | ")));
+        }
+        let include_supporting_hits = !key_hits.is_empty()
+            && !(plan.intent == AutoInspectIntent::WhereIsImplementation && has_read_summaries);
+        if include_supporting_hits {
+            let label = if read_summaries.is_empty() {
+                "Key hits"
+            } else {
+                "Supporting search hits"
+            };
+            sections.push(format!("{label}: {}", key_hits.join("; ")));
+        }
+
+        let mut output = String::new();
+        for section in sections {
+            let candidate = if output.is_empty() {
+                section
+            } else {
+                format!("{output}\n- {section}")
+            };
+            if candidate.chars().count() > budget.total_chars {
+                break;
+            }
+            output = candidate;
+        }
+
+        return if output.is_empty() {
+            None
+        } else {
+            Some(output)
+        };
+    }
+
+    let mut root_entries = Vec::new();
+    let mut code_entries = Vec::new();
+    let mut readme_summary = None;
+    let mut manifest_summary = None;
+    let mut entrypoint_summary = None;
+
+    for result in results {
+        match result.tool_name.as_str() {
+            "list_dir" if result.argument == "." => {
+                root_entries = parse_list_dir_output(&result.output);
+            }
+            "list_dir" if result.argument == "src" => {
+                code_entries = parse_list_dir_output(&result.output);
+            }
+            "read_file" => {
+                if let Some((path, content)) = parse_read_file_output(&result.output) {
+                    match path.as_str() {
+                        "README.md" => {
+                            readme_summary = summarize_readme(&content, budget.readme_chars);
+                        }
+                        "Cargo.toml" => {
+                            manifest_summary =
+                                summarize_cargo_manifest(&content, budget.manifest_chars);
+                        }
+                        "src/main.rs" | "src/lib.rs" => {
+                            entrypoint_summary =
+                                summarize_entrypoint(&path, &content, budget.entrypoint_chars);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut sections = vec![format!(
+        "Automatic inspection context for {}:",
+        plan.context_label
+    )];
+
+    if let Some(repo_type) = top_level_repo_type(&root_entries) {
+        sections.push(repo_type);
+    }
+    if let Some(top_level) = format_entry_list("Top level", &root_entries, budget.top_level_entries)
+    {
+        sections.push(top_level);
+    }
+    if let Some(code_areas) = format_entry_list("Code areas", &code_entries, budget.code_entries) {
+        sections.push(code_areas);
+    }
+    if let Some(summary) = manifest_summary {
+        sections.push(summary);
+    }
+    if let Some(summary) = entrypoint_summary {
+        sections.push(summary);
+    }
+    if let Some(summary) = readme_summary {
+        sections.push(summary);
+    }
+
+    let mut output = String::new();
+    for section in sections {
+        let candidate = if output.is_empty() {
+            section
+        } else {
+            format!("{output}\n- {section}")
+        };
+
+        if candidate.chars().count() > budget.total_chars {
+            break;
+        }
+        output = candidate;
+    }
+
+    if output.is_empty() {
+        None
+    } else if output.starts_with("Automatic inspection context") {
+        Some(output)
+    } else {
+        Some(format!(
+            "Automatic inspection context for {}:\n- {}",
+            plan.context_label, output
+        ))
     }
 }
 
@@ -219,9 +1475,12 @@ fn run_auto_inspection(
     plan: &AutoInspectPlan,
     token_tx: &Sender<InferenceEvent>,
     eco_enabled: bool,
+    backend_name: &str,
+    project_root: &Path,
 ) -> AutoInspectOutcome {
     let _ = token_tx.send(InferenceEvent::SystemMessage(plan.thinking.to_string()));
 
+    let budget = auto_inspection_budget(plan.intent, backend_name, eco_enabled);
     let mut results = Vec::new();
 
     for step in &plan.steps {
@@ -229,6 +1488,7 @@ fn run_auto_inspection(
         let run_result = match step.tool_name {
             "list_dir" => ListDir.run(&step.argument),
             "read_file" => ReadFile.run(&step.argument),
+            "search" => SearchCode.run(&step.argument),
             _ => continue,
         };
 
@@ -251,15 +1511,41 @@ fn run_auto_inspection(
         }
     }
 
-    let hidden_context =
-        ToolRegistry::format_results_with_limit(&results, eco_tool_result_limit(eco_enabled)).map(
-            |formatted| {
-                format!(
-                    "Automatic inspection context for {}:\n\n{}",
-                    plan.context_label, formatted
-                )
-            },
-        );
+    if matches!(
+        plan.intent,
+        AutoInspectIntent::WhereIsImplementation
+            | AutoInspectIntent::FeatureTrace
+            | AutoInspectIntent::ConfigLocate
+    ) {
+        let search_hits = results
+            .iter()
+            .filter(|result| result.tool_name == "search")
+            .flat_map(|result| parse_search_output(&result.output))
+            .collect::<Vec<_>>();
+        let followup_reads = choose_followup_read_steps(plan, project_root, &search_hits, budget);
+        for step in followup_reads {
+            emit_trace(token_tx, ProgressStatus::Started, &step.label, false);
+            match ReadFile.run(&step.argument) {
+                Ok(ToolRunResult::Immediate(output)) => {
+                    emit_trace(token_tx, ProgressStatus::Finished, &step.label, false);
+                    results.push(ToolResult {
+                        tool_name: step.tool_name.to_string(),
+                        argument: step.argument,
+                        output,
+                    });
+                }
+                Ok(ToolRunResult::RequiresApproval(_)) => {
+                    emit_trace(token_tx, ProgressStatus::Failed, &step.label, false);
+                }
+                Err(error) => {
+                    warn!(label = step.label.as_str(), error = %error, "auto inspection step failed");
+                    emit_trace(token_tx, ProgressStatus::Failed, &step.label, false);
+                }
+            }
+        }
+    }
+
+    let hidden_context = synthesize_auto_inspection_context(plan, &results, budget);
 
     AutoInspectOutcome {
         hidden_context,
@@ -1461,10 +2747,16 @@ pub fn model_thread_with_options(
                 session_messages.push(Message::user(&prompt));
 
                 let auto_inspection = detect_auto_inspect_intent(&prompt)
-                    .map(|intent| plan_auto_inspection(intent, &project_root));
+                    .map(|intent| plan_auto_inspection(intent, &prompt, &project_root));
                 let auto_inspection_outcome = auto_inspection.as_ref().map(|plan| {
                     emit_generation_started(&token_tx, plan.status_label, false);
-                    run_auto_inspection(plan, &token_tx, eco_enabled)
+                    run_auto_inspection(
+                        plan,
+                        &token_tx,
+                        eco_enabled,
+                        &backend.name(),
+                        &project_root,
+                    )
                 });
                 let hidden_inspection_context = auto_inspection_outcome
                     .as_ref()
@@ -2065,11 +3357,24 @@ mod tests {
     }
 
     #[test]
-    fn detect_auto_inspect_intent_skips_unrelated_prompts() {
+    fn detect_auto_inspect_intent_matches_workflow_prompts() {
         assert_eq!(
-            detect_auto_inspect_intent("Where is the cache implemented?"),
-            None
+            detect_auto_inspect_intent("Where is cache implemented?"),
+            Some(AutoInspectIntent::WhereIsImplementation)
         );
+        assert_eq!(
+            detect_auto_inspect_intent("Trace how sessions are saved"),
+            Some(AutoInspectIntent::FeatureTrace)
+        );
+        assert_eq!(
+            detect_auto_inspect_intent("Where is eco mode configured?"),
+            Some(AutoInspectIntent::ConfigLocate)
+        );
+    }
+
+    #[test]
+    fn detect_auto_inspect_intent_skips_unrelated_prompts() {
+        assert_eq!(detect_auto_inspect_intent("Explain the cache"), None);
         assert_eq!(detect_auto_inspect_intent("/read README.md"), None);
     }
 
@@ -2082,7 +3387,11 @@ mod tests {
         fs::write(root.join("src/main.rs"), "fn main() {}").expect("write main");
         fs::write(root.join("src/lib.rs"), "pub fn lib() {}").expect("write lib");
 
-        let plan = plan_auto_inspection(AutoInspectIntent::RepoOverview, &root);
+        let plan = plan_auto_inspection(
+            AutoInspectIntent::RepoOverview,
+            "What's in this repo?",
+            &root,
+        );
         let labels = plan
             .steps
             .iter()
@@ -2093,6 +3402,7 @@ mod tests {
             labels,
             vec![
                 "List .",
+                "List src/",
                 "Read README.md",
                 "Read Cargo.toml",
                 "Read src/main.rs"
@@ -2110,7 +3420,7 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "[package]").expect("write cargo");
         fs::write(root.join("package.json"), "{}").expect("write package");
 
-        let plan = plan_auto_inspection(AutoInspectIntent::DirectoryOverview, &root);
+        let plan = plan_auto_inspection(AutoInspectIntent::DirectoryOverview, "What's here", &root);
         let labels = plan
             .steps
             .iter()
@@ -2123,31 +3433,349 @@ mod tests {
     }
 
     #[test]
-    fn auto_inspection_hidden_context_has_expected_heading() {
+    fn workflow_auto_inspection_starts_with_search() {
+        let root = temp_project_root("workflow-plan");
+        fs::create_dir_all(root.join("src")).expect("create src");
+
+        let where_plan = plan_auto_inspection(
+            AutoInspectIntent::WhereIsImplementation,
+            "Where is cache implemented?",
+            &root,
+        );
+        let trace_plan = plan_auto_inspection(
+            AutoInspectIntent::FeatureTrace,
+            "Trace how sessions are saved",
+            &root,
+        );
+        let config_plan = plan_auto_inspection(
+            AutoInspectIntent::ConfigLocate,
+            "Where is eco mode configured?",
+            &root,
+        );
+
+        assert_eq!(where_plan.steps[0].tool_name, "search");
+        assert_eq!(where_plan.steps[0].argument, "cache");
+        assert_eq!(trace_plan.steps[0].tool_name, "search");
+        assert_eq!(trace_plan.steps[0].argument, "save_session");
+        assert_eq!(config_plan.steps[0].tool_name, "search");
+        assert_eq!(config_plan.steps[0].argument, "eco.enabled");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_query_extraction_prefers_salient_terms() {
+        assert_eq!(
+            extract_auto_inspect_query(
+                "Where is session restore implemented?",
+                AutoInspectIntent::WhereIsImplementation
+            )
+            .as_deref(),
+            Some("load_most_recent")
+        );
+        assert_eq!(
+            extract_auto_inspect_query(
+                "Trace how sessions are saved",
+                AutoInspectIntent::FeatureTrace
+            )
+            .as_deref(),
+            Some("save_session")
+        );
+        assert_eq!(
+            extract_auto_inspect_query(
+                "Where is eco mode configured?",
+                AutoInspectIntent::ConfigLocate
+            )
+            .as_deref(),
+            Some("eco.enabled")
+        );
+    }
+
+    #[test]
+    fn parse_search_output_groups_hits_by_file() {
+        let hits = parse_search_output(
+            "Search results for 'cache' (3 matches):\n\nsrc/main.rs:\n     4: mod cache;\n    18: cache::warm();\n\nsrc/cache/mod.rs:\n     2: pub fn warm() {}\n",
+        );
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "src/main.rs");
+        assert_eq!(hits[0].hits.len(), 2);
+        assert_eq!(hits[1].path, "src/cache/mod.rs");
+    }
+
+    #[test]
+    fn config_candidate_ranking_prefers_config_paths() {
+        let hits = vec![
+            SearchFileHit {
+                path: "docs/context/CLAUDE.md".to_string(),
+                hits: vec![SearchLineHit {
+                    line_number: 1,
+                    line_content: "eco mode documentation".to_string(),
+                }],
+            },
+            SearchFileHit {
+                path: "src/config.rs".to_string(),
+                hits: vec![SearchLineHit {
+                    line_number: 22,
+                    line_content: "pub struct EcoConfig".to_string(),
+                }],
+            },
+        ];
+
+        let ranked = rank_search_files(AutoInspectIntent::ConfigLocate, "eco mode", &hits);
+        assert_eq!(ranked[0].path, "src/config.rs");
+    }
+
+    #[test]
+    fn choose_followup_read_steps_prefers_code_paths_when_available() {
+        let root = temp_project_root("workflow-select");
+        fs::create_dir_all(root.join("src/session")).expect("create src/session");
+        fs::write(
+            root.join("src/session/mod.rs"),
+            "pub fn load_session() {}\n",
+        )
+        .expect("write session mod");
+        fs::write(root.join("docs.md"), "load_most_recent docs\n").expect("write docs");
+
         let plan = AutoInspectPlan {
-            thinking: "Thinking: exploring the repo structure and key project docs.",
-            status_label: "inspecting repo...",
-            context_label: "this repo summary request",
+            intent: AutoInspectIntent::WhereIsImplementation,
+            thinking: "Thinking: locating the most likely implementation files.",
+            status_label: "locating implementation...",
+            context_label: "this implementation lookup request",
+            query: Some("load_most_recent".to_string()),
             steps: vec![],
         };
 
-        let hidden = ToolRegistry::format_results_with_limit(
-            &[ToolResult {
-                tool_name: "list_dir".to_string(),
-                argument: ".".to_string(),
-                output: "Directory: .\n\nsrc/\nREADME.md".to_string(),
-            }],
-            eco_tool_result_limit(false),
+        let hits = vec![
+            SearchFileHit {
+                path: "docs/context/CLAUDE.md".to_string(),
+                hits: vec![SearchLineHit {
+                    line_number: 10,
+                    line_content: "load_most_recent docs".to_string(),
+                }],
+            },
+            SearchFileHit {
+                path: "src/session/mod.rs".to_string(),
+                hits: vec![SearchLineHit {
+                    line_number: 2,
+                    line_content: "pub fn load_most_recent()".to_string(),
+                }],
+            },
+        ];
+
+        let steps = choose_followup_read_steps(
+            &plan,
+            &root,
+            &hits,
+            auto_inspection_budget(
+                AutoInspectIntent::WhereIsImplementation,
+                "llama.cpp · qwen",
+                false,
+            ),
+        );
+
+        assert_eq!(steps[0].argument, "src/session/mod.rs");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_inspection_hidden_context_is_compact_and_structural() {
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::RepoOverview,
+            thinking: "Thinking: exploring the repo structure and key project docs.",
+            status_label: "inspecting repo...",
+            context_label: "this repo summary request",
+            query: None,
+            steps: vec![],
+        };
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[
+                ToolResult {
+                    tool_name: "list_dir".to_string(),
+                    argument: ".".to_string(),
+                    output: "Directory: .\n\nsrc/\ndocs/\nREADME.md\nCargo.toml".to_string(),
+                },
+                ToolResult {
+                    tool_name: "list_dir".to_string(),
+                    argument: "src".to_string(),
+                    output: "Directory: src\n\ncache/\ninference/\ntui/\nmain.rs".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "Cargo.toml".to_string(),
+                    output: "File: Cargo.toml\nLines: 8\n\n```\n[package]\nname = \"params-cli\"\ndescription = \"Personal AI coding assistant CLI\"\n\n[dependencies]\ncrossterm = \"0.28\"\nllama-cpp-2 = \"0.1\"\nserde = \"1\"\n```\n".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "src/main.rs".to_string(),
+                    output: "File: src/main.rs\nLines: 5\n\n```\nmod cache;\nmod inference;\nmod tui;\n\nfn main() {}\n```\n".to_string(),
+                },
+            ],
+            auto_inspection_budget(AutoInspectIntent::RepoOverview, "llama.cpp · test", false),
         )
-        .map(|formatted| {
-            format!(
-                "Automatic inspection context for {}:\n\n{}",
-                plan.context_label, formatted
-            )
-        })
         .expect("hidden context");
 
         assert!(hidden.starts_with("Automatic inspection context for this repo summary request:"));
-        assert!(hidden.contains("--- list_dir(.) ---"));
+        assert!(hidden.contains("Repo type: Rust project"));
+        assert!(hidden.contains("Code areas:"));
+        assert!(hidden.contains("Manifest:"));
+        assert!(hidden.contains("Entrypoint `src/main.rs`; modules: cache, inference, tui"));
+        assert!(!hidden.contains("--- list_dir(.) ---"));
+        assert!(!hidden.contains("Tool results:"));
+        assert!(hidden.chars().count() <= 1000);
+    }
+
+    #[test]
+    fn auto_inspection_budget_is_tighter_for_llama_cpp() {
+        let local =
+            auto_inspection_budget(AutoInspectIntent::RepoOverview, "llama.cpp · qwen", false);
+        let cloud = auto_inspection_budget(
+            AutoInspectIntent::RepoOverview,
+            "openai_compat · gpt",
+            false,
+        );
+
+        assert!(local.total_chars < cloud.total_chars);
+        assert!(local.readme_chars < cloud.readme_chars);
+        assert!(local.entrypoint_chars < cloud.entrypoint_chars);
+    }
+
+    #[test]
+    fn auto_inspection_prefers_code_structure_over_large_readme_excerpt() {
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::RepoOverview,
+            thinking: "Thinking: exploring the repo structure and key project docs.",
+            status_label: "inspecting repo...",
+            context_label: "this repo summary request",
+            query: None,
+            steps: vec![],
+        };
+        let long_readme = "README intro ".repeat(120);
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[
+                ToolResult {
+                    tool_name: "list_dir".to_string(),
+                    argument: ".".to_string(),
+                    output: "Directory: .\n\nsrc/\nREADME.md\nCargo.toml".to_string(),
+                },
+                ToolResult {
+                    tool_name: "list_dir".to_string(),
+                    argument: "src".to_string(),
+                    output: "Directory: src\n\ncache/\nconfig/\ninference/\nsession/\ntools/\ntui/\nmain.rs".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "README.md".to_string(),
+                    output: format!("File: README.md\nLines: 40\n\n```\n{}\n```\n", long_readme),
+                },
+                ToolResult {
+                    tool_name: "list_dir".to_string(),
+                    argument: ".".to_string(),
+                    output: "Directory: .\n\nsrc/\nREADME.md\nCargo.toml".to_string(),
+                },
+            ],
+            auto_inspection_budget(AutoInspectIntent::RepoOverview, "llama.cpp · qwen", false),
+        )
+        .expect("hidden context");
+
+        assert!(hidden.contains("Code areas:"));
+        assert!(hidden.contains("`cache/`"));
+        assert!(hidden.contains("`inference/`"));
+        assert!(hidden.chars().count() <= 1000);
+    }
+
+    #[test]
+    fn workflow_hidden_context_is_compact_and_query_driven() {
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::WhereIsImplementation,
+            thinking: "Thinking: locating the most likely implementation files.",
+            status_label: "locating implementation...",
+            context_label: "this implementation lookup request",
+            query: Some("cache".to_string()),
+            steps: vec![],
+        };
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[
+                ToolResult {
+                    tool_name: "search".to_string(),
+                    argument: "cache".to_string(),
+                    output: "Search results for 'cache' (3 matches):\n\nsrc/main.rs:\n     4: mod cache;\n    18: cache::warm();\n\nsrc/cache/mod.rs:\n     2: pub fn warm() {}\n".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "src/cache/mod.rs".to_string(),
+                    output: "File: src/cache/mod.rs\nLines: 4\n\n```\npub fn warm() {}\npub fn clear() {}\n```\n".to_string(),
+                },
+            ],
+            auto_inspection_budget(
+                AutoInspectIntent::WhereIsImplementation,
+                "llama.cpp · qwen",
+                false,
+            ),
+        )
+        .expect("workflow context");
+
+        assert!(hidden
+            .starts_with("Automatic inspection context for this implementation lookup request:"));
+        assert!(hidden.contains("Instruction: answer directly from this evidence."));
+        assert!(
+            hidden.contains("Prefer exact inspected-file evidence over supporting search hits.")
+        );
+        assert!(hidden.contains("Do not emit tool calls or fenced code blocks."));
+        assert!(hidden.contains("Query: cache"));
+        assert!(hidden.contains("Likely files:"));
+        assert!(hidden.contains("Implementation hints:"));
+        assert!(hidden.contains("declarations: 1 `pub fn warm() {}`"));
+        assert!(!hidden.contains("Supporting search hits:"));
+        assert!(!hidden.contains("Tool results:"));
+        assert!(hidden.chars().count() <= 900);
+    }
+
+    #[test]
+    fn workflow_hidden_context_prefers_inspected_file_hits_over_doc_search_hits() {
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::WhereIsImplementation,
+            thinking: "Thinking: locating the most likely implementation files.",
+            status_label: "locating implementation...",
+            context_label: "this implementation lookup request",
+            query: Some("load_most_recent".to_string()),
+            steps: vec![],
+        };
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[
+                ToolResult {
+                    tool_name: "search".to_string(),
+                    argument: "load_most_recent".to_string(),
+                    output: "Search results for 'load_most_recent' (4 matches):\n\nsrc/session/mod.rs:\n   272: pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n   844: let loaded = store.load_most_recent().unwrap().unwrap();\n\ndocs/context/PLANS.md:\n  3189: load_most_recent overview\n".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "src/session/mod.rs".to_string(),
+                    output: "File: src/session/mod.rs\nLines: 8\n\n```\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n        return Ok(None);\n    };\n    self.load_session_by_id(&summary.id)\n}\n\npub fn load_session(&self, selector: &str) -> Result<SavedSession> {\n```\n".to_string(),
+                },
+            ],
+            auto_inspection_budget(
+                AutoInspectIntent::WhereIsImplementation,
+                "llama.cpp · qwen",
+                false,
+            ),
+        )
+        .expect("workflow context");
+
+        assert!(hidden.contains("Likely files: `src/session/mod.rs`"));
+        assert!(hidden.contains(
+            "Implementation hints: `src/session/mod.rs`; exact lines: 1 `pub fn load_most_recent"
+        ));
+        assert!(!hidden.contains("Supporting search hits:"));
+        assert!(!hidden.contains("src/session/mod.rs:844"));
+        assert!(!hidden.contains("docs/context/PLANS.md:3189"));
     }
 }
