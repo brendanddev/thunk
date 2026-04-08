@@ -82,7 +82,7 @@ impl SkippedFactReason {
             Self::Quality => "filtered quality",
             Self::Hedged => "hedged or uncertain",
             Self::Unresolved => "unresolved or intent",
-            Self::Unanchored => "missing evidence anchor",
+            Self::Unanchored => "missing project anchor",
             Self::Duplicate => "duplicate",
         }
     }
@@ -469,10 +469,11 @@ fn merged_provenance(existing: FactProvenance, incoming: FactProvenance) -> Fact
 fn build_fact_extraction_prompt(evidence: &TurnMemoryEvidence) -> Vec<Message> {
     let mut body = String::new();
     body.push_str(
-        "Extract 0-4 verified technical facts from this evidence pack.\n\
+        "Extract 0-4 verified project-specific technical facts from this evidence pack.\n\
          Only emit a fact when it is directly supported by the evidence.\n\
-         Facts must be concrete, resolved outcomes about files, symbols, config values, URLs/hosts, or approved tool results.\n\
-         Do not include hedges, TODOs, plans, user intent, or meta commentary.\n\
+         Facts must be concrete, resolved outcomes about this repo/workspace: files, symbols, config values, URLs/hosts, commands, or approved tool results.\n\
+         Do not include general programming knowledge, language explanations, hedges, TODOs, plans, user intent, or meta commentary.\n\
+         If the evidence does not support a project-specific durable fact, reply with NOTHING.\n\
          If no verified facts exist, reply with NOTHING.\n\
          Write one fact per line with no bullets or numbering.\n\n",
     );
@@ -564,9 +565,6 @@ fn evidence_anchors(evidence: &TurnMemoryEvidence) -> HashSet<String> {
             &mut anchors,
         );
     }
-    if let Some(final_response) = &evidence.final_response {
-        collect_anchor_tokens(final_response, &mut anchors);
-    }
     anchors
 }
 
@@ -575,16 +573,23 @@ fn collect_anchor_tokens(text: &str, anchors: &mut HashSet<String>) {
         if token.len() < 4 {
             continue;
         }
-        if token.contains('/')
-            || token.contains('.')
-            || token.contains("::")
-            || token.contains('_')
-            || token.contains("://")
-            || token.chars().any(|c| c.is_ascii_uppercase())
-        {
+        if is_project_anchor_token(&token) {
             anchors.insert(token.to_lowercase());
         }
     }
+}
+
+fn is_project_anchor_token(token: &str) -> bool {
+    token.contains('/')
+        || token.contains('.')
+        || token.contains("::")
+        || token.contains('_')
+        || token.contains("://")
+        || token.contains('-')
+        || token.starts_with('/')
+        || token.chars().skip(1).any(|c| c.is_ascii_uppercase())
+        || (token.chars().any(|c| c.is_ascii_digit())
+            && token.chars().any(|c| c.is_ascii_alphabetic()))
 }
 
 fn contains_anchor(fact: &str, anchors: &HashSet<String>) -> bool {
@@ -639,7 +644,7 @@ fn is_quality_fact(fact: &str) -> bool {
         return false;
     }
     let first = fact.chars().next().unwrap_or('x');
-    if first.is_ascii_digit() {
+    if first.is_ascii_digit() || matches!(first, '-' | '*') {
         return false;
     }
     let lower = fact.to_lowercase();
@@ -759,6 +764,13 @@ mod tests {
     }
 
     #[test]
+    fn quality_fact_rejects_bullet_style_lines() {
+        assert!(!is_quality_fact(
+            "- C/C++ uses raw pointers directly in the language"
+        ));
+    }
+
+    #[test]
     fn validation_rejects_hedged_fact() {
         let mut anchors = HashSet::new();
         anchors.insert("src/main.rs".to_string());
@@ -809,6 +821,29 @@ mod tests {
         assert!(anchors.contains("src/main.rs"));
         assert!(anchors.contains("factstore"));
         assert!(anchors.contains("src/memory/facts.rs"));
+    }
+
+    #[test]
+    fn generic_answer_content_does_not_create_project_anchors() {
+        let evidence = TurnMemoryEvidence {
+            user_prompt: "So no other languages have pointers?".to_string(),
+            summaries: Vec::new(),
+            tool_results: Vec::new(),
+            final_response: Some(
+                "No, other languages also have pointers, but they handle them differently."
+                    .to_string(),
+            ),
+        };
+
+        let anchors = evidence_anchors(&evidence);
+        assert!(anchors.is_empty());
+        assert_eq!(
+            validate_candidate_fact(
+                "No, other languages also have pointers, but they handle them differently.",
+                &anchors
+            ),
+            Err(SkippedFactReason::Unanchored)
+        );
     }
 
     #[test]

@@ -255,6 +255,7 @@ Session behavior:
 
 Memory behavior:
 - durable facts are promoted per turn from strict evidence instead of raw end-of-session transcript extraction
+- verified facts now need a concrete project/workspace anchor (files, symbols, config values, commands, URLs/hosts, or approved tool evidence), so generic educational answer content is filtered out instead of being stored as durable memory
 - each user turn now builds a retrieval bundle from indexed file summaries, prompt-relevant durable facts, and selective prior-session excerpts from saved sessions in the current project
 - `/memory status` shows loaded fact count plus the most recent retrieval query and the last selected summaries, fact matches, and session excerpts
 - `/memory facts` lists the currently loaded durable facts with `legacy` vs `verified` tags
