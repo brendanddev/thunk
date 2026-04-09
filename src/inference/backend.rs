@@ -1,5 +1,3 @@
-// src/inference/backend.rs
-
 use crate::error::Result;
 use crate::events::InferenceEvent;
 use serde::Serialize;

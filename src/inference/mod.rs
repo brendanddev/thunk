@@ -1,11 +1,3 @@
-// src/inference/mod.rs
-//
-// Public API for the inference module.
-//
-// model_thread loads the backend once and handles prompts in a loop.
-// After each generation it checks for tool calls in the response —
-// if found, it runs them and continues the conversation automatically.
-
 mod approval;
 mod backend;
 mod budget;

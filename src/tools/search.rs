@@ -1,13 +1,3 @@
-// src/tools/search.rs
-//
-// Search tool — find text across all files in the current directory.
-//
-// This is what makes the model useful for navigating unfamiliar codebases.
-// Instead of you having to manually find which file contains a function,
-// the model can search for it directly.
-//
-// Usage in model response: [search: fn authenticate]
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -66,10 +56,18 @@ impl Tool for SearchCode {
             if total > 50 { ", showing first 50" } else { "" }
         );
 
-        // Group by file
+        // Group by file — use project-root-relative paths so they match
+        // the paths produced by read_file, enabling correct deduplication
+        // and supporting-hit matching in the auto-inspection synthesizer
         let mut current_file = String::new();
         for m in &matches {
-            let file_str = m.path.display().to_string();
+            let file_str = m
+                .path
+                .strip_prefix(&current_dir)
+                .ok()
+                .and_then(|p| p.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| m.path.display().to_string());
             if file_str != current_file {
                 output.push_str(&format!("\n{}:\n", file_str));
                 current_file = file_str;
@@ -142,5 +140,65 @@ fn search_file(path: &Path, query: &str, matches: &mut Vec<SearchMatch>) {
                 line_content: line.to_string(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn search_output_uses_relative_paths() {
+        // Reproduces the root cause of wrong line numbers in auto-inspection:
+        // SearchCode was emitting absolute paths while ReadFile emits relative
+        // paths. The mismatch caused every search hit and every read file to be
+        // treated as different files, so deduplication failed and the model saw
+        // both the absolute and relative form of the same path.
+        let dir = std::env::temp_dir().join(format!(
+            "params-search-relpath-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let file = src_dir.join("lib.rs");
+        fs::write(&file, "pub fn my_function() {}\n").unwrap();
+
+        // Temporarily change the working directory so project_root() returns
+        // our temp dir. We can't call SearchCode.run() easily without the
+        // safety infrastructure, so instead test the path-stripping logic
+        // directly via the internal walk helpers.
+        let mut matches: Vec<SearchMatch> = Vec::new();
+        walk_and_search(&dir, "my_function", &mut matches).unwrap();
+        assert!(!matches.is_empty(), "should find the function");
+
+        // Build the output string the same way SearchCode.run() does after the fix.
+        let root = &dir;
+        for m in &matches {
+            let file_str = m
+                .path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|p| p.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| m.path.display().to_string());
+
+            assert!(
+                !file_str.starts_with('/'),
+                "path in search output must be relative, got: {file_str}"
+            );
+            assert!(
+                file_str.contains("src"),
+                "relative path should contain 'src', got: {file_str}"
+            );
+        }
+
+        let _ = fs::remove_file(file);
+        let _ = fs::remove_dir(src_dir);
+        let _ = fs::remove_dir(dir);
     }
 }

@@ -302,7 +302,16 @@ fn extract_auto_inspect_query(prompt: &str, intent: AutoInspectIntent) -> Option
     let normalized = normalize_intent_text(prompt);
     if normalized.contains("session") {
         if normalized.contains("save") || normalized.contains("saved") {
-            return Some("save_session".to_string());
+            // Target the actual persistence function (`save_messages` in
+            // src/session/mod.rs) rather than the private thin wrapper
+            // `save_session` in src/inference/session.rs.  The wrapper file is
+            // ~150 KB — it exceeds the read_file limit and can never be
+            // inspected.  `save_messages` is in the small, readable session
+            // store and IS the true implementation.  Using it as the search
+            // key also avoids finding the query-string literal
+            // `"save_session(".to_string()` that appears in this file's own
+            // query-builder code.
+            return Some("save_messages".to_string());
         }
         if normalized.contains("restore")
             || normalized.contains("restored")
@@ -825,13 +834,11 @@ fn primary_definition_location(
     max_chars: usize,
 ) -> Option<String> {
     let terms = query_terms(query);
-    let mut matches = definition_match_lines_with_numbers(content, &terms, 1);
-    if matches.is_empty() {
-        matches = declaration_lines_with_numbers(content)
-            .into_iter()
-            .take(1)
-            .collect();
-    }
+    let matches = definition_match_lines_with_numbers(content, &terms, 1);
+    // Do NOT fall back to declaration_lines_with_numbers. If the file has no
+    // definition line matching the query, it simply doesn't define the symbol —
+    // reporting an unrelated declaration as the "Primary definition" produces
+    // a false anchor the model will cite with a wrong line number.
     let (line_number, line) = matches.into_iter().next()?;
     Some(format!(
         "{}:{} `{}`",
@@ -986,16 +993,15 @@ fn preferred_config_paths(project_root: &Path) -> Vec<String> {
 fn preferred_workflow_paths(plan: &AutoInspectPlan, project_root: &Path) -> Vec<String> {
     let mut preferred = match plan.query.as_deref() {
         Some("load_most_recent") => {
-            vec![
-                "src/session/mod.rs".to_string(),
-                "src/inference/session.rs".to_string(),
-            ]
+            // src/inference/session.rs is ~150 KB — exceeds the read_file 100 KB
+            // limit and never defines this function. Only list the file that
+            // actually defines it.
+            vec!["src/session/mod.rs".to_string()]
         }
-        Some("save_session") => {
-            vec![
-                "src/inference/session.rs".to_string(),
-                "src/session/mod.rs".to_string(),
-            ]
+        Some("save_messages") => {
+            // The actual persistence logic lives in src/session/mod.rs.
+            // src/inference/session.rs is ~150 KB and always fails to read.
+            vec!["src/session/mod.rs".to_string()]
         }
         Some("eco.enabled") => vec![
             "src/config/profile.rs".to_string(),
@@ -1014,6 +1020,16 @@ fn preferred_workflow_paths(plan: &AutoInspectPlan, project_root: &Path) -> Vec<
         .into_iter()
         .filter(|rel| project_root.join(rel).is_file())
         .collect()
+}
+
+fn is_auto_inspection_read_candidate(project_root: &Path, rel: &str) -> bool {
+    const MAX_READ_BYTES: u64 = 100_000;
+    let path = project_root.join(rel);
+    path.is_file()
+        && path
+            .metadata()
+            .map(|meta| meta.len() <= MAX_READ_BYTES)
+            .unwrap_or(false)
 }
 
 fn choose_followup_read_steps(
@@ -1092,6 +1108,7 @@ fn choose_followup_read_steps(
     selected.truncate(budget.read_files);
     selected
         .into_iter()
+        .filter(|path| is_auto_inspection_read_candidate(project_root, path))
         .map(|path| AutoInspectStep {
             label: format!("Read {path}"),
             tool_name: "read_file",
@@ -1131,7 +1148,7 @@ fn summarize_workflow_read(
             }
             Some(clip_inline(&parts.join("; "), max_chars))
         }
-        AutoInspectIntent::WhereIsImplementation | AutoInspectIntent::FeatureTrace => {
+        AutoInspectIntent::WhereIsImplementation => {
             let matches = if intent == AutoInspectIntent::WhereIsImplementation {
                 let preferred = definition_match_lines_with_numbers(content, &terms, 2);
                 if preferred.is_empty() {
@@ -1149,7 +1166,11 @@ fn summarize_workflow_read(
                     format_numbered_hits(&matches, 48)
                 ));
             }
-            if !declarations.is_empty() {
+            // Only add the generic declarations list when no exact matches were
+            // found. When we already have the target line, the first-N declarations
+            // from the file are unrelated noise — small line numbers from structs
+            // near the top of the file that the model will erroneously cite.
+            if matches.is_empty() && !declarations.is_empty() {
                 parts.push(format!(
                     "declarations: {}",
                     format_numbered_hits(&declarations, 36)
@@ -1157,8 +1178,75 @@ fn summarize_workflow_read(
             }
             Some(clip_inline(&parts.join("; "), max_chars))
         }
+        AutoInspectIntent::FeatureTrace => {
+            let matches = match_lines_with_numbers(content, &terms, 3);
+            if matches.is_empty() {
+                return None;
+            }
+
+            let parts = vec![
+                file_display_name(path),
+                format!("flow lines: {}", format_numbered_hits(&matches, 48)),
+            ];
+            Some(clip_inline(&parts.join("; "), max_chars))
+        }
         AutoInspectIntent::RepoOverview | AutoInspectIntent::DirectoryOverview => None,
     }
+}
+
+fn summarize_feature_trace_hits(
+    query: &str,
+    ranked: &[SearchFileHit],
+    budget: AutoInspectBudget,
+) -> Vec<String> {
+    ranked
+        .iter()
+        .take(budget.search_files)
+        .flat_map(|file| {
+            file.hits
+                .iter()
+                .filter(move |hit| is_feature_trace_anchor_line(query, &hit.line_content))
+                .take(budget.key_hits_per_file + 1)
+                .map(move |hit| {
+                    format!(
+                        "{}:{} `{}`",
+                        file.path,
+                        hit.line_number,
+                        clip_inline(&hit.line_content, 56)
+                    )
+                })
+        })
+        .take(budget.search_files * (budget.key_hits_per_file + 1))
+        .collect()
+}
+
+fn is_feature_trace_anchor_line(query: &str, line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let query_trimmed = query.trim();
+    let bare_query = query_trimmed.trim_end_matches('(');
+    let lower = trimmed.to_ascii_lowercase();
+    let contains_symbol = lower.contains(query_trimmed)
+        || (!bare_query.is_empty() && lower.contains(&format!("{bare_query}(")));
+
+    if !contains_symbol {
+        return false;
+    }
+
+    if trimmed.contains('"')
+        || trimmed.contains('\'')
+        || trimmed.contains("assert!")
+        || trimmed.contains("return Some(")
+        || trimmed.contains("Some(\"")
+        || trimmed.contains("output:")
+    {
+        return false;
+    }
+
+    is_definition_like_line(trimmed) || trimmed.contains(&format!("{bare_query}("))
 }
 
 fn summarize_readme(content: &str, max_chars: usize) -> Option<String> {
@@ -1376,6 +1464,11 @@ fn synthesize_auto_inspection_context(
                 .collect::<Vec<_>>()
         };
         let has_read_summaries = !read_summaries.is_empty();
+        let flow_hits = if plan.intent == AutoInspectIntent::FeatureTrace {
+            summarize_feature_trace_hits(query, &ranked, budget)
+        } else {
+            Vec::new()
+        };
 
         let key_hits = supporting_hits
             .into_iter()
@@ -1408,6 +1501,9 @@ fn synthesize_auto_inspection_context(
             AutoInspectIntent::WhereIsImplementation => {
                 "Instruction: answer directly from this evidence. Prefer exact inspected-file evidence over supporting search hits. Report definition or implementation locations only, not use-sites, call-sites, tests, or later references. If multiple line numbers appear, cite the primary definition line and omit usage lines. Do not ask for more inspection unless the evidence is clearly insufficient. Do not emit tool calls or fenced code blocks. If exact code is not included below, answer in prose with file paths and line references only."
             }
+            AutoInspectIntent::FeatureTrace => {
+                "Instruction: answer directly from this evidence. Focus on the actual control flow using the flow anchors and inspected file hints below. Do not invent function bodies, placeholder snippets, or implementation details that are not present in the evidence — if the evidence shows only a function signature or a call site, describe what the name and signature tell you and cite the file:line location. Do not emit tool calls or fenced code blocks. Do not speculate from unrelated declarations."
+            }
             _ => {
                 "Instruction: answer directly from this evidence. Prefer exact inspected-file evidence over supporting search hits. Do not ask for more inspection unless the evidence is clearly insufficient. Do not emit tool calls or fenced code blocks. If exact code is not included below, answer in prose with file paths and line references only."
             }
@@ -1422,6 +1518,9 @@ fn synthesize_auto_inspection_context(
         }
         if !likely_files.is_empty() {
             sections.push(format!("Likely files: {}", likely_files.join(", ")));
+        }
+        if !flow_hits.is_empty() {
+            sections.push(format!("Primary flow anchors: {}", flow_hits.join("; ")));
         }
         if !read_summaries.is_empty() {
             let label = match plan.intent {
@@ -1443,6 +1542,25 @@ fn synthesize_auto_inspection_context(
                 "Supporting search hits"
             };
             sections.push(format!("{label}: {}", key_hits.join("; ")));
+        }
+        // When the workflow ran but could not inspect any file content (e.g.
+        // every candidate file exceeded the read limit), tell the model
+        // explicitly so it does not fill the gap with invented snippets.
+        if !has_read_summaries
+            && matches!(
+                plan.intent,
+                AutoInspectIntent::FeatureTrace
+                    | AutoInspectIntent::WhereIsImplementation
+                    | AutoInspectIntent::ConfigLocate
+            )
+            && (!flow_hits.is_empty() || !key_hits.is_empty())
+        {
+            sections.push(
+                "Evidence: search anchors only — no file content was inspected. \
+                 Cite only the locations above. Do not infer or invent \
+                 function bodies or implementation details."
+                    .to_string(),
+            );
         }
 
         let mut output = String::new();
@@ -3559,7 +3677,10 @@ mod tests {
         assert_eq!(where_plan.steps[0].tool_name, "search");
         assert_eq!(where_plan.steps[0].argument, "cache");
         assert_eq!(trace_plan.steps[0].tool_name, "search");
-        assert_eq!(trace_plan.steps[0].argument, "save_session");
+        // save_session is a thin wrapper in the ~150 KB unreadable file; the
+        // real persistence function save_messages is in the readable session
+        // store, so we search for that instead.
+        assert_eq!(trace_plan.steps[0].argument, "save_messages");
         assert_eq!(config_plan.steps[0].tool_name, "search");
         assert_eq!(config_plan.steps[0].argument, "eco.enabled");
 
@@ -3582,7 +3703,7 @@ mod tests {
                 AutoInspectIntent::FeatureTrace
             )
             .as_deref(),
-            Some("save_session")
+            Some("save_messages")
         );
         assert_eq!(
             extract_auto_inspect_query(
@@ -3954,5 +4075,275 @@ mod tests {
 
         assert!(hidden.contains("Report definition or implementation locations only"));
         assert!(hidden.contains("omit usage lines"));
+    }
+
+    // --- Tests that reproduce the actual runtime failure modes ---
+
+    #[test]
+    fn summarize_workflow_read_omits_unrelated_declarations_when_exact_match_found() {
+        // Reproduces the "line 28 / line 34 / struct noise" failure: the old
+        // code always appended the first-N declaration lines from the file even
+        // when an exact definition match was already found. Those small line
+        // numbers (top-of-file structs) were cited by the model instead of the
+        // correct line.
+        let content = "pub struct Other {}\n\npub struct AnotherThing {}\n\n\
+                       pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n";
+        let summary = summarize_workflow_read(
+            "src/session/mod.rs",
+            content,
+            "load_most_recent",
+            AutoInspectIntent::WhereIsImplementation,
+            400,
+        )
+        .expect("summary");
+
+        assert!(summary.contains("exact lines: 5 `pub fn load_most_recent"));
+        // The unrelated structs at lines 1 and 3 must NOT appear.
+        assert!(
+            !summary.contains("declarations:"),
+            "declarations section should be omitted when exact match exists"
+        );
+        assert!(!summary.contains("1 `pub struct Other"));
+        assert!(!summary.contains("3 `pub struct AnotherThing"));
+    }
+
+    #[test]
+    fn primary_definition_location_returns_none_for_file_that_only_calls_the_function() {
+        // Reproduces the "line 12 / wrong anchor" failure: the old fallback in
+        // primary_definition_location would pick the first fn/struct in the file
+        // even when the file never *defines* the queried symbol, producing a
+        // completely wrong "Primary definition" anchor.
+        let content = "fn call_something() {\n    store.load_most_recent().unwrap();\n}\n\
+                       fn other() {\n    let x = load_most_recent();\n}\n";
+        let location = primary_definition_location(
+            "src/inference/session.rs",
+            content,
+            "load_most_recent",
+            72,
+        );
+        // Should return None — this file calls but does not define the function.
+        assert!(
+            location.is_none(),
+            "expected None for a file that only calls the function, got: {location:?}"
+        );
+    }
+
+    #[test]
+    fn synthesize_context_deduplicates_search_and_read_paths_when_formats_match() {
+        // Reproduces the absolute-vs-relative path mismatch: SearchCode previously
+        // produced absolute paths while ReadFile produced relative paths, causing
+        // every file to appear twice in Likely files and supporting_hits to be
+        // always empty. After the fix, both use relative paths and this test
+        // verifies they are deduplicated correctly.
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::WhereIsImplementation,
+            thinking: "t",
+            status_label: "s",
+            context_label: "this implementation lookup request",
+            query: Some("load_most_recent".to_string()),
+            steps: vec![],
+        };
+
+        // Both the search output and the read output use the same relative path.
+        let results = vec![
+            ToolResult {
+                tool_name: "search".to_string(),
+                argument: "load_most_recent".to_string(),
+                output: "Search results for 'load_most_recent' (1 match):\n\nsrc/session/mod.rs:\n   272: pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n".to_string(),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: "File: src/session/mod.rs\nLines: 3\n\n```\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n```\n".to_string(),
+            },
+        ];
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &results,
+            auto_inspection_budget(AutoInspectIntent::WhereIsImplementation, "openai", false),
+        )
+        .expect("context");
+
+        // The file should appear exactly once in Likely files — no duplicate
+        // caused by one absolute and one relative representation.
+        let likely_start = hidden.find("Likely files:").expect("Likely files section");
+        let likely_end = hidden[likely_start..]
+            .find('\n')
+            .map(|i| likely_start + i)
+            .unwrap_or(hidden.len());
+        let likely_line = &hidden[likely_start..likely_end];
+        let occurrences = likely_line.matches("src/session/mod.rs").count();
+        assert_eq!(
+            occurrences, 1,
+            "src/session/mod.rs should appear exactly once in Likely files, got: {likely_line}"
+        );
+    }
+
+    #[test]
+    fn primary_definition_location_correct_for_deep_line_number() {
+        // Verifies that the correct line number is reported when the target
+        // function is deep in the file (e.g. line 272 in the real session store),
+        // not confused by unrelated top-of-file structs.
+        let mut content = String::new();
+        // Pad with 271 blank lines so the function starts at line 272.
+        for _ in 0..271 {
+            content.push('\n');
+        }
+        content.push_str("pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n");
+        content.push_str("    Ok(None)\n");
+        content.push_str("}\n");
+
+        let location =
+            primary_definition_location("src/session/mod.rs", &content, "load_most_recent", 72)
+                .expect("location");
+
+        assert!(
+            location.starts_with("src/session/mod.rs:272 "),
+            "expected line 272, got: {location}"
+        );
+    }
+
+    #[test]
+    fn feature_trace_summary_skips_unrelated_declarations_without_matches() {
+        let summary = summarize_workflow_read(
+            "src/session/mod.rs",
+            "pub struct SessionSummary {}\n\npub struct SavedSession {}\n",
+            "save_session",
+            AutoInspectIntent::FeatureTrace,
+            240,
+        );
+
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn feature_trace_context_prefers_search_flow_anchors_when_large_file_cannot_be_read() {
+        // When the target file is too large to read (e.g., src/inference/session.rs),
+        // the workflow falls back to search-only evidence.  The synthesizer must
+        // emit the "search anchors only" evidence-quality warning and the
+        // anti-fabrication FeatureTrace instruction so the model does not invent
+        // code bodies it never read.
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::FeatureTrace,
+            thinking: "Thinking: tracing the main code path for this feature.",
+            status_label: "tracing feature...",
+            context_label: "this feature trace request",
+            query: Some("save_messages".to_string()),
+            steps: vec![],
+        };
+
+        // Use a non-constrained backend so the evidence warning is not truncated
+        // by the tighter llama.cpp budget (900 chars).
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[ToolResult {
+                tool_name: "search".to_string(),
+                argument: "save_messages".to_string(),
+                output: "Search results for 'save_messages' (4 matches):\n\nsrc/session/mod.rs:\n  224: pub fn save_messages(\n  241: save_messages(\n  260: save_messages(&conn, session_id, messages);\n  3635: assert_eq!(trace_plan.steps[0].argument, \"save_messages\");\n".to_string(),
+            }],
+            auto_inspection_budget(AutoInspectIntent::FeatureTrace, "openai_compat · gpt-4", false),
+        )
+        .expect("context");
+
+        assert!(hidden.contains("Primary flow anchors:"));
+        assert!(hidden.contains("src/session/mod.rs:224 `pub fn save_messages(`"));
+        assert!(hidden.contains("src/session/mod.rs:241 `save_messages(`"));
+        // assert_eq! call sites must be filtered out by is_feature_trace_anchor_line
+        assert!(!hidden.contains("assert_eq!(trace_plan.steps[0].argument"));
+        // Anti-fabrication instruction must be present
+        assert!(hidden.contains("Do not invent function bodies, placeholder snippets"));
+        // Evidence-quality warning must appear when no file content was read
+        assert!(hidden.contains("Evidence: search anchors only"));
+    }
+
+    #[test]
+    fn feature_trace_context_grounded_when_file_is_readable() {
+        // Happy path: the readable src/session/mod.rs contains save_messages,
+        // so the synthesizer should produce "Flow hints" from actual file
+        // content and NOT emit the "search anchors only" evidence warning.
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::FeatureTrace,
+            thinking: "Thinking: tracing session save.",
+            status_label: "tracing feature...",
+            context_label: "this feature trace request",
+            query: Some("save_messages".to_string()),
+            steps: vec![],
+        };
+
+        let file_content = "pub fn save_messages(\n    conn: &Connection,\n    session_id: i64,\n    messages: &[Message],\n) -> Result<()> {\n    for msg in messages {\n        conn.execute(INSERT, params![session_id, msg.role, msg.content])?;\n    }\n    Ok(())\n}";
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[
+                ToolResult {
+                    tool_name: "search".to_string(),
+                    argument: "save_messages".to_string(),
+                    output: "Search results for 'save_messages' (2 matches):\n\nsrc/session/mod.rs:\n  224: pub fn save_messages(\n  241: save_messages(&conn, session_id, messages);\n".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "src/session/mod.rs".to_string(),
+                    output: format!("File: src/session/mod.rs\nLines: 10\n\n```\n{file_content}\n```"),
+                },
+            ],
+            auto_inspection_budget(AutoInspectIntent::FeatureTrace, "llama.cpp · qwen", false),
+        )
+        .expect("context");
+
+        // File content was read, so flow hints must appear
+        assert!(hidden.contains("Flow hints"));
+        assert!(hidden.contains("src/session/mod.rs"));
+        // The "search anchors only" warning must NOT appear — we have real evidence
+        assert!(!hidden.contains("Evidence: search anchors only"));
+        // Anti-fabrication instruction must still be present
+        assert!(hidden.contains("Do not invent function bodies, placeholder snippets"));
+    }
+
+    #[test]
+    fn choose_followup_read_steps_skips_oversized_auto_inspection_files() {
+        let root = temp_project_root("workflow-large-skip");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src/small.rs"), "fn helper() {}\n").expect("write small file");
+        let oversized = "a".repeat(100_500);
+        fs::write(root.join("src/large.rs"), oversized).expect("write large file");
+
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::FeatureTrace,
+            thinking: "Thinking: tracing the main code path for this feature.",
+            status_label: "tracing feature...",
+            context_label: "this feature trace request",
+            query: Some("save_session".to_string()),
+            steps: vec![],
+        };
+
+        let hits = vec![
+            SearchFileHit {
+                path: "src/large.rs".to_string(),
+                hits: vec![SearchLineHit {
+                    line_number: 1,
+                    line_content: "fn save_session(".to_string(),
+                }],
+            },
+            SearchFileHit {
+                path: "src/small.rs".to_string(),
+                hits: vec![SearchLineHit {
+                    line_number: 1,
+                    line_content: "fn save_session(".to_string(),
+                }],
+            },
+        ];
+
+        let steps = choose_followup_read_steps(
+            &plan,
+            &root,
+            &hits,
+            auto_inspection_budget(AutoInspectIntent::FeatureTrace, "llama.cpp · qwen", false),
+        );
+
+        assert!(steps.iter().all(|step| step.argument != "src/large.rs"));
+        assert!(steps.iter().any(|step| step.argument == "src/small.rs"));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

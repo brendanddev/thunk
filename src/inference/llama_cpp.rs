@@ -1,7 +1,3 @@
-// src/inference/llama_cpp.rs
-//
-// The llama.cpp backend — runs a .gguf model directly in-process.
-
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
