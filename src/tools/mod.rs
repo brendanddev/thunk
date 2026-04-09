@@ -71,6 +71,20 @@ pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
 }
 
+fn is_read_only_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "list_dir"
+            | "search"
+            | "git"
+            | "lsp_diagnostics"
+            | "lsp_hover"
+            | "lsp_definition"
+            | "fetch_url"
+    )
+}
+
 impl ToolRegistry {
     /// Create a registry with the default built-in tools.
     pub fn default() -> Self {
@@ -137,6 +151,30 @@ impl ToolRegistry {
         desc
     }
 
+    pub fn read_only_tool_descriptions(&self) -> String {
+        let mut desc = String::from(
+            "You have access to read-only repo inspection tools.\n\
+             When you need one, respond with only tool call content.\n\
+             Use one tag per line with the exact syntax `[tool_name: argument]`.\n\
+             Search before guessing, read candidate files, expand only as needed, and answer with file/line evidence once you have enough information.\n\
+             Do not call mutating tools in this mode.\n\n",
+        );
+        for tool in &self.tools {
+            if is_read_only_tool_name(tool.name()) {
+                desc.push_str(&format!(
+                    "  {}: {}\n  Usage: [{}: <argument>]\n\n",
+                    tool.name(),
+                    tool.description(),
+                    tool.name(),
+                ));
+            }
+        }
+        desc.push_str(
+            "If the current evidence is still insufficient after inspecting the repo, say so briefly instead of inventing details.",
+        );
+        desc
+    }
+
     /// Scan a response string for tool calls and execute them all.
     /// Stops early if a tool requires approval.
     pub fn execute_tool_calls(&self, response: &str) -> ToolExecution {
@@ -192,6 +230,63 @@ impl ToolRegistry {
         }
     }
 
+    pub fn execute_read_only_tool_calls(&self, response: &str) -> ReadOnlyToolExecution {
+        let mut results = Vec::new();
+        let mut disallowed_calls = Vec::new();
+
+        for tool in &self.tools {
+            let tag = format!("[{}:", tool.name());
+            let mut search_from = 0;
+            let is_read_only = is_read_only_tool_name(tool.name());
+
+            while let Some(start) = response[search_from..].find(&tag) {
+                let abs_start = search_from + start;
+                let after_tag = abs_start + tag.len();
+
+                if let Some(end_offset) = response[after_tag..].find(']') {
+                    let arg = response[after_tag..after_tag + end_offset]
+                        .trim()
+                        .to_string();
+
+                    if is_read_only {
+                        match tool.run_with_context(&arg, &response[after_tag + end_offset + 1..]) {
+                            Ok(ToolRunResult::Immediate(output)) => {
+                                results.push(ToolResult {
+                                    tool_name: tool.name().to_string(),
+                                    argument: arg,
+                                    output,
+                                });
+                            }
+                            Ok(ToolRunResult::RequiresApproval(_)) => {
+                                disallowed_calls.push(tool.name().to_string());
+                            }
+                            Err(e) => {
+                                results.push(ToolResult {
+                                    tool_name: tool.name().to_string(),
+                                    argument: arg,
+                                    output: format!("Error: {e}"),
+                                });
+                            }
+                        }
+                    } else {
+                        disallowed_calls.push(tool.name().to_string());
+                    }
+
+                    search_from = after_tag + end_offset + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        disallowed_calls.sort();
+        disallowed_calls.dedup();
+        ReadOnlyToolExecution {
+            results,
+            disallowed_calls,
+        }
+    }
+
     /// Format tool results into a message to inject back into the conversation.
     /// Returns None if there were no tool calls.
     pub fn format_results_with_limit(
@@ -239,6 +334,7 @@ impl ToolRegistry {
 }
 
 /// The result of running a single tool call.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolResult {
     pub tool_name: String,
     pub argument: String,
@@ -253,6 +349,11 @@ pub enum ToolRunResult {
 pub struct ToolExecution {
     pub results: Vec<ToolResult>,
     pub pending: Option<PendingToolAction>,
+}
+
+pub struct ReadOnlyToolExecution {
+    pub results: Vec<ToolResult>,
+    pub disallowed_calls: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -411,5 +512,33 @@ mod tests {
         let pending = execution.pending.expect("expected pending action");
         assert_eq!(pending.display_argument, "display:second");
         assert_eq!(pending.argument, "raw:second");
+    }
+
+    #[test]
+    fn read_only_tool_descriptions_exclude_mutating_tools() {
+        let registry = ToolRegistry::default();
+        let descriptions = registry.read_only_tool_descriptions();
+
+        assert!(descriptions.contains("read_file"));
+        assert!(descriptions.contains("search"));
+        assert!(!descriptions.contains("write_file"));
+        assert!(!descriptions.contains("edit_file"));
+        assert!(!descriptions.contains("bash"));
+    }
+
+    #[test]
+    fn execute_read_only_tool_calls_flags_disallowed_tools() {
+        let registry = ToolRegistry {
+            tools: vec![Box::new(ImmediateTool), Box::new(PendingTool)],
+        };
+
+        let execution =
+            registry.execute_read_only_tool_calls("[immediate: first]\n[pending: second]");
+
+        assert_eq!(execution.results.len(), 0);
+        assert_eq!(
+            execution.disallowed_calls,
+            vec!["immediate".to_string(), "pending".to_string()]
+        );
     }
 }

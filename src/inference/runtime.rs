@@ -66,6 +66,29 @@ pub(super) fn eco_tool_result_limit(eco_enabled: bool) -> Option<usize> {
     }
 }
 
+pub(super) fn emit_buffered_tokens(token_tx: &Sender<InferenceEvent>, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+
+    let mut chunk = String::new();
+    let mut visible = 0usize;
+    for ch in text.chars() {
+        chunk.push(ch);
+        visible += 1;
+        let boundary = ch.is_whitespace() || matches!(ch, '.' | ',' | ';' | ':' | '!' | '?');
+        if visible >= 32 && boundary {
+            let _ = token_tx.send(InferenceEvent::Token(chunk.clone()));
+            chunk.clear();
+            visible = 0;
+        }
+    }
+
+    if !chunk.is_empty() {
+        let _ = token_tx.send(InferenceEvent::Token(chunk));
+    }
+}
+
 pub(super) fn run_and_collect(
     backend: &dyn super::InferenceBackend,
     messages: &[super::Message],
@@ -115,12 +138,34 @@ pub(super) fn run_and_collect(
 
 #[cfg(test)]
 mod tests {
-    use super::effective_reflection;
+    use std::sync::mpsc;
+
+    use super::{effective_reflection, emit_buffered_tokens};
+    use crate::events::InferenceEvent;
 
     #[test]
     fn eco_mode_disables_effective_reflection() {
         assert!(effective_reflection(true, false));
         assert!(!effective_reflection(true, true));
         assert!(!effective_reflection(false, false));
+    }
+
+    #[test]
+    fn buffered_tokens_split_long_text_into_multiple_events() {
+        let (tx, rx) = mpsc::channel();
+        emit_buffered_tokens(
+            &tx,
+            "This is a fairly long tool-loop answer that should be replayed in chunks instead of one giant token.",
+        );
+        let chunks = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                InferenceEvent::Token(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(chunks.len() >= 2, "expected multiple buffered token events");
+        assert_eq!(chunks.concat(), "This is a fairly long tool-loop answer that should be replayed in chunks instead of one giant token.");
     }
 }

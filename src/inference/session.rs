@@ -22,9 +22,7 @@ use crate::session::{
     display_name, list_label, short_id, SessionExcerptMatch, SessionExportFormat, SessionStore,
     SessionSummary,
 };
-use crate::tools::{
-    BashTool, ListDir, ReadFile, SearchCode, Tool, ToolRegistry, ToolResult, ToolRunResult,
-};
+use crate::tools::{BashTool, Tool, ToolRegistry, ToolResult};
 
 use super::approval::{handle_pending_action, ApprovalContext};
 use super::budget::{
@@ -35,9 +33,10 @@ use super::cache::{generate_with_cache, store_exact_cache, store_prompt_level_ca
 use super::indexing::{run_idle_index_step, IncrementalIndexState, IDLE_INDEX_POLL_INTERVAL};
 use super::reflection::reflect_response;
 use super::runtime::{
-    eco_tool_result_limit, effective_reflection, emit_generation_started, emit_trace,
-    log_debug_response, summary_limit,
+    eco_tool_result_limit, effective_reflection, emit_buffered_tokens, emit_generation_started,
+    emit_trace, log_debug_response, summary_limit,
 };
+use super::tool_loop::{detect_tool_loop_intent, run_read_only_tool_loop};
 use super::{build_system_prompt, load_backend_with_fallback, Message, SessionCommand};
 
 #[derive(Clone, Copy, Default)]
@@ -122,52 +121,46 @@ struct AutoInspectBudget {
     workflow_summary_chars: usize,
 }
 
-struct AutoInspectOutcome {
-    hidden_context: Option<String>,
-    tool_results: Vec<ToolResult>,
-}
-
 fn detect_auto_inspect_intent(prompt: &str) -> Option<AutoInspectIntent> {
     let normalized = normalize_intent_text(prompt);
+    let tokens = normalized
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     if normalized.starts_with('/') {
         return None;
     }
 
-    if [
-        "whats in this repo",
-        "what is in this repo",
-        "whats in this project",
-        "what is in this project",
-        "summarize this repo",
-        "summarize this project",
-        "summarize this codebase",
-        "what does this repo do",
-        "what does this project do",
-    ]
-    .iter()
-    .any(|pattern| normalized.contains(pattern))
+    let starts_with = |a: &str, b: &str| {
+        tokens.first().map(|t| t == a).unwrap_or(false)
+            && tokens.get(1).map(|t| t == b).unwrap_or(false)
+    };
+    let has_token = |value: &str| tokens.iter().any(|token| token == value);
+    let has_prefix = |prefix: &str| tokens.iter().any(|token| token.starts_with(prefix));
+
+    if (starts_with("what", "is") || starts_with("whats", "in") || starts_with("what", "does"))
+        && (has_token("repo") || has_token("project") || has_token("codebase"))
     {
         return Some(AutoInspectIntent::RepoOverview);
     }
 
-    if [
-        "whats in this directory",
-        "what is in this directory",
-        "whats in this folder",
-        "what is in this folder",
-        "whats here",
-        "what is here",
-    ]
-    .iter()
-    .any(|pattern| normalized.contains(pattern))
+    if starts_with("summarize", "this")
+        && (has_token("repo") || has_token("project") || has_token("codebase"))
+    {
+        return Some(AutoInspectIntent::RepoOverview);
+    }
+
+    if (starts_with("what", "is")
+        || starts_with("whats", "in")
+        || starts_with("whats", "here")
+        || starts_with("what", "here"))
+        && (has_token("directory") || has_token("folder") || has_token("here"))
     {
         return Some(AutoInspectIntent::DirectoryOverview);
     }
 
-    if normalized.starts_with("where is ")
-        && [" implemented", " defined", " handled"]
-            .iter()
-            .any(|suffix| normalized.ends_with(suffix))
+    if starts_with("where", "is")
+        && (has_prefix("implement") || has_prefix("defin") || has_prefix("handl"))
     {
         return Some(AutoInspectIntent::WhereIsImplementation);
     }
@@ -184,11 +177,7 @@ fn detect_auto_inspect_intent(prompt: &str) -> Option<AutoInspectIntent> {
         return Some(AutoInspectIntent::FeatureTrace);
     }
 
-    if normalized.starts_with("where is ")
-        && [" configured", " set"]
-            .iter()
-            .any(|suffix| normalized.ends_with(suffix))
-    {
+    if starts_with("where", "is") && (has_prefix("config") || has_token("set")) {
         return Some(AutoInspectIntent::ConfigLocate);
     }
 
@@ -268,6 +257,7 @@ fn salient_search_token(phrase: &str, intent: AutoInspectIntent) -> Option<Strin
             "where",
             "is",
             "the",
+            "project",
         ][..],
         AutoInspectIntent::FeatureTrace => &[
             "trace", "how", "does", "work", "works", "flow", "what", "handles", "writes", "to",
@@ -291,11 +281,36 @@ fn salient_search_token(phrase: &str, intent: AutoInspectIntent) -> Option<Strin
         .split_whitespace()
         .map(trim_query_noise)
         .map(|token| singularize_token(&token))
-        .find(|token| {
+        .filter(|token| {
             !token.is_empty()
                 && !stopwords.iter().any(|stop| stop == token)
                 && token.chars().any(|ch| ch.is_ascii_alphanumeric())
         })
+        .max_by(|a, b| {
+            token_specificity_score(a)
+                .cmp(&token_specificity_score(b))
+                .then_with(|| a.len().cmp(&b.len()))
+        })
+}
+
+fn token_specificity_score(token: &str) -> usize {
+    let len = token.len();
+    let alpha_bonus = if token.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        1
+    } else {
+        0
+    };
+    let suffix_bonus = if token.ends_with("ing")
+        || token.ends_with("tion")
+        || token.ends_with("ment")
+        || token.ends_with("al")
+    {
+        2
+    } else {
+        0
+    };
+
+    len + alpha_bonus + suffix_bonus
 }
 
 fn extract_auto_inspect_query(prompt: &str, intent: AutoInspectIntent) -> Option<String> {
@@ -327,7 +342,17 @@ fn extract_auto_inspect_query(prompt: &str, intent: AutoInspectIntent) -> Option
     let extracted = match intent {
         AutoInspectIntent::WhereIsImplementation => {
             if let Some(rest) = normalized.strip_prefix("where is ") {
-                trim_query_suffix(rest, &[" implemented", " defined", " handled"]).to_string()
+                trim_query_suffix(
+                    rest,
+                    &[
+                        " implemented",
+                        " defined",
+                        " handled",
+                        " configured",
+                        " configged",
+                    ],
+                )
+                .to_string()
             } else if let Some(rest) = normalized.strip_prefix("find ") {
                 rest.trim().to_string()
             } else if let Some(rest) = normalized.strip_prefix("which file has ") {
@@ -351,7 +376,7 @@ fn extract_auto_inspect_query(prompt: &str, intent: AutoInspectIntent) -> Option
         }
         AutoInspectIntent::ConfigLocate => {
             if let Some(rest) = normalized.strip_prefix("where is ") {
-                trim_query_suffix(rest, &[" configured", " set"]).to_string()
+                trim_query_suffix(rest, &[" configured", " configged", " set"]).to_string()
             } else if let Some(rest) = normalized.strip_prefix("which file configures ") {
                 rest.trim().to_string()
             } else {
@@ -794,6 +819,27 @@ fn declaration_lines_with_numbers(content: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
+fn test_module_start_line(content: &str) -> Option<usize> {
+    content
+        .lines()
+        .enumerate()
+        .find(|(_, line)| {
+            let trimmed = line.trim();
+            trimmed.starts_with("#[cfg(test)]") || trimmed == "mod tests {"
+        })
+        .map(|(idx, _)| idx + 1)
+}
+
+fn filter_non_test_hits(content: &str, hits: Vec<(usize, String)>) -> Vec<(usize, String)> {
+    if let Some(test_start) = test_module_start_line(content) {
+        hits.into_iter()
+            .filter(|(line_number, _)| *line_number < test_start)
+            .collect()
+    } else {
+        hits
+    }
+}
+
 fn match_lines_with_numbers(
     content: &str,
     query_terms: &[crate::memory::retrieval::QueryTerm],
@@ -846,6 +892,26 @@ fn primary_definition_location(
         line_number,
         clip_inline(&line, max_chars)
     ))
+}
+
+fn primary_config_locations(
+    path: &str,
+    content: &str,
+    query: &str,
+    max_chars: usize,
+) -> Vec<String> {
+    let terms = query_terms(query);
+    filter_non_test_hits(content, match_lines_with_numbers(content, &terms, 2))
+        .into_iter()
+        .map(|(line_number, line)| {
+            format!(
+                "{}:{} `{}`",
+                path,
+                line_number,
+                clip_inline(&line, max_chars)
+            )
+        })
+        .collect()
 }
 
 fn format_numbered_hits(hits: &[(usize, String)], clip_chars: usize) -> String {
@@ -1005,9 +1071,9 @@ fn preferred_workflow_paths(plan: &AutoInspectPlan, project_root: &Path) -> Vec<
         }
         Some("eco.enabled") => vec![
             "src/config/profile.rs".to_string(),
-            "src/inference/session.rs".to_string(),
-            "src/tui/commands.rs".to_string(),
             "src/config.rs".to_string(),
+            "src/tui/commands.rs".to_string(),
+            "src/inference/session.rs".to_string(),
         ],
         _ => Vec::new(),
     };
@@ -1092,23 +1158,10 @@ fn choose_followup_read_steps(
         }
     }
 
-    if plan.intent == AutoInspectIntent::ConfigLocate {
-        let mut preferred = preferred_config_paths(project_root);
-        preferred.reverse();
-        for path in preferred {
-            if let Some(existing_idx) = selected.iter().position(|existing| existing == &path) {
-                let item = selected.remove(existing_idx);
-                selected.insert(0, item);
-            } else {
-                selected.insert(0, path);
-            }
-        }
-    }
-
-    selected.truncate(budget.read_files);
     selected
         .into_iter()
         .filter(|path| is_auto_inspection_read_candidate(project_root, path))
+        .take(budget.read_files)
         .map(|path| AutoInspectStep {
             label: format!("Read {path}"),
             tool_name: "read_file",
@@ -1129,7 +1182,8 @@ fn summarize_workflow_read(
 
     match intent {
         AutoInspectIntent::ConfigLocate => {
-            let matches = match_lines_with_numbers(content, &terms, 2);
+            let matches =
+                filter_non_test_hits(content, match_lines_with_numbers(content, &terms, 2));
             let mut parts = vec![format!(
                 "{} ({})",
                 file_display_name(path),
@@ -1150,14 +1204,17 @@ fn summarize_workflow_read(
         }
         AutoInspectIntent::WhereIsImplementation => {
             let matches = if intent == AutoInspectIntent::WhereIsImplementation {
-                let preferred = definition_match_lines_with_numbers(content, &terms, 2);
+                let preferred = filter_non_test_hits(
+                    content,
+                    definition_match_lines_with_numbers(content, &terms, 2),
+                );
                 if preferred.is_empty() {
-                    match_lines_with_numbers(content, &terms, 2)
+                    filter_non_test_hits(content, match_lines_with_numbers(content, &terms, 2))
                 } else {
                     preferred
                 }
             } else {
-                match_lines_with_numbers(content, &terms, 2)
+                filter_non_test_hits(content, match_lines_with_numbers(content, &terms, 2))
             };
             let mut parts = vec![file_display_name(path)];
             if !matches.is_empty() {
@@ -1179,7 +1236,8 @@ fn summarize_workflow_read(
             Some(clip_inline(&parts.join("; "), max_chars))
         }
         AutoInspectIntent::FeatureTrace => {
-            let matches = match_lines_with_numbers(content, &terms, 3);
+            let matches =
+                filter_non_test_hits(content, match_lines_with_numbers(content, &terms, 3));
             if matches.is_empty() {
                 return None;
             }
@@ -1198,15 +1256,22 @@ fn summarize_feature_trace_hits(
     query: &str,
     ranked: &[SearchFileHit],
     budget: AutoInspectBudget,
+    test_starts: &std::collections::HashMap<String, usize>,
 ) -> Vec<String> {
     ranked
         .iter()
         .take(budget.search_files)
-        .flat_map(|file| {
+        .filter_map(|file| {
             file.hits
                 .iter()
                 .filter(move |hit| is_feature_trace_anchor_line(query, &hit.line_content))
-                .take(budget.key_hits_per_file + 1)
+                .filter(move |hit| {
+                    test_starts
+                        .get(&file.path)
+                        .map(|start| hit.line_number < *start)
+                        .unwrap_or(true)
+                })
+                .next()
                 .map(move |hit| {
                     format!(
                         "{}:{} `{}`",
@@ -1216,7 +1281,6 @@ fn summarize_feature_trace_hits(
                     )
                 })
         })
-        .take(budget.search_files * (budget.key_hits_per_file + 1))
         .collect()
 }
 
@@ -1412,6 +1476,8 @@ fn synthesize_auto_inspection_context(
         let mut read_summaries = Vec::new();
         let mut read_paths = Vec::new();
         let mut primary_locations = Vec::new();
+        let mut primary_config_lines = Vec::new();
+        let mut read_test_starts = std::collections::HashMap::new();
 
         for result in results {
             match result.tool_name.as_str() {
@@ -1419,12 +1485,18 @@ fn synthesize_auto_inspection_context(
                 "read_file" => {
                     if let Some((path, content)) = parse_read_file_output(&result.output) {
                         read_paths.push(path.clone());
+                        if let Some(start) = test_module_start_line(&content) {
+                            read_test_starts.insert(path.clone(), start);
+                        }
                         if plan.intent == AutoInspectIntent::WhereIsImplementation {
                             if let Some(location) =
                                 primary_definition_location(&path, &content, query, 72)
                             {
                                 primary_locations.push(location);
                             }
+                        } else if plan.intent == AutoInspectIntent::ConfigLocate {
+                            primary_config_lines
+                                .extend(primary_config_locations(&path, &content, query, 72));
                         }
                         if let Some(summary) = summarize_workflow_read(
                             &path,
@@ -1465,10 +1537,11 @@ fn synthesize_auto_inspection_context(
         };
         let has_read_summaries = !read_summaries.is_empty();
         let flow_hits = if plan.intent == AutoInspectIntent::FeatureTrace {
-            summarize_feature_trace_hits(query, &ranked, budget)
+            summarize_feature_trace_hits(query, &ranked, budget, &read_test_starts)
         } else {
             Vec::new()
         };
+        let read_test_starts_ref = &read_test_starts;
 
         let key_hits = supporting_hits
             .into_iter()
@@ -1479,6 +1552,12 @@ fn synthesize_auto_inspection_context(
                         plan.intent != AutoInspectIntent::WhereIsImplementation
                             || !has_read_summaries
                             || is_definition_like_line(&hit.line_content)
+                    })
+                    .filter(move |hit| {
+                        read_test_starts_ref
+                            .get(&file.path)
+                            .map(|start| hit.line_number < *start)
+                            .unwrap_or(true)
                     })
                     .take(budget.key_hits_per_file)
                     .map(move |hit| {
@@ -1504,6 +1583,9 @@ fn synthesize_auto_inspection_context(
             AutoInspectIntent::FeatureTrace => {
                 "Instruction: answer directly from this evidence. Focus on the actual control flow using the flow anchors and inspected file hints below. Do not invent function bodies, placeholder snippets, or implementation details that are not present in the evidence — if the evidence shows only a function signature or a call site, describe what the name and signature tell you and cite the file:line location. Do not emit tool calls or fenced code blocks. Do not speculate from unrelated declarations."
             }
+            AutoInspectIntent::ConfigLocate => {
+                "Instruction: answer directly from this evidence. Prefer exact config-setting or merge lines over broad section headings, struct declarations, or nearby docs. Cite the concrete file:line locations that set or merge the behavior. Do not emit tool calls or fenced code blocks."
+            }
             _ => {
                 "Instruction: answer directly from this evidence. Prefer exact inspected-file evidence over supporting search hits. Do not ask for more inspection unless the evidence is clearly insufficient. Do not emit tool calls or fenced code blocks. If exact code is not included below, answer in prose with file paths and line references only."
             }
@@ -1514,6 +1596,12 @@ fn synthesize_auto_inspection_context(
             sections.push(format!(
                 "Primary definition: {}",
                 primary_locations.join(", ")
+            ));
+        }
+        if !primary_config_lines.is_empty() {
+            sections.push(format!(
+                "Primary config lines: {}",
+                primary_config_lines.join(", ")
             ));
         }
         if !likely_files.is_empty() {
@@ -1667,88 +1755,6 @@ fn synthesize_auto_inspection_context(
             "Automatic inspection context for {}:\n- {}",
             plan.context_label, output
         ))
-    }
-}
-
-fn run_auto_inspection(
-    plan: &AutoInspectPlan,
-    token_tx: &Sender<InferenceEvent>,
-    eco_enabled: bool,
-    backend_name: &str,
-    project_root: &Path,
-) -> AutoInspectOutcome {
-    let _ = token_tx.send(InferenceEvent::SystemMessage(plan.thinking.to_string()));
-
-    let budget = auto_inspection_budget(plan.intent, backend_name, eco_enabled);
-    let mut results = Vec::new();
-
-    for step in &plan.steps {
-        emit_trace(token_tx, ProgressStatus::Started, &step.label, false);
-        let run_result = match step.tool_name {
-            "list_dir" => ListDir.run(&step.argument),
-            "read_file" => ReadFile.run(&step.argument),
-            "search" => SearchCode.run(&step.argument),
-            _ => continue,
-        };
-
-        match run_result {
-            Ok(ToolRunResult::Immediate(output)) => {
-                emit_trace(token_tx, ProgressStatus::Finished, &step.label, false);
-                results.push(ToolResult {
-                    tool_name: step.tool_name.to_string(),
-                    argument: step.argument.clone(),
-                    output,
-                });
-            }
-            Ok(ToolRunResult::RequiresApproval(_)) => {
-                emit_trace(token_tx, ProgressStatus::Failed, &step.label, false);
-            }
-            Err(error) => {
-                warn!(label = step.label.as_str(), error = %error, "auto inspection step failed");
-                emit_trace(token_tx, ProgressStatus::Failed, &step.label, false);
-            }
-        }
-    }
-
-    if matches!(
-        plan.intent,
-        AutoInspectIntent::WhereIsImplementation
-            | AutoInspectIntent::FeatureTrace
-            | AutoInspectIntent::ConfigLocate
-    ) {
-        let search_hits = results
-            .iter()
-            .filter(|result| result.tool_name == "search")
-            .flat_map(|result| parse_search_output(&result.output))
-            .collect::<Vec<_>>();
-        let followup_reads = choose_followup_read_steps(plan, project_root, &search_hits, budget);
-        for step in followup_reads {
-            emit_trace(token_tx, ProgressStatus::Started, &step.label, false);
-            match ReadFile.run(&step.argument) {
-                Ok(ToolRunResult::Immediate(output)) => {
-                    emit_trace(token_tx, ProgressStatus::Finished, &step.label, false);
-                    results.push(ToolResult {
-                        tool_name: step.tool_name.to_string(),
-                        argument: step.argument,
-                        output,
-                    });
-                }
-                Ok(ToolRunResult::RequiresApproval(_)) => {
-                    emit_trace(token_tx, ProgressStatus::Failed, &step.label, false);
-                }
-                Err(error) => {
-                    warn!(label = step.label.as_str(), error = %error, "auto inspection step failed");
-                    emit_trace(token_tx, ProgressStatus::Failed, &step.label, false);
-                }
-            }
-        }
-    }
-
-    let hidden_context = synthesize_auto_inspection_context(plan, &results, budget);
-
-    AutoInspectOutcome {
-        hidden_context,
-        tool_results: results,
     }
 }
 
@@ -2954,52 +2960,118 @@ pub fn model_thread_with_options(
                 }
                 session_messages.push(Message::user(&prompt));
 
-                let auto_inspection = detect_auto_inspect_intent(&prompt)
-                    .map(|intent| plan_auto_inspection(intent, &prompt, &project_root));
-                let auto_inspection_outcome = auto_inspection.as_ref().map(|plan| {
-                    emit_generation_started(&token_tx, plan.status_label, false);
-                    run_auto_inspection(
-                        plan,
-                        &token_tx,
-                        eco_enabled,
-                        &backend.name(),
-                        &project_root,
-                    )
-                });
-                let hidden_inspection_context = auto_inspection_outcome
-                    .as_ref()
-                    .and_then(|outcome| outcome.hidden_context.clone());
+                let tool_loop_intent = detect_tool_loop_intent(&prompt);
 
-                let retrieval = if auto_inspection
-                    .as_ref()
-                    .map(|plan| suppress_retrieval_for_auto_inspection(plan.intent))
-                    .unwrap_or(false)
-                {
-                    RetrievalBundle::default()
-                } else {
-                    collect_retrieval_bundle(
+                if let Some(intent) = tool_loop_intent {
+                    clear_memory_retrieval(&mut memory_state);
+                    memory_state.last_update = None;
+                    emit_memory_state(&token_tx, &memory_state);
+                    hooks.dispatch(HookEvent::MemorySummariesSelected { summary_count: 0 });
+                    if let Some(first) = session_messages.first_mut() {
+                        if first.role == "system" {
+                            first.content = build_system_prompt(&tools, &[], &[], &[], eco_enabled);
+                        }
+                    }
+                    compression::compress_history(&mut session_messages, &*backend, eco_enabled);
+
+                    let mut turn_memory = TurnMemoryEvidence::new(prompt.clone(), Vec::new());
+                    hooks.dispatch(HookEvent::BeforeGeneration {
+                        backend: backend.name(),
+                        message_count: session_messages.len(),
+                        eco: eco_enabled,
+                        reflection: reflection_enabled,
+                    });
+
+                    match run_read_only_tool_loop(
+                        intent,
                         &prompt,
+                        &session_messages,
+                        &*backend,
+                        &tools,
+                        &cfg,
+                        &project_root,
+                        &token_tx,
+                        None,
+                        &mut cache_stats,
+                        &mut budget,
                         eco_enabled,
-                        &project_name,
-                        project_index.as_ref(),
-                        fact_store.as_ref(),
-                        session_store.as_ref(),
-                        active_session.as_ref().map(|session| session.id.as_str()),
-                        &memory_state.loaded_facts,
-                    )
-                };
+                        reflection_enabled,
+                    ) {
+                        Ok(outcome) => {
+                            for result in &outcome.tool_results {
+                                hooks.dispatch(HookEvent::ToolExecuted {
+                                    tool_name: result.tool_name.clone(),
+                                    argument_chars: result.argument.chars().count(),
+                                    result_chars: result.output.chars().count(),
+                                });
+                                turn_memory.record_tool_result(
+                                    result.tool_name.clone(),
+                                    result.argument.clone(),
+                                    result.output.clone(),
+                                    false,
+                                );
+                            }
+                            turn_memory.set_final_response(outcome.final_response.clone());
+                            if !outcome.final_response.trim().is_empty() {
+                                if !reflection_enabled {
+                                    emit_buffered_tokens(&token_tx, &outcome.final_response);
+                                }
+                                log_debug_response(
+                                    debug_logging_enabled,
+                                    &outcome.final_response,
+                                    debug_log::ResponseSource::Live,
+                                );
+                                session_messages.push(Message::assistant(&outcome.final_response));
+                            }
+                            hooks.dispatch(HookEvent::AfterGeneration {
+                                backend: backend.name(),
+                                response_chars: outcome.final_response.chars().count(),
+                                from_cache: false,
+                                elapsed_ms: 0,
+                            });
+                            emit_trace(&token_tx, ProgressStatus::Finished, "answer ready", false);
+                            if let Some(store) = fact_store.as_ref() {
+                                let update = store.verify_and_store_turn(
+                                    &project_name,
+                                    &turn_memory,
+                                    &*backend,
+                                );
+                                apply_memory_update(&token_tx, &hooks, &mut memory_state, update);
+                            }
+                            save_session(
+                                session_store.as_ref(),
+                                &mut active_session,
+                                &session_messages,
+                                &backend.name(),
+                                &token_tx,
+                            );
+                            let _ = token_tx.send(InferenceEvent::Done);
+                        }
+                        Err(e) => {
+                            emit_trace(
+                                &token_tx,
+                                ProgressStatus::Failed,
+                                "tool loop failed",
+                                false,
+                            );
+                            let _ = token_tx.send(InferenceEvent::Error(e.to_string()));
+                        }
+                    }
+                    continue;
+                }
+
+                let retrieval = collect_retrieval_bundle(
+                    &prompt,
+                    eco_enabled,
+                    &project_name,
+                    project_index.as_ref(),
+                    fact_store.as_ref(),
+                    session_store.as_ref(),
+                    active_session.as_ref().map(|session| session.id.as_str()),
+                    &memory_state.loaded_facts,
+                );
                 let mut turn_memory =
                     TurnMemoryEvidence::new(prompt.clone(), retrieval.summaries.clone());
-                if let Some(outcome) = auto_inspection_outcome {
-                    for result in outcome.tool_results {
-                        turn_memory.record_tool_result(
-                            result.tool_name,
-                            result.argument,
-                            result.output,
-                            false,
-                        );
-                    }
-                }
                 set_memory_retrieval(&mut memory_state, &prompt, &retrieval);
                 memory_state.last_update = None;
                 emit_memory_state(&token_tx, &memory_state);
@@ -3024,15 +3096,8 @@ pub fn model_thread_with_options(
 
                 compression::compress_history(&mut session_messages, &*backend, eco_enabled);
 
-                let mut generation_messages = session_messages.clone();
-                if let Some(hidden_context) = hidden_inspection_context.as_ref() {
-                    generation_messages.push(Message::user(hidden_context));
-                }
-                let generation_exact_cache = if auto_inspection.is_some() {
-                    None
-                } else {
-                    exact_cache.as_ref()
-                };
+                let generation_messages = session_messages.clone();
+                let generation_exact_cache = exact_cache.as_ref();
 
                 emit_generation_started(&token_tx, "generating...", false);
                 emit_trace(
@@ -3591,6 +3656,10 @@ mod tests {
             detect_auto_inspect_intent("Where is eco mode configured?"),
             Some(AutoInspectIntent::ConfigLocate)
         );
+        assert_eq!(
+            detect_auto_inspect_intent("Where is eco mode configged"),
+            Some(AutoInspectIntent::ConfigLocate)
+        );
     }
 
     #[test]
@@ -3713,6 +3782,30 @@ mod tests {
             .as_deref(),
             Some("eco.enabled")
         );
+        assert_eq!(
+            extract_auto_inspect_query(
+                "Where is eco mode configged",
+                AutoInspectIntent::ConfigLocate
+            )
+            .as_deref(),
+            Some("eco.enabled")
+        );
+        assert_eq!(
+            extract_auto_inspect_query(
+                "Where is memory retrieval implemented?",
+                AutoInspectIntent::WhereIsImplementation
+            )
+            .as_deref(),
+            Some("retrieval")
+        );
+        assert_eq!(
+            extract_auto_inspect_query(
+                "Where is project indexing implemented?",
+                AutoInspectIntent::WhereIsImplementation
+            )
+            .as_deref(),
+            Some("indexing")
+        );
     }
 
     #[test]
@@ -3799,6 +3892,66 @@ mod tests {
         );
 
         assert_eq!(steps[0].argument, "src/session/mod.rs");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn choose_followup_read_steps_prefers_profile_config_for_eco_mode() {
+        let root = temp_project_root("workflow-config-select");
+        fs::create_dir_all(root.join("src/config")).expect("create src/config");
+        fs::create_dir_all(root.join("src/tui")).expect("create src/tui");
+        fs::write(
+            root.join("src/config/profile.rs"),
+            "if let Some(e) = profile.eco.enabled {\n    base.eco.enabled = e;\n}\n",
+        )
+        .expect("write profile");
+        fs::write(
+            root.join("src/config.rs"),
+            "pub struct EcoConfig { pub enabled: bool }\n",
+        )
+        .expect("write config");
+        fs::write(
+            root.join("src/tui/commands.rs"),
+            "state.set_eco_enabled(true);\n",
+        )
+        .expect("write commands");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"test\"\n").expect("write cargo");
+
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::ConfigLocate,
+            thinking: "Thinking: checking the files that configure this behavior.",
+            status_label: "locating configuration...",
+            context_label: "this configuration lookup request",
+            query: Some("eco.enabled".to_string()),
+            steps: vec![],
+        };
+
+        let hits = vec![
+            SearchFileHit {
+                path: "src/tui/commands.rs".to_string(),
+                hits: vec![SearchLineHit {
+                    line_number: 1,
+                    line_content: "state.set_eco_enabled(true);".to_string(),
+                }],
+            },
+            SearchFileHit {
+                path: "src/config.rs".to_string(),
+                hits: vec![SearchLineHit {
+                    line_number: 1,
+                    line_content: "pub struct EcoConfig { pub enabled: bool }".to_string(),
+                }],
+            },
+        ];
+
+        let steps = choose_followup_read_steps(
+            &plan,
+            &root,
+            &hits,
+            auto_inspection_budget(AutoInspectIntent::ConfigLocate, "llama.cpp · qwen", false),
+        );
+
+        assert_eq!(steps[0].argument, "src/config/profile.rs");
+        assert_eq!(steps[1].argument, "src/config.rs");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4248,7 +4401,6 @@ mod tests {
 
         assert!(hidden.contains("Primary flow anchors:"));
         assert!(hidden.contains("src/session/mod.rs:224 `pub fn save_messages(`"));
-        assert!(hidden.contains("src/session/mod.rs:241 `save_messages(`"));
         // assert_eq! call sites must be filtered out by is_feature_trace_anchor_line
         assert!(!hidden.contains("assert_eq!(trace_plan.steps[0].argument"));
         // Anti-fabrication instruction must be present
@@ -4298,6 +4450,131 @@ mod tests {
         assert!(!hidden.contains("Evidence: search anchors only"));
         // Anti-fabrication instruction must still be present
         assert!(hidden.contains("Do not invent function bodies, placeholder snippets"));
+    }
+
+    #[test]
+    fn feature_trace_summary_ignores_test_module_hits_in_read_file() {
+        let content = "\
+pub fn save_messages(\n\
+    &self,\n\
+    session_id: &str,\n\
+) -> Result<SessionSummary> {\n\
+    Ok(todo!())\n\
+}\n\
+\n\
+#[cfg(test)]\n\
+mod tests {\n\
+    #[test]\n\
+    fn saves_sessions() {\n\
+        store.save_messages(\"id\", &[], \"llama.cpp\").unwrap();\n\
+    }\n\
+}\n";
+
+        let summary = summarize_workflow_read(
+            "src/session/mod.rs",
+            content,
+            "save_messages",
+            AutoInspectIntent::FeatureTrace,
+            260,
+        )
+        .expect("summary");
+
+        assert!(summary.contains("flow lines: 1 `pub fn save_messages(`"));
+        assert!(!summary.contains("store.save_messages"));
+    }
+
+    #[test]
+    fn feature_trace_context_ignores_test_region_search_hits_for_read_files() {
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::FeatureTrace,
+            thinking: "Thinking: tracing the main code path for this feature.",
+            status_label: "tracing feature...",
+            context_label: "this feature trace request",
+            query: Some("save_messages".to_string()),
+            steps: vec![],
+        };
+
+        let file_content = "\
+pub fn save_messages(\n\
+    &self,\n\
+    session_id: &str,\n\
+) -> Result<SessionSummary> {\n\
+    Ok(todo!())\n\
+}\n\
+\n\
+#[cfg(test)]\n\
+mod tests {\n\
+    #[test]\n\
+    fn saves_sessions() {\n\
+        store.save_messages(\"id\", &[], \"llama.cpp\").unwrap();\n\
+    }\n\
+}\n";
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[
+                ToolResult {
+                    tool_name: "search".to_string(),
+                    argument: "save_messages".to_string(),
+                    output: "Search results for 'save_messages' (3 matches):\n\nsrc/session/mod.rs:\n  1: pub fn save_messages(\n  11: store.save_messages(\"id\", &[], \"llama.cpp\").unwrap();\n\nsrc/inference/session.rs:\n  1975: match s.save_messages(&current.id, messages, backend_name) {\n".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "src/session/mod.rs".to_string(),
+                    output: format!("File: src/session/mod.rs\nLines: 12\n\n```\n{file_content}\n```"),
+                },
+            ],
+            auto_inspection_budget(AutoInspectIntent::FeatureTrace, "openai_compat · gpt-4", false),
+        )
+        .expect("context");
+
+        assert!(
+            hidden.contains("Primary flow anchors: src/session/mod.rs:1 `pub fn save_messages(`")
+        );
+        assert!(hidden.contains("src/inference/session.rs:1975"));
+        assert!(!hidden.contains("src/session/mod.rs:11"));
+    }
+
+    #[test]
+    fn config_locate_context_surfaces_exact_merge_lines() {
+        let plan = AutoInspectPlan {
+            intent: AutoInspectIntent::ConfigLocate,
+            thinking: "Thinking: checking the files that configure this behavior.",
+            status_label: "locating configuration...",
+            context_label: "this configuration lookup request",
+            query: Some("eco.enabled".to_string()),
+            steps: vec![],
+        };
+
+        let content = "\
+pub struct ProjectEcoProfile {\n\
+    pub enabled: Option<bool>,\n\
+}\n\
+\n\
+pub fn apply_profile(mut base: Config, profile: ProjectProfile) -> Config {\n\
+    if let Some(e) = profile.eco.enabled {\n\
+        base.eco.enabled = e;\n\
+    }\n\
+    base\n\
+}\n";
+
+        let hidden = synthesize_auto_inspection_context(
+            &plan,
+            &[ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/config/profile.rs".to_string(),
+                output: format!("File: src/config/profile.rs\nLines: 9\n\n```\n{content}\n```"),
+            }],
+            auto_inspection_budget(
+                AutoInspectIntent::ConfigLocate,
+                "openai_compat · gpt-4",
+                false,
+            ),
+        )
+        .expect("context");
+
+        assert!(hidden.contains("Primary config lines: src/config/profile.rs:6 `if let Some(e) = profile.eco.enabled {`"));
+        assert!(hidden.contains("src/config/profile.rs:7 `base.eco.enabled = e;`"));
     }
 
     #[test]

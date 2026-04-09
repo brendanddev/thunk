@@ -9,6 +9,7 @@ mod openai_compat;
 mod reflection;
 mod runtime;
 mod session;
+mod tool_loop;
 
 pub use backend::{system_prompt_with_tools, InferenceBackend, Message, SYSTEM_PROMPT};
 pub use llama_cpp::LlamaCppBackend;

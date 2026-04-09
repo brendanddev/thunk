@@ -17,6 +17,7 @@ Switch backends by editing `.local/config.toml`.
 - Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a single-row runtime status bar with no divider chrome, a transient activity trace that appears near the prompt when the model is working, a shared left-margin transcript gutter that anchors conversation flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript rows, reverse history search, and inline prompt-adjacent approvals
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
+- Tool-first repo/code navigation: repo-understanding and code-navigation questions now enter a bounded read-only search/read/list/git/LSP loop with visible `Thinking:` and step traces, and the final answer is model-written from observed tool output
 - Mutating tools with approval: shell commands, targeted file edits, and whole-file writes with diff preview
 - Policy sandbox and inspection: project-only read scope, richer approval previews, destructive shell blocking, and private-network fetch blocking
 - Three-level memory: session compression, incremental project index maintenance, prompt-aware fact retrieval, selective prior-session recall, and cross-session facts with verified per-turn promotion, provenance tags, observability, deduplication, TTL pruning, and per-project cap
@@ -255,6 +256,7 @@ Session behavior:
 - exported session transcripts are written under `.local/exports/sessions/`
 
 Memory behavior:
+- repo/code-navigation questions now start with live tool exploration first; memory/index retrieval is secondary supporting context instead of the first move
 - durable facts are promoted per turn from strict evidence instead of raw end-of-session transcript extraction
 - verified facts now need a concrete project/workspace anchor (files, symbols, config values, commands, URLs/hosts, or approved tool evidence), and generic educational answer content, proposal-style lines, trivial code snippets, summary-style document boilerplate, or boilerplate file-description text are filtered out instead of being stored as durable memory
 - each user turn now builds a retrieval bundle from indexed file summaries, prompt-relevant durable facts, and selective prior-session excerpts from saved sessions in the current project
@@ -266,13 +268,9 @@ Memory behavior:
 - routine memory activity stays in runtime/status telemetry instead of injecting extra transcript breaks into assistant replies
 
 Transcript behavior:
-- obvious natural-language repo/directory summary prompts like “what’s in this repo?” and “what’s in this directory?” now trigger a bounded read-only auto-inspection workflow before the answer
-- auto-inspection shows one concise `Thinking:` system note plus short step traces like `List .`, `List src/`, and `Read README.md`, then injects a compact synthesized context block instead of raw file dumps so local backends stay within context budget
-- broader natural-language code-navigation asks now trigger bounded read-only workflows too:
-  - `where is X implemented/defined/handled?`
-  - `trace how X works`
-  - `where is X configured/set?`
-- those workflows run a single bounded `search`, read only the top candidate files, and inject a compact hidden summary with likely files, key hits, and implementation/flow/config hints instead of raw search/read dumps
+- obvious repo/directory summary prompts plus broader code-navigation asks such as `where is X implemented`, `trace how X works`, and `where is X configured` now trigger a generic read-only tool loop instead of a precomputed workflow answer
+- the loop shows one concise `Thinking:` note plus short step traces, lets the model iteratively choose read-only tools like `search`, `read_file`, `list_dir`, `git`, and Rust LSP lookups, and answers from the observed tool output
+- repo-local context files like `README.md` and `docs/context/CLAUDE.md` are available as support context for the loop, but they do not replace live filesystem inspection
 - injected tool results and slash-loaded context blocks auto-collapse into compact transcript cards
 - `Ctrl+O` toggles the focused collapsed/expanded context block
 - `Alt+Up` recalls the previous submitted prompt or slash command into the composer for editing, and `Alt+Down` moves forward through recall history back to your unsent draft
