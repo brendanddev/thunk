@@ -1,3 +1,6 @@
+mod display;
+mod parse;
+
 use std::sync::mpsc;
 use std::thread;
 
@@ -6,12 +9,19 @@ use tracing::info;
 use super::format::sanitize_for_display;
 use super::state::AppState;
 use crate::commands::{
-    builtin_command_specs, resolve_builtin_command, BuiltinKind, CommandRegistry, CustomCommand,
-    CustomCommandBody, CustomCommandStep,
+    resolve_builtin_command, BuiltinKind, CommandRegistry, CustomCommand, CustomCommandBody,
+    CustomCommandStep,
 };
-use crate::events::{FactProvenance, MemorySnapshot};
 use crate::events::{ProgressStatus, ProgressTrace};
 use crate::inference::SessionCommand;
+use display::{
+    custom_help_text, format_custom_commands_list, format_display_status, format_memory_facts,
+    format_memory_last, format_memory_status, format_transcript_status,
+};
+use parse::{
+    decode_slash_write_content, parse_command_parts, parse_sessions_export_args,
+    parse_slash_edit_body,
+};
 
 pub(crate) enum SlashJobOutcome {
     Trace(ProgressTrace),
@@ -68,85 +78,6 @@ fn make_trace(status: ProgressStatus, label: impl Into<String>, persist: bool) -
         label: label.into(),
         persist,
     }
-}
-
-fn parse_command_parts(input: &str) -> (String, &str) {
-    let parts: Vec<&str> = input.splitn(2, ' ').collect();
-    let cmd = parts[0].to_lowercase();
-    let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
-    (cmd, arg)
-}
-
-pub(crate) fn decode_slash_write_content(raw: &str) -> String {
-    let mut output = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.peek().copied() {
-                Some('n') => {
-                    chars.next();
-                    output.push('\n');
-                }
-                Some('t') => {
-                    chars.next();
-                    output.push('\t');
-                }
-                Some('\\') => {
-                    chars.next();
-                    output.push('\\');
-                }
-                Some('"') => {
-                    chars.next();
-                    output.push('"');
-                }
-                _ => output.push(ch),
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-
-    output
-}
-
-fn parse_slash_edit_body(arg: &str) -> Option<(String, String)> {
-    let normalized = arg.trim_start();
-    let first_newline = normalized.find('\n')?;
-    let path = normalized[..first_newline].trim();
-    let body = normalized[first_newline + 1..].trim_start_matches('\r');
-    if path.is_empty() || body.trim().is_empty() {
-        return None;
-    }
-    Some((path.to_string(), body.to_string()))
-}
-
-fn parse_sessions_export_args(arg: &str) -> Option<(String, Option<String>)> {
-    let trimmed = arg.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if let Some((selector, maybe_format)) = trimmed.rsplit_once(' ') {
-        let format = maybe_format.trim().to_ascii_lowercase();
-        if matches!(format.as_str(), "markdown" | "md" | "json") {
-            return Some((selector.trim().to_string(), Some(format)));
-        }
-    }
-
-    Some((trimmed.to_string(), None))
-}
-
-fn format_display_status(state: &AppState) -> String {
-    format!(
-        "display:\n  tokens: {}\n  time: {}",
-        if state.show_top_bar_tokens {
-            "on"
-        } else {
-            "off"
-        },
-        if state.show_top_bar_time { "on" } else { "off" }
-    )
 }
 
 fn run_tool_immediate<T: crate::tools::Tool>(
@@ -344,183 +275,6 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
         }
         _ => None,
     }
-}
-
-fn custom_help_text() -> String {
-    let mut lines = vec!["built-in slash commands:".to_string()];
-    for spec in builtin_command_specs() {
-        let mut line = format!("  {:<18} — {}", spec.usage, spec.description);
-        if !spec.aliases.is_empty() {
-            line.push_str(&format!(" (aliases: {})", spec.aliases.join(", ")));
-        }
-        lines.push(line);
-    }
-    lines.push("".to_string());
-    lines.push("input: Enter sends • Shift+Enter or Ctrl+J insert newlines".to_string());
-    lines.push("transcript: Ctrl+O toggle • [ / ] move focus when input is empty".to_string());
-    lines.push("custom commands: /commands list • /commands reload".to_string());
-    lines.join("\n")
-}
-
-fn format_custom_commands_list(registry: &CommandRegistry) -> String {
-    let mut lines = vec!["built-ins:".to_string()];
-    for spec in builtin_command_specs() {
-        lines.push(format!("  {:<12} — {}", spec.canonical, spec.description));
-    }
-    lines.push(String::new());
-    lines.push("custom commands:".to_string());
-    if registry.list().is_empty() {
-        lines.push("  (none loaded)".to_string());
-    } else {
-        for command in registry.list() {
-            let usage = command
-                .usage
-                .as_ref()
-                .map(|value| format!(" — {value}"))
-                .unwrap_or_default();
-            lines.push(format!(
-                "  {:<12} [{}] — {}{}",
-                command.name, command.origin, command.description, usage
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
-fn format_memory_status(snapshot: &MemorySnapshot) -> String {
-    let accepted = snapshot
-        .last_update
-        .as_ref()
-        .map(|update| update.accepted_facts.len())
-        .unwrap_or(0);
-    let skipped = snapshot
-        .last_update
-        .as_ref()
-        .map(|update| {
-            update
-                .skipped_reasons
-                .iter()
-                .map(|reason| reason.count)
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
-    let mut lines = vec![
-        format!("loaded facts: {}", snapshot.loaded_facts.len()),
-        format!("last summaries: {}", snapshot.last_summary_paths.len()),
-        format!("last fact matches: {}", snapshot.last_selected_facts.len()),
-        format!(
-            "last session excerpts: {}",
-            snapshot.last_selected_session_excerpts.len()
-        ),
-        format!("last update: +{accepted} / -{skipped}"),
-    ];
-    if let Some(query) = &snapshot.last_retrieval_query {
-        lines.push(format!("last retrieval query: {query}"));
-    } else {
-        lines.push("last retrieval query: (none)".to_string());
-    }
-    if snapshot.last_summary_paths.is_empty() {
-        lines.push("recent summary paths: (none)".to_string());
-    } else {
-        lines.push("recent summary paths:".to_string());
-        for path in &snapshot.last_summary_paths {
-            lines.push(format!("  - {path}"));
-        }
-    }
-    lines.join("\n")
-}
-
-fn format_memory_facts(snapshot: &MemorySnapshot) -> String {
-    if snapshot.loaded_facts.is_empty() {
-        return "loaded memory facts:\n  (none)".to_string();
-    }
-
-    let mut lines = vec!["loaded memory facts:".to_string()];
-    for fact in &snapshot.loaded_facts {
-        let label = match fact.provenance {
-            FactProvenance::Legacy => "legacy",
-            FactProvenance::Verified => "verified",
-        };
-        lines.push(format!("  [{label}] {}", fact.content));
-    }
-    lines.join("\n")
-}
-
-fn format_memory_last(snapshot: &MemorySnapshot) -> String {
-    let mut lines = vec!["last memory update:".to_string()];
-    match &snapshot.last_update {
-        Some(update) => {
-            lines.push(format!("  accepted: {}", update.accepted_facts.len()));
-            lines.push(format!("  duplicates: {}", update.duplicate_count));
-            if update.accepted_facts.is_empty() {
-                lines.push("  accepted facts: (none)".to_string());
-            } else {
-                lines.push("  accepted facts:".to_string());
-                for fact in &update.accepted_facts {
-                    lines.push(format!("    - {}", fact.content));
-                }
-            }
-            if update.skipped_reasons.is_empty() {
-                lines.push("  skipped: (none)".to_string());
-            } else {
-                lines.push("  skipped:".to_string());
-                for reason in &update.skipped_reasons {
-                    lines.push(format!("    - {}: {}", reason.reason, reason.count));
-                }
-            }
-        }
-        None => lines.push("  (no verified update yet)".to_string()),
-    }
-
-    lines.push(String::new());
-    lines.push("last retrieval:".to_string());
-    match &snapshot.last_retrieval_query {
-        Some(query) => {
-            lines.push(format!("  query: {query}"));
-            lines.push(format!(
-                "  summaries: {}",
-                snapshot.last_summary_paths.len()
-            ));
-            lines.push(format!(
-                "  fact matches: {}",
-                snapshot.last_selected_facts.len()
-            ));
-            lines.push(format!(
-                "  session excerpts: {}",
-                snapshot.last_selected_session_excerpts.len()
-            ));
-        }
-        None => lines.push("  (no retrieval yet)".to_string()),
-    }
-
-    lines.push(String::new());
-    lines.push("last consolidation:".to_string());
-    match &snapshot.last_consolidation {
-        Some(consolidation) => {
-            lines.push(format!("  ttl pruned: {}", consolidation.ttl_pruned));
-            lines.push(format!("  dedup removed: {}", consolidation.dedup_removed));
-            lines.push(format!("  cap removed: {}", consolidation.cap_removed));
-        }
-        None => lines.push("  (no consolidation recorded yet)".to_string()),
-    }
-
-    lines.join("\n")
-}
-
-fn format_transcript_status(total: usize, collapsed: usize) -> String {
-    let mode = if total == 0 {
-        "no collapsible blocks".to_string()
-    } else if collapsed == total {
-        "fully collapsed".to_string()
-    } else if collapsed == 0 {
-        "fully expanded".to_string()
-    } else if collapsed * 2 >= total {
-        "mostly collapsed".to_string()
-    } else {
-        "mostly expanded".to_string()
-    };
-
-    format!("transcript blocks: {total} collapsible, {collapsed} collapsed ({mode})")
 }
 
 fn execute_custom_template(
@@ -1119,123 +873,4 @@ fn handle_builtin_slash_command(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        decode_slash_write_content, format_display_status, format_memory_facts, format_memory_last,
-        format_memory_status, format_transcript_status, parse_sessions_export_args,
-        parse_slash_edit_body,
-    };
-    use crate::events::{
-        FactProvenance, MemoryConsolidationView, MemoryFactView, MemorySessionExcerptView,
-        MemorySkippedReasonCount, MemorySnapshot, MemoryUpdateReport,
-    };
-    use crate::tui::state::AppState;
-
-    #[test]
-    fn decode_slash_write_content_expands_common_escapes() {
-        let decoded = decode_slash_write_content("hello\\nfrom\\tparams\\\\");
-        assert_eq!(decoded, "hello\nfrom\tparams\\");
-    }
-
-    #[test]
-    fn parse_slash_edit_body_extracts_path_and_multiline_body() {
-        let parsed = parse_slash_edit_body(
-            "src/main.rs\n```params-edit\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n```",
-        )
-        .expect("parse edit body");
-
-        assert_eq!(parsed.0, "src/main.rs");
-        assert!(parsed.1.starts_with("```params-edit"));
-    }
-
-    #[test]
-    fn parse_sessions_export_args_supports_optional_format() {
-        assert_eq!(
-            parse_sessions_export_args("alpha markdown"),
-            Some(("alpha".to_string(), Some("markdown".to_string())))
-        );
-        assert_eq!(
-            parse_sessions_export_args("named session"),
-            Some(("named session".to_string(), None))
-        );
-    }
-
-    #[test]
-    fn memory_formatters_include_counts_and_labels() {
-        let snapshot = MemorySnapshot {
-            loaded_facts: vec![
-                MemoryFactView {
-                    content: "src/main.rs updates cache stats".to_string(),
-                    provenance: FactProvenance::Verified,
-                },
-                MemoryFactView {
-                    content: "legacy session note".to_string(),
-                    provenance: FactProvenance::Legacy,
-                },
-            ],
-            last_summary_paths: vec!["src/main.rs".to_string()],
-            last_retrieval_query: Some("cache stats".to_string()),
-            last_selected_facts: vec![MemoryFactView {
-                content: "src/main.rs updates cache stats".to_string(),
-                provenance: FactProvenance::Verified,
-            }],
-            last_selected_session_excerpts: vec![MemorySessionExcerptView {
-                session_label: "alpha".to_string(),
-                role: "assistant".to_string(),
-                excerpt: "cache stats are reported in the status line".to_string(),
-            }],
-            last_update: Some(MemoryUpdateReport {
-                accepted_facts: vec![MemoryFactView {
-                    content: "src/main.rs updates cache stats".to_string(),
-                    provenance: FactProvenance::Verified,
-                }],
-                skipped_reasons: vec![MemorySkippedReasonCount {
-                    reason: "missing evidence anchor".to_string(),
-                    count: 2,
-                }],
-                duplicate_count: 1,
-            }),
-            last_consolidation: Some(MemoryConsolidationView {
-                ttl_pruned: 1,
-                dedup_removed: 2,
-                cap_removed: 0,
-            }),
-        };
-
-        let status = format_memory_status(&snapshot);
-        let facts = format_memory_facts(&snapshot);
-        let last = format_memory_last(&snapshot);
-
-        assert!(status.contains("loaded facts: 2"));
-        assert!(status.contains("last fact matches: 1"));
-        assert!(status.contains("last session excerpts: 1"));
-        assert!(status.contains("last retrieval query: cache stats"));
-        assert!(status.contains("src/main.rs"));
-        assert!(facts.contains("[verified]"));
-        assert!(facts.contains("[legacy]"));
-        assert!(last.contains("duplicates: 1"));
-        assert!(last.contains("query: cache stats"));
-        assert!(last.contains("dedup removed: 2"));
-    }
-
-    #[test]
-    fn transcript_status_reports_collapse_mode() {
-        assert!(format_transcript_status(0, 0).contains("no collapsible blocks"));
-        assert!(format_transcript_status(3, 3).contains("fully collapsed"));
-        assert!(format_transcript_status(3, 0).contains("fully expanded"));
-        assert!(format_transcript_status(4, 3).contains("mostly collapsed"));
-        assert!(format_transcript_status(4, 1).contains("mostly expanded"));
-    }
-
-    #[test]
-    fn display_status_reports_toggle_state() {
-        let mut state = AppState::new();
-        state.set_show_top_bar_tokens(false);
-        state.set_show_top_bar_time(true);
-
-        let output = format_display_status(&state);
-
-        assert!(output.contains("tokens: off"));
-        assert!(output.contains("time: on"));
-    }
-}
+mod tests;
