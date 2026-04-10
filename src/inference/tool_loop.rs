@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+mod evidence;
+mod intent;
+mod prompting;
+
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use crate::cache::ExactCache;
 use crate::config;
@@ -17,16 +17,19 @@ use super::budget::{
 };
 use super::cache::{generate_with_cache, CacheMode};
 use super::reflection::reflect_response;
-use super::runtime::{eco_tool_result_limit, emit_generation_started, emit_trace};
-use super::{system_prompt_with_tools, InferenceBackend, Message};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ToolLoopIntent {
-    RepoOverview,
-    DirectoryOverview,
-    CodeNavigation,
-    ConfigLocate,
-}
+use super::runtime::{emit_generation_started, emit_trace};
+use super::{InferenceBackend, Message};
+use evidence::{
+    bootstrap_tool_results, format_tool_loop_results_with_limit, grounded_answer_guidance,
+    has_relevant_file_evidence, targeted_investigation_followup,
+};
+use intent::{suggested_search_query, ToolLoopIntent};
+use prompting::{
+    build_tool_loop_seed_messages, build_tool_loop_system_prompt, initial_investigation_hint,
+    initial_tool_only_followup, should_stream_tool_loop_generation, thinking_label,
+    tool_loop_budget, tool_loop_result_limit, with_progress_heartbeat,
+    with_progress_heartbeat_interval,
+};
 
 #[derive(Clone, Copy)]
 struct ToolLoopBudget {
@@ -37,510 +40,11 @@ struct ToolLoopBudget {
 pub(super) struct ToolLoopOutcome {
     pub final_response: String,
     pub tool_results: Vec<ToolResult>,
-}
-
-fn normalize_intent_text(text: &str) -> String {
-    let stripped = text.to_ascii_lowercase().replace(['\'', '’'], "");
-    stripped
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '/' {
-                ch
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn trim_query_noise(query: &str) -> String {
-    let mut trimmed = query.trim().to_string();
-    for prefix in ["the ", "a ", "an ", "this ", "that "] {
-        if let Some(stripped) = trimmed.strip_prefix(prefix) {
-            trimmed = stripped.trim().to_string();
-        }
-    }
-    trimmed
-}
-
-fn trim_query_suffix<'a>(query: &'a str, suffixes: &[&str]) -> &'a str {
-    for suffix in suffixes {
-        if let Some(stripped) = query.strip_suffix(suffix) {
-            return stripped.trim();
-        }
-    }
-    query.trim()
-}
-
-fn singularize_token(token: &str) -> String {
-    if token.len() > 4 && token.ends_with('s') {
-        token[..token.len() - 1].to_string()
-    } else {
-        token.to_string()
-    }
-}
-
-fn token_specificity_score(token: &str) -> usize {
-    let len = token.len();
-    let alpha_bonus = if token.chars().all(|ch| ch.is_ascii_alphabetic()) {
-        1
-    } else {
-        0
-    };
-    let suffix_bonus = if token.ends_with("ing")
-        || token.ends_with("tion")
-        || token.ends_with("ment")
-        || token.ends_with("al")
-    {
-        2
-    } else {
-        0
-    };
-
-    len + alpha_bonus + suffix_bonus
-}
-
-fn salient_search_token(phrase: &str, intent: ToolLoopIntent) -> Option<String> {
-    let stopwords = match intent {
-        ToolLoopIntent::CodeNavigation => &[
-            "implemented",
-            "implement",
-            "define",
-            "defined",
-            "handle",
-            "handled",
-            "find",
-            "which",
-            "file",
-            "has",
-            "where",
-            "is",
-            "the",
-            "project",
-            "trace",
-            "how",
-            "does",
-            "work",
-            "works",
-            "flow",
-            "what",
-            "writes",
-            "to",
-            "are",
-            "saved",
-            "save",
-            "restored",
-            "restore",
-        ][..],
-        ToolLoopIntent::ConfigLocate => &[
-            "configured",
-            "configures",
-            "set",
-            "mode",
-            "which",
-            "file",
-            "where",
-            "is",
-            "the",
-        ][..],
-        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => &[][..],
-    };
-
-    phrase
-        .split_whitespace()
-        .map(trim_query_noise)
-        .map(|token| singularize_token(&token))
-        .filter(|token| {
-            !token.is_empty()
-                && !stopwords.iter().any(|stop| stop == token)
-                && token.chars().any(|ch| ch.is_ascii_alphanumeric())
-        })
-        .max_by(|a, b| {
-            token_specificity_score(a)
-                .cmp(&token_specificity_score(b))
-                .then_with(|| a.len().cmp(&b.len()))
-        })
-}
-
-fn suggested_search_query(prompt: &str, intent: ToolLoopIntent) -> Option<String> {
-    let normalized = normalize_intent_text(prompt);
-    if normalized.contains("session") {
-        if normalized.contains("save") || normalized.contains("saved") {
-            return Some("save_messages".to_string());
-        }
-        if normalized.contains("restore")
-            || normalized.contains("restored")
-            || normalized.contains("resume")
-        {
-            return Some("load_most_recent".to_string());
-        }
-    }
-    if intent == ToolLoopIntent::ConfigLocate && normalized.contains("eco") {
-        return Some("eco.enabled".to_string());
-    }
-
-    let extracted = match intent {
-        ToolLoopIntent::CodeNavigation => {
-            if let Some(rest) = normalized.strip_prefix("where is ") {
-                trim_query_suffix(
-                    rest,
-                    &[
-                        " implemented",
-                        " defined",
-                        " handled",
-                        " configured",
-                        " configged",
-                    ],
-                )
-                .to_string()
-            } else if let Some(rest) = normalized.strip_prefix("find ") {
-                rest.trim().to_string()
-            } else if let Some(rest) = normalized.strip_prefix("which file has ") {
-                rest.trim().to_string()
-            } else if let Some(rest) = normalized.strip_prefix("what handles ") {
-                rest.trim().to_string()
-            } else if let Some(rest) = normalized.strip_prefix("what writes to ") {
-                rest.trim().to_string()
-            } else if let Some(rest) = normalized.strip_prefix("trace how ") {
-                trim_query_suffix(rest, &[" works", " work", " flows", " flow"]).to_string()
-            } else if let Some(rest) = normalized.strip_prefix("how does ") {
-                trim_query_suffix(rest, &[" work", " works", " flow", " flow through"]).to_string()
-            } else {
-                String::new()
-            }
-        }
-        ToolLoopIntent::ConfigLocate => {
-            if let Some(rest) = normalized.strip_prefix("where is ") {
-                trim_query_suffix(rest, &[" configured", " configged", " set"]).to_string()
-            } else if let Some(rest) = normalized.strip_prefix("which file configures ") {
-                rest.trim().to_string()
-            } else {
-                String::new()
-            }
-        }
-        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => String::new(),
-    };
-
-    let cleaned =
-        salient_search_token(&extracted, intent).unwrap_or_else(|| trim_query_noise(&extracted));
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
+    pub streamed_final_response: bool,
 }
 
 pub(super) fn detect_tool_loop_intent(prompt: &str) -> Option<ToolLoopIntent> {
-    let normalized = normalize_intent_text(prompt);
-    if normalized.starts_with('/') {
-        return None;
-    }
-
-    let tokens = normalized
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let first_contains = |needle: &str| {
-        tokens
-            .first()
-            .map(|token| token.contains(needle))
-            .unwrap_or(false)
-    };
-    let second_is = |value: &str| tokens.get(1).map(|token| token == value).unwrap_or(false);
-    let has_token = |value: &str| tokens.iter().any(|token| token == value);
-    let has_prefix = |prefix: &str| tokens.iter().any(|token| token.starts_with(prefix));
-
-    if ((first_contains("what") && second_is("is"))
-        || (first_contains("whats") && (second_is("in") || second_is("here")))
-        || (first_contains("summarize") && second_is("this")))
-        && (has_token("repo")
-            || has_token("project")
-            || has_token("codebase")
-            || has_token("directory")
-            || has_token("folder")
-            || has_token("here"))
-    {
-        if has_token("directory") || has_token("folder") || has_token("here") {
-            return Some(ToolLoopIntent::DirectoryOverview);
-        }
-        return Some(ToolLoopIntent::RepoOverview);
-    }
-
-    if (first_contains("where") && second_is("is"))
-        || normalized.starts_with("find ")
-        || normalized.starts_with("which file has ")
-        || normalized.starts_with("what handles ")
-        || normalized.starts_with("what writes to ")
-        || normalized.starts_with("trace how ")
-        || normalized.starts_with("how does ")
-    {
-        if has_prefix("config") || has_token("set") {
-            return Some(ToolLoopIntent::ConfigLocate);
-        }
-        if has_prefix("implement")
-            || has_prefix("defin")
-            || has_prefix("handl")
-            || normalized.starts_with("trace how ")
-            || normalized.starts_with("how does ")
-            || normalized.starts_with("what handles ")
-            || normalized.starts_with("what writes to ")
-            || normalized.starts_with("find ")
-            || normalized.starts_with("which file has ")
-        {
-            return Some(ToolLoopIntent::CodeNavigation);
-        }
-    }
-
-    None
-}
-
-fn tool_loop_budget(eco_enabled: bool) -> ToolLoopBudget {
-    if eco_enabled {
-        ToolLoopBudget {
-            max_iterations: 3,
-            max_duplicate_calls: 1,
-        }
-    } else {
-        ToolLoopBudget {
-            max_iterations: 5,
-            max_duplicate_calls: 2,
-        }
-    }
-}
-
-fn tool_loop_result_limit(backend_name: &str, eco_enabled: bool) -> Option<usize> {
-    if backend_name.contains("llama.cpp") {
-        if eco_enabled {
-            Some(900)
-        } else {
-            Some(1800)
-        }
-    } else {
-        eco_tool_result_limit(eco_enabled)
-    }
-}
-
-fn with_progress_heartbeat<T, F>(
-    token_tx: &Sender<InferenceEvent>,
-    label: &str,
-    run: F,
-) -> Result<T>
-where
-    F: FnOnce() -> Result<T>,
-{
-    with_progress_heartbeat_interval(token_tx, label, Duration::from_secs(3), run)
-}
-
-fn with_progress_heartbeat_interval<T, F>(
-    token_tx: &Sender<InferenceEvent>,
-    label: &str,
-    interval: Duration,
-    run: F,
-) -> Result<T>
-where
-    F: FnOnce() -> Result<T>,
-{
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
-    let tx = token_tx.clone();
-    let label = label.to_string();
-
-    let heartbeat = thread::spawn(move || {
-        let mut elapsed = 0u64;
-        loop {
-            thread::sleep(interval);
-            if stop_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            elapsed += interval.as_secs().max(1);
-            emit_trace(
-                &tx,
-                ProgressStatus::Updated,
-                &format!("{label} ({elapsed}s elapsed)"),
-                false,
-            );
-        }
-    });
-
-    let result = run();
-    stop.store(true, Ordering::Relaxed);
-    let _ = heartbeat.join();
-    result
-}
-
-fn thinking_label(intent: ToolLoopIntent) -> (&'static str, &'static str) {
-    match intent {
-        ToolLoopIntent::RepoOverview => (
-            "Thinking: exploring the repo structure and key files.",
-            "exploring repo...",
-        ),
-        ToolLoopIntent::DirectoryOverview => (
-            "Thinking: checking the current directory and its key files.",
-            "exploring directory...",
-        ),
-        ToolLoopIntent::CodeNavigation => (
-            "Thinking: searching the repo and reading candidate files.",
-            "investigating code...",
-        ),
-        ToolLoopIntent::ConfigLocate => (
-            "Thinking: searching the repo and reading candidate config files.",
-            "investigating config...",
-        ),
-    }
-}
-
-fn repo_context_paths(project_root: &Path) -> Vec<String> {
-    [
-        "README.md",
-        "docs/context/CLAUDE.md",
-        "AGENTS.md",
-        "SKILLS.md",
-    ]
-    .iter()
-    .filter(|path| project_root.join(path).is_file())
-    .map(|path| (*path).to_string())
-    .collect()
-}
-
-fn repo_context_summary(project_root: &Path) -> Option<String> {
-    let paths = repo_context_paths(project_root);
-    if paths.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "Repo-local context files are available if useful: {}. Treat them as support context, not a substitute for live inspection.",
-        paths.iter()
-            .map(|path| format!("`{path}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
-}
-
-fn build_tool_loop_system_prompt(
-    tools: &ToolRegistry,
-    project_root: &Path,
-    eco_enabled: bool,
-) -> String {
-    let mut prompt = system_prompt_with_tools(&tools.read_only_tool_descriptions());
-    prompt.push_str(
-        "\n\nYou are in repo-navigation mode.\n\
-         Work like a careful developer using live repo tools.\n\
-         Search before guessing when a symbol or feature location is unclear.\n\
-         Do not narrate intended tool use in prose. When you want to inspect something, emit the actual tool tag(s).\n\
-         Read candidate files, then expand outward only if the evidence points elsewhere.\n\
-         Prefer source files over docs when answering implementation questions.\n\
-         Answer with concrete file paths and line references when available.\n\
-         If the current evidence is insufficient, say so briefly instead of inventing details.",
-    );
-    if eco_enabled {
-        prompt.push_str(
-            "\nKeep the investigation compact: prefer the fewest tool calls that answer the question.",
-        );
-    }
-    if let Some(summary) = repo_context_summary(project_root) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&summary);
-    }
-    prompt
-}
-
-fn initial_tool_only_followup(intent: ToolLoopIntent, prompt: &str) -> String {
-    let search_hint = suggested_search_query(prompt, intent);
-    let starting_hint = match intent {
-        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => {
-            "Start by listing the current directory with `[list_dir: .]`."
-        }
-        ToolLoopIntent::CodeNavigation | ToolLoopIntent::ConfigLocate => match search_hint {
-            Some(ref query) => {
-                return format!(
-                    "Repo-navigation mode requires live inspection before answering. \
-                     Your next response must contain only one or more read-only tool tags and no prose. \
-                     Start with `[search: {query}]`. Prefer the concrete symbol or setting name over a broad natural-language phrase."
-                );
-            }
-            None => {
-                "Start by searching for the most relevant symbol, term, or setting with `[search: ...]`."
-            }
-        },
-    };
-
-    format!(
-        "Repo-navigation mode requires live inspection before answering. \
-         Your next response must contain only one or more read-only tool tags and no prose. \
-         {starting_hint}"
-    )
-}
-
-fn initial_investigation_hint(intent: ToolLoopIntent, prompt: &str) -> Option<String> {
-    let query = suggested_search_query(prompt, intent)?;
-    let instruction = match intent {
-        ToolLoopIntent::CodeNavigation => {
-            "Prefer the concrete symbol over the full English question. After searching, read the strongest source-file candidate before answering. Ignore docs, tests, prompt strings, and use-sites unless the repo has no better source hits."
-        }
-        ToolLoopIntent::ConfigLocate => {
-            "Prefer the concrete setting key over the full English question. After searching, read the strongest config or source file before answering."
-        }
-        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => return None,
-    };
-
-    Some(format!(
-        "Investigation hint: the most promising search target for this request is `{query}`. \
-         Start with `[search: {query}]`. {instruction}"
-    ))
-}
-
-fn is_referential_follow_up(prompt: &str) -> bool {
-    let normalized = normalize_intent_text(prompt);
-    let referential_tokens = [
-        "it", "its", "that", "this", "these", "those", "they", "them", "there", "same", "above",
-        "previous", "former", "latter",
-    ];
-
-    normalized
-        .split_whitespace()
-        .any(|token| referential_tokens.contains(&token))
-}
-
-fn build_tool_loop_seed_messages(
-    base_messages: &[Message],
-    system_prompt: &str,
-    prompt: &str,
-) -> Vec<Message> {
-    let mut messages = vec![Message::system(system_prompt)];
-
-    let mut tail = if is_referential_follow_up(prompt) {
-        base_messages
-            .iter()
-            .filter(|message| message.role != "system")
-            .rev()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        base_messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .cloned()
-            .into_iter()
-            .collect::<Vec<_>>()
-    };
-    tail.reverse();
-
-    let already_has_prompt = tail
-        .last()
-        .map(|message| message.role == "user" && message.content == prompt)
-        .unwrap_or(false);
-    if !already_has_prompt {
-        tail.push(Message::user(prompt));
-    }
-
-    messages.extend(tail);
-    messages
+    intent::detect_tool_loop_intent(prompt)
 }
 
 fn repeated_tool_calls(
@@ -558,313 +62,6 @@ fn repeated_tool_calls(
         }
     }
     repeated
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SearchLineHit {
-    line_number: usize,
-    line_content: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SearchFileHit {
-    path: String,
-    hits: Vec<SearchLineHit>,
-}
-
-fn parse_search_output(output: &str) -> Vec<SearchFileHit> {
-    let mut files = Vec::new();
-    let mut current: Option<SearchFileHit> = None;
-
-    for raw_line in output.lines() {
-        let line = raw_line.trim_end();
-        if line.is_empty() || line.starts_with("Search results for ") {
-            continue;
-        }
-
-        if !raw_line.starts_with(' ') && line.ends_with(':') {
-            if let Some(file) = current.take() {
-                files.push(file);
-            }
-            current = Some(SearchFileHit {
-                path: line.trim_end_matches(':').to_string(),
-                hits: Vec::new(),
-            });
-            continue;
-        }
-
-        if let Some(file) = current.as_mut() {
-            let trimmed = raw_line.trim_start();
-            let Some((line_number, line_content)) = trimmed.split_once(':') else {
-                continue;
-            };
-            let Ok(line_number) = line_number.trim().parse::<usize>() else {
-                continue;
-            };
-            file.hits.push(SearchLineHit {
-                line_number,
-                line_content: line_content.trim().to_string(),
-            });
-        }
-    }
-
-    if let Some(file) = current {
-        files.push(file);
-    }
-
-    files
-}
-
-fn is_doc_path(path: &str) -> bool {
-    path.ends_with(".md") || path.starts_with("docs/")
-}
-
-fn is_test_like_path(path: &str) -> bool {
-    path.starts_with("tests/")
-        || path.contains("/tests/")
-        || path.contains("fixtures")
-        || path.contains("snapshots")
-        || path.ends_with("_test.rs")
-        || path.ends_with("_tests.rs")
-}
-
-fn is_source_path(path: &str) -> bool {
-    path.starts_with("src/")
-        || path.ends_with(".rs")
-        || path.ends_with(".py")
-        || path.ends_with(".ts")
-        || path.ends_with(".tsx")
-        || path.ends_with(".js")
-        || path.ends_with(".jsx")
-        || path.ends_with(".go")
-        || path.ends_with(".java")
-        || path.ends_with(".kt")
-        || path.ends_with(".swift")
-}
-
-fn is_config_path(path: &str) -> bool {
-    matches!(
-        path,
-        ".params.toml"
-            | ".local/config.toml"
-            | "Cargo.toml"
-            | "package.json"
-            | "pyproject.toml"
-            | "go.mod"
-    ) || path.contains("config")
-}
-
-fn is_definition_like_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with("pub fn ")
-        || trimmed.starts_with("fn ")
-        || trimmed.starts_with("pub struct ")
-        || trimmed.starts_with("struct ")
-        || trimmed.starts_with("pub enum ")
-        || trimmed.starts_with("enum ")
-        || trimmed.starts_with("impl ")
-        || trimmed.starts_with("pub mod ")
-        || trimmed.starts_with("mod ")
-        || trimmed.starts_with("def ")
-        || trimmed.starts_with("class ")
-        || trimmed.starts_with("interface ")
-}
-
-fn merge_search_hits(results: &[ToolResult]) -> Vec<SearchFileHit> {
-    let mut by_path = HashMap::<String, Vec<SearchLineHit>>::new();
-    for result in results {
-        if result.tool_name != "search" {
-            continue;
-        }
-        for file in parse_search_output(&result.output) {
-            by_path.entry(file.path).or_default().extend(file.hits);
-        }
-    }
-
-    let mut files = by_path
-        .into_iter()
-        .map(|(path, mut hits)| {
-            hits.sort_by_key(|hit| hit.line_number);
-            hits.dedup_by(|a, b| {
-                a.line_number == b.line_number && a.line_content == b.line_content
-            });
-            SearchFileHit { path, hits }
-        })
-        .collect::<Vec<_>>();
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    files
-}
-
-fn score_search_candidate(intent: ToolLoopIntent, query: &str, file: &SearchFileHit) -> isize {
-    let query = query.trim().to_ascii_lowercase();
-    let path = file.path.to_ascii_lowercase();
-    let mut score = 0isize;
-
-    if is_source_path(&file.path) {
-        score += 28;
-    }
-    if file.path.starts_with("src/") {
-        score += 16;
-    }
-    if matches!(intent, ToolLoopIntent::ConfigLocate) && is_config_path(&file.path) {
-        score += 24;
-    }
-    if is_doc_path(&file.path) {
-        score -= 18;
-    }
-    if is_test_like_path(&file.path) {
-        score -= 28;
-    }
-    if path.contains("prompt") || path.contains("fixture") {
-        score -= 14;
-    }
-    if !query.is_empty() && path.contains(&query) {
-        score += 10;
-    }
-
-    score += (file.hits.len().min(6) as isize) * 3;
-
-    for hit in file.hits.iter().take(4) {
-        let line = hit.line_content.trim();
-        let line_lower = line.to_ascii_lowercase();
-        if !query.is_empty() && line_lower.contains(&query) {
-            score += 6;
-        }
-        if is_definition_like_line(line) {
-            score += 24;
-        }
-        if line.contains("assert!")
-            || line.contains("#[test]")
-            || line.contains("mod tests")
-            || line.contains("Search results for")
-        {
-            score -= 10;
-        }
-        if line.contains('"') && !is_definition_like_line(line) {
-            score -= 4;
-        }
-    }
-
-    score
-}
-
-fn preferred_candidate_path(intent: ToolLoopIntent, path: &str) -> bool {
-    match intent {
-        ToolLoopIntent::CodeNavigation => {
-            is_source_path(path) && !is_doc_path(path) && !is_test_like_path(path)
-        }
-        ToolLoopIntent::ConfigLocate => {
-            (is_config_path(path) || is_source_path(path))
-                && !is_doc_path(path)
-                && !is_test_like_path(path)
-        }
-        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => true,
-    }
-}
-
-fn ranked_search_candidates(
-    intent: ToolLoopIntent,
-    prompt: &str,
-    results: &[ToolResult],
-) -> Vec<SearchFileHit> {
-    let query =
-        suggested_search_query(prompt, intent).unwrap_or_else(|| normalize_intent_text(prompt));
-    let mut ranked = merge_search_hits(results);
-    ranked.sort_by(|a, b| {
-        preferred_candidate_path(intent, &b.path)
-            .cmp(&preferred_candidate_path(intent, &a.path))
-            .then_with(|| {
-                score_search_candidate(intent, &query, b)
-                    .cmp(&score_search_candidate(intent, &query, a))
-            })
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    ranked
-}
-
-fn observed_read_paths(results: &[ToolResult]) -> HashSet<String> {
-    results
-        .iter()
-        .filter(|result| result.tool_name == "read_file")
-        .map(|result| result.argument.clone())
-        .collect()
-}
-
-fn has_relevant_file_evidence(
-    intent: ToolLoopIntent,
-    prompt: &str,
-    results: &[ToolResult],
-) -> bool {
-    match intent {
-        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => {
-            results.iter().any(|result| {
-                matches!(
-                    result.tool_name.as_str(),
-                    "list_dir" | "read_file" | "lsp_definition" | "lsp_hover"
-                )
-            })
-        }
-        ToolLoopIntent::CodeNavigation | ToolLoopIntent::ConfigLocate => {
-            if results
-                .iter()
-                .any(|result| matches!(result.tool_name.as_str(), "lsp_definition" | "lsp_hover"))
-            {
-                return true;
-            }
-
-            let read_paths = observed_read_paths(results);
-            if read_paths.is_empty() {
-                return false;
-            }
-            if read_paths
-                .iter()
-                .any(|path| preferred_candidate_path(intent, path))
-            {
-                return true;
-            }
-
-            let ranked = ranked_search_candidates(intent, prompt, results);
-            let has_better_unread = ranked
-                .iter()
-                .any(|file| preferred_candidate_path(intent, &file.path));
-            !has_better_unread
-        }
-    }
-}
-
-fn targeted_investigation_followup(
-    intent: ToolLoopIntent,
-    prompt: &str,
-    results: &[ToolResult],
-) -> Option<String> {
-    let read_paths = observed_read_paths(results);
-    let candidate = ranked_search_candidates(intent, prompt, results)
-        .into_iter()
-        .find(|file| !read_paths.contains(&file.path))?;
-    let anchor = candidate
-        .hits
-        .iter()
-        .find(|hit| is_definition_like_line(&hit.line_content))
-        .or_else(|| candidate.hits.first());
-    let anchor_text = anchor.map(|hit| format!("{}: {}", hit.line_number, hit.line_content));
-
-    let body = match intent {
-        ToolLoopIntent::CodeNavigation => {
-            "Do not answer yet. Read this source candidate next and answer from the inspected implementation, not from docs, tests, prompt strings, or call-sites."
-        }
-        ToolLoopIntent::ConfigLocate => {
-            "Do not answer yet. Read this config/source candidate next and answer from the inspected setting lines."
-        }
-        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => return None,
-    };
-
-    Some(match anchor_text {
-        Some(anchor) => format!(
-            "{body} Next read: `[read_file: {}]`. Strongest search anchor: `{}`.",
-            candidate.path, anchor
-        ),
-        None => format!("{body} Next read: `[read_file: {}]`.", candidate.path),
-    })
 }
 
 pub(super) fn run_read_only_tool_loop(
@@ -888,13 +85,33 @@ pub(super) fn run_read_only_tool_loop(
     let _ = token_tx.send(InferenceEvent::SystemMessage(thinking.to_string()));
     emit_generation_started(token_tx, status_label, false);
 
-    let system_prompt = build_tool_loop_system_prompt(tools, project_root, eco_enabled);
+    let system_prompt = build_tool_loop_system_prompt(tools, project_root, intent, eco_enabled);
     let mut loop_messages = build_tool_loop_seed_messages(base_messages, &system_prompt, prompt);
-    if let Some(hint) = initial_investigation_hint(intent, prompt) {
-        loop_messages.push(Message::user(&hint));
-    }
-    let mut all_tool_results = Vec::new();
+    let mut all_tool_results =
+        bootstrap_tool_results(intent, prompt, &backend.name(), tools, token_tx);
     let mut tool_call_counts = HashMap::new();
+    repeated_tool_calls(
+        &mut tool_call_counts,
+        &all_tool_results,
+        loop_budget.max_duplicate_calls,
+    );
+
+    if all_tool_results.is_empty() {
+        if let Some(hint) = initial_investigation_hint(intent, prompt) {
+            loop_messages.push(Message::user(&hint));
+        }
+    } else {
+        let result_message =
+            format_tool_loop_results_with_limit(intent, prompt, &all_tool_results, result_limit)
+                .unwrap_or_else(|| "Tool results:\n".to_string());
+        loop_messages.push(Message::user(&result_message));
+        if let Some(guidance) = grounded_answer_guidance(intent, prompt, &all_tool_results) {
+            loop_messages.push(Message::user(&guidance));
+        }
+        loop_messages.push(Message::user(
+            "Initial repo scan is ready. Continue investigating only if you still need more evidence. Otherwise answer now using the observed file and line evidence.",
+        ));
+    }
 
     for iteration in 0..loop_budget.max_iterations {
         emit_trace(
@@ -920,7 +137,12 @@ pub(super) fn run_read_only_tool_loop(
                 cfg,
                 project_root,
                 token_tx.clone(),
-                false,
+                should_stream_tool_loop_generation(
+                    intent,
+                    prompt,
+                    &all_tool_results,
+                    reflection_enabled,
+                ),
                 exact_cache,
                 cache_stats,
                 CacheMode::PreferPromptLevel,
@@ -987,9 +209,17 @@ pub(super) fn run_read_only_tool_loop(
             } else {
                 draft.text
             };
+            let streamed_final_response = !reflection_enabled
+                && should_stream_tool_loop_generation(
+                    intent,
+                    prompt,
+                    &all_tool_results,
+                    reflection_enabled,
+                );
             return Ok(ToolLoopOutcome {
                 final_response,
                 tool_results: all_tool_results,
+                streamed_final_response,
             });
         }
 
@@ -1032,7 +262,13 @@ pub(super) fn run_read_only_tool_loop(
         loop_messages.push(Message::assistant(&draft.text));
         let result_message = ToolRegistry::format_results_with_limit(&results, result_limit)
             .unwrap_or_else(|| "Tool results:\n".to_string());
+        let result_message =
+            format_tool_loop_results_with_limit(intent, prompt, &results, result_limit)
+                .unwrap_or(result_message);
         loop_messages.push(Message::user(&result_message));
+        if let Some(guidance) = grounded_answer_guidance(intent, prompt, &all_tool_results) {
+            loop_messages.push(Message::user(&guidance));
+        }
 
         if repeated {
             loop_messages.push(Message::user(
@@ -1063,7 +299,12 @@ pub(super) fn run_read_only_tool_loop(
                 cfg,
                 project_root,
                 token_tx.clone(),
-                false,
+                should_stream_tool_loop_generation(
+                    intent,
+                    prompt,
+                    &all_tool_results,
+                    reflection_enabled,
+                ),
                 exact_cache,
                 cache_stats,
                 CacheMode::PreferPromptLevel,
@@ -1094,9 +335,18 @@ pub(super) fn run_read_only_tool_loop(
         ));
     }
 
+    let streamed_final_response = !reflection_enabled
+        && should_stream_tool_loop_generation(
+            intent,
+            prompt,
+            &all_tool_results,
+            reflection_enabled,
+        );
+
     Ok(ToolLoopOutcome {
         final_response,
         tool_results: all_tool_results,
+        streamed_final_response,
     })
 }
 
@@ -1110,12 +360,18 @@ mod tests {
     use crate::events::InferenceEvent;
 
     struct ScriptedBackend {
+        name: String,
         responses: std::sync::Mutex<Vec<String>>,
     }
 
     impl ScriptedBackend {
         fn new(responses: Vec<&str>) -> Self {
+            Self::with_name("scripted", responses)
+        }
+
+        fn with_name(name: &str, responses: Vec<&str>) -> Self {
             Self {
+                name: name.to_string(),
                 responses: std::sync::Mutex::new(
                     responses.into_iter().rev().map(str::to_string).collect(),
                 ),
@@ -1136,7 +392,7 @@ mod tests {
         }
 
         fn name(&self) -> String {
-            "scripted".to_string()
+            self.name.clone()
         }
     }
 
@@ -1217,7 +473,12 @@ mod tests {
         let _ = std::fs::write(dir.join("README.md"), "# params-cli");
         let _ = std::fs::write(dir.join("docs/context/CLAUDE.md"), "# CLAUDE");
 
-        let prompt = build_tool_loop_system_prompt(&ToolRegistry::default(), &dir, false);
+        let prompt = build_tool_loop_system_prompt(
+            &ToolRegistry::default(),
+            &dir,
+            ToolLoopIntent::CodeNavigation,
+            false,
+        );
         assert!(prompt.contains("read-only repo inspection tools"));
         assert!(prompt.contains("read_file"));
         assert!(prompt.contains("search"));
@@ -1410,6 +671,324 @@ mod tests {
     }
 
     #[test]
+    fn llama_tool_loop_bootstraps_search_and_read_before_first_generation() {
+        let dir = std::env::temp_dir().join("params-tool-loop-llama-bootstrap");
+        let _ = fs::create_dir_all(dir.join("src/session"));
+        let _ = fs::write(
+            dir.join("src/session/mod.rs"),
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+        );
+
+        let backend = ScriptedBackend::with_name(
+            "llama.cpp · qwen",
+            vec!["The implementation is in `src/session/mod.rs` at line 1."],
+        );
+        let (tx, _rx) = mpsc::channel();
+        let mut cache_stats = SessionCacheStats::default();
+        let mut budget = SessionBudget::default();
+        let outcome = run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+        .expect("tool loop");
+
+        assert_eq!(
+            outcome.final_response,
+            "The implementation is in `src/session/mod.rs` at line 1."
+        );
+        assert_eq!(outcome.tool_results.len(), 2);
+        assert_eq!(outcome.tool_results[0].tool_name, "search");
+        assert_eq!(outcome.tool_results[1].tool_name, "read_file");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grounded_tool_loop_generation_streams_final_answer_tokens() {
+        let dir = std::env::temp_dir().join("params-tool-loop-streaming");
+        let _ = fs::create_dir_all(dir.join("src/session"));
+        let _ = fs::write(
+            dir.join("src/session/mod.rs"),
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+        );
+
+        let final_answer = "The implementation is in `src/session/mod.rs` at line 1.";
+        let backend = ScriptedBackend::new(vec![
+            "[search: load_most_recent]",
+            "[read_file: src/session/mod.rs]",
+            final_answer,
+        ]);
+        let (tx, rx) = mpsc::channel();
+        let mut cache_stats = SessionCacheStats::default();
+        let mut budget = SessionBudget::default();
+        let outcome = run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+        .expect("tool loop");
+
+        assert_eq!(outcome.final_response, final_answer);
+        assert!(outcome.streamed_final_response);
+        let streamed = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                InferenceEvent::Token(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            streamed.contains(final_answer),
+            "expected streamed final answer tokens, got {streamed:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grounded_answer_guidance_prefers_definition_and_real_body_lines() {
+        let guidance = grounded_answer_guidance(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: "File: src/session/mod.rs\nLines: 6\n\n```\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n        return Ok(None);\n    };\n    self.load_session_by_id(&summary.id)\n}\n```\n".to_string(),
+            }],
+        )
+        .expect("guidance");
+
+        assert!(guidance.contains("Primary implementation: src/session/mod.rs:1"));
+        // Body lines must be listed one-per-line with file:line prefix so the model cannot
+        // confuse which number belongs to which content.
+        assert!(
+            guidance.contains("src/session/mod.rs:"),
+            "body lines must use file:line prefix"
+        );
+        assert!(guidance.contains("self.load_session_by_id(&summary.id)"));
+        assert!(guidance.contains("Do not include code fences"));
+        assert!(guidance.contains("Do not quote full function bodies"));
+        // Verbatim-quoting rule: must explicitly ban identifier drift.
+        assert!(
+            guidance.contains("do not rename or substitute"),
+            "guidance must forbid renaming identifiers"
+        );
+        // Anti-hedging: must explicitly list banned words.
+        assert!(
+            guidance.contains("presumably"),
+            "guidance must list `presumably` as a banned hedging word"
+        );
+        assert!(
+            guidance.contains("Do not use hedging words"),
+            "guidance must explicitly ban hedging words"
+        );
+    }
+
+    #[test]
+    fn grounded_answer_guidance_captures_ok_none_and_load_by_id_for_load_most_recent() {
+        // Regression: both the Ok(None) early-return line and the load_session_by_id call
+        // must appear in the observed body lines so the model cannot add hedging around them.
+        let fixture_output = concat!(
+            "File: src/session/mod.rs\nLines: 6\n\n```\n",
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n",
+            "    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n",
+            "        return Ok(None);\n",
+            "    };\n",
+            "    self.load_session_by_id(&summary.id)\n",
+            "}\n",
+            "```\n"
+        );
+        let guidance = grounded_answer_guidance(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: fixture_output.to_string(),
+            }],
+        )
+        .expect("guidance");
+
+        // Both critical lines must be present so the model has direct evidence.
+        assert!(
+            guidance.contains("Ok(None)"),
+            "guidance must expose the Ok(None) early-return line"
+        );
+        assert!(
+            guidance.contains("load_session_by_id(&summary.id)"),
+            "guidance must expose the load_session_by_id call line"
+        );
+        // The anti-hedging rule must be present.
+        assert!(guidance.contains("presumably"));
+        assert!(guidance.contains("Do not use hedging words"));
+    }
+
+    #[test]
+    fn grounded_answer_guidance_anti_hedging_is_in_final_synthesis_context() {
+        // Regression: when the final synthesis step runs, the messages must include the
+        // anti-hedging instruction so the model cannot produce `presumably` or `likely` even
+        // when the body lines are directly observed.
+        let dir = std::env::temp_dir().join("params-tool-loop-anti-hedge");
+        let _ = fs::create_dir_all(dir.join("src/session"));
+        let _ = fs::write(
+            dir.join("src/session/mod.rs"),
+            concat!(
+                "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n",
+                "    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n",
+                "        return Ok(None);\n",
+                "    };\n",
+                "    self.load_session_by_id(&summary.id)\n",
+                "}\n"
+            ),
+        );
+
+        let backend = InspectingBackend::new(vec![
+            (
+                Some("Start with `[search: load_most_recent]`"),
+                "[search: load_most_recent]",
+            ),
+            (
+                Some("Next read: `[read_file: src/session/mod.rs]`"),
+                "[read_file: src/session/mod.rs]",
+            ),
+            (
+                // The final synthesis prompt must contain both the anti-hedging instruction
+                // and the verbatim-quoting rule so the model cannot rename identifiers.
+                Some("do not rename or substitute"),
+                "Session restore is at src/session/mod.rs:1. Line 3 returns Ok(None) when no session exists. Line 5 calls load_session_by_id(&summary.id).",
+            ),
+        ]);
+        let (tx, _rx) = mpsc::channel();
+        let mut cache_stats = SessionCacheStats::default();
+        let mut budget = SessionBudget::default();
+        let outcome = run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+        .expect("tool loop");
+
+        assert_eq!(
+            outcome.final_response,
+            "Session restore is at src/session/mod.rs:1. Line 3 returns Ok(None) when no session exists. Line 5 calls load_session_by_id(&summary.id)."
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grounded_answer_guidance_body_lines_use_per_line_file_line_format() {
+        // Regression for line-number drift: body lines must be formatted one-per-line with
+        // a `file:line` prefix so the model cannot confuse which number belongs to which content.
+        // Previously they were comma-separated on a single line, causing the model to cite the
+        // wrong line number (e.g. "line 275" instead of "line 276").
+        let fixture_output = concat!(
+            "File: src/session/mod.rs\nLines: 6\n\n```\n",
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n",
+            "    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n",
+            "        return Ok(None);\n",
+            "    };\n",
+            "    self.load_session_by_id(&summary.id)\n",
+            "}\n",
+            "```\n"
+        );
+        let guidance = grounded_answer_guidance(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: fixture_output.to_string(),
+            }],
+        )
+        .expect("guidance");
+
+        // Each body line must appear on its own line with a `path:N` prefix, not comma-separated.
+        // This ensures the model can unambiguously map line numbers to line content.
+        assert!(
+            guidance.contains("src/session/mod.rs:3"),
+            "Ok(None) must appear as src/session/mod.rs:3"
+        );
+        assert!(
+            guidance.contains("src/session/mod.rs:5"),
+            "load_session_by_id must appear as src/session/mod.rs:5"
+        );
+        // Must not format as comma-separated on a single line.
+        let body_section = guidance
+            .lines()
+            .skip_while(|l| !l.contains("Observed body lines"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body_section.contains("Ok(None)`) ,"),
+            "body lines must not be comma-separated"
+        );
+        // Verbatim rule must be present.
+        assert!(guidance.contains("do not rename or substitute"));
+    }
+
+    #[test]
+    fn tool_loop_formats_read_file_results_as_compact_plaintext_evidence() {
+        let message = format_tool_loop_results_with_limit(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: "File: src/session/mod.rs\nLines: 6\n\n```\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n        return Ok(None);\n    };\n    self.load_session_by_id(&summary.id)\n}\n```\n".to_string(),
+            }],
+            None,
+        )
+        .expect("formatted tool results");
+
+        assert!(message.contains("Primary implementation: src/session/mod.rs:1"));
+        assert!(message.contains("Observed body lines:"));
+        assert!(message.contains("self.load_session_by_id(&summary.id)"));
+        assert!(!message.contains("```"));
+    }
+
+    #[test]
     fn read_only_tool_loop_rejects_initial_prose_and_requires_tool_use() {
         let dir = std::env::temp_dir().join("params-tool-loop-requires-tool");
         let _ = std::fs::create_dir_all(dir.join("src/session"));
@@ -1583,5 +1162,502 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- New routing pattern tests ---
+
+    #[test]
+    fn detect_tool_loop_intent_routes_explain_how_to_code_navigation() {
+        assert_eq!(
+            detect_tool_loop_intent("explain how session restore works"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+        assert_eq!(
+            detect_tool_loop_intent("Explain how the approval flow works"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+        assert_eq!(
+            detect_tool_loop_intent("explain how memory retrieval works"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+    }
+
+    #[test]
+    fn detect_tool_loop_intent_routes_describe_how_to_code_navigation() {
+        assert_eq!(
+            detect_tool_loop_intent("describe how the tool loop works"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+        assert_eq!(
+            detect_tool_loop_intent("Describe how fact promotion flows"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+    }
+
+    #[test]
+    fn detect_tool_loop_intent_routes_show_how_to_code_navigation() {
+        assert_eq!(
+            detect_tool_loop_intent("show me how session persistence works"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+        assert_eq!(
+            detect_tool_loop_intent("show how the approval path works"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+    }
+
+    #[test]
+    fn detect_tool_loop_intent_routes_walk_through_to_code_navigation() {
+        assert_eq!(
+            detect_tool_loop_intent("walk me through the session save flow"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+        assert_eq!(
+            detect_tool_loop_intent("walk through the memory compression logic"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+    }
+
+    #[test]
+    fn detect_tool_loop_intent_routes_what_calls_to_call_site_lookup() {
+        assert_eq!(
+            detect_tool_loop_intent("what calls load_most_recent?"),
+            Some(ToolLoopIntent::CallSiteLookup)
+        );
+        assert_eq!(
+            detect_tool_loop_intent("who calls run_read_only_tool_loop"),
+            Some(ToolLoopIntent::CallSiteLookup)
+        );
+    }
+
+    #[test]
+    fn detect_tool_loop_intent_routes_what_uses_to_usage_lookup() {
+        assert_eq!(
+            detect_tool_loop_intent("what uses SessionStore"),
+            Some(ToolLoopIntent::UsageLookup)
+        );
+    }
+
+    #[test]
+    fn detect_tool_loop_intent_routes_what_does_do_to_code_navigation() {
+        assert_eq!(
+            detect_tool_loop_intent("what does load_most_recent do"),
+            Some(ToolLoopIntent::CodeNavigation)
+        );
+        assert_eq!(
+            detect_tool_loop_intent("What does the session restore function do?"),
+            Some(ToolLoopIntent::CodeNavigation)
+        );
+        // Should NOT match when it doesn't end with "do"
+        assert_eq!(detect_tool_loop_intent("what does this mean"), None);
+        assert_eq!(detect_tool_loop_intent("what does it return"), None);
+    }
+
+    #[test]
+    fn detect_tool_loop_intent_explain_how_config_routes_to_config_locate() {
+        assert_eq!(
+            detect_tool_loop_intent("explain how eco mode is configured"),
+            Some(ToolLoopIntent::ConfigLocate)
+        );
+    }
+
+    #[test]
+    fn suggested_search_query_extracts_subject_from_explain_how() {
+        // "session" + "restore" triggers the hardcoded session-restore mapping.
+        assert_eq!(
+            suggested_search_query(
+                "explain how session restore works",
+                ToolLoopIntent::FlowTrace
+            )
+            .as_deref(),
+            Some("load_most_recent")
+        );
+        // Non-session phrase: subject is extracted from the stripped phrase.
+        assert_eq!(
+            suggested_search_query(
+                "explain how memory retrieval works",
+                ToolLoopIntent::FlowTrace
+            )
+            .as_deref(),
+            Some("retrieval")
+        );
+    }
+
+    #[test]
+    fn suggested_search_query_extracts_subject_from_describe_how() {
+        assert_eq!(
+            suggested_search_query(
+                "describe how the tool loop works",
+                ToolLoopIntent::FlowTrace
+            )
+            .as_deref(),
+            Some("loop")
+        );
+    }
+
+    #[test]
+    fn suggested_search_query_extracts_subject_from_show_me_how() {
+        // "approval" is the only non-stopword token after stripping the verb phrase.
+        assert_eq!(
+            suggested_search_query("show me how approval works", ToolLoopIntent::FlowTrace,)
+                .as_deref(),
+            Some("approval")
+        );
+        assert_eq!(
+            suggested_search_query("show how the search tool works", ToolLoopIntent::FlowTrace,)
+                .as_deref(),
+            Some("search")
+        );
+    }
+
+    #[test]
+    fn suggested_search_query_extracts_subject_from_walk_me_through() {
+        // "session" + "save" triggers the hardcoded session-save mapping.
+        assert_eq!(
+            suggested_search_query(
+                "walk me through the session save flow",
+                ToolLoopIntent::FlowTrace
+            )
+            .as_deref(),
+            Some("save_messages")
+        );
+        // Non-session phrase: subject is extracted directly.
+        assert_eq!(
+            suggested_search_query(
+                "walk me through the approval flow",
+                ToolLoopIntent::FlowTrace
+            )
+            .as_deref(),
+            Some("approval")
+        );
+    }
+
+    #[test]
+    fn suggested_search_query_extracts_subject_from_what_calls() {
+        // Underscores must be preserved — they are stripped by normalize_intent_text but
+        // the raw extraction path preserves the full symbol name.
+        assert_eq!(
+            suggested_search_query(
+                "what calls load_most_recent",
+                ToolLoopIntent::CallSiteLookup
+            )
+            .as_deref(),
+            Some("load_most_recent")
+        );
+        assert_eq!(
+            suggested_search_query(
+                "what calls load_most_recent?",
+                ToolLoopIntent::CallSiteLookup
+            )
+            .as_deref(),
+            Some("load_most_recent")
+        );
+    }
+
+    #[test]
+    fn suggested_search_query_extracts_subject_from_who_calls() {
+        assert_eq!(
+            suggested_search_query(
+                "who calls run_read_only_tool_loop",
+                ToolLoopIntent::CallSiteLookup
+            )
+            .as_deref(),
+            Some("run_read_only_tool_loop")
+        );
+    }
+
+    #[test]
+    fn suggested_search_query_extracts_subject_from_what_uses() {
+        assert_eq!(
+            suggested_search_query("what uses SessionStore", ToolLoopIntent::UsageLookup)
+                .as_deref(),
+            Some("sessionstore")
+        );
+    }
+
+    #[test]
+    fn suggested_search_query_extracts_subject_from_what_does_do() {
+        // Underscores are preserved via the raw extraction path.
+        assert_eq!(
+            suggested_search_query(
+                "what does load_most_recent do",
+                ToolLoopIntent::CodeNavigation
+            )
+            .as_deref(),
+            Some("load_most_recent")
+        );
+        assert_eq!(
+            suggested_search_query(
+                "what does load_most_recent do?",
+                ToolLoopIntent::CodeNavigation
+            )
+            .as_deref(),
+            Some("load_most_recent")
+        );
+    }
+
+    #[test]
+    fn tool_loop_runs_for_explain_how_pattern() {
+        let dir = std::env::temp_dir().join("params-tool-loop-explain-how");
+        let _ = fs::create_dir_all(dir.join("src/session"));
+        let _ = fs::write(
+            dir.join("src/session/mod.rs"),
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+        );
+
+        let backend = ScriptedBackend::new(vec![
+            "[search: session]",
+            "[read_file: src/session/mod.rs]",
+            "Session restore calls load_most_recent in src/session/mod.rs.",
+        ]);
+        let (tx, _rx) = mpsc::channel();
+        let mut cache_stats = SessionCacheStats::default();
+        let mut budget = SessionBudget::default();
+        let outcome = run_read_only_tool_loop(
+            ToolLoopIntent::FlowTrace,
+            "explain how session restore works",
+            &[
+                Message::system("system"),
+                Message::user("explain how session restore works"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+        .expect("tool loop");
+
+        assert_eq!(
+            outcome.final_response,
+            "Session restore calls load_most_recent in src/session/mod.rs."
+        );
+        assert!(
+            outcome
+                .tool_results
+                .iter()
+                .any(|r| r.tool_name == "read_file"),
+            "expected at least one read_file result for explain-how query"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tool_loop_runs_for_what_calls_pattern() {
+        let dir = std::env::temp_dir().join("params-tool-loop-what-calls");
+        let _ = fs::create_dir_all(dir.join("src/session"));
+        let _ = fs::write(
+            dir.join("src/session/mod.rs"),
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+        );
+
+        let backend = ScriptedBackend::new(vec![
+            "[search: load_most_recent]",
+            "[read_file: src/session/mod.rs]",
+            "load_most_recent is called from model_thread in src/inference/session.rs.",
+        ]);
+        let (tx, _rx) = mpsc::channel();
+        let mut cache_stats = SessionCacheStats::default();
+        let mut budget = SessionBudget::default();
+        let outcome = run_read_only_tool_loop(
+            ToolLoopIntent::CallSiteLookup,
+            "what calls load_most_recent",
+            &[
+                Message::system("system"),
+                Message::user("what calls load_most_recent"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+        .expect("tool loop");
+
+        assert_eq!(
+            outcome.final_response,
+            "load_most_recent is called from model_thread in src/inference/session.rs."
+        );
+        assert!(
+            outcome.tool_results.iter().any(|r| r.tool_name == "search"),
+            "expected a search result for what-calls query"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn detect_tool_loop_intent_routes_trace_how_to_flow_trace() {
+        assert_eq!(
+            detect_tool_loop_intent("trace how session restore works"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+        assert_eq!(
+            detect_tool_loop_intent("how does session persistence work"),
+            Some(ToolLoopIntent::FlowTrace)
+        );
+    }
+
+    #[test]
+    fn call_site_lookup_requires_search_and_source_read_for_evidence() {
+        // Search alone is not sufficient — need to also read a source file.
+        assert!(!has_relevant_file_evidence(
+            ToolLoopIntent::CallSiteLookup,
+            "what calls load_most_recent",
+            &[ToolResult {
+                tool_name: "search".to_string(),
+                argument: "load_most_recent".to_string(),
+                output: "src/inference/session.rs:\n  42: load_most_recent()\n".to_string(),
+            }],
+        ));
+
+        // Search + source read is sufficient.
+        assert!(has_relevant_file_evidence(
+            ToolLoopIntent::CallSiteLookup,
+            "what calls load_most_recent",
+            &[
+                ToolResult {
+                    tool_name: "search".to_string(),
+                    argument: "load_most_recent".to_string(),
+                    output: "src/inference/session.rs:\n  42: load_most_recent()\n".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "src/inference/session.rs".to_string(),
+                    output: "File: src/inference/session.rs\n\n```\nfn foo() { load_most_recent() }\n```\n".to_string(),
+                },
+            ],
+        ));
+    }
+
+    #[test]
+    fn call_site_loop_shows_call_site_guidance_not_definition_guidance() {
+        let guidance = grounded_answer_guidance(
+            ToolLoopIntent::CallSiteLookup,
+            "what calls load_most_recent",
+            &[ToolResult {
+                tool_name: "search".to_string(),
+                argument: "load_most_recent".to_string(),
+                output: "src/inference/session.rs:\n  42: let s = store.load_most_recent()\nsrc/inference/mod.rs:\n  10: pub fn load_most_recent() -> Option<Session>\n".to_string(),
+            }],
+        )
+        .expect("guidance for call-site lookup");
+
+        // Must list the invocation line, not the definition line
+        assert!(
+            guidance.contains("42"),
+            "must reference the invocation line number"
+        );
+        assert!(
+            guidance.contains("Observed call-sites:"),
+            "must label evidence as call-sites, not definitions"
+        );
+        // Must not describe the implementation
+        assert!(
+            guidance.contains("Do NOT describe the symbol"),
+            "must not instruct model to describe implementation"
+        );
+        // Anti-hedging rule must be present
+        assert!(guidance.contains("presumably"));
+    }
+
+    #[test]
+    fn usage_lookup_guidance_labels_evidence_as_usages() {
+        let guidance = grounded_answer_guidance(
+            ToolLoopIntent::UsageLookup,
+            "what uses SessionStore",
+            &[ToolResult {
+                tool_name: "search".to_string(),
+                argument: "SessionStore".to_string(),
+                output: "src/inference/session.rs:\n  5: use crate::session::SessionStore;\nsrc/session/mod.rs:\n  1: pub struct SessionStore {\n".to_string(),
+            }],
+        )
+        .expect("guidance for usage lookup");
+
+        assert!(
+            guidance.contains("Observed usages:"),
+            "must label evidence as usages"
+        );
+        // The `use crate::session::SessionStore` import line (non-definition) should appear
+        assert!(
+            guidance.contains("5"),
+            "must include the non-definition reference line"
+        );
+    }
+
+    #[test]
+    fn flow_trace_guidance_shows_multi_file_definitions() {
+        let guidance = grounded_answer_guidance(
+            ToolLoopIntent::FlowTrace,
+            "trace how session restore works",
+            &[
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "src/session/mod.rs".to_string(),
+                    output: "File: src/session/mod.rs\n\n```\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    self.load_session_by_id(&id)\n}\n```\n".to_string(),
+                },
+                ToolResult {
+                    tool_name: "read_file".to_string(),
+                    argument: "src/inference/session.rs".to_string(),
+                    output: "File: src/inference/session.rs\n\n```\nfn restore_session(store: &SessionStore) {\n    let s = store.load_most_recent();\n}\n```\n".to_string(),
+                },
+            ],
+        )
+        .expect("guidance for flow trace");
+
+        assert!(
+            guidance.contains("Observed definitions across files:"),
+            "must aggregate evidence from multiple files"
+        );
+        assert!(
+            guidance.contains("src/session/mod.rs"),
+            "must include first file"
+        );
+        assert!(
+            guidance.contains("src/inference/session.rs"),
+            "must include second file"
+        );
+        assert!(guidance.contains("presumably"));
+    }
+
+    #[test]
+    fn targeted_followup_for_call_site_lookup_prefers_invocation_files() {
+        // When search hits include both a definition file and a caller file,
+        // targeted_investigation_followup for CallSiteLookup should steer toward the caller.
+        let search_output = concat!(
+            "src/session/mod.rs:\n",
+            "  1: pub fn load_most_recent(&self) -> Result<Option<SavedSession>>\n",
+            "src/inference/session.rs:\n",
+            "  42: store.load_most_recent()\n",
+        );
+        let results = &[ToolResult {
+            tool_name: "search".to_string(),
+            argument: "load_most_recent".to_string(),
+            output: search_output.to_string(),
+        }];
+
+        let followup = targeted_investigation_followup(
+            ToolLoopIntent::CallSiteLookup,
+            "what calls load_most_recent",
+            results,
+        )
+        .expect("should produce a followup");
+
+        // Must steer toward the caller file (session.rs has the invocation on line 42)
+        assert!(
+            followup.contains("src/inference/session.rs"),
+            "must suggest reading the file with the call-site, got: {followup}"
+        );
     }
 }

@@ -3013,7 +3013,7 @@ pub fn model_thread_with_options(
                             }
                             turn_memory.set_final_response(outcome.final_response.clone());
                             if !outcome.final_response.trim().is_empty() {
-                                if !reflection_enabled {
+                                if !reflection_enabled && !outcome.streamed_final_response {
                                     emit_buffered_tokens(&token_tx, &outcome.final_response);
                                 }
                                 log_debug_response(
