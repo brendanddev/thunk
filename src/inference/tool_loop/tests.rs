@@ -635,6 +635,93 @@ fn tool_loop_formats_read_file_results_as_compact_plaintext_evidence() {
 }
 
 #[test]
+fn grounded_answer_guidance_summarizes_loaded_file_from_observed_declarations() {
+    let guidance = grounded_answer_guidance(
+        ToolLoopIntent::CodeNavigation,
+        "What does this file do?",
+        &[ToolResult {
+            tool_name: "read_file".to_string(),
+            argument: "src/tui/state/helpers.rs".to_string(),
+            output: concat!(
+                "File: src/tui/state/helpers.rs\n",
+                "Lines: 5\n\n",
+                "```\n",
+                "use crate::events::ProgressStatus;\n",
+                "use super::AppState;\n\n",
+                "pub fn summarize_trace_steps() {}\n",
+                "fn extract_preview_lines() {}\n",
+                "```\n"
+            )
+            .to_string(),
+        }],
+    )
+    .expect("guidance");
+
+    assert!(guidance.contains("Loaded file: `src/tui/state/helpers.rs`"));
+    assert!(guidance.contains("Observed declarations:"));
+    assert!(guidance.contains("src/tui/state/helpers.rs:1 `use crate::events::ProgressStatus;`"));
+    assert!(guidance.contains("src/tui/state/helpers.rs:4 `pub fn summarize_trace_steps() {}`"));
+    assert!(guidance.contains("Do not mention search results"));
+}
+
+#[test]
+fn file_context_question_bootstraps_from_loaded_file_instead_of_searching_wrapper_text() {
+    let dir = std::env::temp_dir().join("params-tool-loop-file-context");
+    let _ = fs::create_dir_all(dir.join("src/tui/state"));
+    let _ = fs::write(
+        dir.join("src/tui/state/helpers.rs"),
+        "use crate::events::ProgressStatus;\n\npub fn summarize_trace_steps() {}\n",
+    );
+
+    let loaded_context = concat!(
+        "I've loaded this file for context:\n\n",
+        "File: src/tui/state/helpers.rs\n",
+        "Lines: 3\n\n",
+        "```\n",
+        "use crate::events::ProgressStatus;\n\n",
+        "pub fn summarize_trace_steps() {}\n",
+        "```\n"
+    );
+
+    let backend = ScriptedBackend::new(vec![
+        "This file defines `summarize_trace_steps` in `src/tui/state/helpers.rs` and imports `ProgressStatus`, so it appears to hold helper logic for transcript/runtime state formatting.",
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = run_read_only_tool_loop(
+        ToolLoopIntent::CodeNavigation,
+        "What does this file do?",
+        &[
+            Message::system("system"),
+            Message::user(loaded_context),
+            Message::user("What does this file do?"),
+        ],
+        &backend,
+        &ToolRegistry::default(),
+        &config::Config::default(),
+        &dir,
+        &tx,
+        None,
+        &mut cache_stats,
+        &mut budget,
+        false,
+        false,
+    )
+    .expect("tool loop");
+
+    assert_eq!(outcome.tool_results.len(), 1);
+    assert_eq!(outcome.tool_results[0].tool_name, "read_file");
+    assert_eq!(outcome.tool_results[0].argument, "src/tui/state/helpers.rs");
+    assert_eq!(
+        outcome.final_response,
+        "This file defines `summarize_trace_steps` in `src/tui/state/helpers.rs` and imports `ProgressStatus`, so it appears to hold helper logic for transcript/runtime state formatting."
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn read_only_tool_loop_rejects_initial_prose_and_requires_tool_use() {
     let dir = std::env::temp_dir().join("params-tool-loop-requires-tool");
     let _ = std::fs::create_dir_all(dir.join("src/session"));
@@ -1037,6 +1124,10 @@ fn suggested_search_query_extracts_subject_from_what_does_do() {
         )
         .as_deref(),
         Some("load_most_recent")
+    );
+    assert_eq!(
+        suggested_search_query("What does this file do?", ToolLoopIntent::CodeNavigation),
+        None
     );
 }
 

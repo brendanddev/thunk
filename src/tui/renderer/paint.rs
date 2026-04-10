@@ -74,6 +74,16 @@ fn build_transcript(
     mut cached_block: impl FnMut(&ChatMessage, bool, u16) -> Vec<StyledLine>,
 ) -> Vec<RenderBlock> {
     let mut blocks = Vec::new();
+    let active_assistant_id = if state.is_generating {
+        state
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .map(|message| message.id)
+    } else {
+        None
+    };
     if state.messages.is_empty() {
         blocks.push(RenderBlock {
             message_id: None,
@@ -98,9 +108,8 @@ fn build_transcript(
                 lines,
             });
         } else {
-            let is_active_assistant = message.role == Role::Assistant
-                && state.is_generating
-                && state.messages.last().map(|last| last.id) == Some(message.id);
+            let is_active_assistant =
+                message.role == Role::Assistant && active_assistant_id == Some(message.id);
             let mut lines =
                 build_standard_message(message, theme, width, is_active_assistant, state.tick);
             if needs_transcript_gap(message, next) {

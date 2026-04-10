@@ -1,7 +1,9 @@
 use crate::memory::retrieval::{query_terms, score_text};
 use crate::tools::ToolResult;
 
-use super::super::intent::{normalize_intent_text, suggested_search_query, ToolLoopIntent};
+use super::super::intent::{
+    is_referential_file_prompt, normalize_intent_text, suggested_search_query, ToolLoopIntent,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SearchLineHit {
@@ -244,6 +246,29 @@ pub(super) fn first_non_empty_lines(content: &str, limit: usize) -> Vec<(usize, 
         .collect()
 }
 
+pub(super) fn declaration_lines_with_numbers(content: &str, limit: usize) -> Vec<(usize, String)> {
+    content
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| (idx + 1, line.trim()))
+        .filter(|(_, line)| {
+            !line.is_empty()
+                && (line.starts_with("pub struct ")
+                    || line.starts_with("struct ")
+                    || line.starts_with("pub enum ")
+                    || line.starts_with("enum ")
+                    || line.starts_with("pub fn ")
+                    || line.starts_with("fn ")
+                    || line.starts_with("impl ")
+                    || line.starts_with("mod ")
+                    || line.starts_with("pub mod ")
+                    || line.starts_with("use "))
+        })
+        .take(limit)
+        .map(|(line_number, line)| (line_number, line.to_string()))
+        .collect()
+}
+
 pub(super) fn compact_read_file_result(
     intent: ToolLoopIntent,
     prompt: &str,
@@ -257,39 +282,54 @@ pub(super) fn compact_read_file_result(
 
     match intent {
         ToolLoopIntent::CodeNavigation => {
-            let definition_hits = filter_non_test_hits(
-                &content,
-                definition_match_lines_with_numbers(&content, &query, 1),
-            );
-            if let Some((line_number, line)) = definition_hits.into_iter().next() {
-                sections.push(format!(
-                    "Primary implementation: {}:{} `{}`",
-                    path,
-                    line_number,
-                    clip_inline(&line, 120)
-                ));
-                let body_lines = surrounding_body_lines(&content, line_number, 4);
-                if !body_lines.is_empty() {
-                    sections.push("Observed body lines:".to_string());
-                    sections.extend(body_lines.into_iter().map(|(line_number, line)| {
+            if is_referential_file_prompt(prompt) {
+                let declarations = declaration_lines_with_numbers(&content, 6);
+                let excerpt = if declarations.is_empty() {
+                    first_non_empty_lines(&content, 6)
+                } else {
+                    declarations
+                };
+                if !excerpt.is_empty() {
+                    sections.push("Observed declarations:".to_string());
+                    sections.extend(excerpt.into_iter().map(|(line_number, line)| {
                         format!("  {line_number}: `{}`", clip_inline(&line, 120))
                     }));
                 }
             } else {
-                let matches = filter_non_test_hits(
+                let definition_hits = filter_non_test_hits(
                     &content,
-                    query_match_lines_with_numbers(&content, &query, 6),
+                    definition_match_lines_with_numbers(&content, &query, 1),
                 );
-                let excerpt = if matches.is_empty() {
-                    first_non_empty_lines(&content, 6)
+                if let Some((line_number, line)) = definition_hits.into_iter().next() {
+                    sections.push(format!(
+                        "Primary implementation: {}:{} `{}`",
+                        path,
+                        line_number,
+                        clip_inline(&line, 120)
+                    ));
+                    let body_lines = surrounding_body_lines(&content, line_number, 4);
+                    if !body_lines.is_empty() {
+                        sections.push("Observed body lines:".to_string());
+                        sections.extend(body_lines.into_iter().map(|(line_number, line)| {
+                            format!("  {line_number}: `{}`", clip_inline(&line, 120))
+                        }));
+                    }
                 } else {
-                    matches
-                };
-                if !excerpt.is_empty() {
-                    sections.push("Observed lines:".to_string());
-                    sections.extend(excerpt.into_iter().map(|(line_number, line)| {
-                        format!("  {line_number}: `{}`", clip_inline(&line, 120))
-                    }));
+                    let matches = filter_non_test_hits(
+                        &content,
+                        query_match_lines_with_numbers(&content, &query, 6),
+                    );
+                    let excerpt = if matches.is_empty() {
+                        first_non_empty_lines(&content, 6)
+                    } else {
+                        matches
+                    };
+                    if !excerpt.is_empty() {
+                        sections.push("Observed lines:".to_string());
+                        sections.extend(excerpt.into_iter().map(|(line_number, line)| {
+                            format!("  {line_number}: `{}`", clip_inline(&line, 120))
+                        }));
+                    }
                 }
             }
         }

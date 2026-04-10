@@ -26,6 +26,20 @@ pub(super) fn normalize_intent_text(text: &str) -> String {
         .join(" ")
 }
 
+pub(super) fn is_referential_file_prompt(prompt: &str) -> bool {
+    let normalized = normalize_intent_text(prompt);
+    matches!(
+        normalized.as_str(),
+        "what does this file do"
+            | "what does the current file do"
+            | "what does the loaded file do"
+            | "what is this file for"
+            | "explain this file"
+            | "describe this file"
+            | "summarize this file"
+    )
+}
+
 fn trim_query_noise(query: &str) -> String {
     let mut trimmed = query.trim().to_string();
     for prefix in ["the ", "a ", "an ", "this ", "that "] {
@@ -156,6 +170,10 @@ fn salient_search_token(phrase: &str, intent: ToolLoopIntent) -> Option<String> 
 }
 
 pub(super) fn suggested_search_query(prompt: &str, intent: ToolLoopIntent) -> Option<String> {
+    if is_referential_file_prompt(prompt) {
+        return None;
+    }
+
     let normalized = normalize_intent_text(prompt);
     if normalized.contains("session") {
         if normalized.contains("save") || normalized.contains("saved") {

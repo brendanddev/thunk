@@ -362,7 +362,12 @@ src/
   inference/
     mod.rs           — public facade, backend loading, session command API
     backend.rs       — InferenceBackend trait
-    session.rs       — model thread + session lifecycle orchestration
+    session.rs       — thin facade for the session runtime submodules
+    session/
+      runtime.rs     — model thread + live session lifecycle orchestration
+      memory.rs      — session-memory retrieval/update helpers
+      support.rs     — session persistence/list/export/reset helpers
+      auto_inspect.rs — legacy hidden auto-inspection helpers and tests
     budget.rs        — budget/cache accounting helpers
     cache.rs         — exact/prompt/semantic cache helpers
     approval.rs      — approval flow helpers
@@ -385,5 +390,10 @@ src/
     commands.rs      — built-in/custom slash command dispatch
     renderer/        — custom framebuffer, layout, paint, and diff renderer
     format.rs        — display sanitization helpers
-    state.rs         — app state
+    state.rs         — thin facade for AppState submodules
+    state/
+      input.rs       — input editing, history, reverse search, autocomplete
+      runtime.rs     — transcript, status, pending-action, and timer state updates
+      helpers.rs     — transcript formatting and state support helpers
+      tests.rs       — AppState regression coverage
 ```

@@ -70,6 +70,33 @@ fn user_messages_render_with_conversation_gutter() {
 }
 
 #[test]
+fn active_assistant_cursor_survives_trailing_system_thinking_message() {
+    let mut state = AppState::new();
+    state.start_generation("generating...", true);
+    state.add_system_message("Thinking: searching the repo and reading candidate files.");
+
+    let model = build_render_model(
+        &mut state,
+        Theme::default(),
+        80,
+        |message, focused, width| build_transcript_block(message, Theme::default(), width, focused),
+    );
+    let transcript_text = model
+        .transcript
+        .iter()
+        .flat_map(|block| block.lines.iter())
+        .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+        .collect::<String>();
+
+    assert!(transcript_text.contains("params"));
+    assert!(
+        transcript_text.contains("▍") || transcript_text.contains("▌"),
+        "expected active assistant cursor in transcript, got {transcript_text:?}"
+    );
+    assert!(transcript_text.contains("Thinking: searching the repo"));
+}
+
+#[test]
 fn system_messages_render_with_dim_gutter() {
     let message = ChatMessage {
         id: 1,

@@ -8,12 +8,16 @@ use crate::events::{InferenceEvent, ProgressStatus};
 use crate::tools::{ToolRegistry, ToolResult};
 
 use super::super::runtime::emit_trace;
-use super::intent::{normalize_intent_text, suggested_search_query, ToolLoopIntent};
+use super::super::Message;
+use super::intent::{
+    is_referential_file_prompt, normalize_intent_text, suggested_search_query, ToolLoopIntent,
+};
 use parse::{
-    clip_inline, clip_tool_output, compact_read_file_result, definition_match_lines_with_numbers,
-    filter_non_test_hits, is_config_path, is_definition_like_line, is_doc_path, is_source_path,
-    is_test_like_path, parse_read_file_output, parse_search_output, surrounding_body_lines,
-    SearchFileHit, SearchLineHit,
+    clip_inline, clip_tool_output, compact_read_file_result, declaration_lines_with_numbers,
+    definition_match_lines_with_numbers, filter_non_test_hits, first_non_empty_lines,
+    is_config_path, is_definition_like_line, is_doc_path, is_source_path, is_test_like_path,
+    parse_read_file_output, parse_search_output, surrounding_body_lines, SearchFileHit,
+    SearchLineHit,
 };
 
 pub(super) fn format_tool_loop_results_with_limit(
@@ -48,9 +52,48 @@ pub(super) fn grounded_answer_guidance(
     prompt: &str,
     results: &[ToolResult],
 ) -> Option<String> {
-    let query = suggested_search_query(prompt, intent)?;
     match intent {
         ToolLoopIntent::CodeNavigation => {
+            if is_referential_file_prompt(prompt) {
+                for result in results
+                    .iter()
+                    .filter(|result| result.tool_name == "read_file")
+                {
+                    let Some((path, content)) = parse_read_file_output(&result.output) else {
+                        continue;
+                    };
+                    let declarations = declaration_lines_with_numbers(&content, 6);
+                    let excerpt = if declarations.is_empty() {
+                        first_non_empty_lines(&content, 6)
+                    } else {
+                        declarations
+                    };
+                    if excerpt.is_empty() {
+                        continue;
+                    }
+                    let mut sections = vec![
+                        "Grounded answer requirements: answer what this loaded file does using only the observed lines below. Do not include code fences. Do not mention search results, wrapper prompt text, or unrelated prompt strings. Do not suggest inspecting another file unless the observed lines are genuinely insufficient.".to_string(),
+                        format!("Loaded file: `{path}`"),
+                        "Observed declarations:".to_string(),
+                    ];
+                    sections.extend(excerpt.into_iter().map(|(line_number, line)| {
+                        format!("  {}:{} `{}`", path, line_number, clip_inline(&line, 120))
+                    }));
+                    sections.push(
+                        "Answer from the observed lines above only. Rules:\n\
+                         1. Summarize the file's role from the declarations/imports/modules actually shown.\n\
+                         2. Cite every concrete fact with exact file:line references.\n\
+                         3. Copy identifiers verbatim — do not rename methods, modules, or types.\n\
+                         4. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`).\n\
+                         5. Do not pivot to other files unless the loaded file clearly delegates there in the observed lines."
+                            .to_string(),
+                    );
+                    return Some(sections.join("\n"));
+                }
+                return None;
+            }
+
+            let query = suggested_search_query(prompt, intent)?;
             for result in results
                 .iter()
                 .filter(|result| result.tool_name == "read_file")
@@ -158,6 +201,7 @@ pub(super) fn grounded_answer_guidance(
             Some(sections.join("\n"))
         }
         ToolLoopIntent::FlowTrace => {
+            let query = suggested_search_query(prompt, intent)?;
             let mut file_sections: Vec<String> = Vec::new();
             for result in results.iter().filter(|r| r.tool_name == "read_file") {
                 let Some((path, content)) = parse_read_file_output(&result.output) else {
@@ -221,6 +265,22 @@ pub(super) fn grounded_answer_guidance(
         | ToolLoopIntent::RepoOverview
         | ToolLoopIntent::DirectoryOverview => None,
     }
+}
+
+fn recent_loaded_file_context_path(base_messages: &[Message]) -> Option<String> {
+    base_messages.iter().rev().find_map(|message| {
+        if message.role != "user"
+            || !message
+                .content
+                .starts_with("I've loaded this file for context:")
+        {
+            return None;
+        }
+        message.content.lines().find_map(|line| {
+            line.strip_prefix("File: ")
+                .map(|path| path.trim().to_string())
+        })
+    })
 }
 
 fn merge_search_hits(results: &[ToolResult]) -> Vec<SearchFileHit> {
@@ -596,10 +656,33 @@ fn auto_read_best_candidate(
 pub(super) fn bootstrap_tool_results(
     intent: ToolLoopIntent,
     prompt: &str,
+    base_messages: &[Message],
     backend_name: &str,
     tools: &ToolRegistry,
     token_tx: &Sender<InferenceEvent>,
 ) -> Vec<ToolResult> {
+    if is_referential_file_prompt(prompt) {
+        if let Some(path) = recent_loaded_file_context_path(base_messages) {
+            emit_trace(
+                token_tx,
+                ProgressStatus::Started,
+                &format!("bootstrapping read {}...", path),
+                false,
+            );
+            let execution = tools.execute_read_only_tool_calls(&format!("[read_file: {path}]"));
+            let results = execution.results;
+            if let Some(read_result) = results.first() {
+                emit_trace(
+                    token_tx,
+                    ProgressStatus::Finished,
+                    &format!("read_file {}", read_result.argument),
+                    false,
+                );
+            }
+            return results;
+        }
+    }
+
     if !backend_name.contains("llama.cpp") {
         return Vec::new();
     }

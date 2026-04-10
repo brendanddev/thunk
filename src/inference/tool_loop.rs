@@ -87,8 +87,14 @@ pub(super) fn run_read_only_tool_loop(
 
     let system_prompt = build_tool_loop_system_prompt(tools, project_root, intent, eco_enabled);
     let mut loop_messages = build_tool_loop_seed_messages(base_messages, &system_prompt, prompt);
-    let mut all_tool_results =
-        bootstrap_tool_results(intent, prompt, &backend.name(), tools, token_tx);
+    let mut all_tool_results = bootstrap_tool_results(
+        intent,
+        prompt,
+        base_messages,
+        &backend.name(),
+        tools,
+        token_tx,
+    );
     let mut tool_call_counts = HashMap::new();
     repeated_tool_calls(
         &mut tool_call_counts,
