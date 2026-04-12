@@ -21,8 +21,8 @@ use parse::{
     is_config_path, is_definition_like_line, is_doc_path, is_internal_tool_loop_path,
     is_legacy_auto_inspect_path, is_source_path, is_test_like_path,
     line_contains_symbol_invocation, line_contains_symbol_reference, parse_read_file_output,
-    parse_search_output, prompt_mentions_tests, surrounding_body_lines, SearchFileHit,
-    SearchLineHit,
+    parse_search_output, prompt_mentions_tests, query_match_lines_with_numbers,
+    surrounding_body_lines, SearchFileHit, SearchLineHit,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,9 +162,26 @@ pub(super) fn grounded_answer_guidance(
                     let Some((path, content)) = parse_read_file_output(&result.output) else {
                         continue;
                     };
-                    let declarations = declaration_lines_with_numbers(&content, 6);
+                    // Use a higher limit so fn main and other key declarations
+                    // appear even in files with many leading mod lines.
+                    let mut declarations = declaration_lines_with_numbers(&content, 14);
+                    let has_main = declarations
+                        .iter()
+                        .any(|(_, l)| l.starts_with("fn main") || l.starts_with("pub fn main"));
+                    if !has_main {
+                        if let Some(main_line) = first_matching_lines(
+                            &content,
+                            |l| l.starts_with("fn main(") || l.starts_with("pub fn main("),
+                            1,
+                        )
+                        .into_iter()
+                        .next()
+                        {
+                            declarations.push(main_line);
+                        }
+                    }
                     let excerpt = if declarations.is_empty() {
-                        first_non_empty_lines(&content, 6)
+                        first_non_empty_lines(&content, 10)
                     } else {
                         declarations
                     };
@@ -182,11 +199,12 @@ pub(super) fn grounded_answer_guidance(
                     sections.push(
                         "Answer from the observed lines above only. Rules:\n\
                          1. Keep the answer to 2-4 short sentences or a flat 3-bullet list.\n\
-                         2. Summarize the file's role from the declarations/imports/modules actually shown.\n\
-                         3. Cite every concrete fact with exact file:line references.\n\
-                         4. Copy identifiers verbatim — do not rename methods, modules, or types.\n\
-                         5. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`).\n\
-                         6. Do not pivot to other files or offer next-step advice unless the observed lines clearly delegate elsewhere."
+                         2. If `fn main` is visible, mention that this is the binary entrypoint and describe its role.\n\
+                         3. Summarize the file's role from the declarations/imports/modules actually shown.\n\
+                         4. Cite every concrete fact with exact file:line references.\n\
+                         5. Copy identifiers verbatim — do not rename methods, modules, or types.\n\
+                         6. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`).\n\
+                         7. Do not pivot to other files or offer next-step advice unless the observed lines clearly delegate elsewhere."
                             .to_string(),
                     );
                     return Some(sections.join("\n"));
@@ -341,22 +359,80 @@ pub(super) fn grounded_answer_guidance(
                 return None;
             }
             let mut sections = vec![
-                "Grounded answer requirements: describe the execution flow using only the observed file evidence. \
-                 Do not include code fences. Describe the sequence as concrete ordered steps."
+                "Grounded answer requirements: explain the execution flow in plain language using \
+                 only the observed file evidence below. Do not list raw code lines. \
+                 Write a short natural-language explanation of what happens, in order, \
+                 with file:line citations. Do not include code fences."
                     .to_string(),
-                "Observed definitions across files:".to_string(),
+                "Observed cross-file evidence:".to_string(),
             ];
             sections.extend(file_sections);
             sections.push(
                 "Answer from the observed evidence above. Rules:\n\
-                 1. Describe the flow as a concrete ordered sequence of steps.\n\
-                 2. Cite file:line for each step.\n\
-                 3. Keep the answer short: 2-5 ordered steps, not an essay.\n\
-                 4. Do not invent steps not visible in the observed evidence.\n\
+                 1. Write a SHORT explanation in plain language (2–4 sentences), not a code dump.\n\
+                 2. Describe what each key step does and where it lives (file:line).\n\
+                 3. Mention branch behavior (early return, None path) if visible.\n\
+                 4. Do not copy raw source lines verbatim into the answer — paraphrase them.\n\
                  5. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`)."
                     .to_string(),
             );
             Some(sections.join("\n"))
+        }
+        ToolLoopIntent::ConfigLocate => {
+            let query = suggested_search_query(prompt, intent)?;
+            // Try each read file; prefer the one with query-matching lines.
+            for result in results.iter().filter(|r| r.tool_name == "read_file") {
+                let Some((path, content)) = parse_read_file_output(&result.output) else {
+                    continue;
+                };
+                if is_test_like_path(&path) && !prompt_mentions_tests(prompt) {
+                    continue;
+                }
+                // Find the most relevant line — a definition match or any query match.
+                let best = filter_non_test_hits(
+                    &content,
+                    definition_match_lines_with_numbers(&content, &query, 1),
+                )
+                .into_iter()
+                .next()
+                .or_else(|| {
+                    query_match_lines_with_numbers(&content, &query, 1)
+                        .into_iter()
+                        .next()
+                });
+                let Some((line_number, line)) = best else {
+                    continue;
+                };
+                let body_lines = surrounding_body_lines(&content, line_number, 3);
+                let mut sections = vec![
+                    "Grounded answer requirements: identify where the config setting is defined, \
+                     parsed, or applied from the observed evidence. \
+                     Do not include code fences."
+                        .to_string(),
+                    format!(
+                        "Primary evidence: {}:{} `{}`",
+                        path,
+                        line_number,
+                        clip_inline(&line, 120)
+                    ),
+                ];
+                if !body_lines.is_empty() {
+                    sections.push("Surrounding lines:".to_string());
+                    for (ln, lt) in &body_lines {
+                        sections.push(format!("  {}:{} `{}`", path, ln, clip_inline(lt, 120)));
+                    }
+                }
+                sections.push(
+                    "Answer from the observed evidence only. Rules:\n\
+                     1. State exactly where the setting is defined or used (file:line).\n\
+                     2. Name the field, struct, or config key as it appears in the code.\n\
+                     3. Keep the answer to 1–2 sentences.\n\
+                     4. Do not use hedging words."
+                        .to_string(),
+                );
+                return Some(sections.join("\n"));
+            }
+            None
         }
         ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => {
             let directories = results
@@ -417,7 +493,6 @@ pub(super) fn grounded_answer_guidance(
             );
             Some(sections.join("\n"))
         }
-        ToolLoopIntent::ConfigLocate => None,
     }
 }
 
@@ -729,6 +804,17 @@ fn observed_definition_evidence(
         )
         .into_iter()
         .next()
+        // For config lookup, also accept non-definition lines that contain the
+        // query term (e.g. field declarations like `pub enabled: bool`).
+        .or_else(|| {
+            if matches!(intent, ToolLoopIntent::ConfigLocate) && !query.is_empty() {
+                query_match_lines_with_numbers(&content, &query, 1)
+                    .into_iter()
+                    .next()
+            } else {
+                None
+            }
+        })
         .or_else(|| {
             first_matching_lines(&content, is_definition_like_line, 1)
                 .into_iter()
@@ -764,9 +850,28 @@ fn observed_file_summary_evidence(
         .filter(|result| result.tool_name == "read_file")
         .find(|result| anchored.map(|path| path == result.argument).unwrap_or(true))?;
     let (path, content) = parse_read_file_output(&target.output)?;
-    let declarations = declaration_lines_with_numbers(&content, 8);
+    // Use a higher limit so files with many `mod` declarations before `fn main` still
+    // capture the entrypoint function.
+    let mut declarations = declaration_lines_with_numbers(&content, 14);
+    // Ensure `fn main` is always present for entrypoint files even if it falls
+    // outside the declaration window.
+    let has_main = declarations
+        .iter()
+        .any(|(_, l)| l.starts_with("fn main") || l.starts_with("pub fn main"));
+    if !has_main {
+        if let Some(main_line) = first_matching_lines(
+            &content,
+            |l| l.starts_with("fn main(") || l.starts_with("pub fn main("),
+            1,
+        )
+        .into_iter()
+        .next()
+        {
+            declarations.push(main_line);
+        }
+    }
     let excerpt = if declarations.is_empty() {
-        first_non_empty_lines(&content, 8)
+        first_non_empty_lines(&content, 10)
     } else {
         declarations
     };
@@ -1385,22 +1490,51 @@ pub(super) fn render_structured_answer(_prompt: &str, evidence: &StructuredEvide
             .map(|line| format!("{} uses `{}`.", render_line_ref(line), evidence.symbol))
             .collect::<Vec<_>>()
             .join("\n"),
-        StructuredEvidence::FlowTrace(evidence) => evidence
-            .steps
-            .iter()
-            .take(5)
-            .enumerate()
-            .map(|(idx, step)| {
-                format!(
-                    "{}. `{}:{}` `{}`",
-                    idx + 1,
-                    step.path,
-                    step.line_number,
-                    clip_inline(&step.line_text, 120)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        StructuredEvidence::FlowTrace(evidence) => {
+            // Build a short prose description of the flow as a fallback.
+            let steps = evidence.steps.iter().take(5).collect::<Vec<_>>();
+            if steps.is_empty() {
+                return String::new();
+            }
+            let mut sentences = Vec::new();
+            for step in &steps {
+                let s = match step.step_kind {
+                    ObservedStepKind::EntryCall => format!(
+                        "The call originates at `{}:{}` (`{}`).",
+                        step.path,
+                        step.line_number,
+                        clip_inline(&step.line_text, 80)
+                    ),
+                    ObservedStepKind::Definition => format!(
+                        "`{}` is defined at `{}:{}` (`{}`).",
+                        evidence.subject,
+                        step.path,
+                        step.line_number,
+                        clip_inline(&step.line_text, 80)
+                    ),
+                    ObservedStepKind::Branch => format!(
+                        "At `{}:{}`, the flow branches: `{}`.",
+                        step.path,
+                        step.line_number,
+                        clip_inline(&step.line_text, 80)
+                    ),
+                    ObservedStepKind::Return => format!(
+                        "It returns at `{}:{}` (`{}`).",
+                        step.path,
+                        step.line_number,
+                        clip_inline(&step.line_text, 80)
+                    ),
+                    ObservedStepKind::Delegation => format!(
+                        "The implementation delegates at `{}:{}` (`{}`).",
+                        step.path,
+                        step.line_number,
+                        clip_inline(&step.line_text, 80)
+                    ),
+                };
+                sentences.push(s);
+            }
+            sentences.join(" ")
+        }
     }
 }
 
@@ -1580,6 +1714,61 @@ fn auto_read_best_candidate(
     Some(result)
 }
 
+/// Like `auto_read_best_candidate` but specifically for CallSiteLookup and
+/// UsageLookup: only reads files that have confirmed non-definition hits for the
+/// symbol so we never waste a read on a file that only contains its definition.
+fn auto_read_best_caller_candidate(
+    intent: ToolLoopIntent,
+    prompt: &str,
+    tools: &ToolRegistry,
+    existing_results: &[ToolResult],
+    token_tx: &Sender<InferenceEvent>,
+) -> Option<ToolResult> {
+    let query = suggested_search_query(prompt, intent)?;
+    let is_call_site = matches!(intent, ToolLoopIntent::CallSiteLookup);
+    let read_paths = observed_read_paths(existing_results);
+
+    // Pick the highest-ranked candidate that has at least one non-definition hit.
+    let candidate = ranked_search_candidates(intent, prompt, existing_results)
+        .into_iter()
+        .find(|file| {
+            !read_paths.contains(&file.path)
+                && preferred_candidate_path(intent, &file.path)
+                && !is_internal_tool_loop_path(&file.path)
+                && !is_legacy_auto_inspect_path(&file.path)
+                && file.hits.iter().any(|hit| {
+                    let line = hit.line_content.trim();
+                    if is_call_site {
+                        line_contains_symbol_invocation(line, &query)
+                            && !is_definition_like_line(line)
+                    } else {
+                        line_contains_symbol_reference(line, &query)
+                            && !is_definition_like_line(line)
+                    }
+                })
+        })?;
+
+    emit_trace(
+        token_tx,
+        ProgressStatus::Started,
+        &format!(
+            "reading top {} candidate {}...",
+            if is_call_site { "caller" } else { "usage" },
+            candidate.path
+        ),
+        false,
+    );
+    let execution = tools.execute_read_only_tool_calls(&format!("[read_file: {}]", candidate.path));
+    let result = execution.results.into_iter().next()?;
+    emit_trace(
+        token_tx,
+        ProgressStatus::Finished,
+        &format!("read_file {}", result.argument),
+        false,
+    );
+    Some(result)
+}
+
 fn read_file_result_from_project_root(project_root: &Path, path: &str) -> Option<ToolResult> {
     let resolved = if Path::new(path).is_absolute() {
         Path::new(path).to_path_buf()
@@ -1697,6 +1886,21 @@ pub(super) fn bootstrap_tool_results(
     {
         if let Some(read_result) =
             auto_read_best_candidate(intent, prompt, tools, &results, token_tx)
+        {
+            results.push(read_result);
+        }
+    }
+
+    // For caller / usage lookup, auto-read the best file that has confirmed
+    // non-definition hits so the loop can answer immediately instead of burning
+    // iterations while the model tries to figure out which file to read.
+    if matches!(
+        intent,
+        ToolLoopIntent::CallSiteLookup | ToolLoopIntent::UsageLookup
+    ) && !has_relevant_file_evidence(intent, prompt, &results)
+    {
+        if let Some(read_result) =
+            auto_read_best_caller_candidate(intent, prompt, tools, &results, token_tx)
         {
             results.push(read_result);
         }

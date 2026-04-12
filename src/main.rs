@@ -10,6 +10,7 @@ mod inference;
 mod memory;
 mod safety;
 mod session;
+mod skills;
 mod tools;
 mod tui;
 
@@ -151,6 +152,10 @@ fn main() -> Result<()> {
                 } else {
                     inference::SYSTEM_PROMPT.to_string()
                 };
+                let project_root =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let mut system_prompt = system_prompt;
+                skills::append_chat_skill_guidance(&project_root, &prompt, &mut system_prompt);
                 let messages = vec![
                     inference::Message::system(&system_prompt),
                     inference::Message::user(&prompt),

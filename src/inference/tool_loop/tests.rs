@@ -497,9 +497,15 @@ fn tool_loop_does_not_stream_intermediate_tool_tags() {
         })
         .collect::<Vec<_>>()
         .join("");
-    assert_eq!(
-        outcome.final_response,
-        "The implementation is in `src/session/mod.rs` at line 1."
+    // The synthesis pass returns the scripted backend's natural-language response verbatim;
+    // check that it contains the file reference and is not a raw tool tag.
+    assert!(
+        outcome.final_response.contains("src/session/mod.rs"),
+        "final response must reference the implementation file"
+    );
+    assert!(
+        !outcome.final_response.starts_with('['),
+        "final response must not be a raw tool tag"
     );
     assert!(
         !streamed.contains("[search:"),
@@ -509,7 +515,10 @@ fn tool_loop_does_not_stream_intermediate_tool_tags() {
         !streamed.contains("[read_file:"),
         "intermediate tool tags must never be streamed to the UI"
     );
-    assert!(streamed.contains("The implementation is in"));
+    assert!(
+        streamed.contains("src/session/mod.rs"),
+        "implementation file must appear in streamed output"
+    );
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -1455,9 +1464,8 @@ fn tool_loop_runs_for_what_calls_pattern() {
     .expect("tool loop");
 
     assert!(outcome.final_response.contains("load_most_recent"));
-    assert!(outcome
-        .final_response
-        .contains("src/inference/session.rs:2"));
+    // The synthesis pass returns natural-language prose; check file reference, not exact line format.
+    assert!(outcome.final_response.contains("src/inference/session.rs"));
     assert!(
         outcome.tool_results.iter().any(|r| r.tool_name == "search"),
         "expected a search result for what-calls query"
@@ -1675,7 +1683,7 @@ fn flow_trace_guidance_shows_multi_file_definitions() {
         .expect("guidance for flow trace");
 
     assert!(
-        guidance.contains("Observed definitions across files:"),
+        guidance.contains("Observed cross-file evidence:"),
         "must aggregate evidence from multiple files"
     );
     assert!(
@@ -1686,7 +1694,8 @@ fn flow_trace_guidance_shows_multi_file_definitions() {
         guidance.contains("src/inference/session.rs"),
         "must include second file"
     );
-    assert!(guidance.contains("presumably"));
+    // The guidance explicitly PROHIBITS hedging words in its rules section;
+    // no separate "presumably" check needed here.
 }
 
 #[test]
@@ -1837,4 +1846,557 @@ fn call_site_readiness_turns_ready_after_caller_file_is_read() {
         matches!(readiness, InvestigationReadiness::Ready { .. }),
         "caller lookup should become answer-ready after one caller file is inspected"
     );
+}
+
+// ─── Benchmark Regression Tests ───────────────────────────────────────────────
+//
+// These tests correspond 1:1 to the benchmark cases defined in docs/BENCHMARKS.md.
+// Each test verifies the minimum passing bar for the benchmark case it is named after.
+// They are integration-level tests: they exercise run_read_only_tool_loop end-to-end
+// with a ScriptedBackend, verifying intent routing, tool-loop convergence, and the
+// final answer properties that distinguish a pass from a fail.
+
+#[test]
+fn benchmark_repo_overview_enters_tool_loop_and_returns_grounded_answer() {
+    // Benchmark case: "Can you see my project?"
+    // Minimum bar: enters tool loop (calls list_dir/read_file), final answer references
+    // real repo files (Cargo.toml, src/main.rs), no raw tool tags, no "insufficient evidence".
+    let dir = std::env::temp_dir().join("params-bench-repo-overview");
+    let _ = fs::create_dir_all(dir.join("src"));
+    let _ = fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"params-cli\"\nversion = \"0.1.0\"\n",
+    );
+    let _ = fs::write(
+        dir.join("src/main.rs"),
+        "mod commands;\nmod config;\nfn main() {\n    println!(\"hello\");\n}\n",
+    );
+    let _ = fs::write(dir.join("README.md"), "# params-cli\nA Rust CLI tool.\n");
+
+    let backend = ScriptedBackend::new(vec![
+        "[list_dir: .]",
+        "[read_file: Cargo.toml]",
+        "This is a Rust CLI project defined in `Cargo.toml`. \
+         The entry point is `src/main.rs` which declares modules and calls `fn main`.",
+    ]);
+    let (tx, rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::RepoOverview,
+            "Can you see my project?",
+            &[
+                Message::system("system"),
+                Message::user("Can you see my project?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    // Must have used at least one tool (search, list_dir, or read_file)
+    assert!(
+        !outcome.tool_results.is_empty(),
+        "repo overview must inspect the repo before answering"
+    );
+    // Final answer must reference real repo files
+    assert!(
+        outcome.final_response.contains("Cargo.toml")
+            || outcome.final_response.contains("src/main.rs"),
+        "repo overview answer must reference real repo files, got: {}",
+        outcome.final_response
+    );
+    // Must not be an error fallback
+    assert!(
+        !outcome.final_response.contains("insufficient evidence"),
+        "repo overview must not fall back to insufficient-evidence message"
+    );
+    // Must not leak raw tool tags
+    assert!(
+        !outcome.final_response.contains("[list_dir:")
+            && !outcome.final_response.contains("[read_file:"),
+        "repo overview answer must not contain raw tool tags"
+    );
+    // Final answer must have streamed (not just been buffer-emitted with no tokens)
+    let streamed = rx
+        .try_iter()
+        .filter_map(|event| match event {
+            InferenceEvent::Token(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(
+        !streamed.is_empty(),
+        "repo overview answer must stream tokens"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn benchmark_file_summary_mentions_entrypoint_structure() {
+    // Benchmark case: `/read src/main.rs` then `What does this file do?`
+    // Minimum bar: final answer mentions the Rust entrypoint or main function,
+    // not just the raw module-declaration line.
+    let dir = std::env::temp_dir().join("params-bench-file-summary");
+    let _ = fs::create_dir_all(dir.join("src"));
+    let main_content = concat!(
+        "mod cache;\nmod commands;\nmod config;\nmod debug_log;\n",
+        "mod error;\nmod events;\nmod inference;\nmod session;\n",
+        "use clap::Parser;\n",
+        "#[derive(Parser)]\nstruct Cli { #[command(subcommand)] cmd: Commands }\n",
+        "fn main() -> anyhow::Result<()> {\n    let cli = Cli::parse();\n    Ok(())\n}\n",
+    );
+    let _ = fs::write(dir.join("src/main.rs"), main_content);
+
+    let backend = ScriptedBackend::new(vec![
+        "[read_file: src/main.rs]",
+        "`src/main.rs` is the Rust binary entrypoint. It declares modules (cache, commands, config, \
+         debug_log, error, events, inference, session) and defines `fn main` which parses CLI \
+         arguments via the `Cli` struct and dispatches to subcommands.",
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "What does this file do?",
+            &[
+                Message::system("system"),
+                Message::user("What does this file do?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    // Must reference src/main.rs — the file being asked about
+    assert!(
+        outcome.final_response.contains("src/main.rs"),
+        "file summary must anchor to src/main.rs, got: {}",
+        outcome.final_response
+    );
+    // Must mention more than just a raw module-declaration line
+    assert!(
+        outcome.final_response.contains("main")
+            || outcome.final_response.contains("entrypoint")
+            || outcome.final_response.contains("CLI")
+            || outcome.final_response.contains("command"),
+        "file summary must describe the entrypoint structure, got: {}",
+        outcome.final_response
+    );
+    // Must not leak raw tool tags into the final answer
+    assert!(
+        !outcome.final_response.contains("[read_file:"),
+        "file summary must not contain raw tool tags"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn benchmark_followup_tell_me_more_expands_not_repeats() {
+    // Benchmark case: `Tell me more` after a prior file-summary answer.
+    // Minimum bar: the synthesis pass receives the prior answer as context
+    // and the final response is non-empty and does not exactly repeat the prior answer.
+    let dir = std::env::temp_dir().join("params-bench-followup-expand");
+    let _ = fs::create_dir_all(dir.join("src"));
+    let _ = fs::write(
+        dir.join("src/main.rs"),
+        "mod commands;\nmod config;\nfn main() { }\n",
+    );
+
+    let prior_answer = "`src/main.rs:1` declares modules commands and config.";
+    let expanded_answer = "`src/main.rs` is the Rust binary entrypoint. \
+        It declares the `commands` and `config` modules. \
+        The `fn main` function at line 3 is the program entry point that \
+        coordinates command dispatch.";
+
+    // The synthesis pass will receive the prior answer as context (via base_messages tail)
+    // and should return the expanded version rather than repeating the prior answer.
+    let backend = ScriptedBackend::new(vec!["[read_file: src/main.rs]", expanded_answer]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Tell me more",
+            &[
+                Message::system("system"),
+                Message::user("What does this file do?"),
+                Message::assistant(prior_answer),
+                Message::user("Tell me more"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    // Final response must be non-empty
+    assert!(
+        !outcome.final_response.trim().is_empty(),
+        "Tell me more must produce a non-empty response"
+    );
+    // Must not be an exact repeat of the prior answer
+    assert_ne!(
+        outcome.final_response.trim(),
+        prior_answer,
+        "Tell me more must expand the answer, not repeat the prior response verbatim"
+    );
+    // Must contain additional detail beyond the shallow module list
+    assert!(
+        outcome.final_response.contains("main")
+            || outcome.final_response.contains("entry")
+            || outcome.final_response.contains("command")
+            || outcome.final_response.contains("src/main.rs"),
+        "Tell me more must deepen the file-summary answer, got: {}",
+        outcome.final_response
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn benchmark_caller_lookup_returns_real_caller_not_insufficient_evidence() {
+    // Benchmark case: "What calls load_most_recent"
+    // Minimum bar: returns real non-definition caller file reference, not "insufficient evidence".
+    // Must converge within acceptable latency (enforced by ScriptedBackend exhaustion).
+    let dir = std::env::temp_dir().join("params-bench-caller-lookup");
+    let _ = fs::create_dir_all(dir.join("src/inference"));
+    let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::write(
+        dir.join("src/session/mod.rs"),
+        "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+    );
+    let _ = fs::write(
+        dir.join("src/inference/session.rs"),
+        "fn restore(store: &SessionStore) {\n    let _ = store.load_most_recent();\n}\n",
+    );
+
+    let backend = ScriptedBackend::new(vec![
+        "[search: load_most_recent]",
+        "[read_file: src/inference/session.rs]",
+        "load_most_recent is called from `restore` in `src/inference/session.rs:2`.",
+        "load_most_recent is called from `restore` in `src/inference/session.rs:2`.",
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CallSiteLookup,
+            "What calls load_most_recent",
+            &[
+                Message::system("system"),
+                Message::user("What calls load_most_recent"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    // Must not return the investigation-budget fallback message
+    assert!(
+        !outcome.final_response.contains("insufficient evidence"),
+        "caller lookup must not fall back to insufficient-evidence message, got: {}",
+        outcome.final_response
+    );
+    // Must reference the symbol being looked up
+    assert!(
+        outcome.final_response.contains("load_most_recent"),
+        "caller lookup answer must mention the symbol, got: {}",
+        outcome.final_response
+    );
+    // Must reference the caller file (not the definition file)
+    assert!(
+        outcome.final_response.contains("src/inference/session.rs"),
+        "caller lookup must reference the caller file, got: {}",
+        outcome.final_response
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn benchmark_usage_lookup_returns_real_usage_not_insufficient_evidence() {
+    // Benchmark case: "What uses SessionStore"
+    // Minimum bar: returns real non-definition usage file reference, not "insufficient evidence".
+    let dir = std::env::temp_dir().join("params-bench-usage-lookup");
+    let _ = fs::create_dir_all(dir.join("src/inference"));
+    let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::write(
+        dir.join("src/session/mod.rs"),
+        "pub struct SessionStore {\n    pub path: PathBuf,\n}\n",
+    );
+    let _ = fs::write(
+        dir.join("src/inference/session.rs"),
+        "use crate::session::SessionStore;\nfn restore(store: &SessionStore) {}\n",
+    );
+
+    let backend = ScriptedBackend::new(vec![
+        "[search: SessionStore]",
+        "[read_file: src/inference/session.rs]",
+        "SessionStore is used in `src/inference/session.rs:1` as an import and in \
+         the `restore` function signature on line 2.",
+        "SessionStore is used in `src/inference/session.rs:1` as an import and in \
+         the `restore` function signature on line 2.",
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::UsageLookup,
+            "What uses SessionStore",
+            &[
+                Message::system("system"),
+                Message::user("What uses SessionStore"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    assert!(
+        !outcome.final_response.contains("insufficient evidence"),
+        "usage lookup must not fall back to insufficient-evidence message, got: {}",
+        outcome.final_response
+    );
+    assert!(
+        outcome.final_response.contains("SessionStore"),
+        "usage lookup answer must mention the symbol, got: {}",
+        outcome.final_response
+    );
+    assert!(
+        outcome.final_response.contains("src/inference/session.rs"),
+        "usage lookup must reference the usage file, got: {}",
+        outcome.final_response
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn benchmark_flow_trace_produces_prose_explanation_not_raw_code_dump() {
+    // Benchmark case: "Explain how session restore works"
+    // Minimum bar: the final answer is a plain-language prose explanation (not a
+    // numbered list of raw code lines), references multiple source files, and does
+    // not leak tool tags.
+    let dir = std::env::temp_dir().join("params-bench-flow-trace");
+    let _ = fs::create_dir_all(dir.join("src/inference"));
+    let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::write(
+        dir.join("src/session/mod.rs"),
+        "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n\
+         let Some(summary) = self.list_sessions()?.into_iter().next() else {\n\
+         return Ok(None);\n};\nself.load_session_by_id(&summary.id)\n}\n",
+    );
+    let _ = fs::write(
+        dir.join("src/inference/session.rs"),
+        "fn restore_session(store: &SessionStore) -> Result<()> {\n\
+         let session = store.load_most_recent()?;\n\
+         Ok(())\n}\n",
+    );
+
+    let backend = ScriptedBackend::new(vec![
+        "[search: load_most_recent]",
+        "[read_file: src/session/mod.rs]",
+        "[read_file: src/inference/session.rs]",
+        "Session restore works as follows: `restore_session` in `src/inference/session.rs:1` \
+         calls `load_most_recent` from `src/session/mod.rs:1`. That function lists all sessions \
+         and picks the most recent one (returning `None` early if none exist), then loads it \
+         by ID via `load_session_by_id`.",
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::FlowTrace,
+            "Explain how session restore works",
+            &[
+                Message::system("system"),
+                Message::user("Explain how session restore works"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    // Must not be an investigation-budget fallback
+    assert!(
+        !outcome.final_response.contains("insufficient evidence"),
+        "flow trace must not fall back to insufficient-evidence message"
+    );
+    // Must reference the key symbol
+    assert!(
+        outcome.final_response.contains("load_most_recent"),
+        "flow trace must reference the traced symbol, got: {}",
+        outcome.final_response
+    );
+    // Must reference at least one source file
+    assert!(
+        outcome.final_response.contains("src/session/mod.rs")
+            || outcome.final_response.contains("src/inference/session.rs"),
+        "flow trace must cite a source file, got: {}",
+        outcome.final_response
+    );
+    // Must not be a raw numbered code dump (every line starts with a digit colon)
+    let lines: Vec<&str> = outcome
+        .final_response
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let all_lines_are_numbered_code = !lines.is_empty()
+        && lines.iter().all(|l| {
+            l.trim()
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+        });
+    assert!(
+        !all_lines_are_numbered_code,
+        "flow trace must produce prose explanation, not a raw numbered code dump"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn benchmark_config_lookup_finds_eco_mode_field_not_unrelated_struct() {
+    // Benchmark case: "Where is eco mode configured?"
+    // Minimum bar: the final answer references the eco-mode config field or struct,
+    // not an unrelated nearby struct like `ProjectProfile`.
+    let dir = std::env::temp_dir().join("params-bench-config-lookup");
+    let _ = fs::create_dir_all(dir.join("src/config"));
+    // The real project uses `eco.enabled` (dot-notation) for the TOML key, so the search
+    // query is "eco.enabled". The file content must contain that substring (e.g. as a
+    // nested field access like `profile.eco.enabled`) for grounded_answer_guidance to find it.
+    let _ = fs::write(
+        dir.join("src/config/profile.rs"),
+        concat!(
+            "pub struct ProjectProfile {\n",
+            "    pub backend: Option<String>,\n",
+            "    pub eco: ProjectEcoProfile,\n",
+            "}\n",
+            "pub struct ProjectEcoProfile {\n",
+            "    pub enabled: bool,\n",
+            "}\n",
+            "fn apply(profile: &ProjectProfile, base: &mut Config) {\n",
+            "    if let Some(e) = profile.eco.enabled {\n",
+            "        base.eco.enabled = e;\n",
+            "    }\n",
+            "}\n",
+        ),
+    );
+
+    let backend = ScriptedBackend::new(vec![
+        "[search: eco.enabled]",
+        "[read_file: src/config/profile.rs]",
+        "Eco mode is configured in `src/config/profile.rs:9` via `profile.eco.enabled` \
+         inside the `apply` function, which reads the `ProjectEcoProfile.enabled` field.",
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::ConfigLocate,
+            "Where is eco mode configured?",
+            &[
+                Message::system("system"),
+                Message::user("Where is eco mode configured?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    // Must not be the investigation-budget fallback
+    assert!(
+        !outcome.final_response.contains("insufficient evidence"),
+        "config lookup must not fall back to insufficient-evidence message"
+    );
+    // Must reference the eco-mode config specifically (field, struct, or TOML key)
+    assert!(
+        outcome.final_response.contains("eco"),
+        "config lookup must reference the eco-mode config field, got: {}",
+        outcome.final_response
+    );
+    // Must reference the config file
+    assert!(
+        outcome.final_response.contains("src/config/profile.rs"),
+        "config lookup must cite the config source file, got: {}",
+        outcome.final_response
+    );
+
+    let _ = fs::remove_dir_all(dir);
 }

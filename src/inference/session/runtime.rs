@@ -14,6 +14,7 @@ use crate::memory::{
     index::ProjectIndex,
 };
 use crate::session::{display_name, SessionStore};
+use crate::skills;
 use crate::tools::{BashTool, Tool, ToolRegistry};
 
 use super::investigation::{resolve_agentic_repo_turn, InvestigationState};
@@ -857,7 +858,15 @@ pub fn model_thread_with_options(
                     hooks.dispatch(HookEvent::MemorySummariesSelected { summary_count: 0 });
                     if let Some(first) = session_messages.first_mut() {
                         if first.role == "system" {
-                            first.content = build_system_prompt(&tools, &[], &[], &[], eco_enabled);
+                            first.content = build_chat_system_prompt(
+                                &project_root,
+                                &prompt,
+                                &tools,
+                                &[],
+                                &[],
+                                &[],
+                                eco_enabled,
+                            );
                         }
                     }
                     compression::compress_history(
@@ -988,7 +997,9 @@ pub fn model_thread_with_options(
 
                 if let Some(first) = session_messages.first_mut() {
                     if first.role == "system" {
-                        first.content = build_system_prompt(
+                        first.content = build_chat_system_prompt(
+                            &project_root,
+                            &prompt,
                             &tools,
                             &memory_fact_lines(&retrieval.facts),
                             &retrieval.summaries,
@@ -1435,4 +1446,18 @@ pub fn model_thread_with_options(
             Err(e) => warn!(error = %e, "memory consolidation failed"),
         }
     }
+}
+
+fn build_chat_system_prompt(
+    project_root: &PathBuf,
+    user_prompt: &str,
+    tools: &ToolRegistry,
+    facts: &[String],
+    summaries: &[(String, String)],
+    session_excerpts: &[crate::events::MemorySessionExcerptView],
+    eco_enabled: bool,
+) -> String {
+    let mut prompt = build_system_prompt(tools, facts, summaries, session_excerpts, eco_enabled);
+    skills::append_chat_skill_guidance(project_root, user_prompt, &mut prompt);
+    prompt
 }

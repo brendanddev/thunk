@@ -16,7 +16,9 @@ use super::budget::{
     estimate_message_tokens, record_generation_budget, SessionBudget, SessionCacheStats,
 };
 use super::cache::{generate_with_cache, CacheMode};
-use super::runtime::{emit_buffered_tokens, emit_generation_started, emit_trace};
+use super::runtime::{
+    emit_buffered_tokens, emit_generation_started, emit_trace, run_and_collect_with_stream_guard,
+};
 use super::session::investigation::InvestigationResolution;
 use super::{InferenceBackend, Message};
 use evidence::{
@@ -156,7 +158,16 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                 stop_reason,
             } => {
                 emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
-                let final_response = finalize_structured_answer(prompt, &evidence, token_tx)?;
+                let final_response = finalize_structured_answer(
+                    intent,
+                    prompt,
+                    &all_tool_results,
+                    resolution,
+                    base_messages,
+                    &evidence,
+                    backend,
+                    token_tx,
+                )?;
                 return Ok(ToolLoopOutcome {
                     final_response,
                     tool_results: all_tool_results,
@@ -239,7 +250,16 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                     stop_reason,
                 } => {
                     emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
-                    let final_response = finalize_structured_answer(prompt, &evidence, token_tx)?;
+                    let final_response = finalize_structured_answer(
+                        intent,
+                        prompt,
+                        &all_tool_results,
+                        resolution,
+                        base_messages,
+                        &evidence,
+                        backend,
+                        token_tx,
+                    )?;
                     return Ok(ToolLoopOutcome {
                         final_response,
                         tool_results: all_tool_results,
@@ -326,7 +346,16 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                 stop_reason,
             } => {
                 emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
-                let final_response = finalize_structured_answer(prompt, &evidence, token_tx)?;
+                let final_response = finalize_structured_answer(
+                    intent,
+                    prompt,
+                    &all_tool_results,
+                    resolution,
+                    base_messages,
+                    &evidence,
+                    backend,
+                    token_tx,
+                )?;
                 return Ok(ToolLoopOutcome {
                     final_response,
                     tool_results: all_tool_results,
@@ -371,7 +400,16 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
             stop_reason,
         } => {
             emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
-            finalize_structured_answer(prompt, &evidence, token_tx)?
+            finalize_structured_answer(
+                intent,
+                prompt,
+                &all_tool_results,
+                resolution,
+                base_messages,
+                &evidence,
+                backend,
+                token_tx,
+            )?
         }
         InvestigationOutcome::Insufficient { reason } => {
             emit_trace(
@@ -423,11 +461,33 @@ fn push_evidence_messages(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_structured_answer(
+    intent: ToolLoopIntent,
     prompt: &str,
+    results: &[ToolResult],
+    resolution: Option<&InvestigationResolution>,
+    base_messages: &[Message],
     evidence: &evidence::StructuredEvidence,
+    backend: &dyn InferenceBackend,
     token_tx: &Sender<InferenceEvent>,
 ) -> Result<String> {
+    // Primary path: model synthesis pass using compact evidence guidance.
+    // This produces streamed, natural-prose answers grounded in real evidence.
+    if let Some(guidance) = grounded_answer_guidance(intent, prompt, resolution, results) {
+        let synthesis_messages = build_synthesis_messages(prompt, &guidance, base_messages);
+        match run_and_collect_with_stream_guard(backend, &synthesis_messages, token_tx.clone()) {
+            Ok(run) if run.streamed && !is_synthesis_junk(&run.text) => {
+                return Ok(run.text);
+            }
+            _ => {
+                // Model started with a tool tag, produced junk, or errored.
+                // Fall through to deterministic fallback below.
+            }
+        }
+    }
+
+    // Fallback: deterministic template rendering emitted as simulated streaming.
     let final_response = render_structured_answer(prompt, evidence);
     if final_response.trim().is_empty() {
         return Err(ParamsError::Inference(
@@ -438,9 +498,72 @@ fn finalize_structured_answer(
     Ok(final_response)
 }
 
+/// Build a tight synthesis message set for the final answer pass.
+/// Includes the last two non-system base messages so referential follow-ups
+/// like "Tell me more" have the previous answer as context.
+fn build_synthesis_messages(
+    prompt: &str,
+    guidance: &str,
+    base_messages: &[Message],
+) -> Vec<Message> {
+    let system = "You are answering a code-navigation question from observed file evidence. \
+        Write in natural language prose — do NOT emit tool tags or code fences. \
+        Be concise: 2–5 sentences or a short structured list. \
+        If a prior answer appears above, expand it with new detail rather than repeating it.";
+
+    let mut messages = vec![Message::system(system)];
+
+    // Include up to the last 2 non-system messages from the live conversation
+    // so follow-ups like \"Tell me more\" see the previous answer as context.
+    let tail: Vec<_> = base_messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .rev()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let already_has_prompt = tail
+        .last()
+        .map(|m| m.role == "user" && m.content == prompt)
+        .unwrap_or(false);
+
+    messages.extend(tail);
+    if !already_has_prompt {
+        messages.push(Message::user(prompt));
+    }
+
+    messages.push(Message::user(guidance));
+    messages
+}
+
 fn final_answer_contains_tool_tags(text: &str, tools: &ToolRegistry) -> bool {
     let execution = tools.execute_read_only_tool_calls(text);
     !execution.results.is_empty() || !execution.disallowed_calls.is_empty()
+}
+
+/// Returns true if the synthesis output looks like a tool tag or is too short
+/// to be a real answer. Used to trigger the deterministic fallback.
+fn is_synthesis_junk(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() < 8 {
+        return true;
+    }
+    // Looks like a tool tag prefix: `[toolname: ...]`
+    if trimmed.starts_with('[') {
+        let inner = &trimmed[1..];
+        let colon_pos = inner.find(':').unwrap_or(usize::MAX);
+        let name_end = inner
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(usize::MAX);
+        if colon_pos <= 32 && name_end == colon_pos {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

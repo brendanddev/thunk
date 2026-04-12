@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::events::{InferenceEvent, ProgressStatus};
+use crate::skills;
 use crate::tools::ToolRegistry;
 
 use super::super::runtime::{eco_tool_result_limit, emit_trace};
@@ -237,6 +238,7 @@ pub(super) fn build_tool_loop_system_prompt(
         prompt.push_str("\n\n");
         prompt.push_str(&summary);
     }
+    skills::append_repo_navigation_skill_guidance(project_root, &mut prompt);
     prompt
 }
 
