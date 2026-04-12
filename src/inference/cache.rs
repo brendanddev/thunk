@@ -68,6 +68,8 @@ fn is_injected_context_message(content: &str) -> bool {
         "LSP check:\n",
         "Fetched web context:\n",
         "User rejected proposed action:",
+        "Structured conversation context:",
+        "Structured investigation context:",
     ];
 
     prefixes.iter().any(|prefix| content.starts_with(prefix))

@@ -15,6 +15,7 @@ pub use backend::{system_prompt_with_tools, InferenceBackend, Message, SYSTEM_PR
 pub use llama_cpp::LlamaCppBackend;
 pub use ollama::OllamaBackend;
 pub use openai_compat::OpenAICompatBackend;
+pub(crate) use session::investigation::{InjectedContextMetadata, StructuredCompressionContext};
 #[allow(unused_imports)]
 pub use session::{model_thread, model_thread_with_options, SessionRuntimeOptions};
 
@@ -29,7 +30,10 @@ use runtime::summary_limit;
 
 pub enum SessionCommand {
     SubmitUser(String),
-    InjectUserContext(String),
+    InjectUserContext {
+        content: String,
+        metadata: Option<InjectedContextMetadata>,
+    },
     RequestShellCommand(String),
     RequestFileWrite {
         path: String,

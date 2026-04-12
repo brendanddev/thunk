@@ -105,7 +105,7 @@ struct SearchFileMatches {
 fn walk_and_search(dir: &Path, query: &str, matches: &mut Vec<SearchMatch>) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Ok(()), // Skip unreadable dirs silently
+        Err(_) => return Ok(()),
     };
 
     let mut entries = entries.flatten().collect::<Vec<_>>();

@@ -1,13 +1,3 @@
-// src/session/mod.rs
-//
-// Session persistence — saves and restores conversation history across app restarts.
-//
-// Design:
-//  - Sessions are scoped to the current project directory and stored in .local/sessions.db.
-//  - Non-system messages are saved per active session; the system prompt is regenerated fresh.
-//  - The most recently opened session is restored by default unless --no-resume is used.
-//  - /clear deletes the currently active saved session and starts a fresh unnamed session.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

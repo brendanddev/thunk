@@ -1,7 +1,3 @@
-// src/tools/lsp.rs
-//
-// Rust-first LSP diagnostics tool.
-
 mod client;
 mod format;
 mod paths;

@@ -1,15 +1,3 @@
-// src/config.rs
-//
-// App-wide configuration loaded from file.
-//
-// Configuration resolution order (highest precedence first):
-//   1. .params.toml  — project-local profile in the current working directory
-//   2. .local/config.toml — global/repo-level config
-//   3. Compiled-in defaults
-//
-// Use load_with_profile() to get the fully-merged Config.
-// Use load() only when you explicitly need the raw global config without a profile.
-
 mod defaults_impl;
 mod files;
 mod profile;
@@ -31,12 +19,10 @@ pub use profile::{
     ProjectSafetyProfile,
 };
 
-/// File name searched in the current working directory for project-level overrides.
 pub const PROJECT_PROFILE_FILE: &str = ".params.toml";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
-    /// Which backend to use. Options: "llama_cpp", "ollama", "openai_compat"
     #[serde(default = "default_backend")]
     pub backend: String,
 
@@ -46,8 +32,6 @@ pub struct Config {
     #[serde(default)]
     pub ollama: OllamaConfig,
 
-    /// OpenAI-compatible config — covers OpenAI, Groq, OpenRouter, Grok.
-    /// Switch providers by changing url, api_key, and model.
     #[serde(default)]
     pub openai_compat: OpenAICompatConfig,
 
@@ -78,15 +62,12 @@ pub struct Config {
     #[serde(default)]
     pub safety: SafetyConfig,
 
-    /// Path to the active project profile, if one was found.
-    /// Set by load_with_profile() — never read from or written to the TOML file.
     #[serde(skip)]
     pub active_profile: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LlamaCppConfig {
-    /// Path to .gguf file. Auto-detects from file path if unset.
     pub model_path: Option<PathBuf>,
 }
 
@@ -127,20 +108,15 @@ pub struct OllamaConfig {
 /// a preset script or command line option even
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAICompatConfig {
-    /// API base URL for the provider
     #[serde(default = "default_openai_url")]
     pub url: String,
 
-    /// API key. Leave empty and set env var or .local/keys.env instead:
-    ///   GROQ_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or XAI_API_KEY
     #[serde(default)]
     pub api_key: String,
 
-    /// Model name as the provider knows it
     #[serde(default = "default_openai_model")]
     pub model: String,
 
-    /// Display name shown in the sidebar. Auto-detected from URL if empty.
     #[serde(default)]
     pub provider_name: String,
 }
@@ -156,63 +132,47 @@ pub struct GenerationConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BudgetConfig {
-    /// Optional estimated input pricing in USD per 1M tokens.
-    /// Leave unset for local backends or if you only want token estimates.
     pub input_cost_per_million: Option<f64>,
-
-    /// Optional estimated output pricing in USD per 1M tokens.
-    /// If unset but input_cost_per_million is set, the input price is reused.
     pub output_cost_per_million: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheConfig {
-    /// How long cache entries remain valid before they are treated as stale.
-    /// Set to 0 to disable TTL-based expiration.
     #[serde(default = "default_cache_ttl_seconds")]
     pub ttl_seconds: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LspConfig {
-    /// Optional explicit path to rust-analyzer for the first LSP slice.
     pub rust_analyzer_path: Option<PathBuf>,
 
-    /// How long to wait for diagnostics from the language server.
     #[serde(default = "default_lsp_timeout_ms")]
     pub timeout_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReflectionConfig {
-    /// Whether to run a hidden self-check pass before showing the final response.
     #[serde(default)]
     pub enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EcoConfig {
-    /// Whether to prefer lower-token prompts and context by default.
     #[serde(default)]
     pub enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DebugLoggingConfig {
-    /// Whether to write user prompts and final assistant replies to a separate debug log.
     #[serde(default)]
     pub content: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MemoryConfig {
-    /// How many days before a fact is considered stale and pruned.
-    /// Set to 0 to disable TTL-based pruning.
     #[serde(default = "default_fact_ttl_days")]
     pub fact_ttl_days: u64,
 
-    /// Maximum number of facts to keep per project.
-    /// When the cap is exceeded, the oldest (least recently seen) facts are removed.
     #[serde(default = "default_max_facts_per_project")]
     pub max_facts_per_project: usize,
 }
@@ -237,22 +197,15 @@ pub struct SafetyConfig {
     #[serde(default = "default_block_destructive_shell")]
     pub block_destructive_shell: bool,
 
-    /// Optional trusted shell command prefixes. If non-empty, every shell segment
-    /// must match one of these prefixes or the command is blocked before approval.
     #[serde(default)]
     pub shell_allowlist: Vec<String>,
 
-    /// Optional blocked shell command prefixes. Any matching segment is blocked
-    /// before approval, even if it also matches an allowlisted prefix.
     #[serde(default)]
     pub shell_denylist: Vec<String>,
 
-    /// Optional allowed public domains/hosts for outbound fetches and cloud API requests.
-    /// Entries match exact hosts or subdomains.
     #[serde(default)]
     pub network_allowlist: Vec<String>,
 
-    /// Whether to inspect outbound provider requests before cloud/API sends.
     #[serde(default = "default_inspect_cloud_requests")]
     pub inspect_cloud_requests: bool,
 }
@@ -322,7 +275,6 @@ fn default_inspect_cloud_requests() -> bool {
 }
 
 impl OpenAICompatConfig {
-    /// Infer a human-readable provider name from the URL if not set in config.
     pub fn resolved_provider_name(&self) -> String {
         if !self.provider_name.is_empty() {
             return self.provider_name.clone();

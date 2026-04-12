@@ -1,30 +1,7 @@
-// src/hooks.rs
-//
-// Lifecycle hooks for the params-cli runtime.
-//
-// Hooks provide a structured, typed extension surface for key events in the
-// single-agent loop. The design is deliberately simple for the first slice:
-// a typed event enum, a trait for implementations, and a dispatcher that
-// calls all registered hooks in order.
-//
-// This is an internal hook system, not a user-facing plugin framework.
-// The primary goal is observability and a clean extension point for future
-// work — not changing product behavior yet.
-//
-// Payloads are structural and privacy-safe: no prompt or response content,
-// only metadata about what happened (counts, timings, flags, names).
-//
-// Hook failures are caught and logged; they never crash the runtime.
-// Hook implementations must be Send (they run on the model thread).
-
 use tracing::debug;
 
-/// Events fired at key points in the agent lifecycle.
-///
-/// All fields are structural — no user text, no prompt content.
 #[derive(Debug)]
 pub enum HookEvent {
-    /// Fired just before a live generation call starts.
     BeforeGeneration {
         backend: String,
         message_count: usize,
@@ -32,34 +9,29 @@ pub enum HookEvent {
         reflection: bool,
     },
 
-    /// Fired after a generation (live or cache-hit) completes.
     AfterGeneration {
         backend: String,
         response_chars: usize,
         from_cache: bool,
-        /// Wall-clock time from the start of the generation call to completion.
-        /// Zero for cache hits (no model work was done).
         elapsed_ms: u64,
     },
 
-    /// Fired after each read-only tool executes successfully.
     ToolExecuted {
         tool_name: String,
         argument_chars: usize,
         result_chars: usize,
     },
 
-    /// Fired when a mutating tool is proposed and the user must approve it.
     ApprovalRequested {
         tool_name: String,
-        /// Human-readable kind string (e.g., "ShellCommand", "WriteFile").
         kind: String,
     },
 
-    /// Fired when the user resolves a pending approval (approve or reject).
-    ApprovalResolved { tool_name: String, approved: bool },
+    ApprovalResolved {
+        tool_name: String,
+        approved: bool,
+    },
 
-    /// Fired when the policy inspection layer evaluates an action.
     InspectionEvaluated {
         operation: String,
         decision: String,
@@ -68,60 +40,59 @@ pub enum HookEvent {
         blocked_reason_count: usize,
     },
 
-    /// Fired when a previous session is successfully loaded from disk.
     SessionRestored {
-        /// Number of messages loaded (excludes the system message).
         message_count: usize,
-        /// Unix timestamp when the session was originally saved.
         saved_at: u64,
     },
 
-    /// Fired when a fresh session is created.
-    SessionCreated { session_id: String, named: bool },
+    SessionCreated {
+        session_id: String,
+        named: bool,
+    },
 
-    /// Fired when an existing session becomes active.
     SessionResumed {
         session_id: String,
         named: bool,
         message_count: usize,
     },
 
-    /// Fired when the active session is renamed.
-    SessionRenamed { session_id: String, named: bool },
+    SessionRenamed {
+        session_id: String,
+        named: bool,
+    },
 
-    /// Fired when a session transcript is exported.
-    SessionExported { session_id: String, format: String },
+    SessionExported {
+        session_id: String,
+        format: String,
+    },
 
-    /// Fired when a saved session is deleted.
     SessionDeleted {
         session_id: String,
         was_active: bool,
     },
 
-    /// Fired when the active saved session is cleared.
-    SessionCleared { session_id: String },
+    SessionCleared {
+        session_id: String,
+    },
 
-    /// Fired when the model thread is about to exit (channel closed).
-    /// This fires before fact extraction and consolidation.
     SessionEnding {
-        /// Total number of messages in the session at exit (includes system).
         message_count: usize,
     },
 
-    /// Fired after memory consolidation runs at session end.
     MemoryConsolidated {
         facts_pruned: usize,
         facts_deduped: usize,
         facts_capped: usize,
     },
 
-    /// Fired when durable memory is loaded into the runtime.
-    MemoryFactsLoaded { fact_count: usize },
+    MemoryFactsLoaded {
+        fact_count: usize,
+    },
 
-    /// Fired when indexed summaries are selected for a turn.
-    MemorySummariesSelected { summary_count: usize },
+    MemorySummariesSelected {
+        summary_count: usize,
+    },
 
-    /// Fired after verified memory update evaluation for a turn.
     MemoryUpdateEvaluated {
         accepted_count: usize,
         skipped_count: usize,
@@ -129,12 +100,10 @@ pub enum HookEvent {
     },
 }
 
-/// The interface every hook implementation must satisfy.
 pub trait Hook: Send {
     fn on_event(&self, event: &HookEvent);
 }
 
-/// Dispatches lifecycle events to all registered hooks.
 pub struct Hooks {
     hooks: Vec<Box<dyn Hook>>,
 }
@@ -148,33 +117,20 @@ impl Hooks {
         self.hooks.push(hook);
     }
 
-    /// Fire an event to all registered hooks in registration order.
-    ///
-    /// Panics inside hook implementations are caught as errors and logged
-    /// so a misbehaving hook cannot bring down the model thread.
     pub fn dispatch(&self, event: HookEvent) {
         for hook in &self.hooks {
-            // std::panic::catch_unwind requires UnwindSafe — skip that
-            // complexity for the first slice. Instead, rely on well-behaved
-            // implementations plus graceful failure in the log hook itself.
             hook.on_event(&event);
         }
     }
 }
 
 impl Default for Hooks {
-    /// Returns a Hooks dispatcher pre-loaded with the built-in log hook.
     fn default() -> Self {
         let mut hooks = Self::new();
         hooks.register(Box::new(StructuralLogHook));
         hooks
     }
 }
-
-// Writes each lifecycle event to the structured audit log (params.log) at
-// debug level. This surfaces timing, tool, and session metadata as distinct
-// structured log entries — complementing the higher-level info!/warn! calls
-// in the main inference loop without duplicating them.
 
 struct StructuralLogHook;
 

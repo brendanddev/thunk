@@ -1,7 +1,3 @@
-// src/tools/git.rs
-//
-// Read-only git context tool.
-
 use std::process::Command;
 use tracing::info;
 

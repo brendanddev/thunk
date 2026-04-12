@@ -1,5 +1,3 @@
-// src/tui/state.rs
-
 mod helpers;
 mod input;
 mod runtime;

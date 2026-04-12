@@ -16,6 +16,7 @@ use crate::memory::{
 use crate::session::{display_name, SessionStore};
 use crate::tools::{BashTool, Tool, ToolRegistry};
 
+use super::investigation::{classify_agentic_repo_turn, InvestigationState};
 use super::memory::{
     apply_memory_update, clear_memory_retrieval, collect_retrieval_bundle, emit_memory_state,
     format_memory_recall, memory_fact_lines, refresh_loaded_facts, retrieval_trace_label,
@@ -41,7 +42,7 @@ use super::super::runtime::{
     eco_tool_result_limit, effective_reflection, emit_buffered_tokens, emit_generation_started,
     emit_trace, log_debug_response,
 };
-use super::super::tool_loop::{detect_tool_loop_intent, run_read_only_tool_loop};
+use super::super::tool_loop::run_read_only_tool_loop;
 use super::super::{build_system_prompt, load_backend_with_fallback, Message, SessionCommand};
 
 #[derive(Clone, Copy, Default)]
@@ -121,6 +122,7 @@ pub fn model_thread_with_options(
         project_index.as_ref().map(|_| IncrementalIndexState::new())
     };
     let mut memory_state = RuntimeMemoryState::default();
+    let mut investigation_state = InvestigationState::default();
     refresh_loaded_facts(&mut memory_state, fact_store.as_ref(), &project_name);
     hooks.dispatch(HookEvent::MemoryFactsLoaded {
         fact_count: memory_state.loaded_facts.len(),
@@ -252,6 +254,7 @@ pub fn model_thread_with_options(
                 );
                 clear_memory_retrieval(&mut memory_state);
                 memory_state.last_update = None;
+                investigation_state.clear();
                 emit_memory_state(&token_tx, &memory_state);
                 if let Some(ref store) = session_store {
                     match store.create_session(None, &backend.name()) {
@@ -319,6 +322,7 @@ pub fn model_thread_with_options(
                 );
                 clear_memory_retrieval(&mut memory_state);
                 memory_state.last_update = None;
+                investigation_state.clear();
                 emit_memory_state(&token_tx, &memory_state);
                 match session_store
                     .as_ref()
@@ -405,6 +409,7 @@ pub fn model_thread_with_options(
                         );
                         clear_memory_retrieval(&mut memory_state);
                         memory_state.last_update = None;
+                        investigation_state.clear();
                         emit_memory_state(&token_tx, &memory_state);
                         let display_messages = saved
                             .messages
@@ -558,8 +563,9 @@ pub fn model_thread_with_options(
                 }
                 continue;
             }
-            SessionCommand::InjectUserContext(content) => {
+            SessionCommand::InjectUserContext { content, metadata } => {
                 info!(chars = content.chars().count(), "user context injected");
+                investigation_state.apply_injected_context(metadata.as_ref(), &content);
                 session_messages.push(Message::user(&content));
                 continue;
             }
@@ -841,7 +847,7 @@ pub fn model_thread_with_options(
                 }
                 session_messages.push(Message::user(&prompt));
 
-                let tool_loop_intent = detect_tool_loop_intent(&prompt);
+                let tool_loop_intent = classify_agentic_repo_turn(&prompt, &investigation_state);
 
                 if let Some(intent) = tool_loop_intent {
                     clear_memory_retrieval(&mut memory_state);
@@ -853,12 +859,22 @@ pub fn model_thread_with_options(
                             first.content = build_system_prompt(&tools, &[], &[], &[], eco_enabled);
                         }
                     }
-                    compression::compress_history(&mut session_messages, &*backend, eco_enabled);
+                    compression::compress_history(
+                        &mut session_messages,
+                        eco_enabled,
+                        investigation_state.compression_context().as_ref(),
+                    );
+
+                    let mut tool_loop_messages = session_messages.clone();
+                    if let Some(summary) = investigation_state.summary_message() {
+                        let insert_at = tool_loop_messages.len().saturating_sub(1);
+                        tool_loop_messages.insert(insert_at, summary);
+                    }
 
                     let mut turn_memory = TurnMemoryEvidence::new(prompt.clone(), Vec::new());
                     hooks.dispatch(HookEvent::BeforeGeneration {
                         backend: backend.name(),
-                        message_count: session_messages.len(),
+                        message_count: tool_loop_messages.len(),
                         eco: eco_enabled,
                         reflection: reflection_enabled,
                     });
@@ -866,7 +882,7 @@ pub fn model_thread_with_options(
                     match run_read_only_tool_loop(
                         intent,
                         &prompt,
-                        &session_messages,
+                        &tool_loop_messages,
                         &*backend,
                         &tools,
                         &cfg,
@@ -879,6 +895,11 @@ pub fn model_thread_with_options(
                         reflection_enabled,
                     ) {
                         Ok(outcome) => {
+                            investigation_state.note_tool_loop_outcome(
+                                intent,
+                                &prompt,
+                                &outcome.tool_results,
+                            );
                             for result in &outcome.tool_results {
                                 hooks.dispatch(HookEvent::ToolExecuted {
                                     tool_name: result.tool_name.clone(),
@@ -975,7 +996,11 @@ pub fn model_thread_with_options(
                     }
                 }
 
-                compression::compress_history(&mut session_messages, &*backend, eco_enabled);
+                compression::compress_history(
+                    &mut session_messages,
+                    eco_enabled,
+                    investigation_state.compression_context().as_ref(),
+                );
 
                 let generation_messages = session_messages.clone();
                 let generation_exact_cache = exact_cache.as_ref();

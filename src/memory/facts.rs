@@ -1,15 +1,3 @@
-// src/memory/facts.rs
-//
-// Level 3: cross-session fact store.
-//
-// Facts are scoped per project and stored in .local/memory/facts.db.
-// The verified-updates slice keeps durable memory strict:
-// - facts are extracted per turn from an explicit evidence pack
-// - facts must pass quality filters and evidence-anchor checks
-// - stored facts carry provenance metadata (legacy vs verified)
-//
-// Consolidation still happens at session end and degrades gracefully.
-
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

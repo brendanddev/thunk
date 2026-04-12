@@ -1,7 +1,3 @@
-// src/safety.rs
-//
-// Policy-layer sandbox and request inspection.
-
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 

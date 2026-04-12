@@ -1,7 +1,3 @@
-// src/tools/bash.rs
-//
-// Approval-driven shell execution tool.
-
 use std::process::Command;
 use tracing::info;
 

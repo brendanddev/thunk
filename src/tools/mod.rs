@@ -1,19 +1,3 @@
-// src/tools/mod.rs
-//
-// The tool system for params-cli.
-//
-// Tools let the model interact with your filesystem — read files, list
-// directories, search code. The model signals it wants to use a tool by
-// including a special tag in its response:
-//
-//   [read_file: src/main.rs]
-//   [list_dir: src/]
-//   [search: fn main]
-//
-// After generation completes, params scans the response for these tags,
-// runs the tools, and injects the results back as a new user message so
-// the model can reason about the actual file contents.
-
 mod bash;
 mod edit;
 mod fs;
@@ -38,26 +22,15 @@ use crate::safety::InspectionReport;
 #[cfg(test)]
 use crate::safety::{InspectionDecision, RiskLevel};
 
-/// The contract every tool must fulfill.
-/// Tools are simple — they take a string argument and return a string result.
 pub trait Tool: Send + Sync {
-    /// The name used in tool tags, e.g. "read_file" for [read_file: path]
     fn name(&self) -> &str;
-
-    /// A short description shown in the system prompt so the model knows
-    /// the tool exists and how to use it.
     fn description(&self) -> &str;
-
-    /// Run the tool with the given argument string.
-    /// Returns the result as a string to be injected back into the conversation.
     fn run(&self, arg: &str) -> Result<ToolRunResult>;
 
-    /// Run the tool with access to the text that follows the tool call tag.
     fn run_with_context(&self, arg: &str, _following_text: &str) -> Result<ToolRunResult> {
         self.run(arg)
     }
 
-    /// Run the tool after the user has approved it.
     fn run_approved(&self, _arg: &str) -> Result<String> {
         Err(ParamsError::Config(format!(
             "Tool {} does not support approval-based execution",
@@ -66,7 +39,6 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// The global tool registry — holds all available tools.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
 }
@@ -86,7 +58,6 @@ fn is_read_only_tool_name(name: &str) -> bool {
 }
 
 impl ToolRegistry {
-    /// Create a registry with the default built-in tools.
     pub fn default() -> Self {
         Self {
             tools: vec![
@@ -105,8 +76,6 @@ impl ToolRegistry {
         }
     }
 
-    /// Returns a string describing all available tools, injected into the
-    /// system prompt so the model knows what it can use.
     pub fn tool_descriptions(&self) -> String {
         let mut desc = String::from(
             "You have access to the following tools.\n\
@@ -175,8 +144,6 @@ impl ToolRegistry {
         desc
     }
 
-    /// Scan a response string for tool calls and execute them all.
-    /// Stops early if a tool requires approval.
     pub fn execute_tool_calls(&self, response: &str) -> ToolExecution {
         let mut results = Vec::new();
 
@@ -188,7 +155,6 @@ impl ToolRegistry {
                 let abs_start = search_from + start;
                 let after_tag = abs_start + tag.len();
 
-                // Find the closing ]
                 if let Some(end_offset) = response[after_tag..].find(']') {
                     let arg = response[after_tag..after_tag + end_offset]
                         .trim()
@@ -287,8 +253,6 @@ impl ToolRegistry {
         }
     }
 
-    /// Format tool results into a message to inject back into the conversation.
-    /// Returns None if there were no tool calls.
     pub fn format_results_with_limit(
         results: &[ToolResult],
         max_chars_per_result: Option<usize>,
@@ -333,7 +297,6 @@ impl ToolRegistry {
     }
 }
 
-/// The result of running a single tool call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolResult {
     pub tool_name: String,

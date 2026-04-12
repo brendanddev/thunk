@@ -23,7 +23,8 @@ use evidence::{
     bootstrap_tool_results, format_tool_loop_results_with_limit, grounded_answer_guidance,
     has_relevant_file_evidence, targeted_investigation_followup,
 };
-use intent::{suggested_search_query, ToolLoopIntent};
+use intent::suggested_search_query;
+pub(super) use intent::ToolLoopIntent;
 use prompting::{
     build_tool_loop_seed_messages, build_tool_loop_system_prompt, initial_investigation_hint,
     initial_tool_only_followup, should_stream_tool_loop_generation, thinking_label,
@@ -91,6 +92,7 @@ pub(super) fn run_read_only_tool_loop(
         intent,
         prompt,
         base_messages,
+        project_root,
         &backend.name(),
         tools,
         token_tx,

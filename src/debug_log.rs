@@ -1,8 +1,3 @@
-// src/debug_log.rs
-//
-// Separate opt-in content debug log. This never feeds into the normal
-// structural audit log and only records prompts/final answers when enabled.
-
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};

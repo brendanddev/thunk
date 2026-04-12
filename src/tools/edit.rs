@@ -1,7 +1,3 @@
-// src/tools/edit.rs
-//
-// Approval-driven targeted file editor using exact search/replace blocks.
-
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;

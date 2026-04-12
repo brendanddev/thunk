@@ -358,7 +358,7 @@ fn is_referential_follow_up(prompt: &str) -> bool {
     let normalized = normalize_intent_text(prompt);
     let referential_tokens = [
         "it", "its", "that", "this", "these", "those", "they", "them", "there", "same", "above",
-        "previous", "former", "latter",
+        "previous", "former", "latter", "now", "again", "more",
     ];
 
     normalized

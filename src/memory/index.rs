@@ -1,17 +1,3 @@
-// src/memory/index.rs
-//
-// Level 2: project file index.
-//
-// Stores a 2-3 sentence summary for each source file in a SQLite database at
-// .local/memory/{project_hash}.db. The hash is derived from the current
-// working directory path so each project gets its own database.
-//
-// Summary generation calls the active backend, so indexing runs on the model
-// thread (or in the `params index .` command path) — never on the UI thread.
-//
-// find_relevant() does simple keyword scoring for now. Semantic search via
-// embeddings can be layered on top later without changing the schema.
-
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -70,9 +56,6 @@ impl ProjectIndex {
         Ok(Self { conn })
     }
 
-    /// Summarize `content` via the backend and store it against `path`.
-    ///
-    /// Replaces any existing entry for this path.
     pub fn index_file(
         &self,
         path: &Path,
@@ -111,9 +94,6 @@ impl ProjectIndex {
         Ok(())
     }
 
-    /// Return up to `limit` (path, summary) pairs whose summaries match the
-    /// query by keyword overlap. Unmatched entries are excluded; ties are
-    /// broken by match count descending.
     pub fn find_relevant(&self, query: &str, limit: usize) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare("SELECT path, summary FROM files")?;
         let query_terms = query_terms(query);
@@ -139,7 +119,6 @@ impl ProjectIndex {
         Ok(scored.into_iter().map(|(_, p, s)| (p, s)).collect())
     }
 
-    /// Returns true if `path` is not yet indexed or its mtime has changed.
     pub fn needs_reindex(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy().to_string();
 
@@ -160,10 +139,6 @@ impl ProjectIndex {
         }
     }
 
-    /// Scan the project tree for changed/new/deleted indexable files.
-    ///
-    /// This is intentionally cheap: it uses file metadata and the existing DB
-    /// records to build a delta without reading file contents.
     pub fn collect_delta(&self, root: &Path) -> Result<IndexDelta> {
         let mut files = Vec::new();
         collect_indexable_files(root, &mut files)?;
@@ -218,7 +193,7 @@ impl ProjectIndex {
     }
 }
 
-/// Recursively collect indexable files from a project root.
+/// Recursively collect indexable files from a project root
 pub fn collect_indexable_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -250,8 +225,7 @@ pub fn is_indexable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Build the path to the project index database.
-/// Creates `.local/memory/` if it doesn't exist.
+/// Build the path to the project index database
 fn db_path_for(project_root: &Path) -> Result<PathBuf> {
     let memory_dir = config::memory_dir()?;
     let hash = path_hash(&project_root.to_string_lossy());

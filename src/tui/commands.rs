@@ -13,7 +13,7 @@ use crate::commands::{
     CustomCommandStep,
 };
 use crate::events::{ProgressStatus, ProgressTrace};
-use crate::inference::SessionCommand;
+use crate::inference::{InjectedContextMetadata, SessionCommand};
 use display::{
     custom_help_text, format_custom_commands_list, format_display_status, format_memory_facts,
     format_memory_last, format_memory_status, format_transcript_status,
@@ -27,31 +27,31 @@ pub(crate) enum SlashJobOutcome {
     Trace(ProgressTrace),
     Context {
         finished_trace: ProgressTrace,
-        context: String,
+        payload: InjectedContextPayload,
     },
     ContextBatch {
         finished_trace: ProgressTrace,
-        contexts: Vec<String>,
+        payloads: Vec<InjectedContextPayload>,
     },
     WorkflowPrompt {
         finished_trace: ProgressTrace,
-        contexts: Vec<String>,
+        payloads: Vec<InjectedContextPayload>,
         prompt: String,
     },
     WorkflowShell {
         finished_trace: ProgressTrace,
-        contexts: Vec<String>,
+        payloads: Vec<InjectedContextPayload>,
         command: String,
     },
     WorkflowWrite {
         finished_trace: ProgressTrace,
-        contexts: Vec<String>,
+        payloads: Vec<InjectedContextPayload>,
         path: String,
         content: String,
     },
     WorkflowEdit {
         finished_trace: ProgressTrace,
-        contexts: Vec<String>,
+        payloads: Vec<InjectedContextPayload>,
         path: String,
         edits: String,
     },
@@ -63,12 +63,19 @@ pub(crate) enum SlashJobOutcome {
 
 type SlashWork = Box<dyn FnOnce() -> std::result::Result<String, String> + Send>;
 
+#[derive(Clone)]
+pub(crate) struct InjectedContextPayload {
+    pub content: String,
+    pub metadata: Option<InjectedContextMetadata>,
+}
+
 struct SlashContextSpec {
     running_status: String,
     started_trace: String,
     finished_trace: String,
     failed_trace: String,
     context_prefix: String,
+    metadata: Option<InjectedContextMetadata>,
     work: SlashWork,
 }
 
@@ -118,7 +125,10 @@ fn spawn_slash_context_job(
                         spec.finished_trace,
                         persist,
                     ),
-                    context,
+                    payload: InjectedContextPayload {
+                        content: context,
+                        metadata: spec.metadata,
+                    },
                 }
             }
             Err(error) => SlashJobOutcome::Error {
@@ -144,6 +154,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
                 finished_trace: format!("loaded {arg}"),
                 failed_trace: format!("read failed for {arg}"),
                 context_prefix: "I've loaded this file for context:".to_string(),
+                metadata: Some(InjectedContextMetadata {
+                    file_path: Some(arg.to_string()),
+                    directory_path: None,
+                    search_query: None,
+                    tool_name: Some("read_file".to_string()),
+                }),
                 work: Box::new(move || {
                     run_tool_immediate(crate::tools::ReadFile, &arg_owned)
                         .map_err(|e| format!("error reading {arg_owned}: {e}"))
@@ -159,6 +175,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
                 finished_trace: format!("listed {path}"),
                 failed_trace: format!("list failed for {path}"),
                 context_prefix: "Directory listing:".to_string(),
+                metadata: Some(InjectedContextMetadata {
+                    file_path: None,
+                    directory_path: Some(path.to_string()),
+                    search_query: None,
+                    tool_name: Some("list_dir".to_string()),
+                }),
                 work: Box::new(move || {
                     run_tool_immediate(crate::tools::ListDir, &path_owned)
                         .map_err(|e| format!("error listing {path_owned}: {e}"))
@@ -176,6 +198,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
                 finished_trace: format!("search complete for {arg}"),
                 failed_trace: format!("search failed for {arg}"),
                 context_prefix: "Search results:".to_string(),
+                metadata: Some(InjectedContextMetadata {
+                    file_path: None,
+                    directory_path: None,
+                    search_query: Some(arg.to_string()),
+                    tool_name: Some("search".to_string()),
+                }),
                 work: Box::new(move || {
                     run_tool_immediate(crate::tools::SearchCode, &arg_owned)
                         .map_err(|e| format!("error searching: {e}"))
@@ -191,6 +219,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
                 finished_trace: format!("git: {git_arg}"),
                 failed_trace: format!("git failed for {git_arg}"),
                 context_prefix: format!("Git context ({git_arg}):"),
+                metadata: Some(InjectedContextMetadata {
+                    file_path: None,
+                    directory_path: None,
+                    search_query: None,
+                    tool_name: Some("git".to_string()),
+                }),
                 work: Box::new(move || {
                     run_tool_immediate(crate::tools::GitTool, &git_arg_owned)
                         .map_err(|e| format!("git error: {e}"))
@@ -208,6 +242,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
                 finished_trace: format!("diagnostics ready for {arg}"),
                 failed_trace: format!("diagnostics failed for {arg}"),
                 context_prefix: "LSP diagnostics:".to_string(),
+                metadata: Some(InjectedContextMetadata {
+                    file_path: Some(arg.to_string()),
+                    directory_path: None,
+                    search_query: None,
+                    tool_name: Some("lsp_diagnostics".to_string()),
+                }),
                 work: Box::new(move || {
                     run_tool_immediate(crate::tools::LspDiagnosticsTool, &arg_owned)
                         .map_err(|e| format!("diagnostics error: {e}"))
@@ -225,6 +265,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
                 finished_trace: format!("hover ready for {arg}"),
                 failed_trace: format!("hover failed for {arg}"),
                 context_prefix: "LSP hover:".to_string(),
+                metadata: Some(InjectedContextMetadata {
+                    file_path: Some(arg.to_string()),
+                    directory_path: None,
+                    search_query: None,
+                    tool_name: Some("lsp_hover".to_string()),
+                }),
                 work: Box::new(move || {
                     run_tool_immediate(crate::tools::LspHoverTool, &arg_owned)
                         .map_err(|e| format!("hover error: {e}"))
@@ -242,6 +288,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
                 finished_trace: format!("definition ready for {arg}"),
                 failed_trace: format!("definition failed for {arg}"),
                 context_prefix: "LSP definition:".to_string(),
+                metadata: Some(InjectedContextMetadata {
+                    file_path: Some(arg.to_string()),
+                    directory_path: None,
+                    search_query: None,
+                    tool_name: Some("lsp_definition".to_string()),
+                }),
                 work: Box::new(move || {
                     run_tool_immediate(crate::tools::LspDefinitionTool, &arg_owned)
                         .map_err(|e| format!("definition error: {e}"))
@@ -254,6 +306,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
             finished_trace: "rust lsp check complete".to_string(),
             failed_trace: "rust lsp check failed".to_string(),
             context_prefix: "LSP check:".to_string(),
+            metadata: Some(InjectedContextMetadata {
+                file_path: None,
+                directory_path: None,
+                search_query: None,
+                tool_name: Some("lsp_health".to_string()),
+            }),
             work: Box::new(move || Ok(crate::tools::rust_lsp_health_report())),
         }),
         "/fetch" => {
@@ -267,6 +325,12 @@ fn build_context_spec(cmd: &str, arg: &str) -> Option<SlashContextSpec> {
                 finished_trace: format!("fetched {arg}"),
                 failed_trace: format!("fetch failed for {arg}"),
                 context_prefix: "Fetched web context:".to_string(),
+                metadata: Some(InjectedContextMetadata {
+                    file_path: None,
+                    directory_path: None,
+                    search_query: Some(arg.to_string()),
+                    tool_name: Some("fetch_url".to_string()),
+                }),
                 work: Box::new(move || {
                     run_tool_immediate(crate::tools::FetchUrlTool, &arg_owned)
                         .map_err(|e| format!("fetch error: {e}"))
@@ -347,7 +411,7 @@ fn execute_custom_workflow(
 
     let tx = slash_tx.clone();
     thread::spawn(move || {
-        let mut contexts = Vec::new();
+        let mut payloads = Vec::new();
 
         for step in expanded_steps {
             match step {
@@ -387,7 +451,10 @@ fn execute_custom_workflow(
                             match (spec.work)() {
                                 Ok(output) => {
                                     let safe = sanitize_for_display(&output);
-                                    contexts.push(format!("{}\n\n{safe}", spec.context_prefix));
+                                    payloads.push(InjectedContextPayload {
+                                        content: format!("{}\n\n{safe}", spec.context_prefix),
+                                        metadata: spec.metadata.clone(),
+                                    });
                                     let _ = tx.send(SlashJobOutcome::Trace(make_trace(
                                         ProgressStatus::Finished,
                                         spec.finished_trace,
@@ -422,7 +489,7 @@ fn execute_custom_workflow(
                                 "/run" => {
                                     let _ = tx.send(SlashJobOutcome::WorkflowShell {
                                         finished_trace: final_trace,
-                                        contexts,
+                                        payloads,
                                         command: arg.to_string(),
                                     });
                                 }
@@ -440,7 +507,7 @@ fn execute_custom_workflow(
                                     };
                                     let _ = tx.send(SlashJobOutcome::WorkflowWrite {
                                         finished_trace: final_trace,
-                                        contexts,
+                                        payloads,
                                         path: path.trim().to_string(),
                                         content: decode_slash_write_content(raw_content.trim()),
                                     });
@@ -459,7 +526,7 @@ fn execute_custom_workflow(
                                     };
                                     let _ = tx.send(SlashJobOutcome::WorkflowEdit {
                                         finished_trace: final_trace,
-                                        contexts,
+                                        payloads,
                                         path,
                                         edits,
                                     });
@@ -491,7 +558,7 @@ fn execute_custom_workflow(
                             format!("completed {workflow_name}"),
                             false,
                         ),
-                        contexts,
+                        payloads,
                         prompt,
                     });
                     return;
@@ -505,7 +572,7 @@ fn execute_custom_workflow(
                 format!("completed {workflow_name}"),
                 false,
             ),
-            contexts,
+            payloads,
         });
     });
 }

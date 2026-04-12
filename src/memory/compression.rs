@@ -1,45 +1,27 @@
-// src/memory/compression.rs
-//
-// Level 1: session compression.
-//
-// When a conversation grows beyond COMPRESSION_THRESHOLD non-system messages
-// (8 turns = 16 messages), we send the older portion to the backend for
-// summarization and collapse it into a single context message. The last
-// KEEP_PAIRS pairs (user + assistant) are always preserved verbatim so the
-// model has immediate context for the current exchange.
-//
-// This function is called from inference/mod.rs inside model_thread(), where
-// the backend reference is available. It cannot be called from state.rs
-// (build_messages returns a plain Vec with no backend access) or from the
-// UI thread (blocking generation would freeze the TUI).
-//
-// Compression is best-effort. If the backend call fails or the summary is
-// empty, we log a warning and leave the message history unchanged.
+use tracing::{debug, info};
 
-use tracing::{debug, info, warn};
+use crate::inference::Message;
+use crate::inference::StructuredCompressionContext;
 
-use super::run_prompt_sync;
-use crate::inference::{InferenceBackend, Message};
-
-/// Non-system messages above this count trigger compression (8 turns).
+/// Non-system messages above this count trigger compression (8 turns)
 const COMPRESSION_THRESHOLD: usize = 16;
 const ECO_COMPRESSION_THRESHOLD: usize = 10;
 
-/// Message pairs to preserve at the tail (user + assistant each).
+/// Message pairs to preserve at the tail (user + assistant each)
 const KEEP_PAIRS: usize = 3;
 const ECO_KEEP_PAIRS: usize = 2;
 
+const STRUCTURED_CONTEXT_PREFIX: &str = "Structured conversation context:";
+
 /// Compress `messages` in-place when history exceeds the threshold.
 ///
-/// After compression the Vec contains:
-///   [system_prompt, summary_message, ...last KEEP_PAIRS pairs]
-///
-/// If there is no system prompt the function still works, treating index 0
-/// as the first history message.
+/// The compressed block is deterministic and structured so long sessions keep
+/// the active goals, decisions, recent repo investigation state, and open
+/// questions without flattening everything into a freeform narrative blob.
 pub fn compress_history(
     messages: &mut Vec<Message>,
-    backend: &dyn InferenceBackend,
     eco_enabled: bool,
+    investigation_context: Option<&StructuredCompressionContext>,
 ) {
     let non_system = messages.iter().filter(|m| m.role != "system").count();
     let threshold = if eco_enabled {
@@ -57,7 +39,6 @@ pub fn compress_history(
         threshold, eco_enabled, "history over threshold, compressing"
     );
 
-    // Index where real history starts (after optional system prompt).
     let history_start = if messages.first().map(|m| m.role.as_str()) == Some("system") {
         1
     } else {
@@ -71,58 +52,250 @@ pub fn compress_history(
     };
     let keep_tail = keep_pairs * 2;
 
-    // Guard: nothing meaningful left to summarize.
     if messages.len() <= history_start + keep_tail {
         return;
     }
 
     let compress_end = messages.len() - keep_tail;
     let to_summarize = &messages[history_start..compress_end];
-
     if to_summarize.is_empty() {
         return;
     }
 
-    // Render the messages to be summarized as plain text.
-    let conversation_text: String = to_summarize
-        .iter()
-        .map(|m| format!("{}: {}\n", m.role, m.content))
-        .collect();
+    let summary = build_structured_context(to_summarize, investigation_context);
+    if summary.trim().is_empty() {
+        return;
+    }
 
-    let prompt = vec![
-        Message::system("You are a helpful assistant that writes concise conversation summaries."),
-        Message::user(&format!(
-            "Summarize the following conversation in 3-5 sentences. \
-             Focus on what was discussed, which files were examined, and any \
-             decisions or conclusions reached. Be concise.\n\n\
-             {conversation_text}"
-        )),
-    ];
+    let tail: Vec<Message> = messages.drain(compress_end..).collect();
+    messages.truncate(history_start);
+    messages.push(Message::user(&summary));
+    messages.extend(tail);
 
-    match run_prompt_sync(backend, &prompt) {
-        Ok(summary) if !summary.trim().is_empty() => {
-            let summary_msg = Message::user(&format!(
-                "Previous conversation summary: {}",
-                summary.trim()
-            ));
+    info!(
+        original = non_system,
+        compressed_to = messages.len().saturating_sub(history_start),
+        "session history compressed"
+    );
+}
 
-            // Drain the tail, truncate to history_start, re-attach.
-            let tail: Vec<Message> = messages.drain(compress_end..).collect();
-            messages.truncate(history_start);
-            messages.push(summary_msg);
-            messages.extend(tail);
+fn build_structured_context(
+    messages: &[Message],
+    investigation_context: Option<&StructuredCompressionContext>,
+) -> String {
+    let mut goals = Vec::new();
+    let mut decisions = Vec::new();
+    let mut open_questions = Vec::new();
+    let mut grounded_facts = Vec::new();
 
-            info!(
-                original = non_system,
-                compressed_to = messages.len().saturating_sub(history_start),
-                "session history compressed"
-            );
+    for message in messages {
+        let content = message.content.trim();
+        if content.is_empty() || is_structured_context_message(content) {
+            continue;
         }
-        Ok(_) => {
-            warn!("summarization returned empty response, keeping full history");
+
+        match message.role.as_str() {
+            "user" => {
+                if !is_injected_context_message(content) {
+                    if is_decision_like(content) {
+                        push_unique(&mut decisions, clip_sentence(content));
+                    } else {
+                        push_unique(&mut goals, clip_sentence(content));
+                    }
+                    if content.ends_with('?') {
+                        push_unique(&mut open_questions, clip_sentence(content));
+                    }
+                } else if let Some(fact) = grounded_fact_from_context(content) {
+                    push_unique(&mut grounded_facts, fact);
+                }
+            }
+            "assistant" => {
+                if content.contains(':') && content.contains("src/") {
+                    push_unique(&mut grounded_facts, clip_sentence(content));
+                }
+            }
+            _ => {}
         }
-        Err(e) => {
-            warn!(error = %e, "session compression failed, keeping full history");
+    }
+
+    let mut lines = vec![STRUCTURED_CONTEXT_PREFIX.to_string()];
+
+    if !goals.is_empty() {
+        lines.push("Active goals:".to_string());
+        for goal in goals.into_iter().take(4) {
+            lines.push(format!("- {goal}"));
         }
+    }
+
+    if !decisions.is_empty() {
+        lines.push("Accepted decisions:".to_string());
+        for decision in decisions.into_iter().take(4) {
+            lines.push(format!("- {decision}"));
+        }
+    }
+
+    if let Some(context) = investigation_context {
+        lines.push("Current technical investigation state:".to_string());
+        for line in context.render().lines().skip(1) {
+            lines.push(format!("- {line}"));
+        }
+    }
+
+    if !grounded_facts.is_empty() {
+        lines.push("Grounded repo facts:".to_string());
+        for fact in grounded_facts.into_iter().take(4) {
+            lines.push(format!("- {fact}"));
+        }
+    }
+
+    if !open_questions.is_empty() {
+        lines.push("Pending open questions:".to_string());
+        for question in open_questions.into_iter().take(3) {
+            lines.push(format!("- {question}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn is_structured_context_message(content: &str) -> bool {
+    content.starts_with(STRUCTURED_CONTEXT_PREFIX)
+        || content.starts_with("Structured investigation context:")
+}
+
+fn is_injected_context_message(content: &str) -> bool {
+    content.starts_with("I've loaded this file for context:")
+        || content.starts_with("Directory listing:")
+        || content.starts_with("Search results:")
+        || content.starts_with("Git context (")
+        || content.starts_with("LSP diagnostics:")
+        || content.starts_with("LSP hover:")
+        || content.starts_with("LSP definition:")
+        || content.starts_with("LSP check:")
+        || content.starts_with("Fetched web context:")
+}
+
+fn is_decision_like(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "i want", "we want", "please", "prefer", "keep", "do not", "dont", "don't", "should",
+        "need to",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn grounded_fact_from_context(content: &str) -> Option<String> {
+    if let Some(path) = content
+        .lines()
+        .find_map(|line| line.strip_prefix("File: ").map(str::trim))
+    {
+        return Some(format!("Loaded `{path}` for context."));
+    }
+    if let Some(path) = content
+        .lines()
+        .find_map(|line| line.strip_prefix("Directory: ").map(str::trim))
+    {
+        return Some(format!("Listed directory `{path}`."));
+    }
+    if let Some(query) = content
+        .lines()
+        .find_map(|line| line.strip_prefix("Search results for '"))
+        .and_then(|rest| {
+            rest.split_once('\'')
+                .map(|(query, _)| query.trim().to_string())
+        })
+    {
+        return Some(format!("Searched for `{query}`."));
+    }
+    None
+}
+
+fn clip_sentence(text: &str) -> String {
+    let text = text.replace('\n', " ");
+    let clipped = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clipped.chars().count() <= 140 {
+        clipped
+    } else {
+        let truncated = clipped
+            .chars()
+            .take(139)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        format!("{truncated}…")
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if value.is_empty() || values.iter().any(|existing| existing == &value) {
+        return;
+    }
+    values.push(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_emits_structured_context_sections() {
+        let mut messages = vec![
+            Message::system("system"),
+            Message::user("Please make repo navigation more agentic."),
+            Message::assistant("I inspected src/inference/tool_loop.rs:120 and found weak routing."),
+            Message::user("I've loaded this file for context:\n\nFile: src/main.rs\n\n```rust\nfn main() {}\n```"),
+            Message::assistant("Noted."),
+            Message::user("Can you trace logging next?"),
+            Message::assistant("Working on it."),
+            Message::user("Do not use canned answers."),
+            Message::assistant("Understood."),
+            Message::user("Please keep the tool loop authoritative for repo questions."),
+            Message::assistant("Agreed."),
+            Message::user("Can you preserve the current slash commands?"),
+            Message::assistant("Yes."),
+            Message::user("What open questions are left?"),
+            Message::assistant("Mostly routing and compression."),
+            Message::user("Please avoid summary-first drift."),
+            Message::assistant("I will."),
+            Message::user("Can you keep repo grounding concise too?"),
+        ];
+
+        compress_history(
+            &mut messages,
+            false,
+            Some(&StructuredCompressionContext {
+                active_investigation: Some("flow trace".to_string()),
+                recent_files: vec!["src/main.rs".to_string()],
+                recent_directories: vec!["src".to_string()],
+                recent_searches: vec!["init_logging".to_string()],
+                top_anchor: Some("init_logging".to_string()),
+            }),
+        );
+
+        let compressed = messages
+            .iter()
+            .find(|message| message.content.starts_with(STRUCTURED_CONTEXT_PREFIX))
+            .expect("structured context should be inserted");
+        assert!(compressed.content.contains("Active goals:"));
+        assert!(compressed.content.contains("Accepted decisions:"));
+        assert!(compressed
+            .content
+            .contains("Current technical investigation state:"));
+        assert!(compressed.content.contains("Grounded repo facts:"));
+    }
+
+    #[test]
+    fn compression_skips_existing_structured_context_messages() {
+        let output = build_structured_context(
+            &[
+                Message::user("Structured conversation context:\nActive goals:\n- old"),
+                Message::user("Please keep tool-first routing."),
+            ],
+            None,
+        );
+
+        assert!(!output.contains("old"));
+        assert!(output.contains("Please keep tool-first routing."));
     }
 }

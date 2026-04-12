@@ -1135,15 +1135,21 @@ fn suggested_search_query_extracts_subject_from_what_does_do() {
 fn tool_loop_runs_for_explain_how_pattern() {
     let dir = std::env::temp_dir().join("params-tool-loop-explain-how");
     let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::create_dir_all(dir.join("src/inference"));
     let _ = fs::write(
         dir.join("src/session/mod.rs"),
-        "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+        "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    crate::inference::restore_session()\n}\n",
+    );
+    let _ = fs::write(
+        dir.join("src/inference/mod.rs"),
+        "pub fn restore_session() -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
     );
 
     let backend = ScriptedBackend::new(vec![
         "[search: session]",
         "[read_file: src/session/mod.rs]",
-        "Session restore calls load_most_recent in src/session/mod.rs.",
+        "[read_file: src/inference/mod.rs]",
+        "Session restore starts in src/session/mod.rs:1, where `load_most_recent` delegates to src/inference/mod.rs:1 `restore_session()`.",
     ]);
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
@@ -1170,14 +1176,16 @@ fn tool_loop_runs_for_explain_how_pattern() {
 
     assert_eq!(
         outcome.final_response,
-        "Session restore calls load_most_recent in src/session/mod.rs."
+        "Session restore starts in src/session/mod.rs:1, where `load_most_recent` delegates to src/inference/mod.rs:1 `restore_session()`."
     );
     assert!(
         outcome
             .tool_results
             .iter()
-            .any(|r| r.tool_name == "read_file"),
-        "expected at least one read_file result for explain-how query"
+            .filter(|r| r.tool_name == "read_file")
+            .count()
+            >= 2,
+        "expected multi-file read evidence for explain-how query"
     );
 
     let _ = fs::remove_dir_all(dir);
@@ -1265,13 +1273,13 @@ fn call_site_lookup_requires_search_and_source_read_for_evidence() {
             ToolResult {
                 tool_name: "search".to_string(),
                 argument: "load_most_recent".to_string(),
-                output: "src/inference/session.rs:\n  42: load_most_recent()\n".to_string(),
+                output: "src/session/mod.rs:\n  1: pub fn load_most_recent() {\n\nsrc/main.rs:\n  12: store.load_most_recent();\n".to_string(),
             },
             ToolResult {
                 tool_name: "read_file".to_string(),
-                argument: "src/inference/session.rs".to_string(),
+                argument: "src/main.rs".to_string(),
                 output:
-                    "File: src/inference/session.rs\n\n```\nfn foo() { load_most_recent() }\n```\n"
+                    "File: src/main.rs\nLines: 3\n\n```\nfn start() {\n    store.load_most_recent();\n}\n```\n"
                         .to_string(),
             },
         ],

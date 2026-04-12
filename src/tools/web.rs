@@ -1,7 +1,3 @@
-// src/tools/web.rs
-//
-// Direct URL fetch tool for pulling explicit web pages into context.
-
 use std::io::Read;
 
 use tracing::info;

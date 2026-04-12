@@ -208,36 +208,45 @@ pub(crate) fn run_app(stdout: &mut io::Stdout, options: TuiOptions) -> Result<()
                 }
                 SlashJobOutcome::Context {
                     finished_trace,
-                    context,
+                    payload,
                 } => {
                     info!(label = finished_trace.label.as_str(), "trace.finished");
                     state.apply_trace(finished_trace);
-                    state.add_user_message(&context);
-                    let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    state.add_user_message(&payload.content);
+                    let _ = prompt_tx.send(SessionCommand::InjectUserContext {
+                        content: payload.content,
+                        metadata: payload.metadata,
+                    });
                     state.finish_response();
                 }
                 SlashJobOutcome::ContextBatch {
                     finished_trace,
-                    contexts,
+                    payloads,
                 } => {
                     info!(label = finished_trace.label.as_str(), "trace.finished");
                     state.apply_trace(finished_trace);
-                    for context in contexts {
-                        state.add_user_message(&context);
-                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    for payload in payloads {
+                        state.add_user_message(&payload.content);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext {
+                            content: payload.content,
+                            metadata: payload.metadata,
+                        });
                     }
                     state.finish_response();
                 }
                 SlashJobOutcome::WorkflowPrompt {
                     finished_trace,
-                    contexts,
+                    payloads,
                     prompt,
                 } => {
                     info!(label = finished_trace.label.as_str(), "trace.finished");
                     state.apply_trace(finished_trace);
-                    for context in contexts {
-                        state.add_user_message(&context);
-                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    for payload in payloads {
+                        state.add_user_message(&payload.content);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext {
+                            content: payload.content,
+                            metadata: payload.metadata,
+                        });
                     }
                     state.add_user_message(&prompt);
                     let _ = prompt_tx.send(SessionCommand::SubmitUser(prompt));
@@ -245,42 +254,51 @@ pub(crate) fn run_app(stdout: &mut io::Stdout, options: TuiOptions) -> Result<()
                 }
                 SlashJobOutcome::WorkflowShell {
                     finished_trace,
-                    contexts,
+                    payloads,
                     command,
                 } => {
                     info!(label = finished_trace.label.as_str(), "trace.finished");
                     state.apply_trace(finished_trace);
-                    for context in contexts {
-                        state.add_user_message(&context);
-                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    for payload in payloads {
+                        state.add_user_message(&payload.content);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext {
+                            content: payload.content,
+                            metadata: payload.metadata,
+                        });
                     }
                     let _ = prompt_tx.send(SessionCommand::RequestShellCommand(command));
                 }
                 SlashJobOutcome::WorkflowWrite {
                     finished_trace,
-                    contexts,
+                    payloads,
                     path,
                     content,
                 } => {
                     info!(label = finished_trace.label.as_str(), "trace.finished");
                     state.apply_trace(finished_trace);
-                    for context in contexts {
-                        state.add_user_message(&context);
-                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    for payload in payloads {
+                        state.add_user_message(&payload.content);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext {
+                            content: payload.content,
+                            metadata: payload.metadata,
+                        });
                     }
                     let _ = prompt_tx.send(SessionCommand::RequestFileWrite { path, content });
                 }
                 SlashJobOutcome::WorkflowEdit {
                     finished_trace,
-                    contexts,
+                    payloads,
                     path,
                     edits,
                 } => {
                     info!(label = finished_trace.label.as_str(), "trace.finished");
                     state.apply_trace(finished_trace);
-                    for context in contexts {
-                        state.add_user_message(&context);
-                        let _ = prompt_tx.send(SessionCommand::InjectUserContext(context));
+                    for payload in payloads {
+                        state.add_user_message(&payload.content);
+                        let _ = prompt_tx.send(SessionCommand::InjectUserContext {
+                            content: payload.content,
+                            metadata: payload.metadata,
+                        });
                     }
                     let _ = prompt_tx.send(SessionCommand::RequestFileEdit { path, edits });
                 }

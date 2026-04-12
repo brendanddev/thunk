@@ -1,7 +1,3 @@
-// src/tools/write.rs
-//
-// Approval-driven whole-file writer with diff preview.
-
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;

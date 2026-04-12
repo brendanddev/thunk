@@ -2,6 +2,7 @@
 mod parse;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::mpsc::Sender;
 
 use crate::events::{InferenceEvent, ProgressStatus};
@@ -261,9 +262,64 @@ pub(super) fn grounded_answer_guidance(
             );
             Some(sections.join("\n"))
         }
-        ToolLoopIntent::ConfigLocate
-        | ToolLoopIntent::RepoOverview
-        | ToolLoopIntent::DirectoryOverview => None,
+        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => {
+            let directories = results
+                .iter()
+                .filter(|result| result.tool_name == "list_dir")
+                .map(|result| clip_inline(&result.output.replace('\n', " | "), 180))
+                .take(2)
+                .collect::<Vec<_>>();
+            let observed_files = results
+                .iter()
+                .filter(|result| result.tool_name == "read_file")
+                .filter_map(|result| {
+                    let (path, content) = parse_read_file_output(&result.output)?;
+                    let declarations = declaration_lines_with_numbers(&content, 5);
+                    let excerpt = if declarations.is_empty() {
+                        first_non_empty_lines(&content, 5)
+                    } else {
+                        declarations
+                    };
+                    Some((path, excerpt))
+                })
+                .collect::<Vec<_>>();
+            if directories.is_empty() && observed_files.is_empty() {
+                return None;
+            }
+            let mut sections = vec![
+                "Grounded answer requirements: summarize the project or directory using only the inspected structure and key file evidence below. Do not include code fences. Do not ask the user to provide files if the repo is already accessible.".to_string(),
+            ];
+            if !directories.is_empty() {
+                sections.push("Observed structure:".to_string());
+                for listing in directories {
+                    sections.push(format!("  `{listing}`"));
+                }
+            }
+            if !observed_files.is_empty() {
+                sections.push("Observed key files:".to_string());
+                for (path, excerpt) in observed_files {
+                    sections.push(format!("  File: `{path}`"));
+                    for (line_number, line) in excerpt {
+                        sections.push(format!(
+                            "    {}:{} `{}`",
+                            path,
+                            line_number,
+                            clip_inline(&line, 120)
+                        ));
+                    }
+                }
+            }
+            sections.push(
+                "Answer from the observed structure and file lines above. Rules:\n\
+                 1. Summarize the project shape, entrypoints, and key modules from inspected evidence only.\n\
+                 2. Cite concrete facts with file:line when available.\n\
+                 3. Do not ask the user to provide files or guess missing paths.\n\
+                 4. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`)."
+                    .to_string(),
+            );
+            Some(sections.join("\n"))
+        }
+        ToolLoopIntent::ConfigLocate => None,
     }
 }
 
@@ -415,12 +471,13 @@ pub(super) fn has_relevant_file_evidence(
 ) -> bool {
     match intent {
         ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => {
-            results.iter().any(|result| {
-                matches!(
-                    result.tool_name.as_str(),
-                    "list_dir" | "read_file" | "lsp_definition" | "lsp_hover"
-                )
-            })
+            let has_structure = results
+                .iter()
+                .any(|result| matches!(result.tool_name.as_str(), "list_dir" | "read_file"));
+            let has_key_file = observed_read_paths(results)
+                .iter()
+                .any(|path| is_repo_key_path(path) || is_source_path(path));
+            has_structure && has_key_file
         }
         ToolLoopIntent::CodeNavigation | ToolLoopIntent::ConfigLocate => {
             if results
@@ -455,9 +512,31 @@ pub(super) fn has_relevant_file_evidence(
                 return true;
             }
             let has_search = results.iter().any(|r| r.tool_name == "search");
-            let read_paths = observed_read_paths(results);
-            let has_source_read = read_paths.iter().any(|path| is_source_path(path));
-            has_search && has_source_read
+            let query = suggested_search_query(prompt, intent).unwrap_or_default();
+            let has_non_definition_source_read = results
+                .iter()
+                .filter(|result| result.tool_name == "read_file")
+                .filter_map(|result| {
+                    let (path, content) = parse_read_file_output(&result.output)?;
+                    Some((path, content))
+                })
+                .any(|(path, content)| {
+                    if !is_source_path(&path) || is_test_like_path(&path) {
+                        return false;
+                    }
+                    content.lines().any(|line| {
+                        let trimmed = line.trim();
+                        if !trimmed.contains(&query) {
+                            return false;
+                        }
+                        if matches!(intent, ToolLoopIntent::CallSiteLookup) {
+                            trimmed.contains('(') && !is_definition_like_line(trimmed)
+                        } else {
+                            !is_definition_like_line(trimmed)
+                        }
+                    })
+                });
+            has_search && has_non_definition_source_read
         }
         ToolLoopIntent::FlowTrace => {
             if results
@@ -467,20 +546,21 @@ pub(super) fn has_relevant_file_evidence(
                 return true;
             }
             let read_paths = observed_read_paths(results);
-            if read_paths.is_empty() {
+            let source_reads = read_paths
+                .iter()
+                .filter(|path| is_source_path(path) && !is_test_like_path(path))
+                .count();
+            if source_reads == 0 {
                 return false;
             }
-            if read_paths
-                .iter()
-                .any(|path| preferred_candidate_path(intent, path))
-            {
+            if source_reads >= 2 {
                 return true;
             }
             let ranked = ranked_search_candidates(intent, prompt, results);
-            let has_better_unread = ranked
-                .iter()
-                .any(|file| preferred_candidate_path(intent, &file.path));
-            !has_better_unread
+            let has_related_unread = ranked.iter().any(|file| {
+                preferred_candidate_path(intent, &file.path) && !read_paths.contains(&file.path)
+            });
+            !has_related_unread
         }
     }
 }
@@ -620,7 +700,18 @@ pub(super) fn targeted_investigation_followup(
                 None => format!("{body} Next read: `[read_file: {}]`.", candidate.path),
             })
         }
-        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => None,
+        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview => {
+            let read_paths = observed_read_paths(results);
+            repo_bootstrap_read_targets(Path::new("."), intent)
+                .into_iter()
+                .find(|path| !read_paths.contains(path))
+                .map(|path| {
+                    format!(
+                        "Do not answer yet. Read this repo file next to ground the overview: `[read_file: {}]`.",
+                        path
+                    )
+                })
+        }
     }
 }
 
@@ -657,6 +748,7 @@ pub(super) fn bootstrap_tool_results(
     intent: ToolLoopIntent,
     prompt: &str,
     base_messages: &[Message],
+    project_root: &Path,
     backend_name: &str,
     tools: &ToolRegistry,
     token_tx: &Sender<InferenceEvent>,
@@ -681,6 +773,13 @@ pub(super) fn bootstrap_tool_results(
             }
             return results;
         }
+    }
+
+    if matches!(
+        intent,
+        ToolLoopIntent::RepoOverview | ToolLoopIntent::DirectoryOverview
+    ) {
+        return bootstrap_repo_overview_results(intent, project_root, tools, token_tx);
     }
 
     if !backend_name.contains("llama.cpp") {
@@ -731,4 +830,162 @@ pub(super) fn bootstrap_tool_results(
     }
 
     results
+}
+
+fn bootstrap_repo_overview_results(
+    intent: ToolLoopIntent,
+    project_root: &Path,
+    tools: &ToolRegistry,
+    token_tx: &Sender<InferenceEvent>,
+) -> Vec<ToolResult> {
+    let mut results = tools.execute_read_only_tool_calls("[list_dir: .]").results;
+    if !results.is_empty() {
+        emit_trace(token_tx, ProgressStatus::Finished, "list_dir .", false);
+    }
+
+    for path in repo_bootstrap_read_targets(project_root, intent) {
+        let execution = tools.execute_read_only_tool_calls(&format!("[read_file: {path}]"));
+        if let Some(result) = execution.results.into_iter().next() {
+            emit_trace(
+                token_tx,
+                ProgressStatus::Finished,
+                &format!("read_file {}", result.argument),
+                false,
+            );
+            results.push(result);
+        }
+    }
+
+    results
+}
+
+fn repo_bootstrap_read_targets(project_root: &Path, intent: ToolLoopIntent) -> Vec<String> {
+    let candidates = match intent {
+        ToolLoopIntent::RepoOverview => {
+            vec!["Cargo.toml", "README.md", "src/main.rs", "src/lib.rs"]
+        }
+        ToolLoopIntent::DirectoryOverview => vec!["Cargo.toml", "src/main.rs", "src/lib.rs"],
+        _ => Vec::new(),
+    };
+
+    candidates
+        .into_iter()
+        .filter(|path| project_root.join(path).is_file())
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_repo_key_path(path: &str) -> bool {
+    matches!(
+        path,
+        "Cargo.toml" | "README.md" | "src/main.rs" | "src/lib.rs"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_overview_bootstrap_reads_manifest_and_entrypoint() {
+        let dir =
+            std::env::temp_dir().join(format!("params-repo-bootstrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(dir.join("README.md"), "# demo\n").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let results = bootstrap_tool_results(
+            ToolLoopIntent::RepoOverview,
+            "Can you see my project?",
+            &[Message::user("Can you see my project?")],
+            &dir,
+            "llama.cpp",
+            &ToolRegistry::default(),
+            &tx,
+        );
+
+        assert!(results.iter().any(|r| r.tool_name == "list_dir"));
+        assert!(results.iter().any(|r| r.argument == "Cargo.toml"));
+        assert!(results.iter().any(|r| r.argument == "src/main.rs"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn callsite_lookup_requires_non_definition_read() {
+        let definition_result = ToolResult {
+            tool_name: "read_file".to_string(),
+            argument: "src/session/mod.rs".to_string(),
+            output:
+                "File: src/session/mod.rs\nLines: 3\n\n```\npub fn load_most_recent() {\n}\n```"
+                    .to_string(),
+        };
+        let search_result = ToolResult {
+            tool_name: "search".to_string(),
+            argument: "load_most_recent".to_string(),
+            output: "src/session/mod.rs:\n  1: pub fn load_most_recent() {\n\nsrc/main.rs:\n  12: store.load_most_recent();\n"
+                .to_string(),
+        };
+
+        assert!(
+            !has_relevant_file_evidence(
+                ToolLoopIntent::CallSiteLookup,
+                "what calls load_most_recent",
+                &[search_result.clone(), definition_result]
+            ),
+            "definition-only reads should not satisfy call-site lookup"
+        );
+
+        let caller_result = ToolResult {
+            tool_name: "read_file".to_string(),
+            argument: "src/main.rs".to_string(),
+            output: "File: src/main.rs\nLines: 5\n\n```\nfn start() {\n    store.load_most_recent();\n}\n```"
+                .to_string(),
+        };
+        assert!(has_relevant_file_evidence(
+            ToolLoopIntent::CallSiteLookup,
+            "what calls load_most_recent",
+            &[search_result, caller_result]
+        ));
+    }
+
+    #[test]
+    fn flow_trace_requires_cross_file_evidence() {
+        let one_read = ToolResult {
+            tool_name: "read_file".to_string(),
+            argument: "src/main.rs".to_string(),
+            output: "File: src/main.rs\nLines: 4\n\n```\nfn main() {\n    init_logging();\n}\n```"
+                .to_string(),
+        };
+        let search = ToolResult {
+            tool_name: "search".to_string(),
+            argument: "logging".to_string(),
+            output: "src/main.rs:\n  2: init_logging();\n\nsrc/logging.rs:\n  1: pub fn init_logging() {}\n"
+                .to_string(),
+        };
+
+        assert!(
+            !has_relevant_file_evidence(
+                ToolLoopIntent::FlowTrace,
+                "Trace how logging works.",
+                &[search.clone(), one_read.clone()]
+            ),
+            "single-file evidence should not satisfy flow tracing"
+        );
+
+        let second_read = ToolResult {
+            tool_name: "read_file".to_string(),
+            argument: "src/logging.rs".to_string(),
+            output: "File: src/logging.rs\nLines: 4\n\n```\npub fn init_logging() {\n    configure_sink();\n}\n```"
+                .to_string(),
+        };
+        assert!(has_relevant_file_evidence(
+            ToolLoopIntent::FlowTrace,
+            "Trace how logging works.",
+            &[search, one_read, second_read]
+        ));
+    }
 }

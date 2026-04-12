@@ -1,12 +1,3 @@
-// src/tools/fs.rs
-//
-// Filesystem tools — read files and list directories.
-//
-// These are the most fundamental coding assistant tools. Without them
-// the model can only work with code you paste directly into the chat.
-// With them, you can say "look at src/auth.rs and tell me what's wrong"
-// and the model will actually read the file.
-
 use std::fs;
 use tracing::info;
 
@@ -14,9 +5,6 @@ use super::{Tool, ToolRunResult};
 use crate::error::{ParamsError, Result};
 use crate::safety::{self, ProjectPathKind};
 
-/// Reads the contents of a file and returns them as a string.
-///
-/// Usage in model response: [read_file: src/main.rs]
 pub struct ReadFile;
 
 impl Tool for ReadFile {
@@ -56,9 +44,6 @@ impl Tool for ReadFile {
     }
 }
 
-/// Lists the contents of a directory.
-///
-/// Usage in model response: [list_dir: src/]
 pub struct ListDir;
 
 impl Tool for ListDir {

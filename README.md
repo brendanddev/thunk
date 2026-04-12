@@ -91,6 +91,13 @@ params
 params --no-resume
 ```
 
+**Optional bootstrap helpers**
+```bash
+./scripts/setup.sh
+./scripts/check.sh
+```
+`setup.sh` creates `.local/` subdirectories plus starter `.local/config.toml` and `.local/keys.env` files if they do not exist. `check.sh` verifies the common prerequisites and backend-specific basics without modifying anything.
+
 ---
 
 ## Configuration

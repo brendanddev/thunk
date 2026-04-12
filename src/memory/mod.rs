@@ -25,14 +25,7 @@ use crate::error::Result;
 use crate::events::InferenceEvent;
 use crate::inference::{InferenceBackend, Message};
 
-/// Run a prompt through the backend and collect the full response as a String.
-///
-/// Both `generate()` implementations (llama.cpp and Ollama) are blocking —
-/// they send all tokens before returning. So after `generate()` returns we
-/// can drain the channel with `try_iter()` without a relay thread.
-///
-/// This helper is used by summarization and fact-extraction code which needs
-/// a string back, not a streaming event channel.
+/// Run a prompt through the backend and collect the full response as a String
 pub(crate) fn run_prompt_sync(
     backend: &dyn InferenceBackend,
     messages: &[Message],
