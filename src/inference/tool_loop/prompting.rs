@@ -7,12 +7,11 @@ use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::events::{InferenceEvent, ProgressStatus};
-use crate::tools::{ToolRegistry, ToolResult};
+use crate::tools::ToolRegistry;
 
 use super::super::runtime::{eco_tool_result_limit, emit_trace};
 use super::super::system_prompt_with_tools;
 use super::super::Message;
-use super::evidence::has_relevant_file_evidence;
 use super::intent::{normalize_intent_text, suggested_search_query, ToolLoopIntent};
 use super::ToolLoopBudget;
 
@@ -40,15 +39,6 @@ pub(super) fn tool_loop_result_limit(backend_name: &str, eco_enabled: bool) -> O
     } else {
         eco_tool_result_limit(eco_enabled)
     }
-}
-
-pub(super) fn should_stream_tool_loop_generation(
-    intent: ToolLoopIntent,
-    prompt: &str,
-    results: &[ToolResult],
-    reflection_enabled: bool,
-) -> bool {
-    !reflection_enabled && has_relevant_file_evidence(intent, prompt, results)
 }
 
 pub(super) fn with_progress_heartbeat<T, F>(

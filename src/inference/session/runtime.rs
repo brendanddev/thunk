@@ -16,7 +16,7 @@ use crate::memory::{
 use crate::session::{display_name, SessionStore};
 use crate::tools::{BashTool, Tool, ToolRegistry};
 
-use super::investigation::{classify_agentic_repo_turn, InvestigationState};
+use super::investigation::{resolve_agentic_repo_turn, InvestigationState};
 use super::memory::{
     apply_memory_update, clear_memory_retrieval, collect_retrieval_bundle, emit_memory_state,
     format_memory_recall, memory_fact_lines, refresh_loaded_facts, retrieval_trace_label,
@@ -42,7 +42,7 @@ use super::super::runtime::{
     eco_tool_result_limit, effective_reflection, emit_buffered_tokens, emit_generation_started,
     emit_trace, log_debug_response,
 };
-use super::super::tool_loop::run_read_only_tool_loop;
+use super::super::tool_loop::run_read_only_tool_loop_with_resolution;
 use super::super::{build_system_prompt, load_backend_with_fallback, Message, SessionCommand};
 
 #[derive(Clone, Copy, Default)]
@@ -847,9 +847,10 @@ pub fn model_thread_with_options(
                 }
                 session_messages.push(Message::user(&prompt));
 
-                let tool_loop_intent = classify_agentic_repo_turn(&prompt, &investigation_state);
+                let tool_loop_resolution = resolve_agentic_repo_turn(&prompt, &investigation_state);
 
-                if let Some(intent) = tool_loop_intent {
+                if let Some(resolution) = tool_loop_resolution {
+                    let intent = resolution.intent;
                     clear_memory_retrieval(&mut memory_state);
                     memory_state.last_update = None;
                     emit_memory_state(&token_tx, &memory_state);
@@ -879,9 +880,10 @@ pub fn model_thread_with_options(
                         reflection: reflection_enabled,
                     });
 
-                    match run_read_only_tool_loop(
+                    match run_read_only_tool_loop_with_resolution(
                         intent,
                         &prompt,
+                        Some(&resolution),
                         &tool_loop_messages,
                         &*backend,
                         &tools,

@@ -1,3 +1,4 @@
+use crate::inference::session::investigation::InvestigationResolution;
 use crate::memory::retrieval::{query_terms, score_text};
 use crate::tools::ToolResult;
 
@@ -67,10 +68,20 @@ pub(super) fn is_doc_path(path: &str) -> bool {
 pub(super) fn is_test_like_path(path: &str) -> bool {
     path.starts_with("tests/")
         || path.contains("/tests/")
+        || path.ends_with("/tests.rs")
+        || path.ends_with("/test.rs")
         || path.contains("fixtures")
         || path.contains("snapshots")
         || path.ends_with("_test.rs")
         || path.ends_with("_tests.rs")
+}
+
+pub(super) fn is_internal_tool_loop_path(path: &str) -> bool {
+    path.starts_with("src/inference/tool_loop/")
+}
+
+pub(super) fn is_legacy_auto_inspect_path(path: &str) -> bool {
+    path.starts_with("src/inference/session/auto_inspect")
 }
 
 pub(super) fn is_source_path(path: &str) -> bool {
@@ -113,6 +124,71 @@ pub(super) fn is_definition_like_line(line: &str) -> bool {
         || trimmed.starts_with("def ")
         || trimmed.starts_with("class ")
         || trimmed.starts_with("interface ")
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn identifier_match_offsets(line: &str, symbol: &str) -> Vec<usize> {
+    if symbol.is_empty() {
+        return Vec::new();
+    }
+
+    line.match_indices(symbol)
+        .filter_map(|(idx, _)| {
+            let prev = line[..idx].chars().next_back();
+            let next = line[idx + symbol.len()..].chars().next();
+            let bounded = !prev.map(is_identifier_char).unwrap_or(false)
+                && !next.map(is_identifier_char).unwrap_or(false);
+            if bounded {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(super) fn prompt_mentions_tests(prompt: &str) -> bool {
+    let normalized = prompt.to_ascii_lowercase();
+    normalized.contains(" test")
+        || normalized.contains("tests")
+        || normalized.starts_with("test ")
+        || normalized.contains(" unit test")
+}
+
+pub(super) fn line_contains_symbol_reference(line: &str, symbol: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("//") {
+        return false;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    let symbol = symbol.to_ascii_lowercase();
+    identifier_match_offsets(&lowered, &symbol)
+        .into_iter()
+        .any(|idx| {
+            let next = lowered[idx + symbol.len()..].chars().next();
+            let prev = lowered[..idx].chars().next_back();
+            !(matches!(prev, Some('"') | Some('\'')) && matches!(next, Some('"') | Some('\'')))
+        })
+}
+
+pub(super) fn line_contains_symbol_invocation(line: &str, symbol: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("//") {
+        return false;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    let symbol = symbol.to_ascii_lowercase();
+    identifier_match_offsets(&lowered, &symbol)
+        .into_iter()
+        .any(|idx| {
+            let next = lowered[idx + symbol.len()..].trim_start();
+            next.starts_with('(') || next.starts_with("::<")
+        })
 }
 
 pub(super) fn clip_inline(text: &str, max_chars: usize) -> String {
@@ -272,6 +348,7 @@ pub(super) fn declaration_lines_with_numbers(content: &str, limit: usize) -> Vec
 pub(super) fn compact_read_file_result(
     intent: ToolLoopIntent,
     prompt: &str,
+    resolution: Option<&InvestigationResolution>,
     result: &ToolResult,
     max_chars_per_result: Option<usize>,
 ) -> Option<String> {
@@ -282,7 +359,14 @@ pub(super) fn compact_read_file_result(
 
     match intent {
         ToolLoopIntent::CodeNavigation => {
-            if is_referential_file_prompt(prompt) {
+            if is_referential_file_prompt(prompt)
+                || resolution
+                    .map(|resolution| {
+                        resolution.prefer_answer_from_anchor
+                            && resolution.anchored_file.as_deref() == Some(path.as_str())
+                    })
+                    .unwrap_or(false)
+            {
                 let declarations = declaration_lines_with_numbers(&content, 6);
                 let excerpt = if declarations.is_empty() {
                     first_non_empty_lines(&content, 6)

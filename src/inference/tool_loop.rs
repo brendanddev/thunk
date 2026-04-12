@@ -16,20 +16,18 @@ use super::budget::{
     estimate_message_tokens, record_generation_budget, SessionBudget, SessionCacheStats,
 };
 use super::cache::{generate_with_cache, CacheMode};
-use super::reflection::reflect_response;
-use super::runtime::{emit_generation_started, emit_trace};
+use super::runtime::{emit_buffered_tokens, emit_generation_started, emit_trace};
+use super::session::investigation::InvestigationResolution;
 use super::{InferenceBackend, Message};
 use evidence::{
     bootstrap_tool_results, format_tool_loop_results_with_limit, grounded_answer_guidance,
-    has_relevant_file_evidence, targeted_investigation_followup,
+    investigation_outcome, render_structured_answer, InvestigationOutcome,
 };
-use intent::suggested_search_query;
 pub(super) use intent::ToolLoopIntent;
 use prompting::{
     build_tool_loop_seed_messages, build_tool_loop_system_prompt, initial_investigation_hint,
-    initial_tool_only_followup, should_stream_tool_loop_generation, thinking_label,
-    tool_loop_budget, tool_loop_result_limit, with_progress_heartbeat,
-    with_progress_heartbeat_interval,
+    initial_tool_only_followup, thinking_label, tool_loop_budget, tool_loop_result_limit,
+    with_progress_heartbeat,
 };
 
 #[derive(Clone, Copy)]
@@ -78,19 +76,54 @@ pub(super) fn run_read_only_tool_loop(
     cache_stats: &mut SessionCacheStats,
     budget: &mut SessionBudget,
     eco_enabled: bool,
-    reflection_enabled: bool,
+    _reflection_enabled: bool,
+) -> Result<ToolLoopOutcome> {
+    run_read_only_tool_loop_with_resolution(
+        intent,
+        prompt,
+        None,
+        base_messages,
+        backend,
+        tools,
+        cfg,
+        project_root,
+        token_tx,
+        exact_cache,
+        cache_stats,
+        budget,
+        eco_enabled,
+        _reflection_enabled,
+    )
+}
+
+pub(super) fn run_read_only_tool_loop_with_resolution(
+    intent: ToolLoopIntent,
+    prompt: &str,
+    resolution: Option<&InvestigationResolution>,
+    base_messages: &[Message],
+    backend: &dyn InferenceBackend,
+    tools: &ToolRegistry,
+    cfg: &config::Config,
+    project_root: &Path,
+    token_tx: &Sender<InferenceEvent>,
+    exact_cache: Option<&ExactCache>,
+    cache_stats: &mut SessionCacheStats,
+    budget: &mut SessionBudget,
+    eco_enabled: bool,
+    _reflection_enabled: bool,
 ) -> Result<ToolLoopOutcome> {
     let loop_budget = tool_loop_budget(eco_enabled);
     let result_limit = tool_loop_result_limit(&backend.name(), eco_enabled);
     let (thinking, status_label) = thinking_label(intent);
-    let _ = token_tx.send(InferenceEvent::SystemMessage(thinking.to_string()));
     emit_generation_started(token_tx, status_label, false);
+    emit_trace(token_tx, ProgressStatus::Started, thinking, false);
 
     let system_prompt = build_tool_loop_system_prompt(tools, project_root, intent, eco_enabled);
     let mut loop_messages = build_tool_loop_seed_messages(base_messages, &system_prompt, prompt);
     let mut all_tool_results = bootstrap_tool_results(
         intent,
         prompt,
+        resolution,
         base_messages,
         project_root,
         &backend.name(),
@@ -109,16 +142,43 @@ pub(super) fn run_read_only_tool_loop(
             loop_messages.push(Message::user(&hint));
         }
     } else {
-        let result_message =
-            format_tool_loop_results_with_limit(intent, prompt, &all_tool_results, result_limit)
-                .unwrap_or_else(|| "Tool results:\n".to_string());
-        loop_messages.push(Message::user(&result_message));
-        if let Some(guidance) = grounded_answer_guidance(intent, prompt, &all_tool_results) {
-            loop_messages.push(Message::user(&guidance));
+        push_evidence_messages(
+            &mut loop_messages,
+            intent,
+            prompt,
+            resolution,
+            &all_tool_results,
+            result_limit,
+        );
+        match investigation_outcome(intent, prompt, resolution, &all_tool_results) {
+            InvestigationOutcome::Ready {
+                evidence,
+                stop_reason,
+            } => {
+                emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
+                let final_response = finalize_structured_answer(prompt, &evidence, token_tx)?;
+                return Ok(ToolLoopOutcome {
+                    final_response,
+                    tool_results: all_tool_results,
+                    streamed_final_response: true,
+                });
+            }
+            InvestigationOutcome::Insufficient { reason } => {
+                emit_trace(
+                    token_tx,
+                    ProgressStatus::Failed,
+                    "insufficient evidence",
+                    false,
+                );
+                emit_buffered_tokens(token_tx, &reason);
+                return Ok(ToolLoopOutcome {
+                    final_response: reason,
+                    tool_results: all_tool_results,
+                    streamed_final_response: true,
+                });
+            }
+            InvestigationOutcome::NeedsMore { .. } => {}
         }
-        loop_messages.push(Message::user(
-            "Initial repo scan is ready. Continue investigating only if you still need more evidence. Otherwise answer now using the observed file and line evidence.",
-        ));
     }
 
     for iteration in 0..loop_budget.max_iterations {
@@ -145,12 +205,7 @@ pub(super) fn run_read_only_tool_loop(
                 cfg,
                 project_root,
                 token_tx.clone(),
-                should_stream_tool_loop_generation(
-                    intent,
-                    prompt,
-                    &all_tool_results,
-                    reflection_enabled,
-                ),
+                false,
                 exact_cache,
                 cache_stats,
                 CacheMode::PreferPromptLevel,
@@ -178,57 +233,45 @@ pub(super) fn run_read_only_tool_loop(
                 loop_messages.push(Message::user(&initial_tool_only_followup(intent, prompt)));
                 continue;
             }
-            if !has_relevant_file_evidence(intent, prompt, &all_tool_results) {
-                emit_trace(
-                    token_tx,
-                    ProgressStatus::Updated,
-                    "tool loop needs file-level evidence before answering",
-                    false,
-                );
-                loop_messages.push(Message::assistant(&draft.text));
-                let followup = targeted_investigation_followup(intent, prompt, &all_tool_results)
-                    .unwrap_or_else(|| {
-                        "You do not have enough file-level evidence yet. \
-                         Do not answer from search hits alone. \
-                         Read the most relevant candidate file or use an LSP read-only tool on the best location, then answer from that evidence."
-                            .to_string()
+            match investigation_outcome(intent, prompt, resolution, &all_tool_results) {
+                InvestigationOutcome::Ready {
+                    evidence,
+                    stop_reason,
+                } => {
+                    emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
+                    let final_response = finalize_structured_answer(prompt, &evidence, token_tx)?;
+                    return Ok(ToolLoopOutcome {
+                        final_response,
+                        tool_results: all_tool_results,
+                        streamed_final_response: true,
                     });
-                loop_messages.push(Message::user(&followup));
-                continue;
+                }
+                InvestigationOutcome::NeedsMore { required_next_step } => {
+                    emit_trace(
+                        token_tx,
+                        ProgressStatus::Updated,
+                        "tool loop needs more evidence before answering",
+                        false,
+                    );
+                    loop_messages.push(Message::assistant(&draft.text));
+                    loop_messages.push(Message::user(&required_next_step));
+                    continue;
+                }
+                InvestigationOutcome::Insufficient { reason } => {
+                    emit_trace(
+                        token_tx,
+                        ProgressStatus::Failed,
+                        "insufficient evidence",
+                        false,
+                    );
+                    emit_buffered_tokens(token_tx, &reason);
+                    return Ok(ToolLoopOutcome {
+                        final_response: reason,
+                        tool_results: all_tool_results,
+                        streamed_final_response: true,
+                    });
+                }
             }
-            let final_response = if reflection_enabled {
-                emit_trace(
-                    token_tx,
-                    ProgressStatus::Updated,
-                    "reflecting final answer...",
-                    false,
-                );
-                reflect_response(
-                    backend,
-                    cfg,
-                    project_root,
-                    budget,
-                    token_tx,
-                    exact_cache,
-                    cache_stats,
-                    &loop_messages,
-                    &draft.text,
-                )?
-            } else {
-                draft.text
-            };
-            let streamed_final_response = !reflection_enabled
-                && should_stream_tool_loop_generation(
-                    intent,
-                    prompt,
-                    &all_tool_results,
-                    reflection_enabled,
-                );
-            return Ok(ToolLoopOutcome {
-                final_response,
-                tool_results: all_tool_results,
-                streamed_final_response,
-            });
         }
 
         if !disallowed_calls.is_empty() {
@@ -268,94 +311,136 @@ pub(super) fn run_read_only_tool_loop(
         all_tool_results.extend(results.clone());
 
         loop_messages.push(Message::assistant(&draft.text));
-        let result_message = ToolRegistry::format_results_with_limit(&results, result_limit)
-            .unwrap_or_else(|| "Tool results:\n".to_string());
-        let result_message =
-            format_tool_loop_results_with_limit(intent, prompt, &results, result_limit)
-                .unwrap_or(result_message);
-        loop_messages.push(Message::user(&result_message));
-        if let Some(guidance) = grounded_answer_guidance(intent, prompt, &all_tool_results) {
-            loop_messages.push(Message::user(&guidance));
-        }
+        push_evidence_messages(
+            &mut loop_messages,
+            intent,
+            prompt,
+            resolution,
+            &results,
+            result_limit,
+        );
 
-        if repeated {
-            loop_messages.push(Message::user(
-                "You are repeating the same tool calls. Answer from the gathered evidence or explain briefly what is still missing.",
-            ));
-        }
-        if let Some(followup) = targeted_investigation_followup(intent, prompt, &all_tool_results) {
-            loop_messages.push(Message::user(&followup));
-        } else if !repeated {
-            loop_messages.push(Message::user(
-                "Continue investigating only if you still need more evidence. Otherwise answer now using the observed file and line evidence.",
-            ));
+        match investigation_outcome(intent, prompt, resolution, &all_tool_results) {
+            InvestigationOutcome::Ready {
+                evidence,
+                stop_reason,
+            } => {
+                emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
+                let final_response = finalize_structured_answer(prompt, &evidence, token_tx)?;
+                return Ok(ToolLoopOutcome {
+                    final_response,
+                    tool_results: all_tool_results,
+                    streamed_final_response: true,
+                });
+            }
+            InvestigationOutcome::NeedsMore { required_next_step } => {
+                if repeated {
+                    loop_messages.push(Message::user(
+                        "You are repeating the same tool calls. Only continue if the next read materially improves the answer.",
+                    ));
+                }
+                loop_messages.push(Message::user(&required_next_step));
+            }
+            InvestigationOutcome::Insufficient { reason } => {
+                emit_trace(
+                    token_tx,
+                    ProgressStatus::Failed,
+                    "insufficient evidence",
+                    false,
+                );
+                emit_buffered_tokens(token_tx, &reason);
+                return Ok(ToolLoopOutcome {
+                    final_response: reason,
+                    tool_results: all_tool_results,
+                    streamed_final_response: true,
+                });
+            }
         }
     }
 
     emit_trace(
         token_tx,
         ProgressStatus::Updated,
-        "tool loop hit its iteration limit; answering from gathered evidence...",
+        "tool loop hit its iteration limit",
         false,
     );
-    let prompt_tokens = estimate_message_tokens(&loop_messages);
-    let final_draft =
-        with_progress_heartbeat(token_tx, "answering from gathered evidence...", || {
-            generate_with_cache(
-                backend,
-                &loop_messages,
-                cfg,
-                project_root,
-                token_tx.clone(),
-                should_stream_tool_loop_generation(
-                    intent,
-                    prompt,
-                    &all_tool_results,
-                    reflection_enabled,
-                ),
-                exact_cache,
-                cache_stats,
-                CacheMode::PreferPromptLevel,
-            )
-        })?;
-    if !final_draft.hit {
-        record_generation_budget(cfg, budget, token_tx, prompt_tokens, &final_draft.text);
-    }
-    let final_response = if reflection_enabled {
-        reflect_response(
-            backend,
-            cfg,
-            project_root,
-            budget,
-            token_tx,
-            exact_cache,
-            cache_stats,
-            &loop_messages,
-            &final_draft.text,
-        )?
-    } else {
-        final_draft.text
+    let final_response = match investigation_outcome(intent, prompt, resolution, &all_tool_results)
+    {
+        InvestigationOutcome::Ready {
+            evidence,
+            stop_reason,
+        } => {
+            emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
+            finalize_structured_answer(prompt, &evidence, token_tx)?
+        }
+        InvestigationOutcome::Insufficient { reason } => {
+            emit_trace(
+                token_tx,
+                ProgressStatus::Failed,
+                "insufficient evidence",
+                false,
+            );
+            emit_buffered_tokens(token_tx, &reason);
+            reason
+        }
+        InvestigationOutcome::NeedsMore { .. } => {
+            let reason = format!(
+                "I couldn't gather enough source evidence to answer {:?} within the current investigation budget.",
+                intent
+            );
+            emit_trace(
+                token_tx,
+                ProgressStatus::Failed,
+                "insufficient evidence",
+                false,
+            );
+            emit_buffered_tokens(token_tx, &reason);
+            reason
+        }
     };
-
-    if final_response.trim().is_empty() {
-        return Err(ParamsError::Inference(
-            "Tool loop returned an empty final response".to_string(),
-        ));
-    }
-
-    let streamed_final_response = !reflection_enabled
-        && should_stream_tool_loop_generation(
-            intent,
-            prompt,
-            &all_tool_results,
-            reflection_enabled,
-        );
 
     Ok(ToolLoopOutcome {
         final_response,
         tool_results: all_tool_results,
-        streamed_final_response,
+        streamed_final_response: true,
     })
+}
+
+fn push_evidence_messages(
+    loop_messages: &mut Vec<Message>,
+    intent: ToolLoopIntent,
+    prompt: &str,
+    resolution: Option<&InvestigationResolution>,
+    results: &[ToolResult],
+    result_limit: Option<usize>,
+) {
+    let result_message =
+        format_tool_loop_results_with_limit(intent, prompt, resolution, results, result_limit)
+            .unwrap_or_else(|| "Tool results:\n".to_string());
+    loop_messages.push(Message::user(&result_message));
+    if let Some(guidance) = grounded_answer_guidance(intent, prompt, resolution, results) {
+        loop_messages.push(Message::user(&guidance));
+    }
+}
+
+fn finalize_structured_answer(
+    prompt: &str,
+    evidence: &evidence::StructuredEvidence,
+    token_tx: &Sender<InferenceEvent>,
+) -> Result<String> {
+    let final_response = render_structured_answer(prompt, evidence);
+    if final_response.trim().is_empty() {
+        return Err(ParamsError::Inference(
+            "Structured evidence produced an empty final answer".to_string(),
+        ));
+    }
+    emit_buffered_tokens(token_tx, &final_response);
+    Ok(final_response)
+}
+
+fn final_answer_contains_tool_tags(text: &str, tools: &ToolRegistry) -> bool {
+    let execution = tools.execute_read_only_tool_calls(text);
+    !execution.results.is_empty() || !execution.disallowed_calls.is_empty()
 }
 
 #[cfg(test)]

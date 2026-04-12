@@ -9,8 +9,8 @@
 ## Build output
 /target
 
-## Documentation
-docs/
+## Examples & notes
+examples/
 
 ## Models
 models/

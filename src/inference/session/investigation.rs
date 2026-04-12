@@ -2,12 +2,64 @@ use crate::inference::tool_loop::ToolLoopIntent;
 use crate::inference::Message;
 use crate::tools::ToolResult;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvestigationLatencyPolicy {
+    FastConvergence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InvestigationAnchor {
+    File(String),
+    Directory(String),
+    Query(String),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InjectedContextMetadata {
     pub file_path: Option<String>,
     pub directory_path: Option<String>,
     pub search_query: Option<String>,
     pub tool_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvestigationResolution {
+    pub(crate) intent: ToolLoopIntent,
+    pub(crate) anchor: Option<InvestigationAnchor>,
+    pub(crate) latency_policy: InvestigationLatencyPolicy,
+    pub(crate) anchored_file: Option<String>,
+    pub(crate) anchored_directory: Option<String>,
+    pub(crate) anchored_query: Option<String>,
+    pub(crate) prefer_answer_from_anchor: bool,
+}
+
+#[allow(dead_code)]
+pub(crate) type TechnicalTurnResolution = InvestigationResolution;
+
+impl InvestigationResolution {
+    fn new(intent: ToolLoopIntent) -> Self {
+        Self {
+            intent,
+            anchor: None,
+            latency_policy: InvestigationLatencyPolicy::FastConvergence,
+            anchored_file: None,
+            anchored_directory: None,
+            anchored_query: None,
+            prefer_answer_from_anchor: false,
+        }
+    }
+
+    fn anchored_to_file(path: Option<String>, query: Option<String>) -> Option<Self> {
+        path.map(|anchored_file| Self {
+            intent: ToolLoopIntent::CodeNavigation,
+            anchor: Some(InvestigationAnchor::File(anchored_file.clone())),
+            latency_policy: InvestigationLatencyPolicy::FastConvergence,
+            anchored_file: Some(anchored_file),
+            anchored_directory: None,
+            anchored_query: query,
+            prefer_answer_from_anchor: true,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,13 +160,20 @@ impl InvestigationState {
         })
     }
 
-    pub(super) fn follow_up_intent(&self, prompt: &str) -> Option<ToolLoopIntent> {
+    pub(super) fn follow_up_resolution(&self, prompt: &str) -> Option<InvestigationResolution> {
         if !self.has_recent_repo_context() {
             return None;
         }
         let normalized = normalize_follow_up_text(prompt);
         if normalized.is_empty() {
             return None;
+        }
+
+        if is_referential_file_prompt(prompt) {
+            return InvestigationResolution::anchored_to_file(
+                self.recent_loaded_files.last().cloned(),
+                self.recent_search_queries.last().cloned(),
+            );
         }
 
         let direct_follow_up = [
@@ -138,18 +197,34 @@ impl InvestigationState {
             "what about this",
         ];
         if direct_follow_up.contains(&normalized.as_str()) {
-            return self.last_intent.or(Some(ToolLoopIntent::CodeNavigation));
+            if let Some(resolution) = InvestigationResolution::anchored_to_file(
+                self.recent_loaded_files.last().cloned(),
+                self.recent_search_queries.last().cloned(),
+            ) {
+                return Some(resolution);
+            }
+            return Some(self.fallback_resolution());
         }
 
         if normalized.contains("this file") || normalized.contains("that file") {
-            return Some(ToolLoopIntent::CodeNavigation);
+            return InvestigationResolution::anchored_to_file(
+                self.recent_loaded_files.last().cloned(),
+                self.recent_search_queries.last().cloned(),
+            )
+            .or_else(|| Some(self.fallback_resolution()));
         }
 
         if normalized.starts_with("can you tell me")
             || normalized.starts_with("tell me")
             || normalized.starts_with("what about ")
         {
-            return self.last_intent.or(Some(ToolLoopIntent::RepoOverview));
+            if let Some(resolution) = InvestigationResolution::anchored_to_file(
+                self.recent_loaded_files.last().cloned(),
+                self.recent_search_queries.last().cloned(),
+            ) {
+                return Some(resolution);
+            }
+            return Some(self.fallback_resolution());
         }
 
         None
@@ -158,6 +233,34 @@ impl InvestigationState {
     pub(super) fn summary_message(&self) -> Option<Message> {
         let context = self.compression_context()?;
         Some(Message::user(&context.render()))
+    }
+
+    fn fallback_resolution(&self) -> InvestigationResolution {
+        let anchored_file = self.recent_loaded_files.last().cloned();
+        let anchored_directory = self.recent_directory_paths.last().cloned();
+        let anchored_query = self.recent_search_queries.last().cloned();
+        let anchor = anchored_file
+            .as_ref()
+            .map(|path| InvestigationAnchor::File(path.clone()))
+            .or_else(|| {
+                anchored_directory
+                    .as_ref()
+                    .map(|path| InvestigationAnchor::Directory(path.clone()))
+            })
+            .or_else(|| {
+                anchored_query
+                    .as_ref()
+                    .map(|query| InvestigationAnchor::Query(query.clone()))
+            });
+        InvestigationResolution {
+            intent: self.last_intent.unwrap_or(ToolLoopIntent::RepoOverview),
+            anchor,
+            latency_policy: InvestigationLatencyPolicy::FastConvergence,
+            anchored_file,
+            anchored_directory,
+            anchored_query,
+            prefer_answer_from_anchor: false,
+        }
     }
 }
 
@@ -216,16 +319,16 @@ impl StructuredCompressionContext {
     }
 }
 
-pub(super) fn classify_agentic_repo_turn(
+pub(super) fn resolve_agentic_repo_turn(
     prompt: &str,
     prior_investigation: &InvestigationState,
-) -> Option<ToolLoopIntent> {
-    if let Some(intent) = crate::inference::tool_loop::detect_tool_loop_intent(prompt) {
-        return Some(intent);
+) -> Option<InvestigationResolution> {
+    if let Some(resolution) = prior_investigation.follow_up_resolution(prompt) {
+        return Some(resolution);
     }
 
-    if let Some(intent) = prior_investigation.follow_up_intent(prompt) {
-        return Some(intent);
+    if let Some(intent) = crate::inference::tool_loop::detect_tool_loop_intent(prompt) {
+        return Some(InvestigationResolution::new(intent));
     }
 
     let normalized = normalize_follow_up_text(prompt);
@@ -245,7 +348,7 @@ pub(super) fn classify_agentic_repo_turn(
             "kind",
         ]);
     if looks_like_repo_overview {
-        return Some(ToolLoopIntent::RepoOverview);
+        return Some(InvestigationResolution::new(ToolLoopIntent::RepoOverview));
     }
 
     let looks_like_directory_overview = has_any(&["directory", "folder", "here"])
@@ -259,7 +362,81 @@ pub(super) fn classify_agentic_repo_turn(
             "what",
         ]);
     if looks_like_directory_overview {
+        return Some(InvestigationResolution::new(
+            ToolLoopIntent::DirectoryOverview,
+        ));
+    }
+
+    detect_broad_technical_intent(&normalized).map(InvestigationResolution::new)
+}
+
+fn detect_broad_technical_intent(normalized: &str) -> Option<ToolLoopIntent> {
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let has_any = |needles: &[&str]| needles.iter().any(|needle| tokens.contains(needle));
+    let contains_any = |needles: &[&str]| needles.iter().any(|needle| normalized.contains(needle));
+
+    if contains_any(&[
+        " src/",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".py",
+        "cargo toml",
+        "readme md",
+    ]) {
+        return Some(ToolLoopIntent::CodeNavigation);
+    }
+
+    if contains_any(&[" this file", " that file", " current file", " loaded file"])
+        && contains_any(&["what", "explain", "describe", "summarize", "tell"])
+    {
+        return Some(ToolLoopIntent::CodeNavigation);
+    }
+
+    if has_any(&["repo", "project", "codebase"]) {
+        return Some(ToolLoopIntent::RepoOverview);
+    }
+
+    if has_any(&["directory", "folder"]) {
         return Some(ToolLoopIntent::DirectoryOverview);
+    }
+
+    if has_any(&["trace", "flow", "walk"])
+        || contains_any(&["how does", "explain how", "describe how"])
+    {
+        return Some(ToolLoopIntent::FlowTrace);
+    }
+
+    if has_any(&["call", "calls"]) {
+        return Some(ToolLoopIntent::CallSiteLookup);
+    }
+
+    if has_any(&["use", "uses"]) {
+        return Some(ToolLoopIntent::UsageLookup);
+    }
+
+    if has_any(&["config", "configured", "setting", "settings"]) {
+        return Some(ToolLoopIntent::ConfigLocate);
+    }
+
+    if has_any(&[
+        "file", "function", "method", "module", "struct", "enum", "trait", "impl", "type",
+        "symbol", "code",
+    ]) || contains_any(&[
+        "where is",
+        "what does",
+        "where does",
+        "implemented",
+        "defined",
+        "entrypoint",
+        "entry point",
+    ]) {
+        return Some(ToolLoopIntent::CodeNavigation);
     }
 
     None
@@ -295,6 +472,19 @@ fn normalize_follow_up_text(prompt: &str) -> String {
         .join(" ")
 }
 
+fn is_referential_file_prompt(prompt: &str) -> bool {
+    matches!(
+        normalize_follow_up_text(prompt).as_str(),
+        "what does this file do"
+            | "what does the current file do"
+            | "what does the loaded file do"
+            | "what is this file for"
+            | "explain this file"
+            | "describe this file"
+            | "summarize this file"
+    )
+}
+
 fn extract_line_value(content: &str, prefix: &str) -> Option<String> {
     content.lines().find_map(|line| {
         line.strip_prefix(prefix)
@@ -321,11 +511,13 @@ mod tests {
     fn broad_repo_prompt_routes_to_repo_overview() {
         let state = InvestigationState::default();
         assert_eq!(
-            classify_agentic_repo_turn("Can you see my project?", &state),
+            resolve_agentic_repo_turn("Can you see my project?", &state)
+                .map(|resolution| resolution.intent),
             Some(ToolLoopIntent::RepoOverview)
         );
         assert_eq!(
-            classify_agentic_repo_turn("Do you understand this repo?", &state),
+            resolve_agentic_repo_turn("Do you understand this repo?", &state)
+                .map(|resolution| resolution.intent),
             Some(ToolLoopIntent::RepoOverview)
         );
     }
@@ -343,10 +535,14 @@ mod tests {
             }],
         );
 
+        let resolution =
+            resolve_agentic_repo_turn("Can you tell me now?", &state).expect("resolution");
+        assert_eq!(resolution.intent, ToolLoopIntent::CodeNavigation);
         assert_eq!(
-            classify_agentic_repo_turn("Can you tell me now?", &state),
-            Some(ToolLoopIntent::CodeNavigation)
+            resolution.anchored_file.as_deref(),
+            Some("src/session/mod.rs")
         );
+        assert!(resolution.prefer_answer_from_anchor);
     }
 
     #[test]

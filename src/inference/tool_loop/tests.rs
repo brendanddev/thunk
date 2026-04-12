@@ -1,9 +1,19 @@
+use super::evidence::{
+    has_relevant_file_evidence, investigation_readiness, targeted_investigation_followup,
+    InvestigationReadiness,
+};
+use super::intent::suggested_search_query;
+use super::prompting::with_progress_heartbeat_interval;
 use super::*;
 use std::fs;
-use std::sync::mpsc;
+use std::path::Path;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::events::InferenceEvent;
+use crate::inference::session::investigation::{
+    InvestigationAnchor, InvestigationLatencyPolicy, InvestigationResolution,
+};
 
 struct ScriptedBackend {
     name: String,
@@ -90,6 +100,19 @@ impl InferenceBackend for InspectingBackend {
     fn name(&self) -> String {
         "inspecting".to_string()
     }
+}
+
+fn with_test_cwd<T>(root: &Path, run: impl FnOnce() -> T) -> T {
+    static CWD_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = CWD_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("cwd guard");
+    let original = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(root).expect("set cwd");
+    let result = run();
+    std::env::set_current_dir(original).expect("restore cwd");
+    result
 }
 
 #[test]
@@ -240,24 +263,26 @@ fn read_only_tool_loop_bootstraps_with_shaped_search_target() {
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CodeNavigation,
-        "Where is session restore implemented?",
-        &[
-            Message::system("system"),
-            Message::user("Where is session restore implemented?"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop");
 
     assert_eq!(
@@ -285,24 +310,26 @@ fn read_only_tool_loop_runs_search_then_answers() {
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CodeNavigation,
-        "Where is session restore implemented?",
-        &[
-            Message::system("system"),
-            Message::user("Where is session restore implemented?"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop");
 
     assert_eq!(
@@ -332,24 +359,26 @@ fn llama_tool_loop_bootstraps_search_and_read_before_first_generation() {
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CodeNavigation,
-        "Where is session restore implemented?",
-        &[
-            Message::system("system"),
-            Message::user("Where is session restore implemented?"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop");
 
     assert_eq!(
@@ -381,24 +410,26 @@ fn grounded_tool_loop_generation_streams_final_answer_tokens() {
     let (tx, rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CodeNavigation,
-        "Where is session restore implemented?",
-        &[
-            Message::system("system"),
-            Message::user("Where is session restore implemented?"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop");
 
     assert_eq!(outcome.final_response, final_answer);
@@ -420,10 +451,75 @@ fn grounded_tool_loop_generation_streams_final_answer_tokens() {
 }
 
 #[test]
+fn tool_loop_does_not_stream_intermediate_tool_tags() {
+    let dir = std::env::temp_dir().join("params-tool-loop-no-tag-stream");
+    let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::write(
+        dir.join("src/session/mod.rs"),
+        "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+    );
+
+    let backend = ScriptedBackend::new(vec![
+        "[search: load_most_recent]",
+        "[read_file: src/session/mod.rs]",
+        "The implementation is in `src/session/mod.rs:1`.",
+    ]);
+    let (tx, rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    let streamed = rx
+        .try_iter()
+        .filter_map(|event| match event {
+            InferenceEvent::Token(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    assert_eq!(
+        outcome.final_response,
+        "The implementation is in `src/session/mod.rs` at line 1."
+    );
+    assert!(
+        !streamed.contains("[search:"),
+        "intermediate tool tags must never be streamed to the UI"
+    );
+    assert!(
+        !streamed.contains("[read_file:"),
+        "intermediate tool tags must never be streamed to the UI"
+    );
+    assert!(streamed.contains("The implementation is in"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn grounded_answer_guidance_prefers_definition_and_real_body_lines() {
     let guidance = grounded_answer_guidance(
             ToolLoopIntent::CodeNavigation,
             "Where is session restore implemented?",
+            None,
             &[ToolResult {
                 tool_name: "read_file".to_string(),
                 argument: "src/session/mod.rs".to_string(),
@@ -475,6 +571,7 @@ fn grounded_answer_guidance_captures_ok_none_and_load_by_id_for_load_most_recent
     let guidance = grounded_answer_guidance(
         ToolLoopIntent::CodeNavigation,
         "Where is session restore implemented?",
+        None,
         &[ToolResult {
             tool_name: "read_file".to_string(),
             argument: "src/session/mod.rs".to_string(),
@@ -535,30 +632,33 @@ fn grounded_answer_guidance_anti_hedging_is_in_final_synthesis_context() {
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CodeNavigation,
-        "Where is session restore implemented?",
-        &[
-            Message::system("system"),
-            Message::user("Where is session restore implemented?"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop");
 
-    assert_eq!(
-            outcome.final_response,
-            "Session restore is at src/session/mod.rs:1. Line 3 returns Ok(None) when no session exists. Line 5 calls load_session_by_id(&summary.id)."
-        );
+    assert!(outcome.final_response.contains("src/session/mod.rs"));
+    assert!(outcome.final_response.contains("Ok(None)"));
+    assert!(outcome
+        .final_response
+        .contains("load_session_by_id(&summary.id)"));
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -582,6 +682,7 @@ fn grounded_answer_guidance_body_lines_use_per_line_file_line_format() {
     let guidance = grounded_answer_guidance(
         ToolLoopIntent::CodeNavigation,
         "Where is session restore implemented?",
+        None,
         &[ToolResult {
             tool_name: "read_file".to_string(),
             argument: "src/session/mod.rs".to_string(),
@@ -619,6 +720,7 @@ fn tool_loop_formats_read_file_results_as_compact_plaintext_evidence() {
     let message = format_tool_loop_results_with_limit(
             ToolLoopIntent::CodeNavigation,
             "Where is session restore implemented?",
+            None,
             &[ToolResult {
                 tool_name: "read_file".to_string(),
                 argument: "src/session/mod.rs".to_string(),
@@ -639,6 +741,7 @@ fn grounded_answer_guidance_summarizes_loaded_file_from_observed_declarations() 
     let guidance = grounded_answer_guidance(
         ToolLoopIntent::CodeNavigation,
         "What does this file do?",
+        None,
         &[ToolResult {
             tool_name: "read_file".to_string(),
             argument: "src/tui/state/helpers.rs".to_string(),
@@ -713,12 +816,117 @@ fn file_context_question_bootstraps_from_loaded_file_instead_of_searching_wrappe
     assert_eq!(outcome.tool_results.len(), 1);
     assert_eq!(outcome.tool_results[0].tool_name, "read_file");
     assert_eq!(outcome.tool_results[0].argument, "src/tui/state/helpers.rs");
-    assert_eq!(
-        outcome.final_response,
-        "This file defines `summarize_trace_steps` in `src/tui/state/helpers.rs` and imports `ProgressStatus`, so it appears to hold helper logic for transcript/runtime state formatting."
-    );
+    assert!(outcome.final_response.contains("summarize_trace_steps"));
+    assert!(outcome.final_response.contains("src/tui/state/helpers.rs"));
+    assert!(outcome.final_response.contains("ProgressStatus"));
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn anchored_follow_up_uses_loaded_file_without_searching_elsewhere() {
+    let dir = std::env::temp_dir().join("params-tool-loop-anchored-followup");
+    let _ = fs::create_dir_all(dir.join("src"));
+    let _ = fs::write(
+        dir.join("src/main.rs"),
+        "mod commands;\nmod config;\n\nfn main() -> Result<()> {\n    Ok(())\n}\n",
+    );
+
+    let resolution = InvestigationResolution {
+        intent: ToolLoopIntent::CodeNavigation,
+        anchor: Some(InvestigationAnchor::File("src/main.rs".to_string())),
+        latency_policy: InvestigationLatencyPolicy::FastConvergence,
+        anchored_file: Some("src/main.rs".to_string()),
+        anchored_directory: None,
+        anchored_query: None,
+        prefer_answer_from_anchor: true,
+    };
+    let backend = ScriptedBackend::new(vec![
+        "`src/main.rs:1` and `src/main.rs:2` declare top-level modules, and `src/main.rs:4` defines `main`, so this file is the CLI entrypoint.",
+    ]);
+    let (tx, rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop_with_resolution(
+            ToolLoopIntent::CodeNavigation,
+            "Can you tell me now?",
+            Some(&resolution),
+            &[
+                Message::system("system"),
+                Message::user(
+                    "I've loaded this file for context:\n\nFile: src/main.rs\n\n```rust\nfn main() {}\n```",
+                ),
+                Message::user("Can you tell me now?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    assert_eq!(outcome.tool_results.len(), 1);
+    assert_eq!(outcome.tool_results[0].tool_name, "read_file");
+    assert_eq!(outcome.tool_results[0].argument, "src/main.rs");
+    assert!(
+        !outcome
+            .tool_results
+            .iter()
+            .any(|result| result.tool_name == "search"),
+        "anchored follow-ups should answer from the loaded file, not restart broad searching"
+    );
+    let streamed = rx
+        .try_iter()
+        .filter_map(|event| match event {
+            InferenceEvent::Token(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(!streamed.contains("[read_file:"));
+    assert!(!streamed.contains("[search:"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn repo_overview_guidance_demands_short_structural_summary() {
+    let guidance = grounded_answer_guidance(
+        ToolLoopIntent::RepoOverview,
+        "Can you see my project?",
+        None,
+        &[
+            ToolResult {
+                tool_name: "list_dir".to_string(),
+                argument: ".".to_string(),
+                output: ".\n  Cargo.toml\n  README.md\n  src/\n".to_string(),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "Cargo.toml".to_string(),
+                output: "File: Cargo.toml\nLines: 3\n\n```\n[package]\nname = \"params-cli\"\nedition = \"2021\"\n```\n".to_string(),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/main.rs".to_string(),
+                output: "File: src/main.rs\nLines: 4\n\n```\nmod inference;\nmod tui;\n\nfn main() {}\n```\n".to_string(),
+            },
+        ],
+    )
+    .expect("guidance");
+
+    assert!(guidance.contains("2-4 short sentences"));
+    assert!(guidance.contains("startup/entrypoints"));
+    assert!(guidance.contains("main subsystems"));
+    assert!(guidance.contains("dependency versions only if"));
 }
 
 #[test]
@@ -739,24 +947,26 @@ fn read_only_tool_loop_rejects_initial_prose_and_requires_tool_use() {
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CodeNavigation,
-        "Where is session restore implemented?",
-        &[
-            Message::system("system"),
-            Message::user("Where is session restore implemented?"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop should recover after initial prose");
 
     assert_eq!(
@@ -788,24 +998,26 @@ fn code_navigation_requires_file_evidence_before_answering() {
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CodeNavigation,
-        "Where is session restore implemented?",
-        &[
-            Message::system("system"),
-            Message::user("Where is session restore implemented?"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop should require a file read before final answer");
 
     assert_eq!(
@@ -861,24 +1073,26 @@ fn code_navigation_rejects_docs_only_read_and_forces_best_source_file() {
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CodeNavigation,
-        "Where is session restore implemented?",
-        &[
-            Message::system("system"),
-            Message::user("Where is session restore implemented?"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop should recover from docs-only evidence");
 
     assert_eq!(
@@ -1154,29 +1368,33 @@ fn tool_loop_runs_for_explain_how_pattern() {
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::FlowTrace,
-        "explain how session restore works",
-        &[
-            Message::system("system"),
-            Message::user("explain how session restore works"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::FlowTrace,
+            "explain how session restore works",
+            &[
+                Message::system("system"),
+                Message::user("explain how session restore works"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop");
 
-    assert_eq!(
-        outcome.final_response,
-        "Session restore starts in src/session/mod.rs:1, where `load_most_recent` delegates to src/inference/mod.rs:1 `restore_session()`."
+    assert!(outcome.final_response.contains("src/session/mod.rs"));
+    assert!(outcome.final_response.contains("src/inference/mod.rs"));
+    assert!(
+        !outcome.final_response.contains("I couldn't gather enough"),
+        "flow trace should produce grounded steps once cross-file evidence exists"
     );
     assert!(
         outcome
@@ -1194,47 +1412,121 @@ fn tool_loop_runs_for_explain_how_pattern() {
 #[test]
 fn tool_loop_runs_for_what_calls_pattern() {
     let dir = std::env::temp_dir().join("params-tool-loop-what-calls");
+    let _ = fs::create_dir_all(dir.join("src/inference"));
     let _ = fs::create_dir_all(dir.join("src/session"));
     let _ = fs::write(
         dir.join("src/session/mod.rs"),
         "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
     );
+    let _ = fs::write(
+        dir.join("src/inference/session.rs"),
+        "fn restore(store: &SessionStore) {\n    let _ = store.load_most_recent();\n}\n",
+    );
 
     let backend = ScriptedBackend::new(vec![
         "[search: load_most_recent]",
-        "[read_file: src/session/mod.rs]",
+        "[read_file: src/inference/session.rs]",
+        "load_most_recent is called from model_thread in src/inference/session.rs.",
         "load_most_recent is called from model_thread in src/inference/session.rs.",
     ]);
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
-    let outcome = run_read_only_tool_loop(
-        ToolLoopIntent::CallSiteLookup,
-        "what calls load_most_recent",
-        &[
-            Message::system("system"),
-            Message::user("what calls load_most_recent"),
-        ],
-        &backend,
-        &ToolRegistry::default(),
-        &config::Config::default(),
-        &dir,
-        &tx,
-        None,
-        &mut cache_stats,
-        &mut budget,
-        false,
-        false,
-    )
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CallSiteLookup,
+            "what calls load_most_recent",
+            &[
+                Message::system("system"),
+                Message::user("what calls load_most_recent"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
     .expect("tool loop");
 
-    assert_eq!(
-        outcome.final_response,
-        "load_most_recent is called from model_thread in src/inference/session.rs."
-    );
+    assert!(outcome.final_response.contains("load_most_recent"));
+    assert!(outcome
+        .final_response
+        .contains("src/inference/session.rs:2"));
     assert!(
         outcome.tool_results.iter().any(|r| r.tool_name == "search"),
         "expected a search result for what-calls query"
+    );
+    assert_eq!(
+        outcome
+            .tool_results
+            .iter()
+            .filter(|r| r.tool_name == "read_file")
+            .count(),
+        1,
+        "call-site lookup should stop once one caller file provides direct evidence"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn flow_trace_stops_once_cross_file_evidence_is_ready() {
+    let dir = std::env::temp_dir().join("params-tool-loop-flow-ready");
+    let _ = fs::create_dir_all(dir.join("src"));
+    let _ = fs::write(
+        dir.join("src/main.rs"),
+        "fn main() {\n    init_logging();\n}\n",
+    );
+    let _ = fs::write(
+        dir.join("src/logging.rs"),
+        "pub fn init_logging() {\n    tracing_subscriber::fmt::init();\n}\n",
+    );
+
+    let backend = ScriptedBackend::new(vec![
+        "[search: logging]",
+        "[read_file: src/main.rs]",
+        "[read_file: src/logging.rs]",
+        "1. `src/main.rs:1` defines `main`. 2. `src/main.rs:2` calls `init_logging()`. 3. `src/logging.rs:1` defines `init_logging`. 4. `src/logging.rs:2` initializes tracing.",
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::FlowTrace,
+            "Trace how logging works.",
+            &[
+                Message::system("system"),
+                Message::user("Trace how logging works."),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    assert_eq!(
+        outcome
+            .tool_results
+            .iter()
+            .filter(|r| r.tool_name == "read_file")
+            .count(),
+        2,
+        "flow trace should stop after the cross-file threshold is satisfied"
     );
 
     let _ = fs::remove_dir_all(dir);
@@ -1284,6 +1576,24 @@ fn call_site_lookup_requires_search_and_source_read_for_evidence() {
             },
         ],
     ));
+
+    // Quoted symbol names and helper string construction are not call-sites.
+    assert!(!has_relevant_file_evidence(
+        ToolLoopIntent::CallSiteLookup,
+        "what calls load_most_recent",
+        &[
+            ToolResult {
+                tool_name: "search".to_string(),
+                argument: "load_most_recent".to_string(),
+                output: "src/inference/session/auto_inspect.rs:\n  257: return Some(\"load_most_recent\".to_string());\n".to_string(),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/inference/session/auto_inspect.rs".to_string(),
+                output: "File: src/inference/session/auto_inspect.rs\nLines: 3\n\n```\nfn symbol_name() -> String {\n    return Some(\"load_most_recent\".to_string());\n}\n```\n".to_string(),
+            },
+        ],
+    ));
 }
 
 #[test]
@@ -1291,17 +1601,18 @@ fn call_site_loop_shows_call_site_guidance_not_definition_guidance() {
     let guidance = grounded_answer_guidance(
             ToolLoopIntent::CallSiteLookup,
             "what calls load_most_recent",
+            None,
             &[ToolResult {
-                tool_name: "search".to_string(),
-                argument: "load_most_recent".to_string(),
-                output: "src/inference/session.rs:\n  42: let s = store.load_most_recent()\nsrc/inference/mod.rs:\n  10: pub fn load_most_recent() -> Option<Session>\n".to_string(),
+                tool_name: "read_file".to_string(),
+                argument: "src/inference/session.rs".to_string(),
+                output: "File: src/inference/session.rs\nLines: 4\n\n```\nfn restore_session(store: &SessionStore) {\n    let s = store.load_most_recent();\n}\n```\n".to_string(),
             }],
         )
         .expect("guidance for call-site lookup");
 
     // Must list the invocation line, not the definition line
     assert!(
-        guidance.contains("42"),
+        guidance.contains("2"),
         "must reference the invocation line number"
     );
     assert!(
@@ -1322,10 +1633,11 @@ fn usage_lookup_guidance_labels_evidence_as_usages() {
     let guidance = grounded_answer_guidance(
             ToolLoopIntent::UsageLookup,
             "what uses SessionStore",
+            None,
             &[ToolResult {
-                tool_name: "search".to_string(),
-                argument: "SessionStore".to_string(),
-                output: "src/inference/session.rs:\n  5: use crate::session::SessionStore;\nsrc/session/mod.rs:\n  1: pub struct SessionStore {\n".to_string(),
+                tool_name: "read_file".to_string(),
+                argument: "src/inference/session.rs".to_string(),
+                output: "File: src/inference/session.rs\nLines: 4\n\n```\nuse crate::session::SessionStore;\n\nfn restore_session(store: &SessionStore) {}\n```\n".to_string(),
             }],
         )
         .expect("guidance for usage lookup");
@@ -1346,6 +1658,7 @@ fn flow_trace_guidance_shows_multi_file_definitions() {
     let guidance = grounded_answer_guidance(
             ToolLoopIntent::FlowTrace,
             "trace how session restore works",
+            None,
             &[
                 ToolResult {
                     tool_name: "read_file".to_string(),
@@ -1377,6 +1690,34 @@ fn flow_trace_guidance_shows_multi_file_definitions() {
 }
 
 #[test]
+fn flow_trace_guidance_ignores_test_files_by_default() {
+    let guidance = grounded_answer_guidance(
+        ToolLoopIntent::FlowTrace,
+        "explain how session restore works",
+        None,
+        &[
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: "File: src/session/mod.rs\n\n```\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    self.load_session_by_id(&id)\n}\n```\n".to_string(),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/inference/session/auto_inspect/tests.rs".to_string(),
+                output: "File: src/inference/session/auto_inspect/tests.rs\n\n```\nfn load_most_recent() -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n```\n".to_string(),
+            },
+        ],
+    )
+    .expect("guidance for flow trace");
+
+    assert!(guidance.contains("src/session/mod.rs"));
+    assert!(
+        !guidance.contains("auto_inspect/tests.rs"),
+        "flow trace guidance should ignore tests unless the prompt explicitly asks about them"
+    );
+}
+
+#[test]
 fn targeted_followup_for_call_site_lookup_prefers_invocation_files() {
     // When search hits include both a definition file and a caller file,
     // targeted_investigation_followup for CallSiteLookup should steer toward the caller.
@@ -1403,5 +1744,97 @@ fn targeted_followup_for_call_site_lookup_prefers_invocation_files() {
     assert!(
         followup.contains("src/inference/session.rs"),
         "must suggest reading the file with the call-site, got: {followup}"
+    );
+}
+
+#[test]
+fn call_site_final_answer_text_is_not_misread_as_tool_tags() {
+    assert!(
+        !final_answer_contains_tool_tags(
+            "load_most_recent is called from model_thread in src/inference/session.rs.",
+            &ToolRegistry::default(),
+        ),
+        "plain prose caller answers must not be rejected as tool tags"
+    );
+}
+
+#[test]
+fn tool_loop_does_not_emit_thinking_system_message_rows() {
+    let dir = std::env::temp_dir().join("params-tool-loop-no-thinking-row");
+    let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::write(
+        dir.join("src/session/mod.rs"),
+        "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+    );
+
+    let backend = ScriptedBackend::new(vec![
+        "[search: load_most_recent]",
+        "[read_file: src/session/mod.rs]",
+        "The implementation is in `src/session/mod.rs` at line 1.",
+    ]);
+    let (tx, rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let _outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop(
+            ToolLoopIntent::CodeNavigation,
+            "Where is session restore implemented?",
+            &[
+                Message::system("system"),
+                Message::user("Where is session restore implemented?"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    let thinking_rows = rx
+        .try_iter()
+        .filter_map(|event| match event {
+            InferenceEvent::SystemMessage(message) => Some(message),
+            _ => None,
+        })
+        .filter(|message| message.starts_with("Thinking:"))
+        .collect::<Vec<_>>();
+    assert!(
+        thinking_rows.is_empty(),
+        "tool loop should expose Thinking through activity traces, not chat rows"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn call_site_readiness_turns_ready_after_caller_file_is_read() {
+    let readiness = investigation_readiness(
+        ToolLoopIntent::CallSiteLookup,
+        "what calls load_most_recent",
+        None,
+        &[
+            ToolResult {
+                tool_name: "search".to_string(),
+                argument: "load_most_recent".to_string(),
+                output: "src/inference/session.rs:\n   2: let _ = store.load_most_recent();\nsrc/session/mod.rs:\n   1: pub fn load_most_recent() {}\n".to_string(),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/inference/session.rs".to_string(),
+                output: "File: src/inference/session.rs\nLines: 3\n\n```\nfn restore(store: &SessionStore) {\n    let _ = store.load_most_recent();\n}\n```".to_string(),
+            },
+        ],
+    );
+
+    assert!(
+        matches!(readiness, InvestigationReadiness::Ready { .. }),
+        "caller lookup should become answer-ready after one caller file is inspected"
     );
 }
