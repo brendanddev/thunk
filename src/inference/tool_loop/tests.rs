@@ -242,6 +242,84 @@ fn tool_loop_seed_messages_keep_short_context_for_referential_follow_up() {
 }
 
 #[test]
+fn synthesis_messages_drop_prior_answer_for_non_referential_prompt() {
+    let messages = build_synthesis_messages(
+        "Explain how session restore works",
+        "Observed guidance",
+        &[
+            Message::system("old system"),
+            Message::user("Tell me more"),
+            Message::assistant("This is about src/main.rs."),
+            Message::user("Explain how session restore works"),
+        ],
+    );
+
+    assert_eq!(messages[0].role, "system");
+    assert!(
+        messages[0]
+            .content
+            .contains("Ignore unrelated prior conversation context"),
+        "fresh synthesis prompts should explicitly ignore prior conversation context"
+    );
+    assert!(
+        messages[0]
+            .content
+            .contains("Treat the current prompt as a standalone question"),
+        "fresh synthesis prompts should treat the current question as standalone"
+    );
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1].role, "user");
+    assert_eq!(messages[1].content, "Explain how session restore works");
+    assert_eq!(messages[2].content, "Observed guidance");
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.content == "This is about src/main.rs."),
+        "non-referential synthesis should not include the prior assistant answer"
+    );
+}
+
+#[test]
+fn synthesis_messages_keep_prior_answer_for_referential_follow_up() {
+    let messages = build_synthesis_messages(
+        "Tell me more",
+        "Observed guidance",
+        &[
+            Message::system("old system"),
+            Message::user("What does this file do?"),
+            Message::assistant("It is the CLI entrypoint."),
+            Message::user("Tell me more"),
+        ],
+    );
+
+    assert_eq!(messages[0].role, "system");
+    assert!(
+        messages[0]
+            .content
+            .contains("expand it with new detail rather than repeating it"),
+        "referential follow-ups should still preserve the expansion instruction"
+    );
+    assert!(
+        messages[0]
+            .content
+            .contains("Reuse prior assistant context only when it matches"),
+        "referential synthesis should still be anchored to the current evidence"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content == "It is the CLI entrypoint."),
+        "referential synthesis should keep the prior assistant answer"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content == "Tell me more"),
+        "referential synthesis should keep the current follow-up prompt"
+    );
+}
+
+#[test]
 fn read_only_tool_loop_bootstraps_with_shaped_search_target() {
     let dir = std::env::temp_dir().join("params-tool-loop-bootstrap-hint");
     let _ = fs::create_dir_all(dir.join("src/session"));
@@ -2103,6 +2181,115 @@ fn anchored_main_followup_guidance_includes_cli_shape_and_startup() {
     assert!(guidance.contains("enum Command"));
     assert!(guidance.contains("Cli::parse()"));
     assert!(guidance.contains("match cli.command"));
+    assert!(guidance.contains("focus on them instead of unrelated helper functions or module declarations"));
+    assert!(guidance.contains("Do not infer hidden subcommands or describe logging setup, indexing behavior, benchmarking behavior"));
+}
+
+#[test]
+fn anchored_main_whats_this_do_synthesis_stays_on_loaded_cli_lines() {
+    let dir = std::env::temp_dir().join("params-tool-loop-main-anchored-shaping");
+    let _ = fs::create_dir_all(dir.join("src"));
+    let _ = fs::write(
+        dir.join("src/main.rs"),
+        concat!(
+            "use clap::{Parser, Subcommand};\n",
+            "use tracing::info;\n\n",
+            "struct Cli {\n",
+            "    prompt: Option<String>,\n",
+            "    command: Option<Command>,\n",
+            "}\n\n",
+            "enum Command {\n",
+            "    Pull,\n",
+            "    Index,\n",
+            "}\n\n",
+            "fn init_logging() {}\n\n",
+            "fn main() -> Result<()> {\n",
+            "    let cli = Cli::parse();\n",
+            "    match cli.command {\n",
+            "        Some(Command::Pull) => {}\n",
+            "        Some(Command::Index) => {}\n",
+            "        None => { info!(\"tui\"); }\n",
+            "    }\n",
+            "}\n"
+        ),
+    );
+
+    let resolution = InvestigationResolution {
+        intent: ToolLoopIntent::CodeNavigation,
+        anchor: Some(InvestigationAnchor::File("src/main.rs".to_string())),
+        latency_policy: InvestigationLatencyPolicy::FastConvergence,
+        anchored_file: Some("src/main.rs".to_string()),
+        anchored_directory: None,
+        anchored_query: None,
+        prefer_answer_from_anchor: true,
+    };
+    let loaded_context = concat!(
+        "I've loaded this file for context:\n\n",
+        "File: src/main.rs\n",
+        "Lines: 20\n\n",
+        "```\n",
+        "use clap::{Parser, Subcommand};\n",
+        "use tracing::info;\n\n",
+        "struct Cli {\n",
+        "    prompt: Option<String>,\n",
+        "    command: Option<Command>,\n",
+        "}\n\n",
+        "enum Command {\n",
+        "    Pull,\n",
+        "    Index,\n",
+        "}\n\n",
+        "fn init_logging() {}\n\n",
+        "fn main() -> Result<()> {\n",
+        "    let cli = Cli::parse();\n",
+        "    match cli.command {\n",
+        "        Some(Command::Pull) => {}\n",
+        "        Some(Command::Index) => {}\n",
+        "        None => { info!(\"tui\"); }\n",
+        "    }\n",
+        "}\n",
+        "```\n"
+    );
+    let backend = InspectingBackend::new(vec![(
+        Some("Do not infer hidden subcommands or describe logging setup, indexing behavior, benchmarking behavior"),
+        "src/main.rs is the binary entrypoint. `src/main.rs:3` defines `Cli`, `src/main.rs:8` defines `Command`, and `src/main.rs:15` / `src/main.rs:16` show `Cli::parse()` followed by `match cli.command`.",
+    )]);
+    let (tx, _rx) = mpsc::channel();
+    let mut cache_stats = SessionCacheStats::default();
+    let mut budget = SessionBudget::default();
+    let outcome = with_test_cwd(&dir, || {
+        run_read_only_tool_loop_with_resolution(
+            ToolLoopIntent::CodeNavigation,
+            "Whats this do",
+            Some(&resolution),
+            &[
+                Message::system("system"),
+                Message::user(loaded_context),
+                Message::user("Whats this do"),
+            ],
+            &backend,
+            &ToolRegistry::default(),
+            &config::Config::default(),
+            &dir,
+            &tx,
+            None,
+            &mut cache_stats,
+            &mut budget,
+            false,
+            false,
+        )
+    })
+    .expect("tool loop");
+
+    assert_eq!(outcome.tool_results.len(), 1);
+    assert_eq!(outcome.tool_results[0].tool_name, "read_file");
+    assert_eq!(outcome.tool_results[0].argument, "src/main.rs");
+    assert!(outcome.final_response.contains("binary entrypoint"));
+    assert!(outcome.final_response.contains("Cli"));
+    assert!(outcome.final_response.contains("Command"));
+    assert!(outcome.final_response.contains("Cli::parse()"));
+    assert!(outcome.final_response.contains("match cli.command"));
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -2139,10 +2326,12 @@ fn flow_trace_guidance_includes_runtime_caller_and_restore_branches() {
     assert!(guidance.contains("src/inference/session/runtime/core.rs:167"));
     assert!(guidance.contains("src/inference/session/runtime/core.rs:171"));
     assert!(guidance.contains("src/session/mod.rs:262"));
+    assert!(guidance.contains("runtime branches around `match store.load_most_recent()`"));
     assert!(guidance.contains("list_sessions()?.into_iter().next()"));
     assert!(guidance.contains("not that it iterates all sessions"));
     assert!(guidance.contains("return Ok(None)"));
     assert!(guidance.contains("load_session_by_id(&summary.id)"));
+    assert!(guidance.contains("Do not mention logging, message counts, restored message totals, `Ok(Some(saved))`, or broader success-path side effects"));
 }
 
 #[test]
@@ -2155,7 +2344,7 @@ fn flow_trace_render_fallback_prefers_runtime_caller_and_restore_handoff() {
             ToolResult {
                 tool_name: "read_file".to_string(),
                 argument: "src/inference/session/runtime/core.rs".to_string(),
-                output: "File: src/inference/session/runtime/core.rs\nLines: 6\n\n```\nmatch store.load_most_recent() {\n    Ok(Some(saved)) => {\n        let _ = saved;\n    }\n    Ok(None) => {}\n}\n```\n".to_string(),
+                output: "File: src/inference/session/runtime/core.rs\nLines: 8\n\n```\nmatch store.load_most_recent() {\n    Ok(Some(saved)) => {\n        let restored_count = saved.messages.len();\n        info!(msg_count = restored_count, \"restoring previous session\");\n    }\n    Ok(None) => {}\n}\n```\n".to_string(),
             },
             ToolResult {
                 tool_name: "read_file".to_string(),
@@ -2172,10 +2361,13 @@ fn flow_trace_render_fallback_prefers_runtime_caller_and_restore_handoff() {
     };
 
     assert!(answer.contains("src/inference/session/runtime/core.rs:1"));
+    assert!(answer.contains("match store.load_most_recent()"));
     assert!(answer.contains("load_most_recent"));
     assert!(answer.contains("list_sessions()?.into_iter().next()"));
     assert!(answer.contains("Ok(None)"));
     assert!(answer.contains("load_session_by_id(&summary.id)"));
+    assert!(!answer.contains("restoring previous session"));
+    assert!(!answer.contains("msg_count"));
     assert!(
         !answer.contains("iterates all sessions"),
         "fallback should stay close to the observed selection step"

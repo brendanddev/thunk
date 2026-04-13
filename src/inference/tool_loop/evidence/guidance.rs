@@ -21,15 +21,37 @@ fn render_step_ref(step: &ObservedStep) -> String {
 fn flow_trace_required_facts(evidence: &FlowTraceEvidence) -> Vec<String> {
     let mut facts = Vec::new();
 
-    if let Some(entry) = evidence
+    let entry = evidence
         .steps
         .iter()
-        .find(|step| step.step_kind == ObservedStepKind::EntryCall)
-    {
+        .find(|step| step.step_kind == ObservedStepKind::EntryCall);
+
+    if let Some(entry) = entry {
+        if entry.line_text.contains("match store.load_most_recent()") {
+            facts.push(format!(
+                "Start from {} and say the runtime branches around `match store.load_most_recent()` there.",
+                render_step_ref(entry)
+            ));
+        } else {
+            facts.push(format!(
+                "Start from {} and state that the runtime restore path calls `{}` there.",
+                render_step_ref(entry),
+                evidence.subject
+            ));
+        }
+    }
+
+    if let Some(runtime_no_session) = entry.and_then(|entry| {
+        evidence.steps.iter().find(|step| {
+            step.path == entry.path
+                && step.line_number != entry.line_number
+                && (step.line_text.contains("Ok(None)") || step.line_text.contains("None =>"))
+        })
+    }) {
         facts.push(format!(
-            "Start from {} and state that the runtime restore path calls `{}` there.",
-            render_step_ref(entry),
-            evidence.subject
+            "Mention the runtime no-session branch visible at {} (`{}`).",
+            render_step_ref(runtime_no_session),
+            clip_inline(&runtime_no_session.line_text, 80)
         ));
     }
 
@@ -43,15 +65,14 @@ fn flow_trace_required_facts(evidence: &FlowTraceEvidence) -> Vec<String> {
         ));
     }
 
-    if let Some(no_session) = evidence.steps.iter().find(|step| {
+    if let Some(no_session_return) = evidence.steps.iter().find(|step| {
         step.line_text.contains("return Ok(None)")
-            || step.line_text.contains("Ok(None)")
-            || step.line_text.contains("None =>")
     }) {
         facts.push(format!(
-            "Mention the no-session branch visible at {} (`{}`).",
-            render_step_ref(no_session),
-            clip_inline(&no_session.line_text, 80)
+            "Mention the no-session return inside `{}` at {} (`{}`).",
+            evidence.subject,
+            render_step_ref(no_session_return),
+            clip_inline(&no_session_return.line_text, 80)
         ));
     }
 
@@ -125,12 +146,14 @@ pub(crate) fn grounded_answer_guidance(
                         "Answer from the observed lines above only. Rules:\n\
                          1. Keep the answer to 2-4 short sentences or a flat 3-bullet list.\n\
                          2. If `fn main` is visible, mention that this is the binary entrypoint and describe its role.\n\
-                         3. If `struct Cli` or `enum Command` are visible, explain the CLI shape and subcommand surface from those lines.\n\
-                         4. If startup lines like `Cli::parse()` or `match cli.command` are visible, describe the startup/orchestration role.\n\
-                         5. Cite every concrete fact with exact file:line references.\n\
-                         6. Copy identifiers verbatim — do not rename methods, modules, or types.\n\
-                         7. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`).\n\
-                         8. Do not pivot to other files or offer next-step advice unless the observed lines clearly delegate elsewhere."
+                         3. If `struct Cli` or `enum Command` are visible, explain only the CLI shape and subcommand surface shown in those exact lines.\n\
+                         4. If startup lines like `Cli::parse()` or `match cli.command` are visible, describe only the entrypoint/orchestration role visible there.\n\
+                         5. When those CLI entrypoint lines are visible, focus on them instead of unrelated helper functions or module declarations.\n\
+                         6. Cite every concrete fact with exact file:line references.\n\
+                         7. Copy identifiers verbatim — do not rename methods, modules, or types.\n\
+                         8. Do not infer hidden subcommands or describe logging setup, indexing behavior, benchmarking behavior, backend setup, or helper-function internals unless the exact cited lines directly show them and the user asked for that detail.\n\
+                         9. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`).\n\
+                         10. Do not pivot to other files or offer next-step advice unless the observed lines clearly delegate elsewhere."
                             .to_string(),
                     );
                     return Some(sections.join("\n"));
@@ -268,12 +291,13 @@ pub(crate) fn grounded_answer_guidance(
             sections.push(
                 "Answer from the observed evidence above. Rules:\n\
                  1. Write a SHORT explanation in plain language (2–4 sentences), not a code dump.\n\
-                 2. Start from the runtime caller when one is visible, then connect it to the definition in execution order.\n\
-                 3. Mention branch behavior (early return, `Ok(None)`, or `None` path) and the successful handoff if visible.\n\
+                 2. Start from the runtime caller when one is visible; if that caller branches around `match store.load_most_recent()`, say so before following the restore path.\n\
+                 3. Mention the no-session path (`Ok(None)` and/or `return Ok(None)`) and the successful handoff if visible.\n\
                  4. If `list_sessions()?.into_iter().next()` is observed, describe it exactly as taking the first summary returned there — do not say it iterates all sessions.\n\
-                 5. Do not invent storage backends, restore helpers, or session behavior that is not present in the observed lines.\n\
-                 6. Do not copy raw source lines verbatim into the answer — paraphrase them.\n\
-                 7. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`)."
+                 5. Do not mention logging, message counts, restored message totals, `Ok(Some(saved))`, or broader success-path side effects even if nearby lines are visible, unless the user explicitly asks about them.\n\
+                 6. Do not invent storage backends, restore helpers, or session behavior that is not present in the observed lines.\n\
+                 7. Do not copy raw source lines verbatim into the answer — paraphrase them.\n\
+                 8. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`)."
                     .to_string(),
             );
             Some(sections.join("\n"))

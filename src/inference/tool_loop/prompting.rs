@@ -346,7 +346,7 @@ pub(super) fn initial_investigation_hint(intent: ToolLoopIntent, prompt: &str) -
     }
 }
 
-fn is_referential_follow_up(prompt: &str) -> bool {
+pub(super) fn is_referential_follow_up(prompt: &str) -> bool {
     let normalized = normalize_intent_text(prompt);
     let referential_tokens = [
         "it", "its", "that", "this", "these", "those", "they", "them", "there", "same", "above",

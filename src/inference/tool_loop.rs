@@ -29,8 +29,8 @@ use evidence::{
 pub(super) use intent::ToolLoopIntent;
 use prompting::{
     build_tool_loop_seed_messages, build_tool_loop_system_prompt, initial_investigation_hint,
-    initial_tool_only_followup, thinking_label, tool_loop_budget, tool_loop_result_limit,
-    with_progress_heartbeat,
+    initial_tool_only_followup, is_referential_follow_up, thinking_label, tool_loop_budget,
+    tool_loop_result_limit, with_progress_heartbeat,
 };
 
 #[derive(Clone, Copy)]
@@ -618,25 +618,42 @@ fn build_synthesis_messages(
     guidance: &str,
     base_messages: &[Message],
 ) -> Vec<Message> {
-    let system = "You are answering a code-navigation question from observed file evidence. \
-        Write in natural language prose — do NOT emit tool tags or code fences. \
-        Be concise: 2–5 sentences or a short structured list. \
-        If a prior answer appears above, expand it with new detail rather than repeating it.";
+    let is_follow_up = is_referential_follow_up(prompt);
+    let system = if is_follow_up {
+        "You are answering a code-navigation question from observed file evidence. \
+         Write in natural language prose — do NOT emit tool tags or code fences. \
+         Be concise: 2–5 sentences or a short structured list. \
+         If a prior answer appears above, expand it with new detail rather than repeating it. \
+         Ignore unrelated prior context and stay anchored to the observed evidence guidance. \
+         Reuse prior assistant context only when it matches the current observed evidence guidance."
+    } else {
+        "You are answering a code-navigation question from observed file evidence. \
+         Write in natural language prose — do NOT emit tool tags or code fences. \
+         Be concise: 2–5 sentences or a short structured list. \
+         Treat the current prompt as a standalone question. \
+         Ignore unrelated prior conversation context and answer only from the observed evidence guidance. \
+         Do not reuse earlier assistant claims unless they are restated in the current observed evidence guidance. \
+         Do not invent behavior, logging, message counts, or helper steps that are not present in the evidence."
+    };
 
     let mut messages = vec![Message::system(system)];
 
-    // Include up to the last 2 non-system messages from the live conversation
-    // so follow-ups like \"Tell me more\" see the previous answer as context.
-    let tail: Vec<_> = base_messages
-        .iter()
-        .filter(|m| m.role != "system")
-        .rev()
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let tail: Vec<_> = if is_follow_up {
+        // Include up to the last 2 non-system messages from the live conversation
+        // so follow-ups like "Tell me more" see the previous answer as context.
+        base_messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .rev()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let already_has_prompt = tail
         .last()

@@ -130,17 +130,10 @@ pub(crate) fn render_structured_answer(_prompt: &str, evidence: &StructuredEvide
                 .unwrap_or(&evidence.declarations[0]);
             if let Some(main_line) = main_line {
                 let mut sentences = Vec::new();
-                if !module_names.is_empty() {
-                    sentences.push(format!(
-                        "{} declares modules {}.",
-                        render_line_ref(&evidence.declarations[0]),
-                        join_names(&module_names)
-                    ));
-                }
                 if let Some(cli_line) = cli_line {
                     if let Some(command_line) = command_line {
                         sentences.push(format!(
-                            "{} defines `Cli` and {} defines `Command`, so this file describes the CLI surface and subcommands.",
+                            "{} defines `Cli` and {} defines `Command`, so this file lays out the visible CLI shape and subcommand surface.",
                             render_line_ref(cli_line),
                             render_line_ref(command_line)
                         ));
@@ -299,44 +292,90 @@ pub(crate) fn render_structured_answer(_prompt: &str, evidence: &StructuredEvide
                 step.line_text
                     .contains("list_sessions()?.into_iter().next()")
             });
-            let no_session = evidence.steps.iter().find(|step| {
-                step.line_text.contains("return Ok(None)")
-                    || step.line_text.contains("Ok(None)")
-                    || step.line_text.contains("None =>")
+            let runtime_no_session = entry.and_then(|entry| {
+                evidence.steps.iter().find(|step| {
+                    step.path == entry.path
+                        && step.line_number != entry.line_number
+                        && (step.line_text.contains("Ok(None)") || step.line_text.contains("None =>"))
+                })
             });
+            let return_no_session = evidence
+                .steps
+                .iter()
+                .find(|step| step.line_text.contains("return Ok(None)"));
             let load_by_id = evidence
                 .steps
                 .iter()
                 .find(|step| step.line_text.contains("load_session_by_id"));
 
             if entry.is_some()
-                && (selection.is_some() || no_session.is_some() || load_by_id.is_some())
+                && (selection.is_some()
+                    || runtime_no_session.is_some()
+                    || return_no_session.is_some()
+                    || load_by_id.is_some())
             {
                 let mut sentences = Vec::new();
                 if let Some(entry) = entry {
-                    sentences.push(format!(
-                        "Session restore starts at {} where the runtime path calls `{}`.",
-                        render_step_ref(entry),
-                        evidence.subject
-                    ));
+                    if entry.line_text.contains("match store.load_most_recent()") {
+                        sentences.push(format!(
+                            "Session restore starts at {} where the runtime branches on `match store.load_most_recent()`.",
+                            render_step_ref(entry)
+                        ));
+                    } else {
+                        sentences.push(format!(
+                            "Session restore starts at {} where the runtime path calls `{}`.",
+                            render_step_ref(entry),
+                            evidence.subject
+                        ));
+                    }
                 }
                 if let Some(selection) = selection {
-                    sentences.push(format!(
-                        "In {}, `{}` takes the first summary returned by `list_sessions()?.into_iter().next()`.",
-                        render_step_ref(selection),
-                        evidence.subject
-                    ));
+                    if let Some(return_no_session) = return_no_session {
+                        if let Some(runtime_no_session) = runtime_no_session {
+                            sentences.push(format!(
+                                "In {}, `{}` takes the first summary from `list_sessions()?.into_iter().next()`; if there is no summary it returns `Ok(None)` at {}, which feeds the runtime no-session branch at {}.",
+                                render_step_ref(selection),
+                                evidence.subject,
+                                render_step_ref(return_no_session),
+                                render_step_ref(runtime_no_session)
+                            ));
+                        } else {
+                            sentences.push(format!(
+                                "In {}, `{}` takes the first summary from `list_sessions()?.into_iter().next()`; if there is no summary it returns `Ok(None)` at {}.",
+                                render_step_ref(selection),
+                                evidence.subject,
+                                render_step_ref(return_no_session)
+                            ));
+                        }
+                    } else {
+                        sentences.push(format!(
+                            "In {}, `{}` takes the first summary from `list_sessions()?.into_iter().next()`.",
+                            render_step_ref(selection),
+                            evidence.subject
+                        ));
+                    }
                 }
-                if let Some(no_session) = no_session {
-                    sentences.push(format!(
-                        "If no saved session is available, the observed flow hits the no-session branch at {} (`{}`).",
-                        render_step_ref(no_session),
-                        clip_inline(&no_session.line_text, 80)
-                    ));
+                if selection.is_none() {
+                    if let Some(runtime_no_session) = runtime_no_session {
+                        sentences.push(format!(
+                            "If no saved session is available, the runtime no-session branch is at {} (`{}`).",
+                            render_step_ref(runtime_no_session),
+                            clip_inline(&runtime_no_session.line_text, 80)
+                        ));
+                    }
+                }
+                if selection.is_none() {
+                    if let Some(return_no_session) = return_no_session {
+                        sentences.push(format!(
+                            "If there is no saved summary, `{}` returns `Ok(None)` at {}.",
+                            evidence.subject,
+                            render_step_ref(return_no_session)
+                        ));
+                    }
                 }
                 if let Some(load_by_id) = load_by_id {
                     sentences.push(format!(
-                        "Otherwise it restores the saved session via `load_session_by_id(&summary.id)` at {}.",
+                        "If a summary exists, it hands off to `load_session_by_id(&summary.id)` at {}.",
                         render_step_ref(load_by_id)
                     ));
                 }
