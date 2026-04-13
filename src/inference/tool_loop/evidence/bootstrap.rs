@@ -10,13 +10,10 @@ use super::super::super::session::investigation::InvestigationResolution;
 use super::super::super::Message;
 use super::super::intent::{suggested_search_query, ToolLoopIntent};
 use super::observe::{
-    observed_read_paths, preferred_candidate_path, ranked_search_candidates,
+    lookup_search_anchor, observed_read_paths, preferred_candidate_path, ranked_search_candidates,
     recent_loaded_file_context_path, should_answer_from_anchor_file,
 };
-use super::parse::{
-    is_definition_like_line, is_internal_tool_loop_path, is_legacy_auto_inspect_path,
-    line_contains_symbol_invocation, line_contains_symbol_reference,
-};
+use super::parse::{is_internal_tool_loop_path, is_legacy_auto_inspect_path};
 use super::readiness::has_relevant_file_evidence;
 
 fn auto_read_best_candidate(
@@ -55,7 +52,7 @@ fn auto_read_best_caller_candidate(
     existing_results: &[ToolResult],
     token_tx: &Sender<InferenceEvent>,
 ) -> Option<ToolResult> {
-    let query = suggested_search_query(prompt, intent)?;
+    suggested_search_query(prompt, intent)?;
     let is_call_site = matches!(intent, ToolLoopIntent::CallSiteLookup);
     let read_paths = observed_read_paths(existing_results);
 
@@ -66,16 +63,7 @@ fn auto_read_best_caller_candidate(
                 && preferred_candidate_path(intent, &file.path)
                 && !is_internal_tool_loop_path(&file.path)
                 && !is_legacy_auto_inspect_path(&file.path)
-                && file.hits.iter().any(|hit| {
-                    let line = hit.line_content.trim();
-                    if is_call_site {
-                        line_contains_symbol_invocation(line, &query)
-                            && !is_definition_like_line(line)
-                    } else {
-                        line_contains_symbol_reference(line, &query)
-                            && !is_definition_like_line(line)
-                    }
-                })
+                && lookup_search_anchor(intent, prompt, file).is_some()
         })?;
 
     emit_trace(

@@ -1,12 +1,3 @@
-// src/inference/openai_compat.rs
-//
-// OpenAI-compatible backend — covers OpenAI, Groq, OpenRouter, and Grok.
-//
-// All four of these providers implement the OpenAI chat completions API format.
-// The request body, streaming format, and authentication are identical — the only
-// differences are the base URL, the API key, and available model names.
-//
-
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::Sender;
 
@@ -15,22 +6,11 @@ use crate::error::{ParamsError, Result};
 use crate::events::InferenceEvent;
 use crate::safety::{self, InspectionDecision};
 
-/// OpenAI-compatible backend.
-/// Works with any provider that implements the /v1/chat/completions endpoint.
+/// OpenAI-compatible backend - works with any provider that implements the /v1/chat/completions endpoint
 pub struct OpenAICompatBackend {
-    /// Base URL for the API, e.g. "https://api.groq.com/openai/v1"
     pub base_url: String,
-
-    /// API key for authentication.
-    /// If empty, falls back to environment variable lookup (see resolve_api_key).
     pub api_key: String,
-
-    /// Model name as the provider knows it.
-    /// e.g. "llama-3.3-70b-versatile" for Groq, "gpt-4o" for OpenAI.
     pub model: String,
-
-    /// Human-readable provider name for display in the sidebar.
-    /// e.g. "groq", "openai", "openrouter"
     pub provider_name: String,
 }
 
@@ -44,18 +24,12 @@ impl OpenAICompatBackend {
         }
     }
 
-    /// Resolve the API key — use the configured value if set, otherwise
-    /// fall back to provider-specific environment variables loaded from
-    /// the shell or .local/keys.env.
-    ///
-    /// This means you can leave api_key empty in config.toml and set the
-    /// env var instead, which is safer (no plaintext key in config file).
+    /// Resolve the API key
     fn resolve_api_key(&self) -> String {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
         }
 
-        // Try provider-specific env vars based on the base URL
         let env_var = if self.base_url.contains("groq.com") {
             "GROQ_API_KEY"
         } else if self.base_url.contains("openai.com") {
@@ -72,8 +46,7 @@ impl OpenAICompatBackend {
         std::env::var(env_var).unwrap_or_default()
     }
 
-    /// Check if the backend is reachable and the API key is valid.
-    /// Makes a lightweight request to the models list endpoint.
+    /// Check if the backend is reachable and the API key is valid
     pub fn health_check(&self) -> Result<()> {
         let api_key = self.resolve_api_key();
         if api_key.is_empty() {
@@ -99,8 +72,6 @@ impl OpenAICompatBackend {
             })?;
 
         if response.status() == 200 || response.status() == 404 {
-            // 404 on /models is fine — some providers don't implement it
-            // but will still accept /chat/completions
             Ok(())
         } else if response.status() == 401 {
             Err(ParamsError::Config(format!(
@@ -131,8 +102,7 @@ impl InferenceBackend for OpenAICompatBackend {
             )));
         }
 
-        // Build the OpenAI-format request body.
-        // This format is identical across all compatible providers.
+        // Build the OpenAI-format request body
         let messages_json: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
@@ -147,8 +117,6 @@ impl InferenceBackend for OpenAICompatBackend {
             "model": self.model,
             "messages": messages_json,
             "stream": true,
-            // Don't set max_tokens here — let the provider use its default.
-            // Users who want a cap can add it to config later.
         });
         let body_text = body.to_string();
 
@@ -163,8 +131,7 @@ impl InferenceBackend for OpenAICompatBackend {
             .set("Content-Type", "application/json")
             .set("Authorization", &format!("Bearer {api_key}"));
 
-        // OpenRouter requires these headers to identify the app.
-        // They're optional for other providers but harmless to send.
+        // OpenRouter requires these headers to identify the app
         if self.base_url.contains("openrouter.ai") {
             request = request
                 .set("HTTP-Referer", "https://github.com/brendanddev/params-cli")
@@ -175,15 +142,7 @@ impl InferenceBackend for OpenAICompatBackend {
             ParamsError::Config(format!("{} request failed: {e}", self.provider_name))
         })?;
 
-        // Read the Server-Sent Events (SSE) stream line by line.
-        //
-        // The OpenAI streaming format looks like this:
-        //   data: {"id":"...","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
-        //   data: {"id":"...","choices":[{"delta":{"content":" world"},"finish_reason":null}]}
-        //   data: [DONE]
-        //
-        // Each line starting with "data: " contains a JSON chunk.
-        // The stream ends with the literal "data: [DONE]".
+        // Read the Server-Sent Events (SSE) stream line by line
         let reader = BufReader::new(response.into_reader());
 
         for line in reader.lines() {
@@ -204,11 +163,10 @@ impl InferenceBackend for OpenAICompatBackend {
             // Parse the JSON chunk
             let parsed: serde_json::Value = match serde_json::from_str(data) {
                 Ok(v) => v,
-                Err(_) => continue, // Skip malformed chunks gracefully
+                Err(_) => continue,
             };
 
             // Extract the token from choices[0].delta.content
-            // This path is identical across OpenAI, Groq, OpenRouter, and Grok.
             if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
                 if !content.is_empty() {
                     if tx.send(InferenceEvent::Token(content.to_string())).is_err() {

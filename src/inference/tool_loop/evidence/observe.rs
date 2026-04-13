@@ -61,6 +61,52 @@ fn merge_search_hits(results: &[ToolResult]) -> Vec<SearchFileHit> {
     files
 }
 
+fn lookup_hit_matches(intent: ToolLoopIntent, query: &str, line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || is_definition_like_line(trimmed) {
+        return false;
+    }
+
+    match intent {
+        ToolLoopIntent::CallSiteLookup => line_contains_symbol_invocation(trimmed, query),
+        ToolLoopIntent::UsageLookup => line_contains_symbol_reference(trimmed, query),
+        _ => false,
+    }
+}
+
+fn lookup_search_anchor_for_query(
+    intent: ToolLoopIntent,
+    query: &str,
+    file: &SearchFileHit,
+) -> Option<SearchLineHit> {
+    if query.trim().is_empty() {
+        return None;
+    }
+
+    if matches!(intent, ToolLoopIntent::UsageLookup) {
+        if let Some(hit) = file.hits.iter().find(|hit| {
+            let line = hit.line_content.trim();
+            line.starts_with("use ") && lookup_hit_matches(intent, query, line)
+        }) {
+            return Some(hit.clone());
+        }
+    }
+
+    file.hits
+        .iter()
+        .find(|hit| lookup_hit_matches(intent, query, hit.line_content.trim()))
+        .cloned()
+}
+
+pub(super) fn lookup_search_anchor(
+    intent: ToolLoopIntent,
+    prompt: &str,
+    file: &SearchFileHit,
+) -> Option<SearchLineHit> {
+    let query = suggested_search_query(prompt, intent).unwrap_or_default();
+    lookup_search_anchor_for_query(intent, &query, file)
+}
+
 fn score_search_candidate(intent: ToolLoopIntent, query: &str, file: &SearchFileHit) -> isize {
     let query = query.trim().to_ascii_lowercase();
     let path = file.path.to_ascii_lowercase();
@@ -95,15 +141,54 @@ fn score_search_candidate(intent: ToolLoopIntent, query: &str, file: &SearchFile
     }
 
     score += (file.hits.len().min(6) as isize) * 3;
+    if matches!(
+        intent,
+        ToolLoopIntent::CallSiteLookup | ToolLoopIntent::UsageLookup
+    ) {
+        if let Some(anchor) = lookup_search_anchor_for_query(intent, &query, file) {
+            score += 30;
+            if matches!(intent, ToolLoopIntent::UsageLookup)
+                && anchor.line_content.trim().starts_with("use ")
+            {
+                score += 18;
+            }
+        } else {
+            score -= 18;
+        }
+    }
 
-    for hit in file.hits.iter().take(4) {
+    for hit in file.hits.iter().take(6) {
         let line = hit.line_content.trim();
         let line_lower = line.to_ascii_lowercase();
         if !query.is_empty() && line_lower.contains(&query) {
             score += 6;
         }
-        if is_definition_like_line(line) {
-            score += 24;
+        match intent {
+            ToolLoopIntent::CallSiteLookup => {
+                if lookup_hit_matches(intent, &query, line) {
+                    score += 26;
+                } else if line_contains_symbol_reference(line, &query)
+                    && !is_definition_like_line(line)
+                {
+                    score += 8;
+                }
+                if is_definition_like_line(line) {
+                    score -= 18;
+                }
+            }
+            ToolLoopIntent::UsageLookup => {
+                if lookup_hit_matches(intent, &query, line) {
+                    score += if line.starts_with("use ") { 28 } else { 18 };
+                }
+                if is_definition_like_line(line) {
+                    score -= 16;
+                }
+            }
+            _ => {
+                if is_definition_like_line(line) {
+                    score += 24;
+                }
+            }
         }
         if line.contains("assert!")
             || line.contains("#[test]")
@@ -258,6 +343,98 @@ fn defined_symbol_name(line: &str) -> Option<String> {
     None
 }
 
+fn push_unique_excerpt_lines(
+    excerpt: &mut Vec<(usize, String)>,
+    lines: impl IntoIterator<Item = (usize, String)>,
+    limit: usize,
+) {
+    for (line_number, line) in lines {
+        if excerpt.len() >= limit {
+            break;
+        }
+        if excerpt
+            .iter()
+            .any(|(existing_line_number, _)| *existing_line_number == line_number)
+        {
+            continue;
+        }
+        excerpt.push((line_number, line));
+    }
+}
+
+fn anchored_file_summary_excerpt(content: &str) -> Vec<(usize, String)> {
+    let mut excerpt = Vec::new();
+    let limit = 24;
+    push_unique_excerpt_lines(
+        &mut excerpt,
+        declaration_lines_with_numbers(content, 14),
+        limit,
+    );
+
+    if let Some((line_number, line)) = first_matching_lines(
+        content,
+        |line| line.starts_with("struct Cli") || line.starts_with("pub struct Cli"),
+        1,
+    )
+    .into_iter()
+    .next()
+    {
+        push_unique_excerpt_lines(
+            &mut excerpt,
+            std::iter::once((line_number, line.clone())),
+            limit,
+        );
+        push_unique_excerpt_lines(
+            &mut excerpt,
+            surrounding_body_lines(content, line_number, 6),
+            limit,
+        );
+    }
+
+    if let Some((line_number, line)) = first_matching_lines(
+        content,
+        |line| line.starts_with("enum Command") || line.starts_with("pub enum Command"),
+        1,
+    )
+    .into_iter()
+    .next()
+    {
+        push_unique_excerpt_lines(
+            &mut excerpt,
+            std::iter::once((line_number, line.clone())),
+            limit,
+        );
+        push_unique_excerpt_lines(
+            &mut excerpt,
+            surrounding_body_lines(content, line_number, 8),
+            limit,
+        );
+    }
+
+    if let Some((line_number, line)) = first_matching_lines(
+        content,
+        |line| line.starts_with("fn main(") || line.starts_with("pub fn main("),
+        1,
+    )
+    .into_iter()
+    .next()
+    {
+        push_unique_excerpt_lines(
+            &mut excerpt,
+            std::iter::once((line_number, line.clone())),
+            limit,
+        );
+        push_unique_excerpt_lines(
+            &mut excerpt,
+            surrounding_body_lines(content, line_number, 12),
+            limit,
+        );
+    }
+
+    excerpt.sort_by_key(|(line_number, _)| *line_number);
+    excerpt
+}
+
 pub(super) fn observed_reference_lines_from_read_results(
     intent: ToolLoopIntent,
     prompt: &str,
@@ -376,26 +553,13 @@ pub(super) fn observed_file_summary_evidence(
         .filter(|result| result.tool_name == "read_file")
         .find(|result| anchored.map(|path| path == result.argument).unwrap_or(true))?;
     let (path, content) = parse_read_file_output(&target.output)?;
-    let mut declarations = declaration_lines_with_numbers(&content, 14);
-    let has_main = declarations
-        .iter()
-        .any(|(_, l)| l.starts_with("fn main") || l.starts_with("pub fn main"));
-    if !has_main {
-        if let Some(main_line) = first_matching_lines(
-            &content,
-            |l| l.starts_with("fn main(") || l.starts_with("pub fn main("),
-            1,
-        )
-        .into_iter()
-        .next()
-        {
-            declarations.push(main_line);
+    let excerpt = {
+        let structured = anchored_file_summary_excerpt(&content);
+        if structured.is_empty() {
+            first_non_empty_lines(&content, 10)
+        } else {
+            structured
         }
-    }
-    let excerpt = if declarations.is_empty() {
-        first_non_empty_lines(&content, 10)
-    } else {
-        declarations
     };
     if excerpt.is_empty() {
         return None;
@@ -549,19 +713,18 @@ pub(super) fn observed_flow_trace_evidence(
                     })
                     .next()
             });
-    if caller.is_none() && implementation.supporting.is_empty() {
+    let caller = caller?;
+    if caller.path == implementation.primary.path {
         return None;
     }
 
     let mut steps = Vec::new();
-    if let Some(caller) = caller {
-        steps.push(ObservedStep {
-            path: caller.path,
-            line_number: caller.line_number,
-            line_text: caller.line_text,
-            step_kind: ObservedStepKind::EntryCall,
-        });
-    }
+    steps.push(ObservedStep {
+        path: caller.path.clone(),
+        line_number: caller.line_number,
+        line_text: caller.line_text.clone(),
+        step_kind: ObservedStepKind::EntryCall,
+    });
 
     steps.push(ObservedStep {
         path: implementation.primary.path.clone(),
@@ -581,42 +744,12 @@ pub(super) fn observed_flow_trace_evidence(
                 step_kind: classify_flow_step(&line.line_text),
             }),
     );
-    if let Some((path, content)) = results
-        .iter()
-        .filter(|result| result.tool_name == "read_file")
-        .filter_map(|result| parse_read_file_output(&result.output))
-        .find(|(path, _)| {
-            path != &implementation.primary.path
-                && preferred_candidate_path(ToolLoopIntent::FlowTrace, path)
-                && !is_internal_tool_loop_path(path)
-                && !is_legacy_auto_inspect_path(path)
-        })
-    {
-        if let Some((line_number, line_text)) =
-            first_matching_lines(&content, is_definition_like_line, 1)
-                .into_iter()
-                .next()
-        {
-            steps.push(ObservedStep {
-                path: path.clone(),
-                line_number,
-                line_text,
-                step_kind: ObservedStepKind::Delegation,
-            });
-        }
-    }
-
-    let has_cross_file_handoff = steps
-        .first()
-        .map(|first| {
-            steps.iter().any(|step| {
-                step.path != first.path
-                    && !is_test_like_path(&step.path)
-                    && !is_internal_tool_loop_path(&step.path)
-                    && !is_legacy_auto_inspect_path(&step.path)
-            })
-        })
-        .unwrap_or(false);
+    let has_cross_file_handoff = steps.iter().any(|step| {
+        step.path != caller.path
+            && !is_test_like_path(&step.path)
+            && !is_internal_tool_loop_path(&step.path)
+            && !is_legacy_auto_inspect_path(&step.path)
+    });
 
     if !has_cross_file_handoff {
         return None;

@@ -38,7 +38,7 @@ Prefer code over lengthy explanation. \
 When showing code, use markdown code blocks with the language specified. \
 If you are unsure about something, say so.";
 
-/// Returns the full system prompt with tool descriptions appended.
+/// Returns the full system prompt with tool descriptions appended
 pub fn system_prompt_with_tools(tool_descriptions: &str) -> String {
     format!("{}\n\n{}", SYSTEM_PROMPT_BASE, tool_descriptions)
 }

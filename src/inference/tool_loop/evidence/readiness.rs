@@ -4,13 +4,12 @@ use super::super::super::session::investigation::InvestigationResolution;
 use super::super::intent::{suggested_search_query, ToolLoopIntent};
 use super::bootstrap::repo_bootstrap_read_targets;
 use super::observe::{
-    observed_definition_evidence, observed_file_summary_evidence, observed_flow_trace_evidence,
-    observed_read_paths, observed_reference_lines_from_read_results,
+    lookup_search_anchor, observed_definition_evidence, observed_file_summary_evidence,
+    observed_flow_trace_evidence, observed_read_paths, observed_reference_lines_from_read_results,
     observed_repo_overview_evidence, preferred_candidate_path, ranked_search_candidates,
 };
 use super::parse::{
     is_definition_like_line, is_internal_tool_loop_path, is_source_path, is_test_like_path,
-    line_contains_symbol_invocation, line_contains_symbol_reference,
 };
 use super::{
     CallSiteEvidence, ConfigEvidence, InvestigationOutcome, InvestigationReadiness,
@@ -89,28 +88,54 @@ pub(crate) fn investigation_outcome(
                 };
             }
 
-            if !ranked_search_candidates(intent, prompt, results)
-                .into_iter()
-                .any(|file| {
-                    !is_test_like_path(&file.path)
-                        && !is_internal_tool_loop_path(&file.path)
-                        && file.hits.iter().any(|hit| {
-                            let line = hit.line_content.trim();
-                            if matches!(intent, ToolLoopIntent::CallSiteLookup) {
-                                line_contains_symbol_invocation(
-                                    line,
-                                    &suggested_search_query(prompt, intent).unwrap_or_default(),
-                                ) && !is_definition_like_line(line)
-                            } else {
-                                line_contains_symbol_reference(
-                                    line,
-                                    &suggested_search_query(prompt, intent).unwrap_or_default(),
-                                ) && !is_definition_like_line(line)
-                            }
-                        })
+            let read_paths = observed_read_paths(results);
+            let source_reads = read_paths
+                .iter()
+                .filter(|path| {
+                    is_source_path(path)
+                        && !is_test_like_path(path)
+                        && !is_internal_tool_loop_path(path)
                 })
+                .count();
+            let candidates = ranked_search_candidates(intent, prompt, results)
+                .into_iter()
+                .filter(|file| {
+                    preferred_candidate_path(intent, &file.path)
+                        && !is_test_like_path(&file.path)
+                        && !is_internal_tool_loop_path(&file.path)
+                        && lookup_search_anchor(intent, prompt, file).is_some()
+                })
+                .collect::<Vec<_>>();
+
+            if candidates
+                .iter()
+                .any(|file| !read_paths.contains(&file.path))
+            {
+                return InvestigationOutcome::NeedsMore {
+                    required_next_step: targeted_investigation_followup(intent, prompt, results)
+                        .unwrap_or_else(default_followup),
+                };
+            }
+
+            if !candidates.is_empty()
+                && candidates
+                    .iter()
+                    .all(|file| read_paths.contains(&file.path))
                 && !results.is_empty()
             {
+                InvestigationOutcome::Insufficient {
+                    reason: format!(
+                        "I couldn't confirm a non-test source {} for `{}` within the current read budget.",
+                        if matches!(intent, ToolLoopIntent::CallSiteLookup) {
+                            "call-site"
+                        } else {
+                            "usage"
+                        },
+                        suggested_search_query(prompt, intent)
+                            .unwrap_or_else(|| "the symbol".to_string())
+                    ),
+                }
+            } else if source_reads >= 2 && !results.is_empty() {
                 InvestigationOutcome::Insufficient {
                     reason: format!(
                         "I couldn't confirm a non-test source {} for `{}` within the current read budget.",
@@ -205,44 +230,31 @@ pub(crate) fn targeted_investigation_followup(
         ToolLoopIntent::CallSiteLookup | ToolLoopIntent::UsageLookup => {
             let read_paths = observed_read_paths(results);
             let is_call_site = matches!(intent, ToolLoopIntent::CallSiteLookup);
-            let query = suggested_search_query(prompt, intent).unwrap_or_default();
             let candidate = ranked_search_candidates(intent, prompt, results)
                 .into_iter()
-                .filter(|file| {
+                .find(|file| {
                     !read_paths.contains(&file.path)
-                        && is_source_path(&file.path)
-                        && !is_test_like_path(&file.path)
-                        && !is_internal_tool_loop_path(&file.path)
-                        && !super::parse::is_legacy_auto_inspect_path(&file.path)
-                        && file.hits.iter().any(|hit| {
-                            let line = hit.line_content.trim();
-                            if is_call_site {
-                                line_contains_symbol_invocation(line, &query)
-                                    && !is_definition_like_line(line)
-                            } else {
-                                line_contains_symbol_reference(line, &query)
-                                    && !is_definition_like_line(line)
-                            }
-                        })
+                        && preferred_candidate_path(intent, &file.path)
+                        && lookup_search_anchor(intent, prompt, file).is_some()
                 })
-                .next();
+                .or_else(|| {
+                    ranked_search_candidates(intent, prompt, results)
+                        .into_iter()
+                        .find(|file| {
+                            !read_paths.contains(&file.path)
+                                && is_source_path(&file.path)
+                                && !is_test_like_path(&file.path)
+                                && !is_internal_tool_loop_path(&file.path)
+                                && !super::parse::is_legacy_auto_inspect_path(&file.path)
+                        })
+                });
             if let Some(file) = candidate {
                 let mode = if is_call_site { "call-site" } else { "usage" };
-                let anchor = file
-                    .hits
-                    .iter()
-                    .find(|hit| {
-                        let l = hit.line_content.trim();
-                        if is_call_site {
-                            line_contains_symbol_invocation(l, &query)
-                                && !is_definition_like_line(l)
-                        } else {
-                            line_contains_symbol_reference(l, &query) && !is_definition_like_line(l)
-                        }
-                    })
-                    .or_else(|| file.hits.first());
-                let anchor_text =
-                    anchor.map(|hit| format!("{}: {}", hit.line_number, hit.line_content));
+                let anchor = lookup_search_anchor(intent, prompt, &file)
+                    .or_else(|| file.hits.first().cloned());
+                let anchor_text = anchor
+                    .as_ref()
+                    .map(|hit| format!("{}: {}", hit.line_number, hit.line_content));
                 return Some(match anchor_text {
                     Some(anchor) => format!(
                         "Do not answer yet. This file contains a {mode}: `[read_file: {}]`. \

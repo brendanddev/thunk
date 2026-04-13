@@ -5,6 +5,7 @@ mod prompting;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::Sender;
+use tracing::info;
 
 use crate::cache::ExactCache;
 use crate::config;
@@ -46,6 +47,22 @@ pub(super) struct ToolLoopOutcome {
 
 pub(super) fn detect_tool_loop_intent(prompt: &str) -> Option<ToolLoopIntent> {
     intent::detect_tool_loop_intent(prompt)
+}
+
+fn investigation_outcome_label(outcome: &InvestigationOutcome) -> &'static str {
+    match outcome {
+        InvestigationOutcome::NeedsMore { .. } => "needs_more",
+        InvestigationOutcome::Ready { .. } => "ready",
+        InvestigationOutcome::Insufficient { .. } => "insufficient",
+    }
+}
+
+fn tool_result_summary(results: &[ToolResult]) -> String {
+    results
+        .iter()
+        .map(|result| format!("{}({})", result.tool_name, result.argument))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn repeated_tool_calls(
@@ -117,6 +134,13 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
     let loop_budget = tool_loop_budget(eco_enabled);
     let result_limit = tool_loop_result_limit(&backend.name(), eco_enabled);
     let (thinking, status_label) = thinking_label(intent);
+    info!(
+        intent = ?intent,
+        prompt,
+        backend = backend.name(),
+        anchored_file = resolution.and_then(|value| value.anchored_file.as_deref()).unwrap_or(""),
+        "tool loop started"
+    );
     emit_generation_started(token_tx, status_label, false);
     emit_trace(token_tx, ProgressStatus::Started, thinking, false);
 
@@ -138,6 +162,14 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
         &all_tool_results,
         loop_budget.max_duplicate_calls,
     );
+    if !all_tool_results.is_empty() {
+        info!(
+            intent = ?intent,
+            bootstrap_results = all_tool_results.len(),
+            results = tool_result_summary(&all_tool_results),
+            "tool loop bootstrap gathered evidence"
+        );
+    }
 
     if all_tool_results.is_empty() {
         if let Some(hint) = initial_investigation_hint(intent, prompt) {
@@ -157,6 +189,12 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                 evidence,
                 stop_reason,
             } => {
+                info!(
+                    intent = ?intent,
+                    stop_reason,
+                    tool_results = all_tool_results.len(),
+                    "tool loop reached ready outcome from bootstrap"
+                );
                 emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
                 let final_response = finalize_structured_answer(
                     intent,
@@ -175,6 +213,12 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                 });
             }
             InvestigationOutcome::Insufficient { reason } => {
+                info!(
+                    intent = ?intent,
+                    reason,
+                    tool_results = all_tool_results.len(),
+                    "tool loop bootstrap ended insufficient"
+                );
                 emit_trace(
                     token_tx,
                     ProgressStatus::Failed,
@@ -193,6 +237,12 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
     }
 
     for iteration in 0..loop_budget.max_iterations {
+        info!(
+            intent = ?intent,
+            iteration,
+            accumulated_results = all_tool_results.len(),
+            "tool loop iteration started"
+        );
         emit_trace(
             token_tx,
             ProgressStatus::Started,
@@ -231,8 +281,25 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
             results,
             disallowed_calls,
         } = tools.execute_read_only_tool_calls(&draft.text);
+        if !results.is_empty() || !disallowed_calls.is_empty() {
+            info!(
+                intent = ?intent,
+                iteration,
+                results = tool_result_summary(&results),
+                disallowed = disallowed_calls.join(", "),
+                "tool loop executed tool calls"
+            );
+        }
 
         if results.is_empty() && disallowed_calls.is_empty() {
+            let outcome = investigation_outcome(intent, prompt, resolution, &all_tool_results);
+            info!(
+                intent = ?intent,
+                iteration,
+                outcome = investigation_outcome_label(&outcome),
+                accumulated_results = all_tool_results.len(),
+                "tool loop draft produced no tool calls"
+            );
             if all_tool_results.is_empty() {
                 emit_trace(
                     token_tx,
@@ -244,11 +311,18 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                 loop_messages.push(Message::user(&initial_tool_only_followup(intent, prompt)));
                 continue;
             }
-            match investigation_outcome(intent, prompt, resolution, &all_tool_results) {
+            match outcome {
                 InvestigationOutcome::Ready {
                     evidence,
                     stop_reason,
                 } => {
+                    info!(
+                        intent = ?intent,
+                        iteration,
+                        stop_reason,
+                        tool_results = all_tool_results.len(),
+                        "tool loop reached ready outcome"
+                    );
                     emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
                     let final_response = finalize_structured_answer(
                         intent,
@@ -267,6 +341,12 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                     });
                 }
                 InvestigationOutcome::NeedsMore { required_next_step } => {
+                    info!(
+                        intent = ?intent,
+                        iteration,
+                        tool_results = all_tool_results.len(),
+                        "tool loop requested another bounded investigation step"
+                    );
                     emit_trace(
                         token_tx,
                         ProgressStatus::Updated,
@@ -278,6 +358,13 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                     continue;
                 }
                 InvestigationOutcome::Insufficient { reason } => {
+                    info!(
+                        intent = ?intent,
+                        iteration,
+                        reason,
+                        tool_results = all_tool_results.len(),
+                        "tool loop reached insufficient outcome"
+                    );
                     emit_trace(
                         token_tx,
                         ProgressStatus::Failed,
@@ -345,6 +432,13 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                 evidence,
                 stop_reason,
             } => {
+                info!(
+                    intent = ?intent,
+                    iteration,
+                    stop_reason,
+                    tool_results = all_tool_results.len(),
+                    "tool loop reached ready outcome after tool execution"
+                );
                 emit_trace(token_tx, ProgressStatus::Finished, stop_reason, false);
                 let final_response = finalize_structured_answer(
                     intent,
@@ -363,6 +457,12 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                 });
             }
             InvestigationOutcome::NeedsMore { required_next_step } => {
+                info!(
+                    intent = ?intent,
+                    iteration,
+                    tool_results = all_tool_results.len(),
+                    "tool loop still needs more evidence after tool execution"
+                );
                 if repeated {
                     loop_messages.push(Message::user(
                         "You are repeating the same tool calls. Only continue if the next read materially improves the answer.",
@@ -371,6 +471,13 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
                 loop_messages.push(Message::user(&required_next_step));
             }
             InvestigationOutcome::Insufficient { reason } => {
+                info!(
+                    intent = ?intent,
+                    iteration,
+                    reason,
+                    tool_results = all_tool_results.len(),
+                    "tool loop reached insufficient outcome after tool execution"
+                );
                 emit_trace(
                     token_tx,
                     ProgressStatus::Failed,
@@ -392,6 +499,11 @@ pub(super) fn run_read_only_tool_loop_with_resolution(
         ProgressStatus::Updated,
         "tool loop hit its iteration limit",
         false,
+    );
+    info!(
+        intent = ?intent,
+        tool_results = all_tool_results.len(),
+        "tool loop hit iteration limit"
     );
     let final_response = match investigation_outcome(intent, prompt, resolution, &all_tool_results)
     {

@@ -25,8 +25,7 @@ pub(super) struct CacheLookup {
     pub text: String,
     pub hit: bool,
     pub source: debug_log::ResponseSource,
-    /// Wall-clock milliseconds spent on live generation.
-    /// Zero for cache hits — no model work was done.
+    /// Wall-clock milliseconds spent on live generation
     pub elapsed_ms: u64,
 }
 

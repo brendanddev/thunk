@@ -1,19 +1,3 @@
-// src/memory/mod.rs
-//
-// Three-level memory system.
-//
-// Level 1 (compression.rs) — session compression: when the conversation
-//   grows past 8 turns, summarize old messages to stay within context limits.
-//
-// Level 2 (index.rs) — project index: store per-file summaries in SQLite at
-//   .local/memory/{project_hash}.db for fast retrieval during sessions.
-//
-// Level 3 (facts.rs) — cross-session facts: extract key decisions and file
-//   names from each session and inject them at the start of future sessions.
-//
-// All three levels degrade gracefully — errors are logged and the TUI keeps
-// running. Nothing in this module should ever crash the application.
-
 pub mod compression;
 pub mod facts;
 pub mod index;

@@ -91,6 +91,8 @@ Checks:
 - no separate `Thinking:` transcript row during active generation
 - no unnecessary iteration-limit fallback on simple technical prompts
 
+---
+
 ## Benchmark Case Template
 
 Use a simple case schema like this:
@@ -114,6 +116,8 @@ Use a simple case schema like this:
   - should stop after confirmed caller evidence
 ```
 
+---
+
 ## Recommended Benchmark Set
 
 Start with a compact tracked set of “must-pass” prompts:
@@ -125,6 +129,8 @@ Start with a compact tracked set of “must-pass” prompts:
 5. `What uses SessionStore`
 6. `Explain how session restore works`
 7. `Where is eco mode configured?`
+
+---
 
 ## Scoring Ideas
 
@@ -177,6 +183,8 @@ Treat it as a recorded behavioral baseline, not a guarantee that the latest work
 - Flow trace can return grounded lines, but the answer shape is still too mechanical and did not stream in this run.
 - Config-location quality is not reliable enough yet.
 
+---
+
 ## Latest Benchmark Run
 
 ### Run Metadata
@@ -225,6 +233,8 @@ Scoring uses the 0-2 scale defined above.
 - Visible streaming behavior is inconsistent or absent in this run.
 - Several good answers feel “hardcoded” because they arrive immediately as rigid evidence-shaped text instead of natural streamed prose.
 
+---
+
 ## Repo Overview Results
 
 ### Case: `Can you see my project?`
@@ -242,6 +252,8 @@ This repo is a Rust CLI project defined in `Cargo.toml:2` `name = "params-cli"`.
   - correctly identified the repo as a Rust CLI project
   - used real file/line grounding
   - felt immediate/template-like rather than naturally investigated
+
+---
 
 ## File Summary Results
 
@@ -276,6 +288,8 @@ This repo is a Rust CLI project defined in `Cargo.toml:2` `name = "params-cli"`.
   - failed as a follow-up expansion
   - repeated the same answer instead of deepening the file summary
 
+---
+
 ## Caller / Usage Results
 
 ### Case: `What calls load_most_recent`
@@ -309,6 +323,8 @@ I couldn't gather enough source evidence to answer UsageLookup within the curren
   - benchmark failure
   - better than the 1m33s caller failure, but still too slow and still incorrect
 
+---
+
 ## Flow Trace Results
 
 ### Case: `Explain how session restore works`
@@ -332,6 +348,8 @@ I couldn't gather enough source evidence to answer UsageLookup within the curren
   - still too mechanical
   - did not feel like a full “trace” across the broader restore flow
 
+---
+
 ## Config Lookup Results
 
 ### Case: `Where is eco mode configured?`
@@ -349,6 +367,8 @@ I couldn't gather enough source evidence to answer UsageLookup within the curren
   - benchmark failure
   - grounded in a real file, but the lines are not the answer to the question
   - indicates weak config-evidence selection
+
+---
 
 ## Latency Results
 
@@ -369,6 +389,8 @@ I couldn't gather enough source evidence to answer UsageLookup within the curren
 - Instant answers currently correlate with rigid/template-like response shapes.
 - The slowest cases are the ones that matter most for coding-agent credibility: caller/use-site lookup.
 - The current system is not yet balancing convergence and answer quality well.
+
+---
 
 ## UX Regression Results
 
@@ -408,6 +430,8 @@ The implementation is in `src/safety.rs` at line 15.
 Assessment:
 - anchored follow-up handling is still unstable in natural conversation
 - the app can jump to an unrelated file even after an explicit `/read src/main.rs`
+
+---
 
 ## What This Baseline Says
 
@@ -468,6 +492,8 @@ These are the concrete conditions the next recorded version should meet before i
 - no raw tool tags should appear
 - no investigation-budget failure on simple caller/use-site questions when evidence exists
 - no contradictory follow-up behavior like `src/main.rs` suddenly pivoting to `src/safety.rs`
+
+---
 
 ## Suggested Release Gate
 

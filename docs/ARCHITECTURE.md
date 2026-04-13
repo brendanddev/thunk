@@ -4,6 +4,8 @@
 
 This document is a snapshot of the current architecture. It is meant to explain how the app is wired today, not to promise a finished long-term design.
 
+---
+
 ## Goals
 
 - Keep day-to-day coding workflows local-first when possible
@@ -11,6 +13,8 @@ This document is a snapshot of the current architecture. It is meant to explain 
 - Use real tools for repo understanding instead of relying only on prompt context
 - Preserve session continuity and memory without letting long threads collapse into noise
 - Keep risky actions approval-gated and observable
+
+---
 
 ## Top-Level Runtime
 
@@ -28,6 +32,8 @@ At a high level, a normal interactive turn looks like this:
 5. `src/tools/` executes file, search, git, web, LSP, shell, write, and edit tools.
 6. `src/memory/` and `src/session/` provide compression, index, durable facts, and saved conversation persistence.
 7. `skills/` provides tracked markdown skill guidance that the runtime can inject for repo-navigation and benchmark-oriented turns.
+
+---
 
 ## Main Subsystems
 
@@ -165,6 +171,8 @@ Current layers:
 Stored state currently lives under `.local/`.
 Tracked built-in skill guidance lives under `skills/`.
 
+---
+
 ## Technical Turn Flow
 
 For a repo-understanding prompt like `What calls load_most_recent`:
@@ -177,6 +185,8 @@ For a repo-understanding prompt like `What calls load_most_recent`:
 6. If evidence is insufficient, the loop asks for one more targeted read.
 7. If evidence is sufficient, the loop returns a grounded answer.
 8. The session runtime records the tool results, updates investigation state, and saves the session.
+
+---
 
 ## Safety Model
 
@@ -191,12 +201,16 @@ Mutating actions:
 - destructive shell commands are blocked by policy
 - stale edit approvals are rejected if the file changes
 
+---
+
 ## Current Architectural Strengths
 
 - Clear separation between TUI, inference runtime, tools, memory, and session persistence
 - Good test coverage around tool-loop regressions
 - Local-first workflows supported across multiple backends
 - Structured session compression and investigation-state tracking
+
+---
 
 ## Current Architectural Pressure Points
 
@@ -205,6 +219,8 @@ Mutating actions:
 - session persistence is still fairly centralized in `src/session/mod.rs`
 - some older hidden auto-inspection code still exists for reference/legacy coverage in `src/inference/session/auto_inspect/`
 - benchmark coverage and live eval tooling still need to mature
+
+---
 
 ## Key Files To Read First
 
@@ -221,6 +237,8 @@ If you are new to the codebase, start here:
 9. `src/tui/app.rs`
 10. `src/tui/renderer/paint/transcript.rs`
 11. `src/tools/mod.rs`
+
+---
 
 ## Near-Term Direction
 

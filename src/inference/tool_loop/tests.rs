@@ -770,7 +770,7 @@ fn grounded_answer_guidance_summarizes_loaded_file_from_observed_declarations() 
     .expect("guidance");
 
     assert!(guidance.contains("Loaded file: `src/tui/state/helpers.rs`"));
-    assert!(guidance.contains("Observed declarations:"));
+    assert!(guidance.contains("Observed file structure:"));
     assert!(guidance.contains("src/tui/state/helpers.rs:1 `use crate::events::ProgressStatus;`"));
     assert!(guidance.contains("src/tui/state/helpers.rs:4 `pub fn summarize_trace_steps() {}`"));
     assert!(guidance.contains("Do not mention search results"));
@@ -1358,21 +1358,23 @@ fn suggested_search_query_extracts_subject_from_what_does_do() {
 fn tool_loop_runs_for_explain_how_pattern() {
     let dir = std::env::temp_dir().join("params-tool-loop-explain-how");
     let _ = fs::create_dir_all(dir.join("src/session"));
-    let _ = fs::create_dir_all(dir.join("src/inference"));
+    let _ = fs::create_dir_all(dir.join("src/inference/session/runtime"));
     let _ = fs::write(
         dir.join("src/session/mod.rs"),
-        "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    crate::inference::restore_session()\n}\n",
+        "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n        return Ok(None);\n    };\n    self.load_session_by_id(&summary.id)\n}\n",
     );
     let _ = fs::write(
-        dir.join("src/inference/mod.rs"),
-        "pub fn restore_session() -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+        dir.join("src/inference/session/runtime/core.rs"),
+        "fn restore_session(store: &SessionStore) -> Result<()> {\n    match store.load_most_recent()? {\n        Some(saved) => {\n            let _ = saved;\n        }\n        None => {}\n    }\n    Ok(())\n}\n",
     );
 
     let backend = ScriptedBackend::new(vec![
-        "[search: session]",
+        "[search: load_most_recent]",
         "[read_file: src/session/mod.rs]",
-        "[read_file: src/inference/mod.rs]",
-        "Session restore starts in src/session/mod.rs:1, where `load_most_recent` delegates to src/inference/mod.rs:1 `restore_session()`.",
+        "[read_file: src/inference/session/runtime/core.rs]",
+        "Session restore starts in `src/inference/session/runtime/core.rs:2`, where startup calls `load_most_recent`. \
+         In `src/session/mod.rs:3`, the function returns `Ok(None)` if no session exists, and in \
+         `src/session/mod.rs:5` it loads the saved session by ID.",
     ]);
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
@@ -1400,7 +1402,9 @@ fn tool_loop_runs_for_explain_how_pattern() {
     .expect("tool loop");
 
     assert!(outcome.final_response.contains("src/session/mod.rs"));
-    assert!(outcome.final_response.contains("src/inference/mod.rs"));
+    assert!(outcome
+        .final_response
+        .contains("src/inference/session/runtime/core.rs"));
     assert!(
         !outcome.final_response.contains("I couldn't gather enough"),
         "flow trace should produce grounded steps once cross-file evidence exists"
@@ -1712,6 +1716,11 @@ fn flow_trace_guidance_ignores_test_files_by_default() {
             },
             ToolResult {
                 tool_name: "read_file".to_string(),
+                argument: "src/inference/session/runtime/core.rs".to_string(),
+                output: "File: src/inference/session/runtime/core.rs\n\n```\nfn restore_session(store: &SessionStore) {\n    let session = store.load_most_recent()?;\n}\n```\n".to_string(),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
                 argument: "src/inference/session/auto_inspect/tests.rs".to_string(),
                 output: "File: src/inference/session/auto_inspect/tests.rs\n\n```\nfn load_most_recent() -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n```\n".to_string(),
             },
@@ -1719,6 +1728,7 @@ fn flow_trace_guidance_ignores_test_files_by_default() {
     )
     .expect("guidance for flow trace");
 
+    assert!(guidance.contains("src/inference/session/runtime/core.rs"));
     assert!(guidance.contains("src/session/mod.rs"));
     assert!(
         !guidance.contains("auto_inspect/tests.rs"),
@@ -1846,6 +1856,200 @@ fn call_site_readiness_turns_ready_after_caller_file_is_read() {
         matches!(readiness, InvestigationReadiness::Ready { .. }),
         "caller lookup should become answer-ready after one caller file is inspected"
     );
+}
+
+#[test]
+fn llama_caller_lookup_bootstrap_reads_runtime_core_caller() {
+    let dir = std::env::temp_dir().join("params-tool-loop-caller-bootstrap-core");
+    let _ = fs::create_dir_all(dir.join("src/inference/session/runtime"));
+    let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::create_dir_all(dir.join("src/tools"));
+    let _ = fs::write(
+        dir.join("src/session/mod.rs"),
+        concat!(
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n",
+            "    Ok(None)\n",
+            "}\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    #[test]\n",
+            "    fn restores() {\n",
+            "        let _ = store.load_most_recent();\n",
+            "    }\n",
+            "}\n"
+        ),
+    );
+    let _ = fs::write(
+        dir.join("src/inference/session/runtime/core.rs"),
+        concat!(
+            "use crate::session::SessionStore;\n\n",
+            "fn restore_previous_session(store: &SessionStore) {\n",
+            "    let _ = store.load_most_recent();\n",
+            "}\n"
+        ),
+    );
+    let _ = fs::write(
+        dir.join("src/tools/search.rs"),
+        concat!(
+            "fn fixture() {\n",
+            "    let example = \"fn restore_previous_session(store: &SessionStore) { let _ = store.load_most_recent(); }\";\n",
+            "    assert!(example.contains(\"load_most_recent\"));\n",
+            "}\n"
+        ),
+    );
+
+    let (tx, _rx) = mpsc::channel();
+    let results = with_test_cwd(&dir, || {
+        bootstrap_tool_results(
+            ToolLoopIntent::CallSiteLookup,
+            "What calls load_most_recent",
+            None,
+            &[Message::user("What calls load_most_recent")],
+            &dir,
+            "llama.cpp · qwen",
+            &ToolRegistry::default(),
+            &tx,
+        )
+    });
+
+    let read = results
+        .iter()
+        .find(|result| result.tool_name == "read_file")
+        .expect("bootstrap read");
+    assert_eq!(read.argument, "src/inference/session/runtime/core.rs");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn llama_usage_lookup_bootstrap_reads_real_source_import() {
+    let dir = std::env::temp_dir().join("params-tool-loop-usage-bootstrap-import");
+    let _ = fs::create_dir_all(dir.join("src/inference/session/runtime"));
+    let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::write(
+        dir.join("src/session/mod.rs"),
+        "pub struct SessionStore {\n    pub id: String,\n}\n",
+    );
+    let _ = fs::write(
+        dir.join("src/inference/session/runtime/core.rs"),
+        concat!(
+            "use crate::session::SessionStore;\n\n",
+            "fn restore_previous_session(store: &SessionStore) {\n",
+            "    let _ = store;\n",
+            "}\n"
+        ),
+    );
+
+    let (tx, _rx) = mpsc::channel();
+    let results = with_test_cwd(&dir, || {
+        bootstrap_tool_results(
+            ToolLoopIntent::UsageLookup,
+            "What uses SessionStore",
+            None,
+            &[Message::user("What uses SessionStore")],
+            &dir,
+            "llama.cpp · qwen",
+            &ToolRegistry::default(),
+            &tx,
+        )
+    });
+
+    let read = results
+        .iter()
+        .find(|result| result.tool_name == "read_file")
+        .expect("bootstrap read");
+    assert_eq!(read.argument, "src/inference/session/runtime/core.rs");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn anchored_main_followup_guidance_includes_cli_shape_and_startup() {
+    let resolution = InvestigationResolution {
+        intent: ToolLoopIntent::CodeNavigation,
+        anchor: Some(InvestigationAnchor::File("src/main.rs".to_string())),
+        latency_policy: InvestigationLatencyPolicy::FastConvergence,
+        anchored_file: Some("src/main.rs".to_string()),
+        anchored_directory: None,
+        anchored_query: None,
+        prefer_answer_from_anchor: true,
+    };
+    let guidance = grounded_answer_guidance(
+        ToolLoopIntent::CodeNavigation,
+        "Tell me more",
+        Some(&resolution),
+        &[ToolResult {
+            tool_name: "read_file".to_string(),
+            argument: "src/main.rs".to_string(),
+            output: concat!(
+                "File: src/main.rs\nLines: 18\n\n```\n",
+                "mod commands;\n",
+                "mod config;\n\n",
+                "struct Cli {\n",
+                "    prompt: Option<String>,\n",
+                "    command: Option<Command>,\n",
+                "}\n\n",
+                "enum Command {\n",
+                "    Pull,\n",
+                "    Index,\n",
+                "}\n\n",
+                "fn main() -> Result<()> {\n",
+                "    let cli = Cli::parse();\n",
+                "    match cli.command {\n",
+                "        Some(Command::Pull) => {}\n",
+                "        Some(Command::Index) => {}\n",
+                "        None => {}\n",
+                "    }\n",
+                "}\n",
+                "```\n"
+            )
+            .to_string(),
+        }],
+    )
+    .expect("guidance");
+
+    assert!(guidance.contains("Observed file structure:"));
+    assert!(guidance.contains("struct Cli"));
+    assert!(guidance.contains("enum Command"));
+    assert!(guidance.contains("Cli::parse()"));
+    assert!(guidance.contains("match cli.command"));
+}
+
+#[test]
+fn flow_trace_guidance_includes_runtime_caller_and_restore_branches() {
+    let core_content = format!(
+        "{}match store.load_most_recent() {{\n    Ok(Some(saved)) => {{\n        let _ = saved;\n    }}\n    Ok(None) => {{}}\n}}\n",
+        "\n".repeat(166)
+    );
+    let restore_content = format!(
+        "{}pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {{\n    let Some(summary) = self.list_sessions()?.into_iter().next() else {{\n        return Ok(None);\n    }};\n    self.load_session_by_id(&summary.id)\n}}\n",
+        "\n".repeat(261)
+    );
+    let guidance = grounded_answer_guidance(
+        ToolLoopIntent::FlowTrace,
+        "Explain how session restore works",
+        None,
+        &[
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/inference/session/runtime/core.rs".to_string(),
+                output: format!(
+                    "File: src/inference/session/runtime/core.rs\nLines: 171\n\n```\n{core_content}```\n"
+                ),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: format!("File: src/session/mod.rs\nLines: 267\n\n```\n{restore_content}```\n"),
+            },
+        ],
+    )
+    .expect("guidance");
+
+    assert!(guidance.contains("src/inference/session/runtime/core.rs:167"));
+    assert!(guidance.contains("src/session/mod.rs:262"));
+    assert!(guidance.contains("return Ok(None)"));
+    assert!(guidance.contains("load_session_by_id(&summary.id)"));
 }
 
 // ─── Benchmark Regression Tests ───────────────────────────────────────────────
@@ -2024,14 +2228,41 @@ fn benchmark_followup_tell_me_more_expands_not_repeats() {
     let _ = fs::create_dir_all(dir.join("src"));
     let _ = fs::write(
         dir.join("src/main.rs"),
-        "mod commands;\nmod config;\nfn main() { }\n",
+        concat!(
+            "mod commands;\n",
+            "mod config;\n\n",
+            "struct Cli {\n",
+            "    prompt: Option<String>,\n",
+            "    command: Option<Command>,\n",
+            "}\n\n",
+            "enum Command {\n",
+            "    Pull,\n",
+            "    Index,\n",
+            "}\n\n",
+            "fn main() -> Result<()> {\n",
+            "    let cli = Cli::parse();\n",
+            "    match cli.command {\n",
+            "        Some(Command::Pull) => {}\n",
+            "        Some(Command::Index) => {}\n",
+            "        None => {}\n",
+            "    }\n",
+            "}\n"
+        ),
     );
 
     let prior_answer = "`src/main.rs:1` declares modules commands and config.";
-    let expanded_answer = "`src/main.rs` is the Rust binary entrypoint. \
-        It declares the `commands` and `config` modules. \
-        The `fn main` function at line 3 is the program entry point that \
-        coordinates command dispatch.";
+    let expanded_answer = "`src/main.rs` is the CLI entrypoint. \
+        It defines the `Cli` struct and the `Command` enum, then `fn main` parses \
+        arguments with `Cli::parse()` and dispatches subcommands via `match cli.command`.";
+    let resolution = InvestigationResolution {
+        intent: ToolLoopIntent::CodeNavigation,
+        anchor: Some(InvestigationAnchor::File("src/main.rs".to_string())),
+        latency_policy: InvestigationLatencyPolicy::FastConvergence,
+        anchored_file: Some("src/main.rs".to_string()),
+        anchored_directory: None,
+        anchored_query: None,
+        prefer_answer_from_anchor: true,
+    };
 
     // The synthesis pass will receive the prior answer as context (via base_messages tail)
     // and should return the expanded version rather than repeating the prior answer.
@@ -2040,9 +2271,10 @@ fn benchmark_followup_tell_me_more_expands_not_repeats() {
     let mut cache_stats = SessionCacheStats::default();
     let mut budget = SessionBudget::default();
     let outcome = with_test_cwd(&dir, || {
-        run_read_only_tool_loop(
+        run_read_only_tool_loop_with_resolution(
             ToolLoopIntent::CodeNavigation,
             "Tell me more",
+            Some(&resolution),
             &[
                 Message::system("system"),
                 Message::user("What does this file do?"),
@@ -2076,10 +2308,10 @@ fn benchmark_followup_tell_me_more_expands_not_repeats() {
     );
     // Must contain additional detail beyond the shallow module list
     assert!(
-        outcome.final_response.contains("main")
-            || outcome.final_response.contains("entry")
-            || outcome.final_response.contains("command")
-            || outcome.final_response.contains("src/main.rs"),
+        outcome.final_response.contains("Cli")
+            || outcome.final_response.contains("Command")
+            || outcome.final_response.contains("parse")
+            || outcome.final_response.contains("dispatch"),
         "Tell me more must deepen the file-summary answer, got: {}",
         outcome.final_response
     );
@@ -2093,22 +2325,22 @@ fn benchmark_caller_lookup_returns_real_caller_not_insufficient_evidence() {
     // Minimum bar: returns real non-definition caller file reference, not "insufficient evidence".
     // Must converge within acceptable latency (enforced by ScriptedBackend exhaustion).
     let dir = std::env::temp_dir().join("params-bench-caller-lookup");
-    let _ = fs::create_dir_all(dir.join("src/inference"));
+    let _ = fs::create_dir_all(dir.join("src/inference/session/runtime"));
     let _ = fs::create_dir_all(dir.join("src/session"));
     let _ = fs::write(
         dir.join("src/session/mod.rs"),
         "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
     );
     let _ = fs::write(
-        dir.join("src/inference/session.rs"),
+        dir.join("src/inference/session/runtime/core.rs"),
         "fn restore(store: &SessionStore) {\n    let _ = store.load_most_recent();\n}\n",
     );
 
     let backend = ScriptedBackend::new(vec![
         "[search: load_most_recent]",
-        "[read_file: src/inference/session.rs]",
-        "load_most_recent is called from `restore` in `src/inference/session.rs:2`.",
-        "load_most_recent is called from `restore` in `src/inference/session.rs:2`.",
+        "[read_file: src/inference/session/runtime/core.rs]",
+        "load_most_recent is called from `restore` in `src/inference/session/runtime/core.rs:2`.",
+        "load_most_recent is called from `restore` in `src/inference/session/runtime/core.rs:2`.",
     ]);
     let (tx, _rx) = mpsc::channel();
     let mut cache_stats = SessionCacheStats::default();
@@ -2149,7 +2381,9 @@ fn benchmark_caller_lookup_returns_real_caller_not_insufficient_evidence() {
     );
     // Must reference the caller file (not the definition file)
     assert!(
-        outcome.final_response.contains("src/inference/session.rs"),
+        outcome
+            .final_response
+            .contains("src/inference/session/runtime/core.rs"),
         "caller lookup must reference the caller file, got: {}",
         outcome.final_response
     );
@@ -2162,23 +2396,23 @@ fn benchmark_usage_lookup_returns_real_usage_not_insufficient_evidence() {
     // Benchmark case: "What uses SessionStore"
     // Minimum bar: returns real non-definition usage file reference, not "insufficient evidence".
     let dir = std::env::temp_dir().join("params-bench-usage-lookup");
-    let _ = fs::create_dir_all(dir.join("src/inference"));
+    let _ = fs::create_dir_all(dir.join("src/inference/session/runtime"));
     let _ = fs::create_dir_all(dir.join("src/session"));
     let _ = fs::write(
         dir.join("src/session/mod.rs"),
         "pub struct SessionStore {\n    pub path: PathBuf,\n}\n",
     );
     let _ = fs::write(
-        dir.join("src/inference/session.rs"),
+        dir.join("src/inference/session/runtime/core.rs"),
         "use crate::session::SessionStore;\nfn restore(store: &SessionStore) {}\n",
     );
 
     let backend = ScriptedBackend::new(vec![
         "[search: SessionStore]",
-        "[read_file: src/inference/session.rs]",
-        "SessionStore is used in `src/inference/session.rs:1` as an import and in \
+        "[read_file: src/inference/session/runtime/core.rs]",
+        "SessionStore is used in `src/inference/session/runtime/core.rs:1` as an import and in \
          the `restore` function signature on line 2.",
-        "SessionStore is used in `src/inference/session.rs:1` as an import and in \
+        "SessionStore is used in `src/inference/session/runtime/core.rs:1` as an import and in \
          the `restore` function signature on line 2.",
     ]);
     let (tx, _rx) = mpsc::channel();
@@ -2217,7 +2451,9 @@ fn benchmark_usage_lookup_returns_real_usage_not_insufficient_evidence() {
         outcome.final_response
     );
     assert!(
-        outcome.final_response.contains("src/inference/session.rs"),
+        outcome
+            .final_response
+            .contains("src/inference/session/runtime/core.rs"),
         "usage lookup must reference the usage file, got: {}",
         outcome.final_response
     );
@@ -2232,7 +2468,7 @@ fn benchmark_flow_trace_produces_prose_explanation_not_raw_code_dump() {
     // numbered list of raw code lines), references multiple source files, and does
     // not leak tool tags.
     let dir = std::env::temp_dir().join("params-bench-flow-trace");
-    let _ = fs::create_dir_all(dir.join("src/inference"));
+    let _ = fs::create_dir_all(dir.join("src/inference/session/runtime"));
     let _ = fs::create_dir_all(dir.join("src/session"));
     let _ = fs::write(
         dir.join("src/session/mod.rs"),
@@ -2241,17 +2477,22 @@ fn benchmark_flow_trace_produces_prose_explanation_not_raw_code_dump() {
          return Ok(None);\n};\nself.load_session_by_id(&summary.id)\n}\n",
     );
     let _ = fs::write(
-        dir.join("src/inference/session.rs"),
+        dir.join("src/inference/session/runtime/core.rs"),
         "fn restore_session(store: &SessionStore) -> Result<()> {\n\
-         let session = store.load_most_recent()?;\n\
+         match store.load_most_recent()? {\n\
+             Some(saved) => {\n\
+                 let _ = saved;\n\
+             }\n\
+             None => {}\n\
+         }\n\
          Ok(())\n}\n",
     );
 
     let backend = ScriptedBackend::new(vec![
         "[search: load_most_recent]",
         "[read_file: src/session/mod.rs]",
-        "[read_file: src/inference/session.rs]",
-        "Session restore works as follows: `restore_session` in `src/inference/session.rs:1` \
+        "[read_file: src/inference/session/runtime/core.rs]",
+        "Session restore works as follows: `restore_session` in `src/inference/session/runtime/core.rs:1` \
          calls `load_most_recent` from `src/session/mod.rs:1`. That function lists all sessions \
          and picks the most recent one (returning `None` early if none exist), then loads it \
          by ID via `load_session_by_id`.",
@@ -2295,8 +2536,17 @@ fn benchmark_flow_trace_produces_prose_explanation_not_raw_code_dump() {
     // Must reference at least one source file
     assert!(
         outcome.final_response.contains("src/session/mod.rs")
-            || outcome.final_response.contains("src/inference/session.rs"),
+            || outcome
+                .final_response
+                .contains("src/inference/session/runtime/core.rs"),
         "flow trace must cite a source file, got: {}",
+        outcome.final_response
+    );
+    assert!(
+        outcome.final_response.contains("Ok(None)")
+            || outcome.final_response.contains("None")
+            || outcome.final_response.contains("load_session_by_id"),
+        "flow trace must describe the restore branch behavior, got: {}",
         outcome.final_response
     );
     // Must not be a raw numbered code dump (every line starts with a digit colon)

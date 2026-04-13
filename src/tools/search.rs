@@ -52,6 +52,20 @@ impl Tool for SearchCode {
 
         let total = matches.len();
         let ranked = rank_search_matches(&current_dir, query, matches);
+        let top_paths = ranked
+            .iter()
+            .take(MAX_FILES_IN_OUTPUT)
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!(
+            tool = "search",
+            query,
+            total_matches = total,
+            shown_files = ranked.len().min(MAX_FILES_IN_OUTPUT),
+            top_paths = top_paths.as_str(),
+            "search ranked results"
+        );
 
         let mut output = format!(
             "Search results for '{}' ({} matches{}):\n\n",
@@ -186,10 +200,20 @@ fn is_doc_path(path: &str) -> bool {
 fn is_test_like_path(path: &str) -> bool {
     path.starts_with("tests/")
         || path.contains("/tests/")
+        || path.ends_with("/tests.rs")
+        || path.ends_with("/test.rs")
         || path.contains("fixtures")
         || path.contains("snapshots")
         || path.ends_with("_test.rs")
         || path.ends_with("_tests.rs")
+}
+
+fn is_internal_tool_loop_path(path: &str) -> bool {
+    path.starts_with("src/inference/tool_loop/")
+}
+
+fn is_legacy_auto_inspect_path(path: &str) -> bool {
+    path.starts_with("src/inference/session/auto_inspect")
 }
 
 fn is_source_path(path: &str) -> bool {
@@ -237,10 +261,16 @@ fn score_search_file(query: &str, file: &SearchFileMatches) -> isize {
         score -= 18;
     }
     if is_test_like_path(&file.path) {
-        score -= 28;
+        score -= 40;
+    }
+    if is_internal_tool_loop_path(&file.path) {
+        score -= 52;
+    }
+    if is_legacy_auto_inspect_path(&file.path) {
+        score -= 40;
     }
     if path.contains("prompt") || path.contains("fixture") {
-        score -= 14;
+        score -= 20;
     }
     if !query.is_empty() && path.contains(&query) {
         score += 10;
@@ -255,17 +285,17 @@ fn score_search_file(query: &str, file: &SearchFileMatches) -> isize {
             score += 6;
         }
         if is_definition_like_line(line) {
-            score += 24;
+            score += 8;
         }
         if line.contains("assert!")
             || line.contains("#[test]")
             || line.contains("mod tests")
             || line.contains("Search results for")
         {
-            score -= 10;
+            score -= 18;
         }
         if line.contains('"') && !is_definition_like_line(line) {
-            score -= 4;
+            score -= 18;
         }
     }
 
@@ -434,6 +464,74 @@ mod tests {
 
         assert!(files <= MAX_FILES_IN_OUTPUT);
         assert!(shown <= MAX_OUTPUT_MATCHES);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_ranking_prefers_runtime_source_over_internal_test_heavy_hits() {
+        let dir = std::env::temp_dir().join(format!(
+            "params-search-runtime-priority-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("src/inference/session/runtime")).unwrap();
+        fs::create_dir_all(dir.join("src/inference/tool_loop")).unwrap();
+        fs::create_dir_all(dir.join("src/inference/session/auto_inspect")).unwrap();
+        fs::create_dir_all(dir.join("src/session")).unwrap();
+
+        fs::write(
+            dir.join("src/session/mod.rs"),
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    Ok(None)\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/inference/session/runtime/core.rs"),
+            "fn restore_session(store: &SessionStore) {\n    let _ = store.load_most_recent();\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/inference/tool_loop/tests.rs"),
+            concat!(
+                "assert!(text.contains(\"load_most_recent\"));\n",
+                "assert_eq!(query, \"load_most_recent\");\n",
+                "fn fixture() { let _ = \"load_most_recent\"; }\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/inference/session/auto_inspect/followup.rs"),
+            "Some(\"load_most_recent\")\nSome(\"load_most_recent\")\n",
+        )
+        .unwrap();
+
+        let mut matches = Vec::new();
+        walk_and_search(&dir, "load_most_recent", &mut matches).unwrap();
+        let ranked = rank_search_matches(&dir, "load_most_recent", matches);
+
+        let runtime_idx = ranked
+            .iter()
+            .position(|file| file.path == "src/inference/session/runtime/core.rs")
+            .expect("runtime caller file present");
+        let tool_loop_idx = ranked
+            .iter()
+            .position(|file| file.path == "src/inference/tool_loop/tests.rs")
+            .expect("internal tool-loop file present");
+        let auto_inspect_idx = ranked
+            .iter()
+            .position(|file| file.path == "src/inference/session/auto_inspect/followup.rs")
+            .expect("legacy auto-inspect file present");
+
+        assert!(
+            runtime_idx < tool_loop_idx,
+            "runtime caller should outrank internal test-heavy files: {ranked:#?}"
+        );
+        assert!(
+            runtime_idx < auto_inspect_idx,
+            "runtime caller should outrank legacy auto-inspect files: {ranked:#?}"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

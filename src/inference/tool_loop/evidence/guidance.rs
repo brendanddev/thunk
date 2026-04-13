@@ -3,13 +3,13 @@ use crate::tools::ToolResult;
 use super::super::super::session::investigation::InvestigationResolution;
 use super::super::intent::{suggested_search_query, ToolLoopIntent};
 use super::observe::{
-    first_matching_lines, observed_reference_lines_from_read_results,
-    should_answer_from_anchor_file,
+    observed_file_summary_evidence, observed_flow_trace_evidence,
+    observed_reference_lines_from_read_results, should_answer_from_anchor_file,
 };
 use super::parse::{
     clip_inline, clip_tool_output, compact_read_file_result, declaration_lines_with_numbers,
     definition_match_lines_with_numbers, filter_non_test_hits, first_non_empty_lines,
-    is_definition_like_line, is_test_like_path, parse_read_file_output, prompt_mentions_tests,
+    is_test_like_path, parse_read_file_output, prompt_mentions_tests,
     query_match_lines_with_numbers, surrounding_body_lines,
 };
 
@@ -50,54 +50,31 @@ pub(crate) fn grounded_answer_guidance(
     match intent {
         ToolLoopIntent::CodeNavigation => {
             if should_answer_from_anchor_file(prompt, resolution) {
-                for result in results
-                    .iter()
-                    .filter(|result| result.tool_name == "read_file")
+                if let Some(evidence) = observed_file_summary_evidence(prompt, resolution, results)
                 {
-                    let Some((path, content)) = parse_read_file_output(&result.output) else {
-                        continue;
-                    };
-                    let mut declarations = declaration_lines_with_numbers(&content, 14);
-                    let has_main = declarations
-                        .iter()
-                        .any(|(_, l)| l.starts_with("fn main") || l.starts_with("pub fn main"));
-                    if !has_main {
-                        if let Some(main_line) = first_matching_lines(
-                            &content,
-                            |l| l.starts_with("fn main(") || l.starts_with("pub fn main("),
-                            1,
-                        )
-                        .into_iter()
-                        .next()
-                        {
-                            declarations.push(main_line);
-                        }
-                    }
-                    let excerpt = if declarations.is_empty() {
-                        first_non_empty_lines(&content, 10)
-                    } else {
-                        declarations
-                    };
-                    if excerpt.is_empty() {
-                        continue;
-                    }
                     let mut sections = vec![
                         "Grounded answer requirements: answer what this loaded file does using only the observed lines below. Do not include code fences. Do not mention search results, wrapper prompt text, or unrelated prompt strings. Do not suggest inspecting another file unless the observed lines are genuinely insufficient.".to_string(),
-                        format!("Loaded file: `{path}`"),
-                        "Observed declarations:".to_string(),
+                        format!("Loaded file: `{}`", evidence.path),
+                        "Observed file structure:".to_string(),
                     ];
-                    sections.extend(excerpt.into_iter().map(|(line_number, line)| {
-                        format!("  {}:{} `{}`", path, line_number, clip_inline(&line, 120))
+                    sections.extend(evidence.declarations.iter().map(|line| {
+                        format!(
+                            "  {}:{} `{}`",
+                            line.path,
+                            line.line_number,
+                            clip_inline(&line.line_text, 120)
+                        )
                     }));
                     sections.push(
                         "Answer from the observed lines above only. Rules:\n\
                          1. Keep the answer to 2-4 short sentences or a flat 3-bullet list.\n\
                          2. If `fn main` is visible, mention that this is the binary entrypoint and describe its role.\n\
-                         3. Summarize the file's role from the declarations/imports/modules actually shown.\n\
-                         4. Cite every concrete fact with exact file:line references.\n\
-                         5. Copy identifiers verbatim — do not rename methods, modules, or types.\n\
-                         6. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`).\n\
-                         7. Do not pivot to other files or offer next-step advice unless the observed lines clearly delegate elsewhere."
+                         3. If `struct Cli` or `enum Command` are visible, explain the CLI shape and subcommand surface from those lines.\n\
+                         4. If startup lines like `Cli::parse()` or `match cli.command` are visible, describe the startup/orchestration role.\n\
+                         5. Cite every concrete fact with exact file:line references.\n\
+                         6. Copy identifiers verbatim — do not rename methods, modules, or types.\n\
+                         7. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`).\n\
+                         8. Do not pivot to other files or offer next-step advice unless the observed lines clearly delegate elsewhere."
                             .to_string(),
                     );
                     return Some(sections.join("\n"));
@@ -184,7 +161,7 @@ pub(crate) fn grounded_answer_guidance(
             let rule = if is_call_site {
                 "List each file:line where the symbol is invoked. Do NOT describe the symbol's own implementation."
             } else {
-                "List each file:line where the symbol is used or referenced. Do NOT describe the symbol's own implementation."
+                "List each file:line where the symbol is used or referenced. Import lines count as real usages when they appear in source files. Do NOT describe the symbol's own implementation."
             };
             let mut sections = vec![
                 format!(
@@ -205,52 +182,7 @@ pub(crate) fn grounded_answer_guidance(
             Some(sections.join("\n"))
         }
         ToolLoopIntent::FlowTrace => {
-            let query = suggested_search_query(prompt, intent)?;
-            let mut file_sections: Vec<String> = Vec::new();
-            for result in results.iter().filter(|r| r.tool_name == "read_file") {
-                let Some((path, content)) = parse_read_file_output(&result.output) else {
-                    continue;
-                };
-                if is_test_like_path(&path) && !prompt_mentions_tests(prompt) {
-                    continue;
-                }
-                let query_hits = filter_non_test_hits(
-                    &content,
-                    definition_match_lines_with_numbers(&content, &query, 1),
-                );
-                let fallback_def: Vec<(usize, String)> = content
-                    .lines()
-                    .enumerate()
-                    .map(|(idx, line)| (idx + 1, line.trim().to_string()))
-                    .filter(|(_, line)| is_definition_like_line(line) && !line.is_empty())
-                    .take(1)
-                    .collect();
-                let hits = if !query_hits.is_empty() {
-                    query_hits
-                } else {
-                    fallback_def
-                };
-                if let Some((line_number, line)) = hits.into_iter().next() {
-                    file_sections.push(format!(
-                        "{}:{} `{}`",
-                        path,
-                        line_number,
-                        clip_inline(&line, 120)
-                    ));
-                    let body = surrounding_body_lines(&content, line_number, 4);
-                    for (ln, line_text) in &body {
-                        file_sections.push(format!(
-                            "  {}:{} `{}`",
-                            path,
-                            ln,
-                            clip_inline(line_text, 120)
-                        ));
-                    }
-                }
-            }
-            if file_sections.is_empty() {
-                return None;
-            }
+            let evidence = observed_flow_trace_evidence(prompt, results)?;
             let mut sections = vec![
                 "Grounded answer requirements: explain the execution flow in plain language using \
                  only the observed file evidence below. Do not list raw code lines. \
@@ -259,12 +191,19 @@ pub(crate) fn grounded_answer_guidance(
                     .to_string(),
                 "Observed cross-file evidence:".to_string(),
             ];
-            sections.extend(file_sections);
+            sections.extend(evidence.steps.iter().map(|step| {
+                format!(
+                    "  {}:{} `{}`",
+                    step.path,
+                    step.line_number,
+                    clip_inline(&step.line_text, 120)
+                )
+            }));
             sections.push(
                 "Answer from the observed evidence above. Rules:\n\
                  1. Write a SHORT explanation in plain language (2–4 sentences), not a code dump.\n\
-                 2. Describe what each key step does and where it lives (file:line).\n\
-                 3. Mention branch behavior (early return, None path) if visible.\n\
+                 2. Connect the runtime caller to the definition and keep the steps in execution order.\n\
+                 3. Mention branch behavior (early return, None path) and the successful handoff if visible.\n\
                  4. Do not copy raw source lines verbatim into the answer — paraphrase them.\n\
                  5. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`)."
                     .to_string(),

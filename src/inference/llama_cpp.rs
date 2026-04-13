@@ -17,8 +17,7 @@ use crate::events::InferenceEvent;
 const LLAMA_CONTEXT_TOKENS: u32 = 8192;
 const LLAMA_BATCH_TOKENS: u32 = 2048;
 
-/// Formats a conversation into a ChatML prompt string.
-/// Qwen uses ChatML format — we build it manually.
+/// Formats a conversation into a ChatML prompt string
 pub fn format_messages(messages: &[Message]) -> String {
     let mut prompt = String::new();
     for msg in messages {
@@ -31,11 +30,9 @@ pub fn format_messages(messages: &[Message]) -> String {
     prompt
 }
 
-/// The llama.cpp backend. Holds the loaded model in memory permanently
-/// so it doesn't need to reload between messages.
+/// The llama.cpp backend. Holds the loaded model in memory permanently, no reload between sessions
 pub struct LlamaCppBackend {
     model: LlamaModel,
-    // We keep the backend alive here — it must outlive the model
     _backend: LlamaBackend,
     pub model_name: String,
     pub max_tokens: i32,
@@ -43,8 +40,7 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
-    /// Load a model from a .gguf file path. This is the slow step — it reads
-    /// the weights from disk and uploads them to GPU memory.
+    /// Load a model from a .gguf file path
     pub fn load(model_path: PathBuf, max_tokens: i32, temperature: f32) -> Result<Self> {
         let mut backend =
             LlamaBackend::init().map_err(|e| ParamsError::Inference(e.to_string()))?;
@@ -54,7 +50,7 @@ impl LlamaCppBackend {
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
             .map_err(|e| ParamsError::Model(e.to_string()))?;
 
-        // Extract just the filename for display (e.g. "qwen2.5-coder-7b-q4_k_m.gguf")
+        // Extract just the filename for display
         let model_name = model_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -77,9 +73,7 @@ impl InferenceBackend for LlamaCppBackend {
     }
 
     fn generate(&self, messages: &[Message], tx: Sender<InferenceEvent>) -> Result<()> {
-        // Create a fresh context for each generation.
-        // The model weights stay loaded — only the KV cache is reset.
-        // This is much cheaper than reloading the model.
+        // Create a fresh context for each generation
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(LLAMA_CONTEXT_TOKENS))
             .with_n_batch(LLAMA_BATCH_TOKENS);

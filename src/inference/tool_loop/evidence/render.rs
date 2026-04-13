@@ -98,6 +98,25 @@ pub(crate) fn render_structured_answer(_prompt: &str, evidence: &StructuredEvide
                 .into_iter()
                 .map(|name| name.split("::").last().unwrap_or(&name).to_string())
                 .collect::<Vec<_>>();
+            let cli_line = evidence.declarations.iter().find(|line| {
+                line.line_text.starts_with("struct Cli")
+                    || line.line_text.starts_with("pub struct Cli")
+            });
+            let command_line = evidence.declarations.iter().find(|line| {
+                line.line_text.starts_with("enum Command")
+                    || line.line_text.starts_with("pub enum Command")
+            });
+            let main_line = evidence.declarations.iter().find(|line| {
+                line.line_text.starts_with("pub fn main(") || line.line_text.starts_with("fn main(")
+            });
+            let parse_line = evidence
+                .declarations
+                .iter()
+                .find(|line| line.line_text.contains("::parse()"));
+            let dispatch_line = evidence
+                .declarations
+                .iter()
+                .find(|line| line.line_text.contains("match cli.command"));
             let fn_anchor = evidence
                 .declarations
                 .iter()
@@ -105,6 +124,53 @@ pub(crate) fn render_structured_answer(_prompt: &str, evidence: &StructuredEvide
                     line.line_text.starts_with("pub fn ") || line.line_text.starts_with("fn ")
                 })
                 .unwrap_or(&evidence.declarations[0]);
+            if let Some(main_line) = main_line {
+                let mut sentences = Vec::new();
+                if !module_names.is_empty() {
+                    sentences.push(format!(
+                        "{} declares modules {}.",
+                        render_line_ref(&evidence.declarations[0]),
+                        join_names(&module_names)
+                    ));
+                }
+                if let Some(cli_line) = cli_line {
+                    if let Some(command_line) = command_line {
+                        sentences.push(format!(
+                            "{} defines `Cli` and {} defines `Command`, so this file describes the CLI surface and subcommands.",
+                            render_line_ref(cli_line),
+                            render_line_ref(command_line)
+                        ));
+                    } else {
+                        sentences.push(format!(
+                            "{} defines `Cli`, so this file describes the command-line surface.",
+                            render_line_ref(cli_line)
+                        ));
+                    }
+                }
+                let startup_ref = match (parse_line, dispatch_line) {
+                    (Some(parse_line), Some(dispatch_line)) => format!(
+                        " Startup orchestration is visible in {} and {}.",
+                        render_line_ref(parse_line),
+                        render_line_ref(dispatch_line)
+                    ),
+                    (Some(parse_line), None) => {
+                        format!(
+                            " Startup orchestration is visible in {}.",
+                            render_line_ref(parse_line)
+                        )
+                    }
+                    (None, Some(dispatch_line)) => format!(
+                        " Startup orchestration is visible in {}.",
+                        render_line_ref(dispatch_line)
+                    ),
+                    (None, None) => String::new(),
+                };
+                sentences.push(format!(
+                    "{} defines `main`, so this file is the CLI entrypoint.{startup_ref}",
+                    render_line_ref(main_line)
+                ));
+                return sentences.into_iter().take(3).collect::<Vec<_>>().join(" ");
+            }
             if !module_names.is_empty() && fn_names.iter().any(|name| name == "main") {
                 return format!(
                     "{} declares modules {}, and {} defines `main`, so this file is the CLI entrypoint.",
@@ -207,7 +273,13 @@ pub(crate) fn render_structured_answer(_prompt: &str, evidence: &StructuredEvide
         StructuredEvidence::Usages(evidence) => evidence
             .usages
             .iter()
-            .map(|line| format!("{} uses `{}`.", render_line_ref(line), evidence.symbol))
+            .map(|line| {
+                if line.line_text.trim().starts_with("use ") {
+                    format!("{} imports `{}`.", render_line_ref(line), evidence.symbol)
+                } else {
+                    format!("{} uses `{}`.", render_line_ref(line), evidence.symbol)
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         StructuredEvidence::FlowTrace(evidence) => {

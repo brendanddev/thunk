@@ -150,6 +150,44 @@ fn identifier_match_offsets(line: &str, symbol: &str) -> Vec<usize> {
         .collect()
 }
 
+fn is_escaped_at(line: &str, idx: usize) -> bool {
+    let bytes = line.as_bytes();
+    if idx == 0 || idx > bytes.len() {
+        return false;
+    }
+
+    let mut backslashes = 0usize;
+    let mut cursor = idx;
+    while cursor > 0 {
+        cursor -= 1;
+        if bytes[cursor] == b'\\' {
+            backslashes += 1;
+        } else {
+            break;
+        }
+    }
+    backslashes % 2 == 1
+}
+
+fn offset_inside_string_literal(line: &str, offset: usize) -> bool {
+    let mut in_double = false;
+    let mut in_backtick = false;
+
+    for (idx, ch) in line.char_indices() {
+        if idx >= offset {
+            break;
+        }
+
+        match ch {
+            '"' if !in_backtick && !is_escaped_at(line, idx) => in_double = !in_double,
+            '`' if !in_double && !is_escaped_at(line, idx) => in_backtick = !in_backtick,
+            _ => {}
+        }
+    }
+
+    in_double || in_backtick
+}
+
 pub(super) fn prompt_mentions_tests(prompt: &str) -> bool {
     let normalized = prompt.to_ascii_lowercase();
     normalized.contains(" test")
@@ -169,6 +207,9 @@ pub(super) fn line_contains_symbol_reference(line: &str, symbol: &str) -> bool {
     identifier_match_offsets(&lowered, &symbol)
         .into_iter()
         .any(|idx| {
+            if offset_inside_string_literal(trimmed, idx) {
+                return false;
+            }
             let next = lowered[idx + symbol.len()..].chars().next();
             let prev = lowered[..idx].chars().next_back();
             !(matches!(prev, Some('"') | Some('\'')) && matches!(next, Some('"') | Some('\'')))
@@ -186,6 +227,9 @@ pub(super) fn line_contains_symbol_invocation(line: &str, symbol: &str) -> bool 
     identifier_match_offsets(&lowered, &symbol)
         .into_iter()
         .any(|idx| {
+            if offset_inside_string_literal(trimmed, idx) {
+                return false;
+            }
             let next = lowered[idx + symbol.len()..].trim_start();
             next.starts_with('(') || next.starts_with("::<")
         })

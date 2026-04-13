@@ -1,7 +1,3 @@
-// src/inference/ollama.rs
-//
-// The Ollama backend — talks to a running Ollama server via HTTP.
-
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::Sender;
 
@@ -9,7 +5,7 @@ use super::backend::{InferenceBackend, Message};
 use crate::error::{ParamsError, Result};
 use crate::events::InferenceEvent;
 
-/// The Ollama backend. Makes HTTP requests to an Ollama server.
+/// The Ollama backend
 pub struct OllamaBackend {
     pub base_url: String,
     pub model: String,
@@ -23,8 +19,7 @@ impl OllamaBackend {
         }
     }
 
-    /// Check if the Ollama server is reachable.
-    /// Returns Ok(()) if healthy, Err if not running or unreachable.
+    /// Check if the Ollama server is reachable
     pub fn health_check(&self) -> Result<()> {
         let url = format!("{}/api/tags", self.base_url);
         let response = ureq::get(&url).call().map_err(|e| {
@@ -48,9 +43,7 @@ impl InferenceBackend for OllamaBackend {
     }
 
     fn generate(&self, messages: &[Message], tx: Sender<InferenceEvent>) -> Result<()> {
-        // Build the request body.
-        // Ollama's /api/chat endpoint accepts a list of messages with roles,
-        // exactly like OpenAI's chat format. We convert our Message type to JSON.
+        // Build the request body
         let messages_json: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
@@ -64,25 +57,18 @@ impl InferenceBackend for OllamaBackend {
         let body = serde_json::json!({
             "model": self.model,
             "messages": messages_json,
-            // stream: true means Ollama sends tokens as they're generated
-            // rather than waiting for the full response
             "stream": true,
         });
 
         let url = format!("{}/api/chat", self.base_url);
 
-        // Make the HTTP POST request.
-        // ureq is a simple blocking HTTP client — good fit for a background thread.
+        // Make the HTTP POST request
         let response = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())
             .map_err(|e| ParamsError::Config(format!("Ollama request failed: {e}")))?;
 
-        // Read the streaming response line by line.
-        // Ollama sends one JSON object per line (newline-delimited JSON / NDJSON).
-        // Each line looks like:
-        //   {"model":"qwen...","message":{"role":"assistant","content":"Hello"},"done":false}
-        // The last line has "done": true.
+        // Read the streaming response line by line
         let reader = BufReader::new(response.into_reader());
 
         for line in reader.lines() {

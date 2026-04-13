@@ -8,8 +8,7 @@ use crate::safety::{ReadScope, ShellMode};
 
 use super::{load, Config, PROJECT_PROFILE_FILE};
 
-/// Project-local config overrides loaded from .params.toml.
-/// Every field is optional — only present fields are applied.
+/// Project-local config overrides loaded from .toml file
 #[derive(Debug, Deserialize, Default)]
 pub struct ProjectProfile {
     pub backend: Option<String>,
@@ -213,13 +212,7 @@ pub fn apply_profile(mut base: Config, profile: ProjectProfile) -> Config {
     base
 }
 
-/// Load the global config and apply any project-local .params.toml overrides.
-///
-/// This is the function all callers should use. It returns the fully-merged
-/// Config with `active_profile` set if a profile was found.
-///
-/// If .params.toml exists but cannot be parsed, a warning is logged and the
-/// global config is returned unchanged so the app still starts cleanly.
+/// Load global config and apply any project local .toml overrides
 pub fn load_with_profile() -> Result<Config> {
     let base = load()?;
 
