@@ -407,7 +407,7 @@ fn detect_broad_technical_intent(normalized: &str) -> Option<ToolLoopIntent> {
     }
 
     if has_any(&["trace", "flow", "walk"])
-        || contains_any(&["how does", "explain how", "describe how"])
+        || contains_any(&["how does", "explain how", "xplain how", "describe how"])
     {
         return Some(ToolLoopIntent::FlowTrace);
     }
@@ -519,6 +519,16 @@ mod tests {
             resolve_agentic_repo_turn("Do you understand this repo?", &state)
                 .map(|resolution| resolution.intent),
             Some(ToolLoopIntent::RepoOverview)
+        );
+    }
+
+    #[test]
+    fn typoed_explain_how_prompt_routes_to_flow_trace() {
+        let state = InvestigationState::default();
+        assert_eq!(
+            resolve_agentic_repo_turn("xplain how session restore works", &state)
+                .map(|resolution| resolution.intent),
+            Some(ToolLoopIntent::FlowTrace)
         );
     }
 

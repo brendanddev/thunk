@@ -61,6 +61,35 @@ fn merge_search_hits(results: &[ToolResult]) -> Vec<SearchFileHit> {
     files
 }
 
+pub(super) fn search_candidates_in_output_order(results: &[ToolResult]) -> Vec<SearchFileHit> {
+    let mut by_path = HashMap::<String, Vec<SearchLineHit>>::new();
+    let mut order = Vec::<String>::new();
+
+    for result in results {
+        if result.tool_name != "search" {
+            continue;
+        }
+        for file in parse_search_output(&result.output) {
+            if !by_path.contains_key(&file.path) {
+                order.push(file.path.clone());
+            }
+            by_path.entry(file.path).or_default().extend(file.hits);
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|path| {
+            let mut hits = by_path.remove(&path)?;
+            hits.sort_by_key(|hit| hit.line_number);
+            hits.dedup_by(|a, b| {
+                a.line_number == b.line_number && a.line_content == b.line_content
+            });
+            Some(SearchFileHit { path, hits })
+        })
+        .collect()
+}
+
 fn lookup_hit_matches(intent: ToolLoopIntent, query: &str, line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() || is_definition_like_line(trimmed) {
@@ -651,16 +680,21 @@ fn classify_flow_step(line_text: &str) -> ObservedStepKind {
     let trimmed = line_text.trim();
     if trimmed.contains("return ") {
         ObservedStepKind::Return
+    } else if trimmed.contains("=>")
+        || trimmed.starts_with("if ")
+        || trimmed.starts_with("match ")
+        || trimmed.starts_with("Some(")
+        || trimmed.starts_with("None")
+        || trimmed.starts_with("Ok(")
+    {
+        ObservedStepKind::Branch
     } else if trimmed.contains("load_")
         || trimmed.contains("save_")
         || trimmed.contains('.')
         || trimmed.contains("::")
     {
         ObservedStepKind::Delegation
-    } else if trimmed.contains("else")
-        || trimmed.starts_with("if ")
-        || trimmed.starts_with("match ")
-    {
+    } else if trimmed.contains("else") {
         ObservedStepKind::Branch
     } else {
         ObservedStepKind::Definition
@@ -725,6 +759,24 @@ pub(super) fn observed_flow_trace_evidence(
         line_text: caller.line_text.clone(),
         step_kind: ObservedStepKind::EntryCall,
     });
+    if let Some((_, caller_content)) = results
+        .iter()
+        .filter(|result| result.tool_name == "read_file")
+        .filter_map(|result| parse_read_file_output(&result.output))
+        .find(|(path, _)| path == &caller.path)
+    {
+        steps.extend(
+            surrounding_body_lines(&caller_content, caller.line_number, 5)
+                .into_iter()
+                .filter(|(_, line)| !line.trim().is_empty())
+                .map(|(line_number, line_text)| ObservedStep {
+                    path: caller.path.clone(),
+                    line_number,
+                    line_text: line_text.clone(),
+                    step_kind: classify_flow_step(&line_text),
+                }),
+        );
+    }
 
     steps.push(ObservedStep {
         path: implementation.primary.path.clone(),

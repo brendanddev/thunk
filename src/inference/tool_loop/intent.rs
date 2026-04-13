@@ -258,6 +258,8 @@ pub(super) fn suggested_search_query(prompt: &str, intent: ToolLoopIntent) -> Op
                 trim_query_suffix(rest, &[" work", " works", " flow", " flow through"]).to_string()
             } else if let Some(rest) = normalized.strip_prefix("explain how ") {
                 trim_query_suffix(rest, &[" works", " work", " flows", " flow"]).to_string()
+            } else if let Some(rest) = normalized.strip_prefix("xplain how ") {
+                trim_query_suffix(rest, &[" works", " work", " flows", " flow"]).to_string()
             } else if let Some(rest) = normalized.strip_prefix("describe how ") {
                 trim_query_suffix(rest, &[" works", " work", " flows", " flow"]).to_string()
             } else if let Some(rest) = normalized.strip_prefix("show me how ") {
@@ -341,6 +343,7 @@ pub(super) fn detect_tool_loop_intent(prompt: &str) -> Option<ToolLoopIntent> {
     if normalized.starts_with("trace how ")
         || normalized.starts_with("how does ")
         || normalized.starts_with("explain how ")
+        || normalized.starts_with("xplain how ")
         || normalized.starts_with("describe how ")
         || normalized.starts_with("show me how ")
         || normalized.starts_with("show how ")

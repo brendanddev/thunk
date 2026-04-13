@@ -122,6 +122,10 @@ fn detect_tool_loop_intent_handles_typoed_where_prompt() {
         Some(ToolLoopIntent::CodeNavigation)
     );
     assert_eq!(
+        detect_tool_loop_intent("xplain how session restore works"),
+        Some(ToolLoopIntent::FlowTrace)
+    );
+    assert_eq!(
         detect_tool_loop_intent("Where is eco mode configged"),
         Some(ToolLoopIntent::ConfigLocate)
     );
@@ -1964,6 +1968,92 @@ fn llama_usage_lookup_bootstrap_reads_real_source_import() {
 }
 
 #[test]
+fn llama_flow_trace_bootstrap_reads_restore_caller_after_store_definition() {
+    let dir = std::env::temp_dir().join("params-tool-loop-flow-bootstrap-restore");
+    let _ = fs::create_dir_all(dir.join("src/inference/session/runtime"));
+    let _ = fs::create_dir_all(dir.join("src/session"));
+    let _ = fs::create_dir_all(dir.join("src/tools"));
+    let _ = fs::write(
+        dir.join("src/session/mod.rs"),
+        concat!(
+            "pub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n",
+            "    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n",
+            "        return Ok(None);\n",
+            "    };\n",
+            "    self.load_session_by_id(&summary.id)\n",
+            "}\n"
+        ),
+    );
+    let _ = fs::write(
+        dir.join("src/inference/session/runtime/core.rs"),
+        concat!(
+            "use crate::session::SessionStore;\n\n",
+            "fn restore_previous_session(store: &SessionStore) {\n",
+            "    match store.load_most_recent() {\n",
+            "        Ok(Some(saved)) => {\n",
+            "            let _ = saved;\n",
+            "        }\n",
+            "        Ok(None) => {}\n",
+            "        Err(_) => {}\n",
+            "    }\n",
+            "}\n"
+        ),
+    );
+    let _ = fs::write(
+        dir.join("src/tools/search.rs"),
+        concat!(
+            "fn search_fixture() {\n",
+            "    let query = \"load_most_recent\";\n",
+            "    walk_and_search(&dir, query, &mut matches).unwrap();\n",
+            "    let example = \"match store.load_most_recent() { Ok(None) => {} }\";\n",
+            "    assert!(example.contains(\"load_most_recent\"));\n",
+            "}\n"
+        ),
+    );
+
+    let (tx, _rx) = mpsc::channel();
+    let results = with_test_cwd(&dir, || {
+        bootstrap_tool_results(
+            ToolLoopIntent::FlowTrace,
+            "Explain how session restore works",
+            None,
+            &[Message::user("Explain how session restore works")],
+            &dir,
+            "llama.cpp · qwen",
+            &ToolRegistry::default(),
+            &tx,
+        )
+    });
+
+    let read_paths = results
+        .iter()
+        .filter(|result| result.tool_name == "read_file")
+        .map(|result| result.argument.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_paths,
+        vec![
+            "src/session/mod.rs",
+            "src/inference/session/runtime/core.rs"
+        ]
+    );
+    assert!(
+        matches!(
+            investigation_readiness(
+                ToolLoopIntent::FlowTrace,
+                "Explain how session restore works",
+                None,
+                &results
+            ),
+            InvestigationReadiness::Ready { .. }
+        ),
+        "flow trace bootstrap should gather cross-file evidence without waiting for another model planning turn"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn anchored_main_followup_guidance_includes_cli_shape_and_startup() {
     let resolution = InvestigationResolution {
         intent: ToolLoopIntent::CodeNavigation,
@@ -2047,9 +2137,49 @@ fn flow_trace_guidance_includes_runtime_caller_and_restore_branches() {
     .expect("guidance");
 
     assert!(guidance.contains("src/inference/session/runtime/core.rs:167"));
+    assert!(guidance.contains("src/inference/session/runtime/core.rs:171"));
     assert!(guidance.contains("src/session/mod.rs:262"));
+    assert!(guidance.contains("list_sessions()?.into_iter().next()"));
+    assert!(guidance.contains("not that it iterates all sessions"));
     assert!(guidance.contains("return Ok(None)"));
     assert!(guidance.contains("load_session_by_id(&summary.id)"));
+}
+
+#[test]
+fn flow_trace_render_fallback_prefers_runtime_caller_and_restore_handoff() {
+    let outcome = investigation_readiness(
+        ToolLoopIntent::FlowTrace,
+        "Explain how session restore works",
+        None,
+        &[
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/inference/session/runtime/core.rs".to_string(),
+                output: "File: src/inference/session/runtime/core.rs\nLines: 6\n\n```\nmatch store.load_most_recent() {\n    Ok(Some(saved)) => {\n        let _ = saved;\n    }\n    Ok(None) => {}\n}\n```\n".to_string(),
+            },
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                argument: "src/session/mod.rs".to_string(),
+                output: "File: src/session/mod.rs\nLines: 5\n\n```\npub fn load_most_recent(&self) -> Result<Option<SavedSession>> {\n    let Some(summary) = self.list_sessions()?.into_iter().next() else {\n        return Ok(None);\n    };\n    self.load_session_by_id(&summary.id)\n}\n```\n".to_string(),
+            },
+        ],
+    );
+    let answer = match outcome {
+        InvestigationReadiness::Ready { evidence, .. } => {
+            render_structured_answer("Explain how session restore works", &evidence)
+        }
+        _ => panic!("expected flow trace evidence"),
+    };
+
+    assert!(answer.contains("src/inference/session/runtime/core.rs:1"));
+    assert!(answer.contains("load_most_recent"));
+    assert!(answer.contains("list_sessions()?.into_iter().next()"));
+    assert!(answer.contains("Ok(None)"));
+    assert!(answer.contains("load_session_by_id(&summary.id)"));
+    assert!(
+        !answer.contains("iterates all sessions"),
+        "fallback should stay close to the observed selection step"
+    );
 }
 
 // ─── Benchmark Regression Tests ───────────────────────────────────────────────

@@ -7,6 +7,7 @@ use super::observe::{
     lookup_search_anchor, observed_definition_evidence, observed_file_summary_evidence,
     observed_flow_trace_evidence, observed_read_paths, observed_reference_lines_from_read_results,
     observed_repo_overview_evidence, preferred_candidate_path, ranked_search_candidates,
+    search_candidates_in_output_order,
 };
 use super::parse::{
     is_definition_like_line, is_internal_tool_loop_path, is_source_path, is_test_like_path,
@@ -271,7 +272,7 @@ pub(crate) fn targeted_investigation_followup(
         }
         ToolLoopIntent::FlowTrace => {
             let read_paths = observed_read_paths(results);
-            let candidate = ranked_search_candidates(intent, prompt, results)
+            let candidate = search_candidates_in_output_order(results)
                 .into_iter()
                 .find(|file| {
                     !read_paths.contains(&file.path)

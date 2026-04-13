@@ -11,7 +11,8 @@ use super::super::super::Message;
 use super::super::intent::{suggested_search_query, ToolLoopIntent};
 use super::observe::{
     lookup_search_anchor, observed_read_paths, preferred_candidate_path, ranked_search_candidates,
-    recent_loaded_file_context_path, should_answer_from_anchor_file,
+    recent_loaded_file_context_path, search_candidates_in_output_order,
+    should_answer_from_anchor_file,
 };
 use super::parse::{is_internal_tool_loop_path, is_legacy_auto_inspect_path};
 use super::readiness::has_relevant_file_evidence;
@@ -74,6 +75,41 @@ fn auto_read_best_caller_candidate(
             if is_call_site { "caller" } else { "usage" },
             candidate.path
         ),
+        false,
+    );
+    let execution = tools.execute_read_only_tool_calls(&format!("[read_file: {}]", candidate.path));
+    let result = execution.results.into_iter().next()?;
+    emit_trace(
+        token_tx,
+        ProgressStatus::Finished,
+        &format!("read_file {}", result.argument),
+        false,
+    );
+    Some(result)
+}
+
+fn auto_read_best_flow_followup_candidate(
+    prompt: &str,
+    tools: &ToolRegistry,
+    existing_results: &[ToolResult],
+    token_tx: &Sender<InferenceEvent>,
+) -> Option<ToolResult> {
+    suggested_search_query(prompt, ToolLoopIntent::FlowTrace)?;
+    let read_paths = observed_read_paths(existing_results);
+
+    let candidate = search_candidates_in_output_order(existing_results)
+        .into_iter()
+        .find(|file| {
+            !read_paths.contains(&file.path)
+                && preferred_candidate_path(ToolLoopIntent::FlowTrace, &file.path)
+                && !is_internal_tool_loop_path(&file.path)
+                && !is_legacy_auto_inspect_path(&file.path)
+        })?;
+
+    emit_trace(
+        token_tx,
+        ProgressStatus::Started,
+        &format!("reading related flow candidate {}...", candidate.path),
         false,
     );
     let execution = tools.execute_read_only_tool_calls(&format!("[read_file: {}]", candidate.path));
@@ -204,6 +240,16 @@ pub(crate) fn bootstrap_tool_results(
     {
         if let Some(read_result) =
             auto_read_best_candidate(intent, prompt, tools, &results, token_tx)
+        {
+            results.push(read_result);
+        }
+    }
+
+    if matches!(intent, ToolLoopIntent::FlowTrace)
+        && !has_relevant_file_evidence(intent, prompt, &results)
+    {
+        if let Some(read_result) =
+            auto_read_best_flow_followup_candidate(prompt, tools, &results, token_tx)
         {
             results.push(read_result);
         }

@@ -85,7 +85,6 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     Some(guard)
 }
 
-/// The main function
 fn main() -> Result<()> {
     config::load_local_env()?;
 

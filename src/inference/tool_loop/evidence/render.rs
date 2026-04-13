@@ -1,5 +1,5 @@
 use super::parse::clip_inline;
-use super::{ObservedLine, ObservedStepKind, StructuredEvidence};
+use super::{ObservedLine, ObservedStep, ObservedStepKind, StructuredEvidence};
 
 fn render_line_ref(line: &ObservedLine) -> String {
     format!("`{}:{}`", line.path, line.line_number)
@@ -11,6 +11,10 @@ fn render_code_ref(line: &ObservedLine) -> String {
         render_line_ref(line),
         clip_inline(&line.line_text, 120)
     )
+}
+
+fn render_step_ref(step: &ObservedStep) -> String {
+    format!("`{}:{}`", step.path, step.line_number)
 }
 
 fn extract_declared_names(lines: &[ObservedLine], prefixes: &[&str], limit: usize) -> Vec<String> {
@@ -287,6 +291,60 @@ pub(crate) fn render_structured_answer(_prompt: &str, evidence: &StructuredEvide
             if steps.is_empty() {
                 return String::new();
             }
+            let entry = evidence
+                .steps
+                .iter()
+                .find(|step| step.step_kind == ObservedStepKind::EntryCall);
+            let selection = evidence.steps.iter().find(|step| {
+                step.line_text
+                    .contains("list_sessions()?.into_iter().next()")
+            });
+            let no_session = evidence.steps.iter().find(|step| {
+                step.line_text.contains("return Ok(None)")
+                    || step.line_text.contains("Ok(None)")
+                    || step.line_text.contains("None =>")
+            });
+            let load_by_id = evidence
+                .steps
+                .iter()
+                .find(|step| step.line_text.contains("load_session_by_id"));
+
+            if entry.is_some()
+                && (selection.is_some() || no_session.is_some() || load_by_id.is_some())
+            {
+                let mut sentences = Vec::new();
+                if let Some(entry) = entry {
+                    sentences.push(format!(
+                        "Session restore starts at {} where the runtime path calls `{}`.",
+                        render_step_ref(entry),
+                        evidence.subject
+                    ));
+                }
+                if let Some(selection) = selection {
+                    sentences.push(format!(
+                        "In {}, `{}` takes the first summary returned by `list_sessions()?.into_iter().next()`.",
+                        render_step_ref(selection),
+                        evidence.subject
+                    ));
+                }
+                if let Some(no_session) = no_session {
+                    sentences.push(format!(
+                        "If no saved session is available, the observed flow hits the no-session branch at {} (`{}`).",
+                        render_step_ref(no_session),
+                        clip_inline(&no_session.line_text, 80)
+                    ));
+                }
+                if let Some(load_by_id) = load_by_id {
+                    sentences.push(format!(
+                        "Otherwise it restores the saved session via `load_session_by_id(&summary.id)` at {}.",
+                        render_step_ref(load_by_id)
+                    ));
+                }
+                if !sentences.is_empty() {
+                    return sentences.join(" ");
+                }
+            }
+
             let mut sentences = Vec::new();
             for step in &steps {
                 let s = match step.step_kind {

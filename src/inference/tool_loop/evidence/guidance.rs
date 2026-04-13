@@ -12,6 +12,62 @@ use super::parse::{
     is_test_like_path, parse_read_file_output, prompt_mentions_tests,
     query_match_lines_with_numbers, surrounding_body_lines,
 };
+use super::{FlowTraceEvidence, ObservedStep, ObservedStepKind};
+
+fn render_step_ref(step: &ObservedStep) -> String {
+    format!("`{}:{}`", step.path, step.line_number)
+}
+
+fn flow_trace_required_facts(evidence: &FlowTraceEvidence) -> Vec<String> {
+    let mut facts = Vec::new();
+
+    if let Some(entry) = evidence
+        .steps
+        .iter()
+        .find(|step| step.step_kind == ObservedStepKind::EntryCall)
+    {
+        facts.push(format!(
+            "Start from {} and state that the runtime restore path calls `{}` there.",
+            render_step_ref(entry),
+            evidence.subject
+        ));
+    }
+
+    if let Some(selection) = evidence.steps.iter().find(|step| {
+        step.line_text
+            .contains("list_sessions()?.into_iter().next()")
+    }) {
+        facts.push(format!(
+            "If you describe session selection, anchor it to {} and say it takes the first summary from `list_sessions()?.into_iter().next()`, not that it iterates all sessions.",
+            render_step_ref(selection)
+        ));
+    }
+
+    if let Some(no_session) = evidence.steps.iter().find(|step| {
+        step.line_text.contains("return Ok(None)")
+            || step.line_text.contains("Ok(None)")
+            || step.line_text.contains("None =>")
+    }) {
+        facts.push(format!(
+            "Mention the no-session branch visible at {} (`{}`).",
+            render_step_ref(no_session),
+            clip_inline(&no_session.line_text, 80)
+        ));
+    }
+
+    if let Some(load_by_id) = evidence
+        .steps
+        .iter()
+        .find(|step| step.line_text.contains("load_session_by_id"))
+    {
+        facts.push(format!(
+            "Mention the successful restore handoff at {} via `load_session_by_id(&summary.id)`.",
+            render_step_ref(load_by_id)
+        ));
+    }
+
+    facts
+}
 
 pub(crate) fn format_tool_loop_results_with_limit(
     intent: ToolLoopIntent,
@@ -199,13 +255,25 @@ pub(crate) fn grounded_answer_guidance(
                     clip_inline(&step.line_text, 120)
                 )
             }));
+            let required_facts = flow_trace_required_facts(&evidence);
+            if !required_facts.is_empty() {
+                sections.push("Required facts to cover:".to_string());
+                sections.extend(
+                    required_facts
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, fact)| format!("  {}. {}", idx + 1, fact)),
+                );
+            }
             sections.push(
                 "Answer from the observed evidence above. Rules:\n\
                  1. Write a SHORT explanation in plain language (2–4 sentences), not a code dump.\n\
-                 2. Connect the runtime caller to the definition and keep the steps in execution order.\n\
-                 3. Mention branch behavior (early return, None path) and the successful handoff if visible.\n\
-                 4. Do not copy raw source lines verbatim into the answer — paraphrase them.\n\
-                 5. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`)."
+                 2. Start from the runtime caller when one is visible, then connect it to the definition in execution order.\n\
+                 3. Mention branch behavior (early return, `Ok(None)`, or `None` path) and the successful handoff if visible.\n\
+                 4. If `list_sessions()?.into_iter().next()` is observed, describe it exactly as taking the first summary returned there — do not say it iterates all sessions.\n\
+                 5. Do not invent storage backends, restore helpers, or session behavior that is not present in the observed lines.\n\
+                 6. Do not copy raw source lines verbatim into the answer — paraphrase them.\n\
+                 7. Do not use hedging words (`presumably`, `likely`, `suggests`, `appears to`, `seems to`, `may`)."
                     .to_string(),
             );
             Some(sections.join("\n"))
