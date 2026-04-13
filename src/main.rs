@@ -24,7 +24,6 @@ use tracing::info;
 #[command(about = "Local-first AI coding assistant")]
 #[command(version)]
 struct Cli {
-    /// An optional one-shot prompt
     prompt: Option<String>,
 
     #[arg(long)]
@@ -34,28 +33,27 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// All the subcommands params supports
 #[derive(Subcommand)]
 enum Command {
-    /// Download a model to .local/models/
+    /// Download a model for local use
     Pull { model: String },
 
-    /// Index a project so params can use it as context
+    /// Index a project for retrieval and repo-aware assistance
     Index {
         #[arg(default_value = ".")]
         path: String,
     },
 
-    /// Run a prompt through both the local model and Claude side by side
+    /// Compare local against provider responses
     Compare { prompt: String },
 
-    /// Show a summary of your benchmark ratings
+    /// Show summary of benchmark ratings
     Bench {
         #[arg(long, default_value = "50")]
         last: usize,
     },
 
-    /// Fine-tune the local model on a project's codebase
+    /// Fine-tune the local model on a projects codebase
     Train {
         #[arg(long, default_value = ".")]
         project: String,
@@ -65,7 +63,7 @@ enum Command {
     LspCheck,
 }
 
-/// Initialises file-based logging to .local/params.log
+/// Initialises file-based logging
 fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = config::log_dir().ok()?;
 
@@ -166,7 +164,7 @@ fn main() -> Result<()> {
                 let backend = inference::load_backend_from_config(&cfg)?;
                 let mut collected = String::new();
 
-                // Spawn generation on a thread, print tokens as they arrive.
+                // Spawn generation on a thread, print tokens as they arrive
                 let handle = std::thread::spawn(move || backend.generate(&messages, tx));
 
                 for event in rx {

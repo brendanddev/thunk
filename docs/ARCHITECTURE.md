@@ -18,7 +18,7 @@ At a high level, a normal interactive turn looks like this:
 
 1. `src/main.rs` parses CLI arguments and launches either one-shot mode or the TUI.
 2. `src/tui/` owns input handling, transcript state, rendering, command launcher behavior, approvals, and activity traces.
-3. `src/inference/session/runtime.rs` runs the long-lived session loop:
+3. `src/inference/session/runtime.rs` is the stable facade for the long-lived session loop, with the implementation split under `src/inference/session/runtime/`:
    - loads config and backend
    - manages session restore/save
    - routes user prompts
@@ -27,6 +27,7 @@ At a high level, a normal interactive turn looks like this:
 4. `src/inference/tool_loop.rs` runs bounded read-only repo investigations.
 5. `src/tools/` executes file, search, git, web, LSP, shell, write, and edit tools.
 6. `src/memory/` and `src/session/` provide compression, index, durable facts, and saved conversation persistence.
+7. `skills/` provides tracked markdown skill guidance that the runtime can inject for repo-navigation and benchmark-oriented turns.
 
 ## Main Subsystems
 
@@ -34,12 +35,14 @@ At a high level, a normal interactive turn looks like this:
 
 - `src/main.rs`
 - `src/config.rs`
+- `src/skills.rs`
 
 Responsibilities:
 - parse arguments
 - load config and profile overrides
 - choose TUI vs one-shot mode
 - initialize logging
+- inject built-in skill guidance for matching turns
 
 Important note:
 - the clap command name is `params`, but the Cargo package name is currently `params-cli`
@@ -48,6 +51,7 @@ Important note:
 ### Session Runtime
 
 - `src/inference/session/runtime.rs`
+- `src/inference/session/runtime/`
 - `src/inference/session/investigation.rs`
 - `src/inference/session/memory.rs`
 
@@ -66,7 +70,7 @@ The current design goal is:
 
 - `src/inference/tool_loop.rs`
 - `src/inference/tool_loop/evidence.rs`
-- `src/inference/tool_loop/intent.rs`
+- `src/inference/tool_loop/evidence/`
 - `src/inference/tool_loop/prompting.rs`
 - `src/inference/tool_loop/parse.rs`
 
@@ -114,6 +118,8 @@ Backends currently supported:
 - `src/tui/state/`
 - `src/tui/renderer/`
 - `src/tui/commands.rs`
+- `src/tui/commands/`
+- `src/tui/renderer/paint/`
 
 Responsibilities:
 - terminal event loop
@@ -147,6 +153,7 @@ Important safety boundary:
 - `src/memory/compression.rs`
 - `src/memory/index.rs`
 - `src/memory/facts.rs`
+- `src/memory/facts/`
 - `src/session/mod.rs`
 
 Current layers:
@@ -156,6 +163,7 @@ Current layers:
 - saved session history in SQLite
 
 Stored state currently lives under `.local/`.
+Tracked built-in skill guidance lives under `skills/`.
 
 ## Technical Turn Flow
 
@@ -192,9 +200,10 @@ Mutating actions:
 
 ## Current Architectural Pressure Points
 
-- `src/inference/tool_loop/evidence.rs` is still dense and central to answer quality
+- `src/inference/tool_loop/` is still the hardest subsystem to keep both fast and accurate, especially evidence readiness and final synthesis behavior
 - the tool loop is the hardest subsystem to keep both fast and accurate
-- some older hidden auto-inspection code still exists for reference/legacy coverage in `src/inference/session/auto_inspect.rs`
+- session persistence is still fairly centralized in `src/session/mod.rs`
+- some older hidden auto-inspection code still exists for reference/legacy coverage in `src/inference/session/auto_inspect/`
 - benchmark coverage and live eval tooling still need to mature
 
 ## Key Files To Read First
@@ -204,11 +213,14 @@ If you are new to the codebase, start here:
 1. `src/main.rs`
 2. `src/inference/session/runtime.rs`
 3. `src/inference/session/investigation.rs`
-4. `src/inference/tool_loop.rs`
-5. `src/inference/tool_loop/evidence.rs`
-6. `src/tui/app.rs`
-7. `src/tui/state/`
-8. `src/tools/mod.rs`
+4. `src/inference/session/runtime/core.rs`
+5. `src/inference/session/runtime/turns.rs`
+6. `src/inference/tool_loop.rs`
+7. `src/inference/tool_loop/evidence/observe.rs`
+8. `src/skills.rs`
+9. `src/tui/app.rs`
+10. `src/tui/renderer/paint/transcript.rs`
+11. `src/tools/mod.rs`
 
 ## Near-Term Direction
 

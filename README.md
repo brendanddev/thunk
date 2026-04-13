@@ -17,10 +17,11 @@ Switch backends by editing `.local/config.toml`.
 - Streaming custom-rendered TUI with a framebuffer/diff renderer, calmer terminal-native layout, a single-row runtime status bar with no divider chrome, a transient activity trace that appears near the prompt when the model is working, a shared left-margin transcript gutter that anchors conversation flow, responsive resize-aware layout, multiline input, slash commands, autocomplete, collapsible tool/context transcript rows, reverse history search, and inline prompt-adjacent approvals
 - `llama_cpp`, `ollama`, and `openai_compat` backends
 - Read-only tools: file read, directory listing, search, git, web fetch, Rust LSP diagnostics
-- Tool-first repo/code navigation: repo-understanding and code-navigation questions now enter a bounded read-only search/read/list/git/LSP loop with visible `Thinking:` and step traces, and the final answer is model-written from observed tool output
+- Tool-first repo/code navigation: repo-understanding and code-navigation questions now enter a bounded read-only search/read/list/git/LSP loop with prompt-adjacent activity traces, and the final answer is synthesized from observed tool evidence instead of plain chat fallback
 - Mutating tools with approval: shell commands, targeted file edits, and whole-file writes with diff preview
 - Policy sandbox and inspection: project-only read scope, richer approval previews, destructive shell blocking, and private-network fetch blocking
 - Three-level memory: session compression, incremental project index maintenance, prompt-aware fact retrieval, selective prior-session recall, and cross-session facts with verified per-turn promotion, provenance tags, observability, deduplication, TTL pruning, and per-project cap
+- Built-in markdown-driven skills: repo navigation and benchmark evaluation guidance now ship in the tracked `skills/` folder and are injected automatically for matching turns
 - Budget tracking, per-turn timing in the sidebar, reflection toggle, and eco mode
 - Structured logging to `.local/params.log`
 - Response caching for repeated generations: exact full-context hits, prompt-level fallback, and lightweight semantic reuse for plain chat turns, with TTL + project-change invalidation and `/clear-cache`
@@ -83,13 +84,15 @@ Set `backend = "openai_compat"` and configure `[openai_compat]` for Groq, OpenAI
 
 **5. Run**
 ```bash
-cargo run --release
-# or after installing:
-params
+cargo run --release --
+# or after installing with Cargo:
+params-cli
 
 # start fresh without restoring the most recent saved session
-params --no-resume
+params-cli --no-resume
 ```
+
+If you prefer typing `params`, add a shell alias for `params-cli`.
 
 **Optional bootstrap helpers**
 ```bash
@@ -189,7 +192,7 @@ You can commit `.params.toml` to share project settings with collaborators, or a
 
 ### Project indexing
 
-`params index .` now works incrementally:
+`cargo run --release -- index .` now works incrementally, and the installed binary form is `params-cli index .` unless you alias it:
 - indexes only changed or new indexable files
 - removes stale rows for deleted files
 - skips oversized files
@@ -202,10 +205,10 @@ During normal TUI use, params also maintains the project index in the background
 
 ```bash
 # Open the TUI
-params
+params-cli
 
 # One-shot prompt
-params "explain what this function does"
+params-cli "explain what this function does"
 ```
 
 **TUI keybindings:**
@@ -257,7 +260,7 @@ Safety behavior:
 
 Session behavior:
 - params resumes the most recently opened session for the current project by default
-- `params --no-resume` starts a fresh unnamed session without deleting saved sessions
+- `params-cli --no-resume` starts a fresh unnamed session without deleting saved sessions
 - session selectors accept either an exact real session name or a unique id prefix from `/sessions list`
 - `/sessions list` now marks the current session clearly and shows compact selector-friendly ids inline
 - exported session transcripts are written under `.local/exports/sessions/`
@@ -348,59 +351,80 @@ Notes:
 ## Current Stubs
 
 These CLI surfaces exist but are still scaffolding, not finished features:
-- `params compare`
-- `params bench`
-- `params train`
+- `params-cli compare`
+- `params-cli bench`
+- `params-cli train`
 
 ---
 
 ## Project structure
 
 ```
+skills/
+  repo-navigation/        — built-in markdown guidance for technical repo turns
+  benchmark-evaluator/    — built-in markdown guidance for benchmark/eval turns
+
 src/
-  main.rs            — CLI entry point, argument routing
-  commands.rs        — built-in slash metadata and custom command registry
-  cache/             — exact response cache
-  config.rs          — config facade and core config types
-  config/            — config loading, .local helpers, project profile merge logic
-  error.rs           — unified error type
-  events.rs          — shared channel event types
-  safety.rs          — policy sandbox and typed request inspection
+  main.rs                 — CLI entry point, argument routing
+  commands.rs             — built-in slash metadata and custom command registry
+  skills.rs               — built-in skill loading and prompt injection
+  cache/                  — exact response cache
+  config.rs               — config facade and core config types
+  config/                 — config loading, .local helpers, project profile merge logic
+  error.rs                — unified error type
+  events.rs               — shared channel event types
+  safety.rs               — public safety facade
+  safety/
+    types.rs              — safety/report types
+    paths.rs              — project-scoped path inspection
+    shell.rs              — shell policy inspection
+    network.rs            — fetch/provider URL inspection
   inference/
-    mod.rs           — public facade, backend loading, session command API
-    backend.rs       — InferenceBackend trait
-    session.rs       — thin facade for the session runtime submodules
+    mod.rs                — public facade, backend loading, session command API
+    session.rs            — thin facade for the session runtime submodules
     session/
-      runtime.rs     — model thread + live session lifecycle orchestration
-      memory.rs      — session-memory retrieval/update helpers
-      support.rs     — session persistence/list/export/reset helpers
-      auto_inspect.rs — legacy hidden auto-inspection helpers and tests
-    budget.rs        — budget/cache accounting helpers
-    cache.rs         — exact/prompt/semantic cache helpers
-    approval.rs      — approval flow helpers
-    indexing.rs      — idle incremental indexing helpers
-    reflection.rs    — hidden reflection helpers
-    runtime.rs       — traces and generation/runtime helpers
-    llama_cpp.rs     — llama.cpp implementation
-    ollama.rs        — Ollama HTTP implementation
-    openai_compat.rs — OpenAI-compatible API implementation
-  tools/             — tool registry and built-in tools
-  tools/lsp/         — rust-analyzer probing, transport, parsing, and formatting helpers
+      runtime.rs          — runtime facade
+      runtime/            — live session loop split by concern
+      investigation.rs    — technical-turn routing and anchor tracking
+      memory.rs           — retrieval/update helpers
+      support.rs          — session persistence/list/export/reset helpers
+      auto_inspect.rs     — legacy facade for older hidden inspection helpers
+      auto_inspect/       — older auto-inspection internals and tests
+    tool_loop.rs          — bounded read-only repo investigation loop
+    tool_loop/
+      evidence.rs         — evidence facade
+      evidence/           — evidence extraction, readiness, bootstrap, rendering
+      parse.rs            — tool-call parsing
+      prompting.rs        — tool-loop system/final-answer prompting
+    budget.rs             — budget/cache accounting helpers
+    cache.rs              — exact/prompt/semantic cache helpers
+    approval.rs           — approval flow helpers
+    indexing.rs           — idle incremental indexing helpers
+    runtime.rs            — traces and generation/runtime helpers
+    reflection.rs         — hidden reflection helpers
+    llama_cpp.rs          — llama.cpp implementation
+    ollama.rs             — Ollama HTTP implementation
+    openai_compat.rs      — OpenAI-compatible API implementation
+  tools/                  — tool registry and built-in tools
+  tools/lsp/              — rust-analyzer probing, transport, parsing, and formatting helpers
   memory/
-    compression.rs   — session compression for long histories
-    retrieval.rs     — shared retrieval scoring/normalization helpers
-    index.rs         — project file summary index
-    facts.rs         — cross-session fact store and consolidation
+    compression.rs        — session compression for long histories
+    retrieval.rs          — shared retrieval scoring/normalization helpers
+    index.rs              — project file summary index
+    facts.rs              — durable-facts facade
+    facts/                — fact storage, prompting, filtering, and tests
+  session/
+    mod.rs                — saved-session persistence and export
   tui/
-    mod.rs           — terminal setup/cleanup and public TUI entrypoints
-    app.rs           — event loop and keyboard handling
-    commands.rs      — built-in/custom slash command dispatch
-    renderer/        — custom framebuffer, layout, paint, and diff renderer
-    format.rs        — display sanitization helpers
-    state.rs         — thin facade for AppState submodules
-    state/
-      input.rs       — input editing, history, reverse search, autocomplete
-      runtime.rs     — transcript, status, pending-action, and timer state updates
-      helpers.rs     — transcript formatting and state support helpers
-      tests.rs       — AppState regression coverage
+    mod.rs                — terminal setup/cleanup and public TUI entrypoints
+    app.rs                — event loop and keyboard handling
+    commands.rs           — slash-command dispatch facade
+    commands/             — slash-command parsing and display helpers
+    renderer/             — custom framebuffer, layout, paint, and diff renderer
+    renderer/paint/       — transcript/composer/approval paint helpers
+    format.rs             — display sanitization helpers
+    state.rs              — thin facade for AppState submodules
+    state/                — input/runtime/helper state modules
 ```
+
+Several top-level files like `safety.rs`, `src/memory/facts.rs`, `src/inference/session/runtime.rs`, and `src/tui/renderer/paint.rs` are now intentionally small facades over focused submodules. That keeps the public module paths stable while making the implementation easier to maintain.

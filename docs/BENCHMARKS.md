@@ -167,6 +167,8 @@ The first recorded baseline for this document is:
 
 This baseline is useful because it captures the project after a large repo-navigation/runtime refactor, but before the behavior feels consistently trustworthy in live use.
 
+Treat it as a recorded behavioral baseline, not a guarantee that the latest worktree still behaves exactly the same. Structural cleanup and modularization can land between benchmark runs without changing the version string.
+
 ### High-Level Summary
 
 - Repo overview is fast and grounded, but it feels templated and does not visibly stream.

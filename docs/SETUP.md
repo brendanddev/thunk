@@ -81,6 +81,8 @@ Important note:
 
 If you want a shell shortcut today, add an alias, or add an explicit Cargo binary name later.
 
+The repo also ships tracked built-in skill guidance under `skills/`. Those files are part of the project and are separate from `.local/`, which is still reserved for machine-local config, cache, logs, and state.
+
 ---
 
 ## Backend Setup
@@ -154,6 +156,8 @@ Use:
 After setup, validate these basics:
 
 1. start the TUI successfully
+   - `cargo run --release --`
+   - or `params-cli` if installed
 2. confirm the selected backend responds
 3. run `/read src/main.rs`
 4. ask `What does this file do?`

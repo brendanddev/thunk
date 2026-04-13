@@ -1,5 +1,6 @@
 use super::*;
 use crate::inference::session::memory::suppress_retrieval_for_auto_inspection;
+use crate::tools::ToolResult;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};

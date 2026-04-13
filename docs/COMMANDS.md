@@ -22,6 +22,7 @@ Important note:
 - the clap command name is `params`
 - the Cargo package name is currently `params-cli`
 - unless an explicit Cargo binary name is added, your installed executable will usually be `params-cli`
+- the examples below use `cargo run --release -- ...` for consistency; if you install locally, substitute `params-cli ...`
 
 ### One-Shot Prompt
 
@@ -157,6 +158,19 @@ new text
 >>>>>>> REPLACE
 ```
 ````
+
+---
+
+## Implementation Map
+
+The command system is currently split like this:
+
+- `src/commands.rs`: built-in command metadata and custom command registry/loading
+- `src/tui/commands.rs`: slash-command dispatch facade
+- `src/tui/commands/parse.rs`: argument/body parsing helpers
+- `src/tui/commands/display.rs`: status/help/memory formatting helpers
+
+Custom slash commands still live in `.local/commands.toml`.
 
 ---
 

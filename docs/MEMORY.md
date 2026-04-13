@@ -43,6 +43,9 @@ Current behavior:
 
 Relevant files:
 - `src/memory/facts.rs`
+- `src/memory/facts/store.rs`
+- `src/memory/facts/quality.rs`
+- `src/memory/facts/prompting.rs`
 - `src/inference/session/memory.rs`
 
 Purpose:
@@ -53,6 +56,9 @@ Current behavior:
 - verified facts are preferred over legacy ones
 - irrelevant/generic facts can be pruned
 - TTL and project caps apply
+
+Implementation note:
+- `src/memory/facts.rs` is now a facade; storage, fact-quality filtering, and extraction-prompt construction live in the split `src/memory/facts/` submodules
 
 ---
 
