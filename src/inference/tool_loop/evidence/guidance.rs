@@ -65,9 +65,11 @@ fn flow_trace_required_facts(evidence: &FlowTraceEvidence) -> Vec<String> {
         ));
     }
 
-    if let Some(no_session_return) = evidence.steps.iter().find(|step| {
-        step.line_text.contains("return Ok(None)")
-    }) {
+    if let Some(no_session_return) = evidence
+        .steps
+        .iter()
+        .find(|step| step.line_text.contains("return Ok(None)"))
+    {
         facts.push(format!(
             "Mention the no-session return inside `{}` at {} (`{}`).",
             evidence.subject,

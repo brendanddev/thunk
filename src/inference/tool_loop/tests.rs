@@ -2181,7 +2181,8 @@ fn anchored_main_followup_guidance_includes_cli_shape_and_startup() {
     assert!(guidance.contains("enum Command"));
     assert!(guidance.contains("Cli::parse()"));
     assert!(guidance.contains("match cli.command"));
-    assert!(guidance.contains("focus on them instead of unrelated helper functions or module declarations"));
+    assert!(guidance
+        .contains("focus on them instead of unrelated helper functions or module declarations"));
     assert!(guidance.contains("Do not infer hidden subcommands or describe logging setup, indexing behavior, benchmarking behavior"));
 }
 

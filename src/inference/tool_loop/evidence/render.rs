@@ -296,7 +296,8 @@ pub(crate) fn render_structured_answer(_prompt: &str, evidence: &StructuredEvide
                 evidence.steps.iter().find(|step| {
                     step.path == entry.path
                         && step.line_number != entry.line_number
-                        && (step.line_text.contains("Ok(None)") || step.line_text.contains("None =>"))
+                        && (step.line_text.contains("Ok(None)")
+                            || step.line_text.contains("None =>"))
                 })
             });
             let return_no_session = evidence

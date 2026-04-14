@@ -367,26 +367,75 @@ pub(super) fn first_non_empty_lines(content: &str, limit: usize) -> Vec<(usize, 
 }
 
 pub(super) fn declaration_lines_with_numbers(content: &str, limit: usize) -> Vec<(usize, String)> {
-    content
-        .lines()
-        .enumerate()
-        .map(|(idx, line)| (idx + 1, line.trim()))
-        .filter(|(_, line)| {
-            !line.is_empty()
-                && (line.starts_with("pub struct ")
-                    || line.starts_with("struct ")
-                    || line.starts_with("pub enum ")
-                    || line.starts_with("enum ")
-                    || line.starts_with("pub fn ")
-                    || line.starts_with("fn ")
-                    || line.starts_with("impl ")
-                    || line.starts_with("mod ")
-                    || line.starts_with("pub mod ")
-                    || line.starts_with("use "))
-        })
-        .take(limit)
-        .map(|(line_number, line)| (line_number, line.to_string()))
-        .collect()
+    let declaration_prefixes = [
+        "pub struct ",
+        "struct ",
+        "pub enum ",
+        "enum ",
+        "pub fn ",
+        "fn ",
+        "impl ",
+        "mod ",
+        "pub mod ",
+        "use ",
+    ];
+    let boundary_markers = ["#[cfg(test)]", "mod tests {", "#[cfg(all(test", "#[rstest]"];
+
+    let mut lines = Vec::new();
+    let mut in_test_region = false;
+    let mut brace_depth = 0isize;
+    let mut skip_until_brace_close = false;
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        let line_number = idx + 1;
+
+        if !in_test_region {
+            for marker in &boundary_markers {
+                if line.starts_with(marker) {
+                    in_test_region = true;
+                    break;
+                }
+            }
+        }
+
+        if in_test_region {
+            continue;
+        }
+
+        if skip_until_brace_close {
+            brace_depth += line.matches('{').count() as isize;
+            brace_depth -= line.matches('}').count() as isize;
+            if brace_depth <= 0 {
+                skip_until_brace_close = false;
+                brace_depth = 0;
+            }
+            continue;
+        }
+
+        if !line.is_empty() {
+            let is_decl = declaration_prefixes.iter().any(|p| line.starts_with(p));
+            if is_decl {
+                lines.push((line_number, line.to_string()));
+
+                if line.contains('{') {
+                    skip_until_brace_close = true;
+                    brace_depth =
+                        line.matches('{').count() as isize - line.matches('}').count() as isize;
+                    if brace_depth > 0 && line.ends_with('}') {
+                        skip_until_brace_close = false;
+                        brace_depth = 0;
+                    }
+                }
+
+                if lines.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    lines
 }
 
 pub(super) fn compact_read_file_result(

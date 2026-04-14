@@ -283,11 +283,49 @@ pub(super) fn ranked_search_candidates(
     ranked
 }
 
-pub(super) fn observed_read_paths(results: &[ToolResult]) -> HashSet<String> {
+fn normalize_read_path(path: &str) -> String {
+    let path = path.split(':').next().unwrap_or(path);
+    let normalized = path.replace("\\", "/");
+    if let Some(stripped) = normalized.strip_prefix("./") {
+        stripped.to_string()
+    } else {
+        normalized
+    }
+}
+
+pub(super) fn all_search_candidate_paths(
+    intent: ToolLoopIntent,
+    prompt: &str,
+    results: &[ToolResult],
+) -> Vec<String> {
+    ranked_search_candidates(intent, prompt, results)
+        .into_iter()
+        .filter(|file| {
+            is_source_path(&file.path)
+                && !is_test_like_path(&file.path)
+                && !is_internal_tool_loop_path(&file.path)
+                && !is_legacy_auto_inspect_path(&file.path)
+        })
+        .map(|file| file.path)
+        .collect()
+}
+
+pub(crate) fn all_candidates_fully_read(
+    intent: ToolLoopIntent,
+    prompt: &str,
+    results: &[ToolResult],
+) -> bool {
+    let candidates = all_search_candidate_paths(intent, prompt, results);
+    let read_paths = observed_read_paths(results);
+
+    candidates.iter().all(|path| read_paths.contains(path)) && !candidates.is_empty()
+}
+
+pub(crate) fn observed_read_paths(results: &[ToolResult]) -> HashSet<String> {
     results
         .iter()
         .filter(|result| result.tool_name == "read_file")
-        .map(|result| result.argument.clone())
+        .map(|result| normalize_read_path(&result.argument))
         .collect()
 }
 
