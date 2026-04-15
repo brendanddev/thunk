@@ -18,7 +18,7 @@ use super::super::super::runtime::{
 };
 use super::super::super::tool_loop::run_read_only_tool_loop_with_resolution;
 use super::super::super::Message;
-use super::super::investigation::resolve_agentic_repo_turn;
+use super::super::super::investigation::{resolve_agentic_repo_turn, InvestigationResolution};
 use super::super::memory::{
     apply_memory_update, clear_memory_retrieval, collect_retrieval_bundle, emit_memory_state,
     memory_fact_lines, retrieval_trace_label, set_memory_retrieval,
@@ -60,118 +60,7 @@ pub(super) fn handle_submit_user(
     let tool_loop_resolution = resolve_agentic_repo_turn(&prompt, &state.investigation_state);
 
     if let Some(resolution) = tool_loop_resolution {
-        let intent = resolution.intent;
-        clear_memory_retrieval(&mut state.memory_state);
-        state.memory_state.last_update = None;
-        emit_memory_state(ctx.token_tx, &state.memory_state);
-        ctx.hooks
-            .dispatch(HookEvent::MemorySummariesSelected { summary_count: 0 });
-        state.set_chat_system_prompt(ctx, &prompt, &[], &[], &[]);
-        compression::compress_history(
-            &mut state.session_messages,
-            state.eco_enabled,
-            state.investigation_state.compression_context().as_ref(),
-        );
-
-        let mut tool_loop_messages = state.session_messages.clone();
-        if let Some(summary) = state.investigation_state.summary_message() {
-            let insert_at = tool_loop_messages.len().saturating_sub(1);
-            tool_loop_messages.insert(insert_at, summary);
-        }
-
-        let mut turn_memory = TurnMemoryEvidence::new(prompt.clone(), Vec::new());
-        ctx.hooks.dispatch(HookEvent::BeforeGeneration {
-            backend: ctx.backend.name(),
-            message_count: tool_loop_messages.len(),
-            eco: state.eco_enabled,
-            reflection: state.reflection_enabled,
-        });
-
-        match run_read_only_tool_loop_with_resolution(
-            intent,
-            &prompt,
-            Some(&resolution),
-            &tool_loop_messages,
-            ctx.backend,
-            ctx.tools,
-            ctx.cfg,
-            ctx.project_root,
-            ctx.token_tx,
-            None,
-            &mut state.cache_stats,
-            &mut state.budget,
-            state.eco_enabled,
-            state.reflection_enabled,
-        ) {
-            Ok(outcome) => {
-                state.investigation_state.note_tool_loop_outcome(
-                    intent,
-                    &prompt,
-                    &outcome.tool_results,
-                );
-                for result in &outcome.tool_results {
-                    ctx.hooks.dispatch(HookEvent::ToolExecuted {
-                        tool_name: result.tool_name.clone(),
-                        argument_chars: result.argument.chars().count(),
-                        result_chars: result.output.chars().count(),
-                    });
-                    turn_memory.record_tool_result(
-                        result.tool_name.clone(),
-                        result.argument.clone(),
-                        result.output.clone(),
-                        false,
-                    );
-                }
-                turn_memory.set_final_response(outcome.final_response.clone());
-                if !outcome.final_response.trim().is_empty() {
-                    if !state.reflection_enabled && !outcome.streamed_final_response {
-                        emit_buffered_tokens(ctx.token_tx, &outcome.final_response);
-                    }
-                    log_debug_response(
-                        state.debug_logging_enabled,
-                        &outcome.final_response,
-                        debug_log::ResponseSource::Live,
-                    );
-                    state
-                        .session_messages
-                        .push(Message::assistant(&outcome.final_response));
-                }
-                ctx.hooks.dispatch(HookEvent::AfterGeneration {
-                    backend: ctx.backend.name(),
-                    response_chars: outcome.final_response.chars().count(),
-                    from_cache: false,
-                    elapsed_ms: 0,
-                });
-                emit_trace(
-                    ctx.token_tx,
-                    ProgressStatus::Finished,
-                    "answer ready",
-                    false,
-                );
-                if let Some(store) = ctx.fact_store {
-                    let update =
-                        store.verify_and_store_turn(ctx.project_name, &turn_memory, ctx.backend);
-                    apply_memory_update(ctx.token_tx, ctx.hooks, &mut state.memory_state, update);
-                }
-                save_session(
-                    ctx.session_store,
-                    &mut state.active_session,
-                    &state.session_messages,
-                    &ctx.backend.name(),
-                    ctx.token_tx,
-                );
-                let _ = ctx.token_tx.send(InferenceEvent::Done);
-            }
-            Err(e) => {
-                emit_trace(
-                    ctx.token_tx,
-                    ProgressStatus::Failed,
-                    "tool loop failed",
-                    false,
-                );
-                let _ = ctx.token_tx.send(InferenceEvent::Error(e.to_string()));
-            }
-        }
+        dispatch_repo_turn(ctx, state, &prompt, resolution);
         return;
     }
 
@@ -573,6 +462,129 @@ pub(super) fn handle_submit_user(
                 ctx.token_tx,
             );
             let _ = ctx.token_tx.send(InferenceEvent::Done);
+        }
+    }
+}
+
+/// Handles a user turn that has been classified as a repo-investigation request.
+/// Extracted from handle_submit_user so the investigation dispatch path is a
+/// named, self-contained unit separate from the general-purpose chat path.
+fn dispatch_repo_turn(
+    ctx: &RuntimeContext<'_>,
+    state: &mut RuntimeState,
+    prompt: &str,
+    resolution: InvestigationResolution,
+) {
+    let intent = resolution.intent;
+    clear_memory_retrieval(&mut state.memory_state);
+    state.memory_state.last_update = None;
+    emit_memory_state(ctx.token_tx, &state.memory_state);
+    ctx.hooks
+        .dispatch(HookEvent::MemorySummariesSelected { summary_count: 0 });
+    state.set_chat_system_prompt(ctx, prompt, &[], &[], &[]);
+    compression::compress_history(
+        &mut state.session_messages,
+        state.eco_enabled,
+        state.investigation_state.compression_context().as_ref(),
+    );
+
+    let mut tool_loop_messages = state.session_messages.clone();
+    if let Some(summary) = state.investigation_state.summary_message() {
+        let insert_at = tool_loop_messages.len().saturating_sub(1);
+        tool_loop_messages.insert(insert_at, summary);
+    }
+
+    let mut turn_memory = TurnMemoryEvidence::new(prompt.to_string(), Vec::new());
+    ctx.hooks.dispatch(HookEvent::BeforeGeneration {
+        backend: ctx.backend.name(),
+        message_count: tool_loop_messages.len(),
+        eco: state.eco_enabled,
+        reflection: state.reflection_enabled,
+    });
+
+    match run_read_only_tool_loop_with_resolution(
+        intent,
+        prompt,
+        Some(&resolution),
+        &tool_loop_messages,
+        ctx.backend,
+        ctx.tools,
+        ctx.cfg,
+        ctx.project_root,
+        ctx.token_tx,
+        None,
+        &mut state.cache_stats,
+        &mut state.budget,
+        state.eco_enabled,
+        state.reflection_enabled,
+    ) {
+        Ok(outcome) => {
+            state.investigation_state.note_tool_loop_outcome(
+                intent,
+                prompt,
+                &outcome.tool_results,
+            );
+            for result in &outcome.tool_results {
+                ctx.hooks.dispatch(HookEvent::ToolExecuted {
+                    tool_name: result.tool_name.clone(),
+                    argument_chars: result.argument.chars().count(),
+                    result_chars: result.output.chars().count(),
+                });
+                turn_memory.record_tool_result(
+                    result.tool_name.clone(),
+                    result.argument.clone(),
+                    result.output.clone(),
+                    false,
+                );
+            }
+            turn_memory.set_final_response(outcome.final_response.clone());
+            if !outcome.final_response.trim().is_empty() {
+                if !state.reflection_enabled && !outcome.streamed_final_response {
+                    emit_buffered_tokens(ctx.token_tx, &outcome.final_response);
+                }
+                log_debug_response(
+                    state.debug_logging_enabled,
+                    &outcome.final_response,
+                    debug_log::ResponseSource::Live,
+                );
+                state
+                    .session_messages
+                    .push(Message::assistant(&outcome.final_response));
+            }
+            ctx.hooks.dispatch(HookEvent::AfterGeneration {
+                backend: ctx.backend.name(),
+                response_chars: outcome.final_response.chars().count(),
+                from_cache: false,
+                elapsed_ms: 0,
+            });
+            emit_trace(
+                ctx.token_tx,
+                ProgressStatus::Finished,
+                "answer ready",
+                false,
+            );
+            if let Some(store) = ctx.fact_store {
+                let update =
+                    store.verify_and_store_turn(ctx.project_name, &turn_memory, ctx.backend);
+                apply_memory_update(ctx.token_tx, ctx.hooks, &mut state.memory_state, update);
+            }
+            save_session(
+                ctx.session_store,
+                &mut state.active_session,
+                &state.session_messages,
+                &ctx.backend.name(),
+                ctx.token_tx,
+            );
+            let _ = ctx.token_tx.send(InferenceEvent::Done);
+        }
+        Err(e) => {
+            emit_trace(
+                ctx.token_tx,
+                ProgressStatus::Failed,
+                "tool loop failed",
+                false,
+            );
+            let _ = ctx.token_tx.send(InferenceEvent::Error(e.to_string()));
         }
     }
 }

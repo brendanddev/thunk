@@ -20,135 +20,13 @@ use super::cache::{generate_with_cache, CacheMode};
 use super::runtime::{
     emit_buffered_tokens, emit_generation_started, emit_trace, run_and_collect_with_stream_guard,
 };
-use super::session::investigation::InvestigationResolution;
+use super::investigation::InvestigationResolution;
 use super::{InferenceBackend, Message};
-use evidence::observe::observed_read_paths;
 use evidence::{
     bootstrap_tool_results, format_tool_loop_results_with_limit, grounded_answer_guidance,
-    investigation_outcome, render_structured_answer, InvestigationOutcome, StructuredEvidence,
+    investigation_outcome, render_structured_answer, validate_final_answer, InvestigationOutcome,
 };
 pub(super) use intent::ToolLoopIntent;
-
-fn validate_final_answer(
-    answer: &str,
-    evidence: &evidence::StructuredEvidence,
-    results: &[ToolResult],
-) -> bool {
-    if answer.trim().len() < 12 {
-        return false;
-    }
-
-    let read_paths_set: std::collections::HashSet<String> = observed_read_paths(results);
-
-    match evidence {
-        evidence::StructuredEvidence::FileSummary(fe) => {
-            let all_paths: Vec<String> = read_paths_set.iter().cloned().collect();
-            let mut valid = !fe.declarations().is_empty();
-            for line in fe.declarations() {
-                let path_str = line.path().to_string();
-                let path_part = path_str.split(':').next().unwrap_or(&path_str).to_string();
-                if !all_paths.contains(&path_part) {
-                    valid = false;
-                    break;
-                }
-            }
-            valid
-        }
-        evidence::StructuredEvidence::Implementation(ie) => {
-            let path_str = ie.primary().path().to_string();
-            let path_part = path_str.split(':').next().unwrap_or(&path_str).to_string();
-            read_paths_set.contains(&path_part) && ie.primary().line_number() > 0
-        }
-        evidence::StructuredEvidence::Config(ce) => {
-            let mut valid = !ce.lines().is_empty();
-            for line in ce.lines() {
-                let path_str = line.path().to_string();
-                if !path_str.contains("config") && !read_paths_set.contains(&path_str) {
-                    valid = false;
-                    break;
-                }
-            }
-            valid
-        }
-        evidence::StructuredEvidence::CallSites(cse) => {
-            let mut valid = !cse.sites().is_empty();
-            for line in cse.sites() {
-                let path_str = line.path().to_string();
-                let path_part = path_str.split(':').next().unwrap_or(&path_str).to_string();
-                if !read_paths_set.contains(&path_part) {
-                    valid = false;
-                    break;
-                }
-            }
-            valid
-        }
-        evidence::StructuredEvidence::Usages(ue) => {
-            let mut valid = !ue.usages().is_empty();
-            for line in ue.usages() {
-                let path_str = line.path().to_string();
-                let path_part = path_str.split(':').next().unwrap_or(&path_str).to_string();
-                if !read_paths_set.contains(&path_part) {
-                    valid = false;
-                    break;
-                }
-            }
-            valid
-        }
-        evidence::StructuredEvidence::FlowTrace(fte) => {
-            let mut valid = !fte.steps().is_empty();
-            for step in fte.steps() {
-                let path_str = step.path().to_string();
-                if !read_paths_set.contains(&path_str) {
-                    valid = false;
-                    break;
-                }
-            }
-            if valid {
-                valid = validate_session_restore_trace(fte, results);
-            }
-            valid
-        }
-        evidence::StructuredEvidence::RepoOverview(_) => true,
-    }
-}
-
-fn validate_session_restore_trace(
-    fte: &evidence::FlowTraceEvidence,
-    results: &[ToolResult],
-) -> bool {
-    let subject_lower = fte.subject().to_ascii_lowercase();
-    if !subject_lower.contains("session") && !subject_lower.contains("restore") {
-        return true;
-    }
-
-    let required_paths = [
-        "src/inference/session/runtime/core.rs",
-        "src/session/runtime/core.rs",
-    ];
-    let required_patterns = ["load_most_recent", "load_session_by_id"];
-    let forbidden_patterns = ["message_count", "log_messages", "saved_messages"];
-
-    let steps_paths: Vec<String> = fte.steps().iter().map(|s| s.path().to_string()).collect();
-    let steps_text: String = steps_paths.join(" ");
-
-    let has_core = steps_paths.iter().any(|p| p.contains("runtime/core.rs"));
-    let has_load_most_recent = steps_text.contains("load_most_recent");
-    let has_load_session_by_id = steps_text.contains("load_session_by_id");
-    let has_no_session_branch = steps_text.contains("Ok(None)")
-        || steps_text.contains("None")
-        || steps_text.contains("no session");
-    let has_handoff = steps_text.contains("load_session_by_id");
-
-    let has_forbidden = forbidden_patterns
-        .iter()
-        .any(|p| steps_text.to_lowercase().contains(&p.to_lowercase()));
-
-    if has_forbidden {
-        return false;
-    }
-
-    has_core && has_load_most_recent && (has_no_session_branch || has_handoff)
-}
 
 use prompting::{
     build_tool_loop_seed_messages, build_tool_loop_system_prompt, initial_investigation_hint,

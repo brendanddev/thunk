@@ -33,7 +33,7 @@ use super::super::super::runtime::{effective_reflection, emit_trace};
 use super::super::super::{
     build_system_prompt, load_backend_with_fallback, Message, SessionCommand,
 };
-use super::super::investigation::InvestigationState;
+use super::super::super::investigation::InvestigationState;
 use super::super::memory::{emit_memory_state, refresh_loaded_facts, RuntimeMemoryState};
 use super::super::support::session_info;
 

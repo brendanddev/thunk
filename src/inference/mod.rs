@@ -3,6 +3,7 @@ mod backend;
 mod budget;
 mod cache;
 mod indexing;
+pub(crate) mod investigation;
 mod llama_cpp;
 mod ollama;
 mod openai_compat;
@@ -15,7 +16,7 @@ pub use backend::{system_prompt_with_tools, InferenceBackend, Message, SYSTEM_PR
 pub use llama_cpp::LlamaCppBackend;
 pub use ollama::OllamaBackend;
 pub use openai_compat::OpenAICompatBackend;
-pub(crate) use session::investigation::{InjectedContextMetadata, StructuredCompressionContext};
+pub(crate) use investigation::{InjectedContextMetadata, StructuredCompressionContext};
 #[allow(unused_imports)]
 pub use session::{model_thread, model_thread_with_options, SessionRuntimeOptions};
 

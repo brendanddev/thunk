@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::tools::ToolResult;
 
-use super::super::super::session::investigation::InvestigationResolution;
+use super::super::super::investigation::InvestigationResolution;
 use super::super::super::Message;
 use super::super::intent::{
     is_referential_file_prompt, normalize_intent_text, suggested_search_query, ToolLoopIntent,

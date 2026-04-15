@@ -14,7 +14,7 @@ use super::super::super::approval::ApprovalContext;
 use super::super::super::budget::{SessionBudget, SessionCacheStats};
 use super::super::super::indexing::IncrementalIndexState;
 use super::super::super::{build_system_prompt, InferenceBackend, Message, SessionCommand};
-use super::super::investigation::InvestigationState;
+use super::super::super::investigation::InvestigationState;
 use super::super::memory::{
     clear_memory_retrieval, emit_memory_state, memory_fact_lines, RuntimeMemoryState,
 };

@@ -1,4 +1,4 @@
-use crate::inference::session::investigation::InvestigationResolution;
+use crate::inference::investigation::InvestigationResolution;
 use crate::memory::retrieval::{query_terms, score_text};
 use crate::tools::ToolResult;
 

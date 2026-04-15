@@ -1,6 +1,6 @@
 use crate::tools::ToolResult;
 
-use super::super::super::session::investigation::InvestigationResolution;
+use super::super::super::investigation::InvestigationResolution;
 use super::super::intent::{suggested_search_query, ToolLoopIntent};
 use super::observe::{
     observed_file_summary_evidence, observed_flow_trace_evidence,
@@ -12,85 +12,7 @@ use super::parse::{
     is_test_like_path, parse_read_file_output, prompt_mentions_tests,
     query_match_lines_with_numbers, surrounding_body_lines,
 };
-use super::{FlowTraceEvidence, ObservedStep, ObservedStepKind};
-
-fn render_step_ref(step: &ObservedStep) -> String {
-    format!("`{}:{}`", step.path, step.line_number)
-}
-
-fn flow_trace_required_facts(evidence: &FlowTraceEvidence) -> Vec<String> {
-    let mut facts = Vec::new();
-
-    let entry = evidence
-        .steps
-        .iter()
-        .find(|step| step.step_kind == ObservedStepKind::EntryCall);
-
-    if let Some(entry) = entry {
-        if entry.line_text.contains("match store.load_most_recent()") {
-            facts.push(format!(
-                "Start from {} and say the runtime branches around `match store.load_most_recent()` there.",
-                render_step_ref(entry)
-            ));
-        } else {
-            facts.push(format!(
-                "Start from {} and state that the runtime restore path calls `{}` there.",
-                render_step_ref(entry),
-                evidence.subject
-            ));
-        }
-    }
-
-    if let Some(runtime_no_session) = entry.and_then(|entry| {
-        evidence.steps.iter().find(|step| {
-            step.path == entry.path
-                && step.line_number != entry.line_number
-                && (step.line_text.contains("Ok(None)") || step.line_text.contains("None =>"))
-        })
-    }) {
-        facts.push(format!(
-            "Mention the runtime no-session branch visible at {} (`{}`).",
-            render_step_ref(runtime_no_session),
-            clip_inline(&runtime_no_session.line_text, 80)
-        ));
-    }
-
-    if let Some(selection) = evidence.steps.iter().find(|step| {
-        step.line_text
-            .contains("list_sessions()?.into_iter().next()")
-    }) {
-        facts.push(format!(
-            "If you describe session selection, anchor it to {} and say it takes the first summary from `list_sessions()?.into_iter().next()`, not that it iterates all sessions.",
-            render_step_ref(selection)
-        ));
-    }
-
-    if let Some(no_session_return) = evidence
-        .steps
-        .iter()
-        .find(|step| step.line_text.contains("return Ok(None)"))
-    {
-        facts.push(format!(
-            "Mention the no-session return inside `{}` at {} (`{}`).",
-            evidence.subject,
-            render_step_ref(no_session_return),
-            clip_inline(&no_session_return.line_text, 80)
-        ));
-    }
-
-    if let Some(load_by_id) = evidence
-        .steps
-        .iter()
-        .find(|step| step.line_text.contains("load_session_by_id"))
-    {
-        facts.push(format!(
-            "Mention the successful restore handoff at {} via `load_session_by_id(&summary.id)`.",
-            render_step_ref(load_by_id)
-        ));
-    }
-
-    facts
-}
+use super::readiness::flow_trace_required_facts;
 
 pub(crate) fn format_tool_loop_results_with_limit(
     intent: ToolLoopIntent,

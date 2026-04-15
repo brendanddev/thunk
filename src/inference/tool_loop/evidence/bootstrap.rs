@@ -6,7 +6,7 @@ use crate::events::{InferenceEvent, ProgressStatus};
 use crate::tools::{ToolRegistry, ToolResult};
 
 use super::super::super::runtime::emit_trace;
-use super::super::super::session::investigation::InvestigationResolution;
+use super::super::super::investigation::InvestigationResolution;
 use super::super::super::Message;
 use super::super::intent::{suggested_search_query, ToolLoopIntent};
 use super::observe::{

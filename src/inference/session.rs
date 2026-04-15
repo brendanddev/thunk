@@ -1,5 +1,4 @@
 mod auto_inspect;
-pub(crate) mod investigation;
 mod memory;
 mod runtime;
 mod support;

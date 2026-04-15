@@ -11,7 +11,7 @@ use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::events::InferenceEvent;
-use crate::inference::session::investigation::{
+use crate::inference::investigation::{
     InvestigationAnchor, InvestigationLatencyPolicy, InvestigationResolution,
 };
 

@@ -63,7 +63,7 @@ impl InvestigationResolution {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct InvestigationState {
+pub(crate) struct InvestigationState {
     last_intent: Option<ToolLoopIntent>,
     recent_loaded_files: Vec<String>,
     recent_directory_paths: Vec<String>,
@@ -72,7 +72,7 @@ pub(super) struct InvestigationState {
 }
 
 impl InvestigationState {
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.last_intent = None;
         self.recent_loaded_files.clear();
         self.recent_directory_paths.clear();
@@ -80,14 +80,14 @@ impl InvestigationState {
         self.last_anchor = None;
     }
 
-    pub(super) fn has_recent_repo_context(&self) -> bool {
+    pub(crate) fn has_recent_repo_context(&self) -> bool {
         self.last_intent.is_some()
             || !self.recent_loaded_files.is_empty()
             || !self.recent_directory_paths.is_empty()
             || !self.recent_search_queries.is_empty()
     }
 
-    pub(super) fn apply_injected_context(
+    pub(crate) fn apply_injected_context(
         &mut self,
         metadata: Option<&InjectedContextMetadata>,
         content: &str,
@@ -128,7 +128,7 @@ impl InvestigationState {
         }
     }
 
-    pub(super) fn note_tool_loop_outcome(
+    pub(crate) fn note_tool_loop_outcome(
         &mut self,
         intent: ToolLoopIntent,
         prompt: &str,
@@ -146,7 +146,7 @@ impl InvestigationState {
         }
     }
 
-    pub(super) fn compression_context(&self) -> Option<StructuredCompressionContext> {
+    pub(crate) fn compression_context(&self) -> Option<StructuredCompressionContext> {
         if !self.has_recent_repo_context() {
             return None;
         }
@@ -160,7 +160,7 @@ impl InvestigationState {
         })
     }
 
-    pub(super) fn follow_up_resolution(&self, prompt: &str) -> Option<InvestigationResolution> {
+    pub(crate) fn follow_up_resolution(&self, prompt: &str) -> Option<InvestigationResolution> {
         if !self.has_recent_repo_context() {
             return None;
         }
@@ -230,7 +230,7 @@ impl InvestigationState {
         None
     }
 
-    pub(super) fn summary_message(&self) -> Option<Message> {
+    pub(crate) fn summary_message(&self) -> Option<Message> {
         let context = self.compression_context()?;
         Some(Message::user(&context.render()))
     }
@@ -319,7 +319,7 @@ impl StructuredCompressionContext {
     }
 }
 
-pub(super) fn resolve_agentic_repo_turn(
+pub(crate) fn resolve_agentic_repo_turn(
     prompt: &str,
     prior_investigation: &InvestigationState,
 ) -> Option<InvestigationResolution> {
@@ -457,7 +457,7 @@ fn intent_label(intent: ToolLoopIntent) -> String {
 fn normalize_follow_up_text(prompt: &str) -> String {
     prompt
         .to_ascii_lowercase()
-        .replace(['\'', '’'], "")
+        .replace(['\'', '\u{2019}'], "")
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '/' {
