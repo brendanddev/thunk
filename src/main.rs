@@ -1,0 +1,6 @@
+use params_cli::app;
+
+/// Main entry point for the application
+fn main() -> app::Result<()> {
+    app::run()
+}

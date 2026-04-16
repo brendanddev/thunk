@@ -2,21 +2,33 @@
 
 Personal AI coding assistant CLI focused on local-first workflows, modular backends, privacy, and real coding actions.
 
+> Version 0.8.5 - Focused rebuild
+
 ---
 
 ## Requirements
 
 - Rust (stable)
-- macOS Apple Silicon, Linux x86_64, or Windows (WSL)
-- `cmake` (for llama.cpp backend)
-- A `.gguf` model file, Ollama, or an API key depending on backend
+- An interactive terminal
 
 ---
 
 ## Project structure
 
 ```
-src/
-docs/
-data/
+params-cli/
+├── README.md
+├── Cargo.toml
+├── Cargo.lock
+├── config.toml
+├── data/
+├── docs/
+├── logs/
+├── src/
+│   ├── app/
+│   ├── runtime/
+│   ├── tui/
+│   ├── lib.rs
+│   └── main.rs
+└── tests/
 ```

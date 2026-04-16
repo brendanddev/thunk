@@ -19,6 +19,7 @@ logs/
 
 
 ## Local files
+# Legacy archive/state from the previous implementation.
 .local/
 .claude/
 
@@ -27,4 +28,3 @@ models/
 *.gguf
 *.ggml
 *.bin
-
