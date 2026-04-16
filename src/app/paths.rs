@@ -14,6 +14,7 @@ pub struct AppPaths {
     pub config_file: PathBuf,
     pub data_dir: PathBuf,
     pub logs_dir: PathBuf,
+    pub session_db: PathBuf,
 }
 
 /// Discovers the necessary paths for the application based on the current working directory
@@ -31,6 +32,7 @@ impl AppPaths {
             config_file: root_dir.join(CONFIG_FILE_NAME),
             data_dir: root_dir.join("data"),
             logs_dir: root_dir.join("logs"),
+            session_db: root_dir.join("data").join("sessions.db"),
             root_dir,
         })
     }

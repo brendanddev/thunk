@@ -93,6 +93,22 @@ impl AppState {
         }
     }
 
+    /// Adds a tool-related notification to the transcript (shown as a system message).
+    pub fn add_tool_message(&mut self, content: impl Into<String>) {
+        self.messages.push(ChatMessage {
+            role: Role::System,
+            content: content.into(),
+        });
+    }
+
+    /// Clears all transcript messages except the initial welcome line.
+    /// Does not affect the runtime conversation — call RuntimeRequest::Reset separately.
+    pub fn clear_messages(&mut self) {
+        self.messages.retain(|m| {
+            m.role == Role::System && m.content.contains("ready")
+        });
+    }
+
     /// Updates the visible status line
     pub fn set_status(&mut self, status: &str) {
         self.status = status.to_string();

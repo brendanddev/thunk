@@ -36,6 +36,21 @@ impl Conversation {
     pub fn snapshot(&self) -> Vec<Message> {
         self.messages.clone()
     }
+
+    /// Returns the content of the most recently added assistant message, if any.
+    pub fn last_assistant_content(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.content.as_str())
+    }
+
+    /// Resets the conversation to just the system prompt.
+    pub fn reset(&mut self, system_prompt: String) {
+        self.messages.clear();
+        self.messages.push(Message::system(system_prompt));
+    }
 }
 
 #[cfg(test)]

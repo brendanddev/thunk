@@ -17,6 +17,12 @@ pub enum AppError {
 
     #[error("Runtime error: {0}")]
     Runtime(String),
+
+    #[error("Storage error: {0}")]
+    Storage(String),
+
+    #[error("Tool error: {0}")]
+    Tool(String),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

@@ -6,8 +6,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crate::app::config::Config;
 use crate::app::paths::AppPaths;
 use crate::app::Result;
-use crate::runtime::{Runtime, RuntimeEvent, RuntimeRequest};
+use crate::runtime::{AnswerSource, Runtime, RuntimeEvent, RuntimeRequest};
 
+use super::commands;
 use super::render::render;
 use super::state::AppState;
 
@@ -27,7 +28,6 @@ pub(crate) fn run_app(
             return Ok(());
         }
 
-        // Poll for events with a timeout to allow periodic rendering updates
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => handle_key_event(stdout, &mut state, runtime, key)?,
@@ -39,7 +39,6 @@ pub(crate) fn run_app(
     }
 }
 
-/// Handles a key event, updating the app state accordingly
 fn handle_key_event(
     stdout: &mut io::Stdout,
     state: &mut AppState,
@@ -52,22 +51,12 @@ fn handle_key_event(
             state.should_quit = true;
         }
         (KeyCode::Enter, _) => {
-            if let Some(prompt) = state.submit_input() {
-                state.add_user_message(prompt.clone());
-                let mut render_error = None;
-                runtime.handle(RuntimeRequest::Submit { text: prompt }, &mut |event| {
-                    if render_error.is_some() {
-                        return;
-                    }
-
-                    apply_runtime_event(state, event);
-                    if let Err(error) = render(stdout, state) {
-                        render_error = Some(error);
-                    }
-                });
-
-                if let Some(error) = render_error {
-                    return Err(error);
+            if let Some(input) = state.submit_input() {
+                // Check for slash commands before forwarding to the runtime.
+                if let Some(cmd) = commands::parse(&input) {
+                    handle_command(stdout, state, runtime, cmd)?;
+                } else {
+                    submit_to_runtime(stdout, state, runtime, input)?;
                 }
             }
         }
@@ -83,12 +72,74 @@ fn handle_key_event(
     Ok(())
 }
 
+fn submit_to_runtime(
+    stdout: &mut io::Stdout,
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    prompt: String,
+) -> Result<()> {
+    state.add_user_message(prompt.clone());
+    let mut render_error = None;
+
+    runtime.handle(RuntimeRequest::Submit { text: prompt }, &mut |event| {
+        if render_error.is_some() {
+            return;
+        }
+        apply_runtime_event(state, event);
+        if let Err(e) = render(stdout, state) {
+            render_error = Some(e);
+        }
+    });
+
+    if let Some(e) = render_error {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn handle_command(
+    _stdout: &mut io::Stdout,
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    cmd: commands::Command,
+) -> Result<()> {
+    match cmd {
+        commands::Command::Help => {
+            state.add_system_message(
+                "Commands: /help — show this message  |  /clear — clear history  |  /quit — exit",
+            );
+        }
+        commands::Command::Quit => {
+            state.should_quit = true;
+        }
+        commands::Command::Clear => {
+            state.clear_messages();
+            runtime.handle(RuntimeRequest::Reset, &mut |_| {});
+        }
+    }
+    Ok(())
+}
+
 fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
     match event {
         RuntimeEvent::ActivityChanged(activity) => state.set_status(activity.label()),
         RuntimeEvent::AssistantMessageStarted => state.begin_assistant_message(),
         RuntimeEvent::AssistantMessageChunk(chunk) => state.append_assistant_chunk(&chunk),
         RuntimeEvent::AssistantMessageFinished => {}
+        RuntimeEvent::ToolCallStarted { name } => {
+            state.add_tool_message(format!("tool: {name}"));
+        }
+        RuntimeEvent::ToolCallFinished { name, success } => {
+            if !success {
+                state.add_tool_message(format!("tool failed: {name}"));
+            }
+        }
+        RuntimeEvent::AnswerReady(source) => {
+            if let AnswerSource::ToolLimitReached = source {
+                state.add_system_message("Tool limit reached. Response may be incomplete.");
+            }
+        }
         RuntimeEvent::Failed { message } => {
             state.set_status("error");
             state.add_system_message(message);

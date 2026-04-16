@@ -1,4 +1,5 @@
 mod app;
+pub mod commands;
 mod input;
 mod render;
 mod state;

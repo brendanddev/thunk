@@ -1,31 +1,46 @@
 use crate::app::config::Config;
+use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
+use crate::tools::{EntryKind, ToolOutput, ToolRegistry};
 
 use super::conversation::Conversation;
+use super::tool_parser;
+use super::types::{Activity, AnswerSource, RuntimeEvent, RuntimeRequest};
 use super::prompt;
-use super::types::{Activity, RuntimeEvent, RuntimeRequest};
+
+/// Maximum tool rounds per turn. Prevents infinite loops when the model keeps
+/// producing tool calls without reaching a final answer.
+const MAX_TOOL_ROUNDS: usize = 10;
 
 pub struct Runtime {
     conversation: Conversation,
     backend: Box<dyn ModelBackend>,
+    registry: ToolRegistry,
+    system_prompt: String,
 }
 
 impl Runtime {
-    pub fn new(config: &Config, backend: Box<dyn ModelBackend>) -> Self {
+    pub fn new(config: &Config, backend: Box<dyn ModelBackend>, registry: ToolRegistry) -> Self {
+        let specs = registry.specs();
+        let system_prompt = prompt::build_system_prompt(&config.app.name, &specs);
         Self {
-            conversation: Conversation::new(prompt::build_system_prompt(&config.app.name)),
+            conversation: Conversation::new(system_prompt.clone()),
             backend,
+            registry,
+            system_prompt,
         }
     }
 
-    pub fn handle(
-        &mut self,
-        request: RuntimeRequest,
-        on_event: &mut dyn FnMut(RuntimeEvent),
-    ) {
+    pub fn handle(&mut self, request: RuntimeRequest, on_event: &mut dyn FnMut(RuntimeEvent)) {
         match request {
             RuntimeRequest::Submit { text } => self.handle_submit(text, on_event),
+            RuntimeRequest::Reset => self.handle_reset(on_event),
         }
+    }
+
+    fn handle_reset(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        self.conversation.reset(self.system_prompt.clone());
+        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
     }
 
     fn handle_submit(&mut self, text: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
@@ -38,56 +53,167 @@ impl Runtime {
         }
 
         self.conversation.push_user(text);
-
-        let request = GenerateRequest::new(self.conversation.snapshot());
         on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
-        let mut started_assistant_message = false;
 
-        let backend = &mut self.backend;
-        let conversation = &mut self.conversation;
-        let result = backend.generate(request, &mut |event| match event {
-            BackendEvent::StatusChanged(status) => {
-                on_event(RuntimeEvent::ActivityChanged(map_backend_status(status)));
-            }
-            BackendEvent::TextDelta(chunk) => {
-                if !started_assistant_message {
-                    started_assistant_message = true;
-                    conversation.begin_assistant_reply();
-                    on_event(RuntimeEvent::ActivityChanged(Activity::Responding));
-                    on_event(RuntimeEvent::AssistantMessageStarted);
-                }
+        let mut tool_rounds = 0usize;
 
-                conversation.push_assistant_chunk(&chunk);
-                on_event(RuntimeEvent::AssistantMessageChunk(chunk));
-            }
-            BackendEvent::Finished => {}
-        });
-
-        match result {
-            Ok(()) => {
-                if !started_assistant_message {
+        loop {
+            let response = match run_generate_turn(
+                self.backend.as_mut(),
+                &mut self.conversation,
+                on_event,
+            ) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
                     on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
                     on_event(RuntimeEvent::Failed {
-                        message: format!("{} returned no output.", backend.name()),
+                        message: format!("{} returned no output.", self.backend.name()),
                     });
                     return;
                 }
-
-                on_event(RuntimeEvent::AssistantMessageFinished);
-                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-            }
-            Err(error) => {
-                if started_assistant_message {
-                    on_event(RuntimeEvent::AssistantMessageFinished);
+                Err(e) => {
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    on_event(RuntimeEvent::Failed { message: e.to_string() });
+                    return;
                 }
+            };
 
+            let calls = tool_parser::parse_tool_calls(&response);
+
+            if calls.is_empty() {
+                let source = if tool_rounds == 0 {
+                    AnswerSource::Direct
+                } else {
+                    AnswerSource::ToolAssisted { rounds: tool_rounds }
+                };
+                on_event(RuntimeEvent::AnswerReady(source));
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                on_event(RuntimeEvent::Failed {
-                    message: error.to_string(),
-                });
+                return;
             }
+
+            tool_rounds += 1;
+
+            if tool_rounds > MAX_TOOL_ROUNDS {
+                on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolLimitReached));
+                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                return;
+            }
+
+            on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
+
+            let mut results_text = String::new();
+            for input in calls {
+                let name = input.tool_name().to_string();
+                on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
+                match self.registry.dispatch(input) {
+                    Ok(result) => {
+                        on_event(RuntimeEvent::ToolCallFinished {
+                            name: name.clone(),
+                            success: true,
+                        });
+                        results_text.push_str(&format_tool_result(&name, &result.output));
+                    }
+                    Err(e) => {
+                        on_event(RuntimeEvent::ToolCallFinished {
+                            name: name.clone(),
+                            success: false,
+                        });
+                        results_text
+                            .push_str(&format!("[tool_error: {name}]\n{e}\n[/tool_error]\n\n"));
+                    }
+                }
+            }
+
+            self.conversation.push_user(results_text);
         }
     }
+}
+
+/// Runs a single generation turn: sends the current conversation to the backend,
+/// streams tokens into the conversation and fires events, then returns the
+/// complete assistant response text, or None if the backend produced no output.
+fn run_generate_turn(
+    backend: &mut dyn ModelBackend,
+    conversation: &mut Conversation,
+    on_event: &mut dyn FnMut(RuntimeEvent),
+) -> Result<Option<String>> {
+    let request = GenerateRequest::new(conversation.snapshot());
+    let mut started = false;
+
+    let result = backend.generate(request, &mut |event| match event {
+        BackendEvent::StatusChanged(status) => {
+            on_event(RuntimeEvent::ActivityChanged(map_backend_status(status)));
+        }
+        BackendEvent::TextDelta(chunk) => {
+            if !started {
+                started = true;
+                conversation.begin_assistant_reply();
+                on_event(RuntimeEvent::ActivityChanged(Activity::Responding));
+                on_event(RuntimeEvent::AssistantMessageStarted);
+            }
+            conversation.push_assistant_chunk(&chunk);
+            on_event(RuntimeEvent::AssistantMessageChunk(chunk));
+        }
+        BackendEvent::Finished => {}
+    });
+
+    result?;
+
+    if started {
+        on_event(RuntimeEvent::AssistantMessageFinished);
+        Ok(conversation.last_assistant_content().map(|s| s.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Formats a tool result for insertion into the conversation as a user message.
+/// The model reads this to know what the tool returned before continuing.
+fn format_tool_result(name: &str, output: &ToolOutput) -> String {
+    let body = match output {
+        ToolOutput::FileContents(f) => {
+            if f.truncated {
+                format!("{}\n[file truncated at read limit]", f.contents)
+            } else {
+                f.contents.clone()
+            }
+        }
+        ToolOutput::DirectoryListing(d) => {
+            if d.entries.is_empty() {
+                "(empty directory)".to_string()
+            } else {
+                d.entries
+                    .iter()
+                    .map(|e| {
+                        let kind = match e.kind {
+                            EntryKind::Dir => "dir ",
+                            EntryKind::File => "file",
+                            EntryKind::Symlink => "link",
+                        };
+                        format!("{kind}  {}", e.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        ToolOutput::SearchResults(s) => {
+            if s.matches.is_empty() {
+                "No matches found.".to_string()
+            } else {
+                let mut lines: Vec<String> = s
+                    .matches
+                    .iter()
+                    .map(|m| format!("{}:{}: {}", m.file, m.line_number, m.line))
+                    .collect();
+                if s.truncated {
+                    lines.push("[results truncated at match limit]".to_string());
+                }
+                lines.join("\n")
+            }
+        }
+    };
+
+    format!("[tool_result: {name}]\n{body}\n[/tool_result]\n\n")
 }
 
 fn map_backend_status(status: BackendStatus) -> Activity {

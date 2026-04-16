@@ -6,8 +6,12 @@ edition = "2021"
 [dependencies]
 crossterm = "0.28"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 llama-cpp-2 = "=0.1.143"
 llama-cpp-sys-2 = "=0.1.143"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

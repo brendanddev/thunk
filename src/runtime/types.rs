@@ -5,6 +5,7 @@ pub enum Activity {
     LoadingModel,
     Generating,
     Responding,
+    ExecutingTools,
 }
 
 impl Activity {
@@ -15,13 +16,29 @@ impl Activity {
             Self::LoadingModel => "loading model",
             Self::Generating => "generating",
             Self::Responding => "responding",
+            Self::ExecutingTools => "running tools",
         }
     }
+}
+
+/// Describes why the tool loop terminated and how the final answer was reached.
+#[derive(Debug, Clone)]
+pub enum AnswerSource {
+    /// Model produced a final answer without using any tools.
+    Direct,
+    /// Model produced a final answer after one or more tool rounds.
+    ToolAssisted { rounds: usize },
+    /// Loop was cut off at the tool round limit before a final answer.
+    ToolLimitReached,
+    /// Backend failed mid-loop; last assistant output (if any) is the best available.
+    BackendError(String),
 }
 
 #[derive(Debug, Clone)]
 pub enum RuntimeRequest {
     Submit { text: String },
+    /// Clears conversation history and resets to a fresh session.
+    Reset,
 }
 
 #[derive(Debug, Clone)]
@@ -30,5 +47,8 @@ pub enum RuntimeEvent {
     AssistantMessageStarted,
     AssistantMessageChunk(String),
     AssistantMessageFinished,
+    ToolCallStarted { name: String },
+    ToolCallFinished { name: String, success: bool },
+    AnswerReady(AnswerSource),
     Failed { message: String },
 }
