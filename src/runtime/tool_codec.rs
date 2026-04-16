@@ -14,12 +14,35 @@ use crate::tools::{EntryKind, ToolInput, ToolOutput};
 
 const CALL_OPEN: &str = "<tool_call>";
 const CALL_CLOSE: &str = "</tool_call>";
+const EDIT_OPEN: &str = "<edit_file>";
+const EDIT_CLOSE: &str = "</edit_file>";
+const WRITE_OPEN: &str = "<write_file>";
+const WRITE_CLOSE: &str = "</write_file>";
+
+const SEARCH_DELIM: &str = "---search---";
+const REPLACE_DELIM: &str = "---replace---";
+const CONTENT_DELIM: &str = "---content---";
+// Line-anchored form: require delimiter to appear at the start of a line
+// so occurrences embedded mid-line in content are not mistaken for delimiters.
+const REPLACE_LINE: &str = "\n---replace---";
 
 // ── Inbound: model text → ToolInput ──────────────────────────────────────────
 
-/// Scans model output for all `<tool_call>...</tool_call>` blocks and returns
-/// a typed `ToolInput` for each one that is valid and recognized.
-/// Unknown tool names and malformed blocks are silently skipped.
+/// Scans model output for all tool block types and returns typed ToolInput values
+/// in document order. Handles `<tool_call>`, `<edit_file>`, and `<write_file>` blocks.
+/// Malformed or unrecognized blocks are silently skipped.
+pub fn parse_all_tool_inputs(text: &str) -> Vec<ToolInput> {
+    let mut all: Vec<(usize, ToolInput)> = Vec::new();
+    all.extend(scan_tool_call_blocks(text));
+    all.extend(scan_edit_blocks(text));
+    all.extend(scan_write_blocks(text));
+    all.sort_by_key(|(pos, _)| *pos);
+    all.into_iter().map(|(_, input)| input).collect()
+}
+
+/// Scans model output for `<tool_call>...</tool_call>` blocks only.
+/// Preserved as-is for the existing engine.rs call site; will be replaced by
+/// parse_all_tool_inputs in the engine once the approval flow lands (Step 5).
 pub fn parse_tool_calls(text: &str) -> Vec<ToolInput> {
     let mut calls = Vec::new();
     let mut remaining = text;
@@ -41,6 +64,78 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolInput> {
     calls
 }
 
+fn scan_tool_call_blocks(text: &str) -> Vec<(usize, ToolInput)> {
+    let mut results = Vec::new();
+    let mut remaining = text;
+    let mut offset = 0usize;
+
+    while let Some(open_pos) = remaining.find(CALL_OPEN) {
+        let after_open = &remaining[open_pos + CALL_OPEN.len()..];
+        match after_open.find(CALL_CLOSE) {
+            Some(close_pos) => {
+                let block = &after_open[..close_pos];
+                if let Some(input) = parse_block(block) {
+                    results.push((offset + open_pos, input));
+                }
+                let advance = open_pos + CALL_OPEN.len() + close_pos + CALL_CLOSE.len();
+                offset += advance;
+                remaining = &remaining[advance..];
+            }
+            None => break,
+        }
+    }
+
+    results
+}
+
+fn scan_edit_blocks(text: &str) -> Vec<(usize, ToolInput)> {
+    let mut results = Vec::new();
+    let mut remaining = text;
+    let mut offset = 0usize;
+
+    while let Some(open_pos) = remaining.find(EDIT_OPEN) {
+        let after_open = &remaining[open_pos + EDIT_OPEN.len()..];
+        match after_open.find(EDIT_CLOSE) {
+            Some(close_pos) => {
+                let block = &after_open[..close_pos];
+                if let Some(input) = parse_edit_block(block) {
+                    results.push((offset + open_pos, input));
+                }
+                let advance = open_pos + EDIT_OPEN.len() + close_pos + EDIT_CLOSE.len();
+                offset += advance;
+                remaining = &remaining[advance..];
+            }
+            None => break,
+        }
+    }
+
+    results
+}
+
+fn scan_write_blocks(text: &str) -> Vec<(usize, ToolInput)> {
+    let mut results = Vec::new();
+    let mut remaining = text;
+    let mut offset = 0usize;
+
+    while let Some(open_pos) = remaining.find(WRITE_OPEN) {
+        let after_open = &remaining[open_pos + WRITE_OPEN.len()..];
+        match after_open.find(WRITE_CLOSE) {
+            Some(close_pos) => {
+                let block = &after_open[..close_pos];
+                if let Some(input) = parse_write_block(block) {
+                    results.push((offset + open_pos, input));
+                }
+                let advance = open_pos + WRITE_OPEN.len() + close_pos + WRITE_CLOSE.len();
+                offset += advance;
+                remaining = &remaining[advance..];
+            }
+            None => break,
+        }
+    }
+
+    results
+}
+
 fn parse_block(block: &str) -> Option<ToolInput> {
     let params = parse_kvs(block);
     match params.get("name")?.as_str() {
@@ -56,6 +151,39 @@ fn parse_block(block: &str) -> Option<ToolInput> {
         }),
         _ => None,
     }
+}
+
+fn parse_edit_block(block: &str) -> Option<ToolInput> {
+    let search_pos = block.find(SEARCH_DELIM)?;
+    let after_search = &block[search_pos + SEARCH_DELIM.len()..];
+    // Use the line-anchored form so ---replace--- embedded mid-line in the search
+    // content (e.g. inside a comment) is not mistaken for the actual delimiter.
+    let replace_nl_offset = after_search.find(REPLACE_LINE)?;
+    let replace_pos = search_pos + SEARCH_DELIM.len() + replace_nl_offset + 1;
+
+    let path = parse_kvs(&block[..search_pos]).get("path")?.clone();
+    let search = trim_block_content(&after_search[..replace_nl_offset]);
+    let replace = trim_block_content(&block[replace_pos + REPLACE_DELIM.len()..]);
+
+    Some(ToolInput::EditFile { path, search, replace })
+}
+
+fn parse_write_block(block: &str) -> Option<ToolInput> {
+    let content_pos = block.find(CONTENT_DELIM)?;
+
+    let path = parse_kvs(&block[..content_pos]).get("path")?.clone();
+    let content = trim_block_content(&block[content_pos + CONTENT_DELIM.len()..]);
+
+    Some(ToolInput::WriteFile { path, content })
+}
+
+/// Strips exactly one leading newline and one trailing newline from block content.
+/// This removes the newlines that immediately follow a delimiter line and precede
+/// the next delimiter or closing tag, without touching internal whitespace.
+fn trim_block_content(s: &str) -> String {
+    let s = s.strip_prefix('\n').unwrap_or(s);
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    s.to_string()
 }
 
 /// Parses `key: value` lines into a map. The first `:` on each line is the separator;
@@ -137,19 +265,37 @@ fn render_output(output: &ToolOutput) -> String {
 // ── Protocol description ──────────────────────────────────────────────────────
 
 /// Returns the format instructions block that prompt.rs includes in the system prompt.
-/// Keeping this here ensures the prompt's description of the format always matches
-/// the actual format that parse_tool_calls expects and format_tool_result produces.
+/// Keeping this here ensures the prompt's description always matches the actual
+/// formats that the scanners expect and format_tool_result produces.
 pub fn format_instructions() -> &'static str {
-    r#"To use a tool, output a tool call block in exactly this format:
+    r#"To read files or search code, use a tool call block:
 
 <tool_call>
 name: <tool_name>
 <param_name>: <param_value>
 </tool_call>
 
-The tool result will be returned to you as a user message wrapped in [tool_result: name]...[/tool_result].
-You may then continue your response or make further tool calls.
-Only call tools when they are needed to answer the question. When you have enough information, respond directly without a tool call."#
+To edit an existing file, use an edit block with the exact text to find and its replacement:
+
+<edit_file>
+path: path/to/file
+---search---
+exact text to find
+---replace---
+replacement text
+</edit_file>
+
+To create or overwrite a file, use a write block:
+
+<write_file>
+path: path/to/file
+---content---
+full file content
+</write_file>
+
+Tool results are returned as [tool_result: name]...[/tool_result].
+You may continue your response or make further tool calls after receiving a result.
+Only call tools when needed. When you have enough information, respond directly."#
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -158,7 +304,7 @@ Only call tools when they are needed to answer the question. When you have enoug
 mod tests {
     use super::*;
 
-    // — Parsing —
+    // — Existing <tool_call> parsing (unchanged) —
 
     #[test]
     fn parses_read_file_call() {
@@ -239,6 +385,115 @@ mod tests {
         );
     }
 
+    // — <edit_file> parsing —
+
+    #[test]
+    fn parses_valid_edit_block() {
+        let text = "<edit_file>\npath: src/lib.rs\n---search---\nfn old() {}\n---replace---\nfn new() {}\n</edit_file>";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "src/lib.rs" && search == "fn old() {}" && replace == "fn new() {}"));
+    }
+
+    #[test]
+    fn edit_block_missing_search_delimiter_is_skipped() {
+        let text = "<edit_file>\npath: src/lib.rs\n---replace---\nfn new() {}\n</edit_file>";
+        assert!(parse_all_tool_inputs(text).is_empty());
+    }
+
+    #[test]
+    fn edit_block_replace_delim_inside_search_content_is_handled_correctly() {
+        // ---replace--- appearing inside the search text must not be treated as the delimiter.
+        let text = "<edit_file>\npath: src/lib.rs\n---search---\n// see ---replace--- below\n---replace---\n// fixed\n</edit_file>";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        let ToolInput::EditFile { search, replace, .. } = &inputs[0] else {
+            panic!("expected EditFile");
+        };
+        assert_eq!(search, "// see ---replace--- below");
+        assert_eq!(replace, "// fixed");
+    }
+
+    #[test]
+    fn edit_block_missing_replace_delimiter_is_skipped() {
+        let text = "<edit_file>\npath: src/lib.rs\n---search---\nfn old() {}\n</edit_file>";
+        assert!(parse_all_tool_inputs(text).is_empty());
+    }
+
+    #[test]
+    fn edit_block_preserves_multiline_content() {
+        let text = "<edit_file>\npath: src/lib.rs\n---search---\nfn old() {\n    println!(\"old\");\n}\n---replace---\nfn new() {\n    println!(\"new\");\n}\n</edit_file>";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        let ToolInput::EditFile { search, replace, .. } = &inputs[0] else {
+            panic!("expected EditFile");
+        };
+        assert!(search.contains("println!(\"old\")"));
+        assert!(search.contains('\n'));
+        assert!(replace.contains("println!(\"new\")"));
+        assert!(replace.contains('\n'));
+    }
+
+    // — <write_file> parsing —
+
+    #[test]
+    fn parses_valid_write_block() {
+        let text = "<write_file>\npath: src/new.rs\n---content---\npub fn hello() {}\n</write_file>";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::WriteFile { path, content }
+            if path == "src/new.rs" && content == "pub fn hello() {}"));
+    }
+
+    #[test]
+    fn write_block_missing_content_delimiter_is_skipped() {
+        let text = "<write_file>\npath: src/new.rs\npub fn hello() {}\n</write_file>";
+        assert!(parse_all_tool_inputs(text).is_empty());
+    }
+
+    #[test]
+    fn write_block_preserves_multiline_content() {
+        let text = "<write_file>\npath: src/new.rs\n---content---\nuse std::fs;\n\npub fn hello() {\n    println!(\"hi\");\n}\n</write_file>";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        let ToolInput::WriteFile { content, .. } = &inputs[0] else {
+            panic!("expected WriteFile");
+        };
+        assert!(content.contains("use std::fs;"));
+        assert!(content.contains("println!(\"hi\")"));
+        assert!(content.contains('\n'));
+    }
+
+    // — Document order across mixed block types —
+
+    #[test]
+    fn mixed_blocks_preserve_document_order() {
+        let text = "\
+<tool_call>\nname: read_file\npath: a.rs\n</tool_call>\n\
+<edit_file>\npath: b.rs\n---search---\nold\n---replace---\nnew\n</edit_file>\n\
+<write_file>\npath: c.rs\n---content---\nhello\n</write_file>";
+
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 3);
+        assert!(matches!(&inputs[0], ToolInput::ReadFile { path } if path == "a.rs"));
+        assert!(matches!(&inputs[1], ToolInput::EditFile { path, .. } if path == "b.rs"));
+        assert!(matches!(&inputs[2], ToolInput::WriteFile { path, .. } if path == "c.rs"));
+    }
+
+    #[test]
+    fn mixed_blocks_order_is_by_position_not_type() {
+        // write comes before tool_call in document order
+        let text = "\
+<write_file>\npath: first.rs\n---content---\nhello\n</write_file>\n\
+<tool_call>\nname: read_file\npath: second.rs\n</tool_call>";
+
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 2);
+        assert!(matches!(&inputs[0], ToolInput::WriteFile { path, .. } if path == "first.rs"));
+        assert!(matches!(&inputs[1], ToolInput::ReadFile { path } if path == "second.rs"));
+    }
+
     // — Formatting —
 
     #[test]
@@ -266,10 +521,17 @@ mod tests {
     }
 
     #[test]
-    fn format_instructions_mentions_both_tags() {
+    fn format_instructions_mentions_all_block_types() {
         let instructions = format_instructions();
         assert!(instructions.contains("<tool_call>"));
         assert!(instructions.contains("</tool_call>"));
+        assert!(instructions.contains("<edit_file>"));
+        assert!(instructions.contains("</edit_file>"));
+        assert!(instructions.contains("<write_file>"));
+        assert!(instructions.contains("</write_file>"));
+        assert!(instructions.contains("---search---"));
+        assert!(instructions.contains("---replace---"));
+        assert!(instructions.contains("---content---"));
         assert!(instructions.contains("[tool_result:"));
     }
 }

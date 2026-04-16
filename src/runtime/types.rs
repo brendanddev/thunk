@@ -1,3 +1,5 @@
+use crate::tools::PendingAction;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
     Idle,
@@ -37,6 +39,10 @@ pub enum RuntimeRequest {
     Submit { text: String },
     /// Clears conversation history and resets to a fresh session.
     Reset,
+    /// Confirms a pending tool action, allowing execute_approved() to run.
+    Approve,
+    /// Cancels a pending tool action without executing it.
+    Reject,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +53,9 @@ pub enum RuntimeEvent {
     AssistantMessageFinished,
     ToolCallStarted { name: String },
     ToolCallFinished { name: String, success: bool },
+    /// Fired when a mutating tool requires user approval before execution.
+    /// The turn is paused until RuntimeRequest::Approve or Reject is received.
+    ApprovalRequired(PendingAction),
     AnswerReady(AnswerSource),
     Failed { message: String },
 }

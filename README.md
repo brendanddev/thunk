@@ -2,7 +2,7 @@
 
 Personal AI coding assistant CLI focused on local-first workflows, modular architecture, privacy, and real coding actions.
 
-> Version 0.8.6 — Focused rebuild
+> Version 0.8.7 — Focused rebuild
 
 ---
 

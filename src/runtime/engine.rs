@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::app::config::Config;
 use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
-use crate::tools::{ToolRegistry, ToolRunResult};
+use crate::tools::{PendingAction, ToolInput, ToolRegistry, ToolRunResult};
 
 use super::conversation::Conversation;
 use super::prompt;
@@ -19,6 +19,19 @@ pub struct Runtime {
     backend: Box<dyn ModelBackend>,
     registry: ToolRegistry,
     system_prompt: String,
+    /// Holds a mutating tool action that is waiting for user approval.
+    /// Set when a tool round suspends; cleared by Approve or Reject.
+    /// At most one pending action exists at any time.
+    pending_action: Option<PendingAction>,
+}
+
+/// Outcome of dispatching one round of tool calls.
+enum ToolRoundOutcome {
+    /// All tools in this round completed immediately; results are ready to push.
+    Completed { results: String },
+    /// A tool requested approval. Results accumulated before it are preserved.
+    /// The turn is now suspended; the caller must store pending and fire the event.
+    ApprovalRequired { accumulated: String, pending: PendingAction },
 }
 
 impl Runtime {
@@ -36,6 +49,7 @@ impl Runtime {
             backend,
             registry,
             system_prompt,
+            pending_action: None,
         }
     }
 
@@ -54,15 +68,25 @@ impl Runtime {
         match request {
             RuntimeRequest::Submit { text } => self.handle_submit(text, on_event),
             RuntimeRequest::Reset => self.handle_reset(on_event),
+            RuntimeRequest::Approve => self.handle_approve(on_event),
+            RuntimeRequest::Reject => self.handle_reject(on_event),
         }
     }
 
     fn handle_reset(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        self.pending_action = None;
         self.conversation.reset(self.system_prompt.clone());
         on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
     }
 
     fn handle_submit(&mut self, text: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        if self.pending_action.is_some() {
+            on_event(RuntimeEvent::Failed {
+                message: "Cannot submit while a tool approval is pending. Use /approve or /reject first.".to_string(),
+            });
+            return;
+        }
+
         let trimmed = text.trim();
         if trimmed.is_empty() {
             on_event(RuntimeEvent::Failed {
@@ -73,9 +97,64 @@ impl Runtime {
 
         self.conversation.push_user(text);
         on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+        self.run_turns(0, on_event);
+    }
 
-        let mut tool_rounds = 0usize;
+    fn handle_approve(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        let pending = match self.pending_action.take() {
+            Some(p) => p,
+            None => {
+                on_event(RuntimeEvent::Failed {
+                    message: "No pending action to approve.".to_string(),
+                });
+                return;
+            }
+        };
 
+        on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
+        let tool_name = pending.tool_name.clone();
+
+        match self.registry.execute_approved(&pending) {
+            Ok(output) => {
+                on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), success: true });
+                let result_text = tool_codec::format_tool_result(&tool_name, &output);
+                self.conversation.push_user(result_text);
+            }
+            Err(e) => {
+                on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), success: false });
+                let error_text = tool_codec::format_tool_error(&tool_name, &e.to_string());
+                self.conversation.push_user(error_text);
+            }
+        }
+
+        on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+        self.run_turns(0, on_event);
+    }
+
+    fn handle_reject(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        let pending = match self.pending_action.take() {
+            Some(p) => p,
+            None => {
+                on_event(RuntimeEvent::Failed {
+                    message: "No pending action to reject.".to_string(),
+                });
+                return;
+            }
+        };
+
+        let tool_name = pending.tool_name.clone();
+        on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), success: false });
+        let rejection = tool_codec::format_tool_error(&tool_name, "user rejected the proposed change");
+        self.conversation.push_user(rejection);
+
+        on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+        self.run_turns(0, on_event);
+    }
+
+    /// Runs the generate → tool-round loop until the model produces a final answer,
+    /// the tool round limit is reached, or a tool action requires approval.
+    /// `tool_rounds` is the count already consumed before this call (0 for a fresh turn).
+    fn run_turns(&mut self, mut tool_rounds: usize, on_event: &mut dyn FnMut(RuntimeEvent)) {
         loop {
             let response = match run_generate_turn(
                 self.backend.as_mut(),
@@ -120,29 +199,60 @@ impl Runtime {
 
             on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
 
-            let mut results_text = String::new();
-            for input in calls {
-                let name = input.tool_name().to_string();
-                on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
-                match self.registry.dispatch(input) {
-                    Ok(ToolRunResult::Immediate(output)) => {
-                        on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: true });
-                        results_text.push_str(&tool_codec::format_tool_result(&name, &output));
+            match run_tool_round(&self.registry, calls, on_event) {
+                ToolRoundOutcome::Completed { results } => {
+                    self.conversation.push_user(results);
+                }
+                ToolRoundOutcome::ApprovalRequired { accumulated, pending } => {
+                    if !accumulated.is_empty() {
+                        self.conversation.push_user(accumulated);
                     }
-                    Ok(ToolRunResult::Approval(_)) => {
-                        on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: false });
-                        results_text.push_str(&tool_codec::format_tool_error(&name, "approval required but not yet supported"));
-                    }
-                    Err(e) => {
-                        on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: false });
-                        results_text.push_str(&tool_codec::format_tool_error(&name, &e.to_string()));
-                    }
+                    self.pending_action = Some(pending.clone());
+                    on_event(RuntimeEvent::ApprovalRequired(pending));
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    return;
                 }
             }
-
-            self.conversation.push_user(results_text);
         }
     }
+
+    #[cfg(test)]
+    fn set_pending_for_test(&mut self, action: PendingAction) {
+        self.pending_action = Some(action);
+    }
+}
+
+/// Dispatches one round of tool calls, accumulating results.
+/// Stops at the first tool that requires approval and returns any results
+/// accumulated before it alongside the PendingAction.
+/// ToolCallStarted is fired for each tool, but ToolCallFinished is NOT fired
+/// for the approval-requiring tool — handle_approve/reject fires it after resolution.
+fn run_tool_round(
+    registry: &ToolRegistry,
+    calls: Vec<ToolInput>,
+    on_event: &mut dyn FnMut(RuntimeEvent),
+) -> ToolRoundOutcome {
+    let mut accumulated = String::new();
+
+    for input in calls {
+        let name = input.tool_name().to_string();
+        on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
+        match registry.dispatch(input) {
+            Ok(ToolRunResult::Immediate(output)) => {
+                on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: true });
+                accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
+            }
+            Ok(ToolRunResult::Approval(pending)) => {
+                return ToolRoundOutcome::ApprovalRequired { accumulated, pending };
+            }
+            Err(e) => {
+                on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: false });
+                accumulated.push_str(&tool_codec::format_tool_error(&name, &e.to_string()));
+            }
+        }
+    }
+
+    ToolRoundOutcome::Completed { results: accumulated }
 }
 
 /// Runs a single generation turn: sends the current conversation to the backend,
@@ -187,5 +297,137 @@ fn map_backend_status(status: BackendStatus) -> Activity {
     match status {
         BackendStatus::LoadingModel => Activity::LoadingModel,
         BackendStatus::Generating => Activity::Generating,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::app::config::Config;
+    use crate::tools::{default_registry, RiskLevel};
+
+    struct TestBackend {
+        responses: Vec<String>,
+        call_count: usize,
+    }
+
+    impl TestBackend {
+        fn new(responses: Vec<impl Into<String>>) -> Self {
+            Self {
+                responses: responses.into_iter().map(Into::into).collect(),
+                call_count: 0,
+            }
+        }
+    }
+
+    impl ModelBackend for TestBackend {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn generate(
+            &mut self,
+            _request: GenerateRequest,
+            on_event: &mut dyn FnMut(BackendEvent),
+        ) -> crate::app::Result<()> {
+            let reply = self.responses.get(self.call_count).cloned().unwrap_or_default();
+            self.call_count += 1;
+            if !reply.is_empty() {
+                on_event(BackendEvent::TextDelta(reply));
+            }
+            on_event(BackendEvent::Finished);
+            Ok(())
+        }
+    }
+
+    fn make_runtime(responses: Vec<impl Into<String>>) -> Runtime {
+        Runtime::new(
+            &Config::default(),
+            &PathBuf::from("."),
+            Box::new(TestBackend::new(responses)),
+            default_registry(PathBuf::from(".")),
+        )
+    }
+
+    fn collect_events(runtime: &mut Runtime, request: RuntimeRequest) -> Vec<RuntimeEvent> {
+        let mut events = Vec::new();
+        runtime.handle(request, &mut |e| events.push(e));
+        events
+    }
+
+    fn has_failed(events: &[RuntimeEvent]) -> bool {
+        events.iter().any(|e| matches!(e, RuntimeEvent::Failed { .. }))
+    }
+
+    fn failed_message(events: &[RuntimeEvent]) -> Option<String> {
+        events.iter().find_map(|e| {
+            if let RuntimeEvent::Failed { message } = e {
+                Some(message.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn approve_with_no_pending_fires_failed() {
+        let mut rt = make_runtime(vec!["hello"]);
+        let events = collect_events(&mut rt, RuntimeRequest::Approve);
+        assert!(has_failed(&events), "expected Failed, got: {events:?}");
+        assert_eq!(
+            failed_message(&events).as_deref(),
+            Some("No pending action to approve.")
+        );
+    }
+
+    #[test]
+    fn reject_with_no_pending_fires_failed() {
+        let mut rt = make_runtime(vec!["hello"]);
+        let events = collect_events(&mut rt, RuntimeRequest::Reject);
+        assert!(has_failed(&events), "expected Failed, got: {events:?}");
+        assert_eq!(
+            failed_message(&events).as_deref(),
+            Some("No pending action to reject.")
+        );
+    }
+
+    #[test]
+    fn submit_while_pending_fires_failed() {
+        let mut rt = make_runtime(vec!["hello"]);
+        rt.set_pending_for_test(PendingAction {
+            tool_name: "edit_file".into(),
+            summary: "edit src/lib.rs".into(),
+            risk: RiskLevel::Medium,
+            payload: "{}".into(),
+        });
+        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "continue".into() });
+        assert!(has_failed(&events), "expected Failed, got: {events:?}");
+        assert!(
+            failed_message(&events)
+                .as_deref()
+                .unwrap_or("")
+                .contains("pending"),
+        );
+    }
+
+    #[test]
+    fn reset_clears_pending_state() {
+        let mut rt = make_runtime(vec!["hello"]);
+        rt.set_pending_for_test(PendingAction {
+            tool_name: "write_file".into(),
+            summary: "write src/new.rs".into(),
+            risk: RiskLevel::High,
+            payload: "{}".into(),
+        });
+        collect_events(&mut rt, RuntimeRequest::Reset);
+        // After reset, approve should fail with "no pending" — not "submit blocked"
+        let events = collect_events(&mut rt, RuntimeRequest::Approve);
+        assert!(has_failed(&events), "expected Failed after reset, got: {events:?}");
+        assert_eq!(
+            failed_message(&events).as_deref(),
+            Some("No pending action to approve.")
+        );
     }
 }

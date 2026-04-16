@@ -44,6 +44,7 @@ impl AppPaths {
     }
 }
 
+/// Walks up the directory tree from the starting point to find a directory containing the config file
 fn find_project_root(start_dir: &Path) -> Option<PathBuf> {
     for candidate in start_dir.ancestors() {
         let config_file = candidate.join(CONFIG_FILE_NAME);

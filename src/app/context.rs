@@ -42,6 +42,7 @@ impl AppContext {
         Ok(())
     }
 
+    /// Initializes the AppContext by building a Runtime and loading the session history.
     pub fn build(
         config: &Config,
         project_root: &Path,

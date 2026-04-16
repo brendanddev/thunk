@@ -148,5 +148,12 @@ fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
             state.set_status("error");
             state.add_system_message(message);
         }
+        RuntimeEvent::ApprovalRequired(pending) => {
+            state.add_system_message(format!(
+                "[approval required] {} — type /approve to confirm or /reject to cancel",
+                pending.summary
+            ));
+            state.set_status("awaiting approval");
+        }
     }
 }

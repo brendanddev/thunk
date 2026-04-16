@@ -51,7 +51,7 @@ impl ActiveSession {
     }
 }
 
-// ── Conversion: runtime ↔ storage ────────────────────────────────────────────
+// Conversion: runtime <--> storage
 //
 // System messages are excluded. The system prompt is reconstructed at runtime
 // from config; storing it would create a stale copy that could diverge.
