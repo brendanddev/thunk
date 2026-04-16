@@ -6,6 +6,26 @@ Personal AI coding assistant CLI focused on local-first workflows, modular backe
 
 ---
 
+## Overview
+
+`params-cli` is a Rust-based AI coding agent designed to be:
+
+- local-first
+- tool-using
+- modular and extensible
+- usable for real development workflows
+
+It is not a simple chatbot wrapper. The goal is to build a durable coding agent runtime that can evolve over time without constant rewrites.
+
+The project is currently being rebuilt with a strong focus on:
+
+- clear architectural boundaries
+- low coupling between subsystems
+- explicit runtime behavior
+- long-term maintainability
+
+---
+
 ## Requirements
 
 - Rust (stable)
@@ -19,15 +39,17 @@ Personal AI coding assistant CLI focused on local-first workflows, modular backe
 params-cli/
 ├── README.md
 ├── Cargo.toml
-├── Cargo.lock
 ├── config.toml
 ├── data/
-├── docs/
+├── docs/           # Documentation and design notes
 ├── logs/
 ├── src/
-│   ├── app/
-│   ├── runtime/
-│   ├── tui/
+│   ├── app/        # orchestration, session coordination
+│   ├── llm/        # backend abstraction and providers
+│   ├── runtime/    # engine, conversation, tool codec
+│   ├── storage/    # persistence layer
+│   ├── tools/      # tool registry and implementations
+│   ├── tui/        # UI, rendering, commands
 │   ├── lib.rs
 │   └── main.rs
 └── tests/

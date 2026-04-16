@@ -55,16 +55,23 @@ impl Default for ToolRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
-    use crate::tools::types::{ToolInput, ToolOutput};
-    use crate::tools::read_file::ReadFileTool;
+    use crate::tools::context::ToolContext;
     use crate::tools::list_dir::ListDirTool;
+    use crate::tools::read_file::ReadFileTool;
+    use crate::tools::types::{ToolInput, ToolOutput};
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(PathBuf::from("."))
+    }
 
     #[test]
     fn specs_are_sorted_by_name() {
         let mut registry = ToolRegistry::new();
-        registry.register(ReadFileTool);
-        registry.register(ListDirTool);
+        registry.register(ReadFileTool::new(ctx()));
+        registry.register(ListDirTool::new(ctx()));
 
         let specs = registry.specs();
         let names: Vec<_> = specs.iter().map(|s| s.name).collect();
@@ -85,11 +92,10 @@ mod tests {
     #[test]
     fn dispatch_routes_to_correct_tool() {
         let mut registry = ToolRegistry::new();
-        registry.register(ListDirTool);
+        registry.register(ListDirTool::new(ctx()));
 
         // list_dir on a valid path should succeed (use cwd, which always exists)
-        let result = registry
-            .dispatch(ToolInput::ListDir { path: ".".into() });
+        let result = registry.dispatch(ToolInput::ListDir { path: ".".into() });
         assert!(result.is_ok());
         let ToolOutput::DirectoryListing(_) = result.unwrap().output else {
             panic!("expected DirectoryListing output");

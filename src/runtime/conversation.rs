@@ -46,6 +46,17 @@ impl Conversation {
             .map(|m| m.content.as_str())
     }
 
+    /// Appends historical messages into the conversation after the current content.
+    /// Used only at startup to restore a prior session. The system prompt must
+    /// already be set; history messages are appended after it.
+    pub fn extend_history(&mut self, messages: Vec<Message>) {
+        debug_assert!(
+            self.messages.len() == 1,
+            "extend_history called on non-empty conversation"
+        );
+        self.messages.extend(messages);
+    }
+
     /// Resets the conversation to just the system prompt.
     pub fn reset(&mut self, system_prompt: String) {
         self.messages.clear();

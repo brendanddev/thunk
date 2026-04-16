@@ -17,19 +17,18 @@ use crossterm::{
 };
 
 use crate::app::config::Config;
+use crate::app::context::AppContext;
 use crate::app::paths::AppPaths;
 use crate::app::{AppError, Result};
-use crate::runtime::Runtime;
 
 /// Main entry point for the TUI, handling terminal setup and teardown
-pub fn run(config: &Config, paths: &AppPaths, runtime: &mut Runtime) -> Result<()> {
+pub fn run(config: &Config, paths: &AppPaths, mut app: AppContext) -> Result<()> {
     if !io::stdout().is_terminal() {
         return Err(AppError::Tui(
             "The TUI requires an interactive terminal (stdout is not a TTY).".to_string(),
         ));
     }
 
-    // Check if the terminal is "dumb", which does not support necessary features for the TUI
     if std::env::var("TERM").as_deref() == Ok("dumb") {
         return Err(AppError::Tui(
             "The TUI cannot run with TERM=dumb.".to_string(),
@@ -49,7 +48,7 @@ pub fn run(config: &Config, paths: &AppPaths, runtime: &mut Runtime) -> Result<(
     )?;
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        app::run_app(&mut stdout, config, paths, runtime)
+        app::run_app(&mut stdout, config, paths, &mut app)
     }));
 
     disable_raw_mode()?;

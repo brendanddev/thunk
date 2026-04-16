@@ -1,16 +1,22 @@
 use std::fs;
-use std::path::Path;
 
-use super::types::{
-    FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolSpec,
-};
+use super::context::ToolContext;
+use super::types::{FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolSpec};
 use super::Tool;
 
 /// Maximum bytes read from a single file before truncation.
 /// Prevents large files from flooding the model context.
 const MAX_BYTES: usize = 100_000;
 
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    context: ToolContext,
+}
+
+impl ReadFileTool {
+    pub fn new(context: ToolContext) -> Self {
+        Self { context }
+    }
+}
 
 impl Tool for ReadFileTool {
     fn spec(&self) -> ToolSpec {
@@ -28,8 +34,8 @@ impl Tool for ReadFileTool {
             ));
         };
 
-        let path = Path::new(path);
-        let raw = fs::read(path)?;
+        let path = self.context.resolve(path);
+        let raw = fs::read(&path)?;
 
         let (contents, truncated) = if raw.len() > MAX_BYTES {
             let sliced = &raw[..MAX_BYTES];
@@ -67,12 +73,15 @@ fn is_char_boundary(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
     fn read(path: &str) -> Result<ToolOutput, ToolError> {
-        ReadFileTool.run(&ToolInput::ReadFile { path: path.to_string() })
+        ReadFileTool::new(ToolContext::new(PathBuf::from(".")))
+            .run(&ToolInput::ReadFile { path: path.to_string() })
     }
 
     #[test]

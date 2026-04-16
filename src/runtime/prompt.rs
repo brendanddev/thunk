@@ -1,14 +1,18 @@
+use std::path::Path;
+
 use crate::tools::ToolSpec;
 
 use super::tool_codec;
 
-pub fn build_system_prompt(app_name: &str, specs: &[ToolSpec]) -> String {
+pub fn build_system_prompt(app_name: &str, project_root: &Path, specs: &[ToolSpec]) -> String {
     let mut prompt = format!(
         "You are {app_name}, a local AI coding assistant. \
+You are working in the project at {}. \
 Be concise, grounded, and practical. \
 Prefer directly useful answers over long theory. \
 If you are unsure, say so plainly. \
-When you show code, keep it focused on the user's request."
+When you show code, keep it focused on the user's request.",
+        project_root.display()
     );
 
     if !specs.is_empty() {

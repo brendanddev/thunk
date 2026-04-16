@@ -1,12 +1,18 @@
 use std::fs;
-use std::path::Path;
 
-use super::types::{
-    DirEntry, DirectoryListingOutput, EntryKind, ToolError, ToolInput, ToolOutput, ToolSpec,
-};
+use super::context::ToolContext;
+use super::types::{DirEntry, DirectoryListingOutput, EntryKind, ToolError, ToolInput, ToolOutput, ToolSpec};
 use super::Tool;
 
-pub struct ListDirTool;
+pub struct ListDirTool {
+    context: ToolContext,
+}
+
+impl ListDirTool {
+    pub fn new(context: ToolContext) -> Self {
+        Self { context }
+    }
+}
 
 impl Tool for ListDirTool {
     fn spec(&self) -> ToolSpec {
@@ -24,8 +30,8 @@ impl Tool for ListDirTool {
             ));
         };
 
-        let dir = Path::new(path);
-        let read = fs::read_dir(dir)?;
+        let dir = self.context.resolve(path);
+        let read = fs::read_dir(&dir)?;
 
         let mut entries: Vec<DirEntry> = read
             .filter_map(|entry| entry.ok())
@@ -69,12 +75,16 @@ impl Tool for ListDirTool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;
 
     fn list(path: &str) -> Result<ToolOutput, ToolError> {
-        ListDirTool.run(&ToolInput::ListDir { path: path.to_string() })
+        ListDirTool::new(ToolContext::new(PathBuf::from("."))).run(&ToolInput::ListDir {
+            path: path.to_string(),
+        })
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::app::config::Config;
 use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
@@ -20,15 +22,32 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(config: &Config, backend: Box<dyn ModelBackend>, registry: ToolRegistry) -> Self {
+    pub fn new(
+        config: &Config,
+        project_root: &Path,
+        backend: Box<dyn ModelBackend>,
+        registry: ToolRegistry,
+    ) -> Self {
         let specs = registry.specs();
-        let system_prompt = prompt::build_system_prompt(&config.app.name, &specs);
+        let system_prompt =
+            prompt::build_system_prompt(&config.app.name, project_root, &specs);
         Self {
             conversation: Conversation::new(system_prompt.clone()),
             backend,
             registry,
             system_prompt,
         }
+    }
+
+    /// Returns a snapshot of all current conversation messages for persistence.
+    pub fn messages_snapshot(&self) -> Vec<crate::llm::backend::Message> {
+        self.conversation.snapshot()
+    }
+
+    /// Appends historical messages into the conversation after the system prompt.
+    /// Called once at startup when restoring a prior session. Not for use mid-turn.
+    pub fn load_history(&mut self, messages: Vec<crate::llm::backend::Message>) {
+        self.conversation.extend_history(messages);
     }
 
     pub fn handle(&mut self, request: RuntimeRequest, on_event: &mut dyn FnMut(RuntimeEvent)) {

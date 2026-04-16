@@ -1,9 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-use super::types::{
-    SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput, ToolSpec,
-};
+use super::context::ToolContext;
+use super::types::{SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput, ToolSpec};
 use super::Tool;
 
 /// Maximum number of matches returned in a single search. Prevents context overload.
@@ -19,7 +18,15 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "html", "css", "scss", "xml", "sql", "env", "gitignore", "lock",
 ];
 
-pub struct SearchCodeTool;
+pub struct SearchCodeTool {
+    context: ToolContext,
+}
+
+impl SearchCodeTool {
+    pub fn new(context: ToolContext) -> Self {
+        Self { context }
+    }
+}
 
 impl Tool for SearchCodeTool {
     fn spec(&self) -> ToolSpec {
@@ -41,8 +48,11 @@ impl Tool for SearchCodeTool {
             return Err(ToolError::InvalidInput("search query cannot be empty".into()));
         }
 
-        let root = path.as_deref().unwrap_or(".");
-        let root = Path::new(root);
+        let root = match path.as_deref() {
+            Some(p) => self.context.resolve(p),
+            None => self.context.root.clone(),
+        };
+        let root = root.as_path();
 
         let mut matches = Vec::new();
         walk_and_search(root, query, &mut matches)?;
@@ -124,12 +134,14 @@ fn is_text_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;
 
     fn search(query: &str, path: &str) -> Result<ToolOutput, ToolError> {
-        SearchCodeTool.run(&ToolInput::SearchCode {
+        SearchCodeTool::new(ToolContext::new(PathBuf::from("."))).run(&ToolInput::SearchCode {
             query: query.to_string(),
             path: Some(path.to_string()),
         })
@@ -163,7 +175,7 @@ mod tests {
 
     #[test]
     fn returns_error_on_empty_query() {
-        let err = SearchCodeTool
+        let err = SearchCodeTool::new(ToolContext::new(PathBuf::from(".")))
             .run(&ToolInput::SearchCode { query: "".into(), path: None })
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));

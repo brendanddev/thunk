@@ -4,20 +4,20 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::config::Config;
+use crate::app::AppContext;
 use crate::app::paths::AppPaths;
 use crate::app::Result;
-use crate::runtime::{AnswerSource, Runtime, RuntimeEvent, RuntimeRequest};
+use crate::runtime::{AnswerSource, RuntimeEvent, RuntimeRequest};
 
 use super::commands;
 use super::render::render;
 use super::state::AppState;
 
-/// Runs the TUI app, handling rendering and user input
 pub(crate) fn run_app(
     stdout: &mut io::Stdout,
     config: &Config,
     paths: &AppPaths,
-    runtime: &mut Runtime,
+    app: &mut AppContext,
 ) -> Result<()> {
     let mut state = AppState::new(config, paths);
 
@@ -30,7 +30,7 @@ pub(crate) fn run_app(
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => handle_key_event(stdout, &mut state, runtime, key)?,
+                Event::Key(key) => handle_key_event(stdout, &mut state, app, key)?,
                 Event::Paste(text) => state.insert_str(&text),
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -42,7 +42,7 @@ pub(crate) fn run_app(
 fn handle_key_event(
     stdout: &mut io::Stdout,
     state: &mut AppState,
-    runtime: &mut Runtime,
+    app: &mut AppContext,
     key: KeyEvent,
 ) -> Result<()> {
     match (key.code, key.modifiers) {
@@ -52,11 +52,10 @@ fn handle_key_event(
         }
         (KeyCode::Enter, _) => {
             if let Some(input) = state.submit_input() {
-                // Check for slash commands before forwarding to the runtime.
                 if let Some(cmd) = commands::parse(&input) {
-                    handle_command(state, runtime, cmd)?;
+                    handle_command(state, app, cmd)?;
                 } else {
-                    submit_to_runtime(stdout, state, runtime, input)?;
+                    submit_to_app(stdout, state, app, input)?;
                 }
             }
         }
@@ -72,16 +71,16 @@ fn handle_key_event(
     Ok(())
 }
 
-fn submit_to_runtime(
+fn submit_to_app(
     stdout: &mut io::Stdout,
     state: &mut AppState,
-    runtime: &mut Runtime,
+    app: &mut AppContext,
     prompt: String,
 ) -> Result<()> {
     state.add_user_message(prompt.clone());
     let mut render_error = None;
 
-    runtime.handle(RuntimeRequest::Submit { text: prompt }, &mut |event| {
+    let handle_result = app.handle(RuntimeRequest::Submit { text: prompt }, &mut |event| {
         if render_error.is_some() {
             return;
         }
@@ -95,12 +94,16 @@ fn submit_to_runtime(
         return Err(e);
     }
 
+    if let Err(e) = handle_result {
+        apply_runtime_event(state, RuntimeEvent::Failed { message: e.to_string() });
+    }
+
     Ok(())
 }
 
 fn handle_command(
     state: &mut AppState,
-    runtime: &mut Runtime,
+    app: &mut AppContext,
     cmd: commands::Command,
 ) -> Result<()> {
     match cmd {
@@ -114,7 +117,9 @@ fn handle_command(
         }
         commands::Command::Clear => {
             state.clear_messages();
-            runtime.handle(RuntimeRequest::Reset, &mut |_| {});
+            if let Err(e) = app.reset() {
+                state.add_system_message(format!("session reset failed: {e}"));
+            }
         }
     }
     Ok(())
