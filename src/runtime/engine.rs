@@ -1,14 +1,14 @@
 use crate::app::config::Config;
 use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
-use crate::tools::{EntryKind, ToolOutput, ToolRegistry};
+use crate::tools::ToolRegistry;
 
 use super::conversation::Conversation;
-use super::tool_parser;
-use super::types::{Activity, AnswerSource, RuntimeEvent, RuntimeRequest};
 use super::prompt;
+use super::tool_codec;
+use super::types::{Activity, AnswerSource, RuntimeEvent, RuntimeRequest};
 
-/// Maximum tool rounds per turn. Prevents infinite loops when the model keeps
+/// Maximum tool rounds per turn. Prevents runaway loops when the model keeps
 /// producing tool calls without reaching a final answer.
 const MAX_TOOL_ROUNDS: usize = 10;
 
@@ -78,7 +78,7 @@ impl Runtime {
                 }
             };
 
-            let calls = tool_parser::parse_tool_calls(&response);
+            let calls = tool_codec::parse_tool_calls(&response);
 
             if calls.is_empty() {
                 let source = if tool_rounds == 0 {
@@ -107,19 +107,12 @@ impl Runtime {
                 on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
                 match self.registry.dispatch(input) {
                     Ok(result) => {
-                        on_event(RuntimeEvent::ToolCallFinished {
-                            name: name.clone(),
-                            success: true,
-                        });
-                        results_text.push_str(&format_tool_result(&name, &result.output));
+                        on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: true });
+                        results_text.push_str(&tool_codec::format_tool_result(&name, &result.output));
                     }
                     Err(e) => {
-                        on_event(RuntimeEvent::ToolCallFinished {
-                            name: name.clone(),
-                            success: false,
-                        });
-                        results_text
-                            .push_str(&format!("[tool_error: {name}]\n{e}\n[/tool_error]\n\n"));
+                        on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: false });
+                        results_text.push_str(&tool_codec::format_tool_error(&name, &e.to_string()));
                     }
                 }
             }
@@ -165,55 +158,6 @@ fn run_generate_turn(
     } else {
         Ok(None)
     }
-}
-
-/// Formats a tool result for insertion into the conversation as a user message.
-/// The model reads this to know what the tool returned before continuing.
-fn format_tool_result(name: &str, output: &ToolOutput) -> String {
-    let body = match output {
-        ToolOutput::FileContents(f) => {
-            if f.truncated {
-                format!("{}\n[file truncated at read limit]", f.contents)
-            } else {
-                f.contents.clone()
-            }
-        }
-        ToolOutput::DirectoryListing(d) => {
-            if d.entries.is_empty() {
-                "(empty directory)".to_string()
-            } else {
-                d.entries
-                    .iter()
-                    .map(|e| {
-                        let kind = match e.kind {
-                            EntryKind::Dir => "dir ",
-                            EntryKind::File => "file",
-                            EntryKind::Symlink => "link",
-                        };
-                        format!("{kind}  {}", e.name)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        }
-        ToolOutput::SearchResults(s) => {
-            if s.matches.is_empty() {
-                "No matches found.".to_string()
-            } else {
-                let mut lines: Vec<String> = s
-                    .matches
-                    .iter()
-                    .map(|m| format!("{}:{}: {}", m.file, m.line_number, m.line))
-                    .collect();
-                if s.truncated {
-                    lines.push("[results truncated at match limit]".to_string());
-                }
-                lines.join("\n")
-            }
-        }
-    };
-
-    format!("[tool_result: {name}]\n{body}\n[/tool_result]\n\n")
 }
 
 fn map_backend_status(status: BackendStatus) -> Activity {

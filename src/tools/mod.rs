@@ -8,7 +8,10 @@ pub use list_dir::ListDirTool;
 pub use read_file::ReadFileTool;
 pub use registry::ToolRegistry;
 pub use search_code::SearchCodeTool;
-pub use types::{EntryKind, ToolError, ToolInput, ToolOutput, ToolSpec};
+pub use types::{
+    DirEntry, DirectoryListingOutput, EntryKind, FileContentsOutput, SearchMatch,
+    SearchResultsOutput, ToolError, ToolInput, ToolOutput, ToolSpec,
+};
 
 /// The core tool trait. Each implementation handles exactly one ToolInput variant.
 /// Returns structured ToolOutput — never a formatted string intended for logic consumers.

@@ -30,8 +30,6 @@ pub enum AnswerSource {
     ToolAssisted { rounds: usize },
     /// Loop was cut off at the tool round limit before a final answer.
     ToolLimitReached,
-    /// Backend failed mid-loop; last assistant output (if any) is the best available.
-    BackendError(String),
 }
 
 #[derive(Debug, Clone)]

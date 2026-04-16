@@ -25,6 +25,8 @@ pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub status: String,
     pub should_quit: bool,
+    // Stored once at construction; used to restore messages on /clear.
+    welcome_message: String,
 }
 
 /// Defines methods for modifying the input buffer and cursor position in the app state
@@ -32,15 +34,15 @@ impl AppState {
 
     /// Creates a new AppState instance, initializing the message history with a system message based on the provided config and paths
     pub fn new(config: &Config, paths: &AppPaths) -> Self {
-        let mut messages = Vec::new();
-        messages.push(ChatMessage {
+        let welcome = format!(
+            "{} ready. Root: {}. Press Ctrl+Q to quit.",
+            config.app.name,
+            paths.root_dir.display()
+        );
+        let messages = vec![ChatMessage {
             role: Role::System,
-            content: format!(
-                "{} ready. Root: {}. Press Ctrl+Q to quit.",
-                config.app.name,
-                paths.root_dir.display()
-            ),
-        });
+            content: welcome.clone(),
+        }];
 
         Self {
             app_name: config.app.name.clone(),
@@ -50,6 +52,7 @@ impl AppState {
             messages,
             status: "ready".to_string(),
             should_quit: false,
+            welcome_message: welcome,
         }
     }
 
@@ -101,11 +104,13 @@ impl AppState {
         });
     }
 
-    /// Clears all transcript messages except the initial welcome line.
+    /// Clears all transcript messages and restores only the initial welcome line.
     /// Does not affect the runtime conversation — call RuntimeRequest::Reset separately.
     pub fn clear_messages(&mut self) {
-        self.messages.retain(|m| {
-            m.role == Role::System && m.content.contains("ready")
+        self.messages.clear();
+        self.messages.push(ChatMessage {
+            role: Role::System,
+            content: self.welcome_message.clone(),
         });
     }
 

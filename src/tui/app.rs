@@ -54,7 +54,7 @@ fn handle_key_event(
             if let Some(input) = state.submit_input() {
                 // Check for slash commands before forwarding to the runtime.
                 if let Some(cmd) = commands::parse(&input) {
-                    handle_command(stdout, state, runtime, cmd)?;
+                    handle_command(state, runtime, cmd)?;
                 } else {
                     submit_to_runtime(stdout, state, runtime, input)?;
                 }
@@ -99,7 +99,6 @@ fn submit_to_runtime(
 }
 
 fn handle_command(
-    _stdout: &mut io::Stdout,
     state: &mut AppState,
     runtime: &mut Runtime,
     cmd: commands::Command,

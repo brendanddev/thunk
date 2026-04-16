@@ -1,9 +1,8 @@
 mod conversation;
 mod engine;
 mod prompt;
-mod tool_parser;
+mod tool_codec;
 mod types;
 
 pub use engine::Runtime;
-pub use types::{RuntimeEvent, RuntimeRequest};
-pub use types::AnswerSource;
+pub use types::{AnswerSource, RuntimeEvent, RuntimeRequest};
