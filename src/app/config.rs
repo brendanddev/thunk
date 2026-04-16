@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -11,6 +12,8 @@ use super::{AppError, Result};
 pub struct Config {
     pub app: AppConfig,
     pub ui: UiConfig,
+    pub llm: LlmConfig,
+    pub llama_cpp: LlamaCppConfig,
 }
 
 /// Application configuration for the app
@@ -45,6 +48,65 @@ impl Default for UiConfig {
     }
 }
 
+/// Model provider selection for the application
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LlmConfig {
+    pub provider: String,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: "mock".to_string(),
+        }
+    }
+}
+
+/// llama.cpp provider configuration
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LlamaCppConfig {
+    pub model_path: Option<PathBuf>,
+    pub gpu_layers: u32,
+    pub context_tokens: u32,
+    pub batch_tokens: u32,
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub show_native_logs: bool,
+}
+
+impl Default for LlamaCppConfig {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            gpu_layers: 0,
+            context_tokens: 2048,
+            batch_tokens: 256,
+            max_tokens: 512,
+            temperature: 0.7,
+            show_native_logs: false,
+        }
+    }
+}
+
+impl Config {
+    pub fn resolve_paths(mut self, root_dir: &Path) -> Self {
+        self.llama_cpp.resolve_paths(root_dir);
+        self
+    }
+}
+
+impl LlamaCppConfig {
+    fn resolve_paths(&mut self, root_dir: &Path) {
+        if let Some(model_path) = self.model_path.as_mut() {
+            if model_path.is_relative() {
+                *model_path = root_dir.join(&*model_path);
+            }
+        }
+    }
+}
+
 /// Loads the config from a TOML file at the specified path
 pub fn load(path: &Path) -> Result<Config> {
     if !path.exists() {
@@ -60,4 +122,31 @@ pub fn load(path: &Path) -> Result<Config> {
     }
 
     Ok(toml::from_str(&raw)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{Config, LlamaCppConfig};
+
+    #[test]
+    fn resolves_relative_llama_model_paths_from_project_root() {
+        let mut config = Config::default();
+        config.llama_cpp = LlamaCppConfig {
+            model_path: Some("data/models/model.gguf".into()),
+            gpu_layers: 0,
+            context_tokens: 2048,
+            batch_tokens: 256,
+            max_tokens: 128,
+            temperature: 0.5,
+            show_native_logs: false,
+        };
+
+        let resolved = config.resolve_paths(Path::new("/tmp/project"));
+        assert_eq!(
+            resolved.llama_cpp.model_path.as_deref(),
+            Some(Path::new("/tmp/project/data/models/model.gguf"))
+        );
+    }
 }

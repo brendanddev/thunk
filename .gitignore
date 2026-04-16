@@ -11,6 +11,9 @@ data/
 ## Logs
 logs/
 
+## Private documentation
+docs/private/
+
 # OS
 .DS_Store
 *.swp

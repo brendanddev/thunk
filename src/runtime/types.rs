@@ -2,6 +2,8 @@
 pub enum Activity {
     Idle,
     Processing,
+    LoadingModel,
+    Generating,
     Responding,
 }
 
@@ -10,6 +12,8 @@ impl Activity {
         match self {
             Self::Idle => "ready",
             Self::Processing => "processing",
+            Self::LoadingModel => "loading model",
+            Self::Generating => "generating",
             Self::Responding => "responding",
         }
     }

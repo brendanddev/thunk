@@ -30,7 +30,7 @@ pub(crate) fn run_app(
         // Poll for events with a timeout to allow periodic rendering updates
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => handle_key_event(&mut state, runtime, key),
+                Event::Key(key) => handle_key_event(stdout, &mut state, runtime, key)?,
                 Event::Paste(text) => state.insert_str(&text),
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -40,7 +40,12 @@ pub(crate) fn run_app(
 }
 
 /// Handles a key event, updating the app state accordingly
-fn handle_key_event(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) {
+fn handle_key_event(
+    stdout: &mut io::Stdout,
+    state: &mut AppState,
+    runtime: &mut Runtime,
+    key: KeyEvent,
+) -> Result<()> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL)
         | (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
@@ -49,8 +54,21 @@ fn handle_key_event(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) 
         (KeyCode::Enter, _) => {
             if let Some(prompt) = state.submit_input() {
                 state.add_user_message(prompt.clone());
-                let events = runtime.handle(RuntimeRequest::Submit { text: prompt });
-                apply_runtime_events(state, events);
+                let mut render_error = None;
+                runtime.handle(RuntimeRequest::Submit { text: prompt }, &mut |event| {
+                    if render_error.is_some() {
+                        return;
+                    }
+
+                    apply_runtime_event(state, event);
+                    if let Err(error) = render(stdout, state) {
+                        render_error = Some(error);
+                    }
+                });
+
+                if let Some(error) = render_error {
+                    return Err(error);
+                }
             }
         }
         (KeyCode::Backspace, _) => state.delete_char_before(),
@@ -61,19 +79,19 @@ fn handle_key_event(state: &mut AppState, runtime: &mut Runtime, key: KeyEvent) 
         (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => state.insert_char(c),
         _ => {}
     }
+
+    Ok(())
 }
 
-fn apply_runtime_events(state: &mut AppState, events: Vec<RuntimeEvent>) {
-    for event in events {
-        match event {
-            RuntimeEvent::ActivityChanged(activity) => state.set_status(activity.label()),
-            RuntimeEvent::AssistantMessageStarted => state.begin_assistant_message(),
-            RuntimeEvent::AssistantMessageChunk(chunk) => state.append_assistant_chunk(&chunk),
-            RuntimeEvent::AssistantMessageFinished => {}
-            RuntimeEvent::Failed { message } => {
-                state.set_status("error");
-                state.add_system_message(message);
-            }
+fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
+    match event {
+        RuntimeEvent::ActivityChanged(activity) => state.set_status(activity.label()),
+        RuntimeEvent::AssistantMessageStarted => state.begin_assistant_message(),
+        RuntimeEvent::AssistantMessageChunk(chunk) => state.append_assistant_chunk(&chunk),
+        RuntimeEvent::AssistantMessageFinished => {}
+        RuntimeEvent::Failed { message } => {
+            state.set_status("error");
+            state.add_system_message(message);
         }
     }
 }

@@ -1,59 +1,98 @@
-use std::path::PathBuf;
-
 use crate::app::config::Config;
-use crate::app::paths::AppPaths;
+use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
 
+use super::conversation::Conversation;
+use super::prompt;
 use super::types::{Activity, RuntimeEvent, RuntimeRequest};
 
-#[derive(Debug)]
 pub struct Runtime {
-    app_name: String,
-    workspace_root: PathBuf,
+    conversation: Conversation,
+    backend: Box<dyn ModelBackend>,
 }
 
 impl Runtime {
-    pub fn new(config: &Config, paths: &AppPaths) -> Self {
+    pub fn new(config: &Config, backend: Box<dyn ModelBackend>) -> Self {
         Self {
-            app_name: config.app.name.clone(),
-            workspace_root: paths.root_dir.clone(),
+            conversation: Conversation::new(prompt::build_system_prompt(&config.app.name)),
+            backend,
         }
     }
 
-    pub fn handle(&mut self, request: RuntimeRequest) -> Vec<RuntimeEvent> {
+    pub fn handle(
+        &mut self,
+        request: RuntimeRequest,
+        on_event: &mut dyn FnMut(RuntimeEvent),
+    ) {
         match request {
-            RuntimeRequest::Submit { text } => self.handle_submit(text),
+            RuntimeRequest::Submit { text } => self.handle_submit(text, on_event),
         }
     }
 
-    fn handle_submit(&mut self, text: String) -> Vec<RuntimeEvent> {
+    fn handle_submit(&mut self, text: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            return vec![RuntimeEvent::Failed {
+            on_event(RuntimeEvent::Failed {
                 message: "Cannot submit an empty prompt.".to_string(),
-            }];
+            });
+            return;
         }
 
-        let reply = self.compose_reply(trimmed);
-        vec![
-            RuntimeEvent::ActivityChanged(Activity::Processing),
-            RuntimeEvent::AssistantMessageStarted,
-            RuntimeEvent::ActivityChanged(Activity::Responding),
-            RuntimeEvent::AssistantMessageChunk(reply),
-            RuntimeEvent::AssistantMessageFinished,
-            RuntimeEvent::ActivityChanged(Activity::Idle),
-        ]
+        self.conversation.push_user(text);
+
+        let request = GenerateRequest::new(self.conversation.snapshot());
+        on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+        let mut started_assistant_message = false;
+
+        let backend = &mut self.backend;
+        let conversation = &mut self.conversation;
+        let result = backend.generate(request, &mut |event| match event {
+            BackendEvent::StatusChanged(status) => {
+                on_event(RuntimeEvent::ActivityChanged(map_backend_status(status)));
+            }
+            BackendEvent::TextDelta(chunk) => {
+                if !started_assistant_message {
+                    started_assistant_message = true;
+                    conversation.begin_assistant_reply();
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Responding));
+                    on_event(RuntimeEvent::AssistantMessageStarted);
+                }
+
+                conversation.push_assistant_chunk(&chunk);
+                on_event(RuntimeEvent::AssistantMessageChunk(chunk));
+            }
+            BackendEvent::Finished => {}
+        });
+
+        match result {
+            Ok(()) => {
+                if !started_assistant_message {
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    on_event(RuntimeEvent::Failed {
+                        message: format!("{} returned no output.", backend.name()),
+                    });
+                    return;
+                }
+
+                on_event(RuntimeEvent::AssistantMessageFinished);
+                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+            }
+            Err(error) => {
+                if started_assistant_message {
+                    on_event(RuntimeEvent::AssistantMessageFinished);
+                }
+
+                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                on_event(RuntimeEvent::Failed {
+                    message: error.to_string(),
+                });
+            }
+        }
     }
+}
 
-    fn compose_reply(&self, prompt: &str) -> String {
-        match prompt {
-            "help" | "Help" => format!(
-                "{} is running with the new runtime boundary in place. The next layer is wiring a real model backend into this request/event flow.",
-                self.app_name
-            ),
-            _ => format!(
-                "Runtime received: \"{prompt}\".\n\nThis reply is coming from src/runtime/engine.rs, so the TUI is now only rendering state and forwarding requests. Workspace root: {}.",
-                self.workspace_root.display()
-            ),
-        }
+fn map_backend_status(status: BackendStatus) -> Activity {
+    match status {
+        BackendStatus::LoadingModel => Activity::LoadingModel,
+        BackendStatus::Generating => Activity::Generating,
     }
 }

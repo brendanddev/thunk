@@ -32,3 +32,11 @@ params-cli/
 │   └── main.rs
 └── tests/
 ```
+
+---
+
+## Documentation
+| Section | Description |
+|---------|-------------|
+| [Architecture](docs/architecture.md) | Overview of the system's modular design and components. |
+| [Setup](docs/setup.md) | Instructions for installing Rust and running the application. |
