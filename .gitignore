@@ -2,18 +2,29 @@
 ## Environment variables
 .env
 
-## Local files
-.local/
-.claude/
-
 ## Build output
 /target
 
-## Examples & notes
-examples/
+## Data
+data/
+
+## Logs
+logs/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+
+
+## Local files
+.local/
+.claude/
 
 ## Models
 models/
 *.gguf
 *.ggml
 *.bin
+
