@@ -524,6 +524,12 @@ fn dispatch_repo_turn(
                 prompt,
                 &outcome.tool_results,
             );
+            info!(
+                intent = ?intent,
+                answer_source = ?outcome.answer_source,
+                chars = outcome.final_response.len(),
+                "repo turn completed"
+            );
             for result in &outcome.tool_results {
                 ctx.hooks.dispatch(HookEvent::ToolExecuted {
                     tool_name: result.tool_name.clone(),

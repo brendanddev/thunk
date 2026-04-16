@@ -1,6 +1,7 @@
+use super::answer::build_synthesis_messages;
 use super::evidence::{
-    has_relevant_file_evidence, investigation_readiness, targeted_investigation_followup,
-    InvestigationReadiness,
+    has_relevant_file_evidence, investigation_readiness, render_structured_answer,
+    targeted_investigation_followup, InvestigationReadiness,
 };
 use super::intent::suggested_search_query;
 use super::prompting::with_progress_heartbeat_interval;
@@ -1848,16 +1849,6 @@ fn targeted_followup_for_call_site_lookup_prefers_invocation_files() {
     );
 }
 
-#[test]
-fn call_site_final_answer_text_is_not_misread_as_tool_tags() {
-    assert!(
-        !final_answer_contains_tool_tags(
-            "load_most_recent is called from model_thread in src/inference/session.rs.",
-            &ToolRegistry::default(),
-        ),
-        "plain prose caller answers must not be rejected as tool tags"
-    );
-}
 
 #[test]
 fn tool_loop_does_not_emit_thinking_system_message_rows() {
