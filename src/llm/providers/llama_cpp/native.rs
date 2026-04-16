@@ -74,9 +74,11 @@ pub(super) fn load_model(config: &LlamaCppConfig, model_path: &Path) -> Result<L
 
     let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
     let model = {
-        // Some native output (repack tensor messages, backend init prints) goes to stderr
-        // via fprintf directly, bypassing log callbacks. Suppress fd 2 for the duration.
-        let _suppress = (!config.show_native_logs).then(StderrSuppress::new);
+        // Native output (repack tensor messages, backend init prints) writes directly to
+        // stderr via fprintf, bypassing log callbacks. Always suppress fd 2 here — the TUI
+        // shares the terminal with stderr and must never receive raw native bytes regardless
+        // of the show_native_logs setting.
+        let _suppress = StderrSuppress::new();
         LlamaModel::load_from_file(&backend, model_path, &model_params)
             .map_err(map_llama_error)?
     };
@@ -115,8 +117,9 @@ pub(super) fn run_generation(
         .with_op_offload(false);
 
     let mut ctx = {
-        // Context creation also prints sched_reserve / backend-init lines directly to stderr.
-        let _suppress = (!config.show_native_logs).then(StderrSuppress::new);
+        // Context creation prints sched_reserve / kv_cache / graph_reserve lines directly to
+        // stderr. Always suppress — same reasoning as load_from_file above.
+        let _suppress = StderrSuppress::new();
         loaded
             .model
             .new_context(&loaded.backend, ctx_params)

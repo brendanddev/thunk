@@ -14,4 +14,4 @@ context_tokens = 2048
 batch_tokens = 256
 max_tokens = 512
 temperature = 0.7
-show_native_logs = true
+show_native_logs = false
