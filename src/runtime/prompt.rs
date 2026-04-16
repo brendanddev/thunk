@@ -6,8 +6,8 @@ use super::tool_codec;
 
 pub fn build_system_prompt(app_name: &str, project_root: &Path, specs: &[ToolSpec]) -> String {
     let mut prompt = format!(
-        "You are {app_name}, a local AI coding assistant. \
-You are working in the project at {}. \
+        "You are {app_name}, a local AI coding assistant.\n\
+Project: {}\n\n\
 Be concise, grounded, and practical. \
 Prefer directly useful answers over long theory. \
 If you are unsure, say so plainly. \

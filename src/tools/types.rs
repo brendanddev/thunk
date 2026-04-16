@@ -1,9 +1,11 @@
 use thiserror::Error;
 
+use super::pending::PendingAction;
+
 // ── Input ─────────────────────────────────────────────────────────────────────
 
-/// Typed input for each supported tool. The runtime's tool-call parser (Phase 2)
-/// converts raw model output into one of these variants before dispatch.
+/// Typed input for each supported tool. The runtime's tool-call parser converts
+/// raw model output into one of these variants before dispatch.
 /// Nothing outside the tools module should parse these back out of strings.
 #[derive(Debug, Clone)]
 pub enum ToolInput {
@@ -21,6 +23,20 @@ pub enum ToolInput {
         /// Optional sub-path to restrict the search. Searches entire tree if None.
         path: Option<String>,
     },
+    EditFile {
+        /// Path relative to the project root, or absolute.
+        path: String,
+        /// Exact text to find in the file.
+        search: String,
+        /// Replacement text.
+        replace: String,
+    },
+    WriteFile {
+        /// Path relative to the project root, or absolute.
+        path: String,
+        /// Full content to write.
+        content: String,
+    },
 }
 
 impl ToolInput {
@@ -31,14 +47,16 @@ impl ToolInput {
             ToolInput::ReadFile { .. } => "read_file",
             ToolInput::ListDir { .. } => "list_dir",
             ToolInput::SearchCode { .. } => "search_code",
+            ToolInput::EditFile { .. } => "edit_file",
+            ToolInput::WriteFile { .. } => "write_file",
         }
     }
 }
 
 // ── Output ────────────────────────────────────────────────────────────────────
 
-/// Structured output for each tool. Callers consume the typed data; rendering
-/// into prompt text happens separately in the tool loop (Phase 2).
+/// Structured output from a completed tool execution. Callers consume the typed
+/// data; rendering into prompt text happens in the tool loop.
 #[derive(Debug, Clone)]
 pub enum ToolOutput {
     FileContents(FileContentsOutput),
@@ -90,24 +108,19 @@ pub struct SearchMatch {
     pub line: String,
 }
 
-// ── Call / Result ─────────────────────────────────────────────────────────────
+// ── Run result ────────────────────────────────────────────────────────────────
 
-/// A dispatched tool invocation.
+/// The outcome of dispatching a tool. Read-only tools always return Immediate.
+/// Mutating tools return Approval, pausing the turn until the user responds.
 #[derive(Debug, Clone)]
-pub struct ToolCall {
-    pub input: ToolInput,
-}
-
-/// The complete outcome of a tool invocation: the original call paired with its output.
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub call: ToolCall,
-    pub output: ToolOutput,
+pub enum ToolRunResult {
+    Immediate(ToolOutput),
+    Approval(PendingAction),
 }
 
 // ── Spec ──────────────────────────────────────────────────────────────────────
 
-/// Static metadata describing a tool. Used by Phase 2 to build tool descriptions
+/// Static metadata describing a tool. Used to build tool descriptions
 /// for the system prompt.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {

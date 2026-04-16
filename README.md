@@ -1,8 +1,8 @@
 # params-cli
 
-Personal AI coding assistant CLI focused on local-first workflows, modular backends, privacy, and real coding actions.
+Personal AI coding assistant CLI focused on local-first workflows, modular architecture, privacy, and real coding actions.
 
-> Version 0.8.5 - Focused rebuild
+> Version 0.8.6 — Focused rebuild
 
 ---
 
@@ -10,30 +10,78 @@ Personal AI coding assistant CLI focused on local-first workflows, modular backe
 
 `params-cli` is a Rust-based AI coding agent designed to be:
 
-- local-first
-- tool-using
-- modular and extensible
-- usable for real development workflows
+- local-first  
+- tool-using  
+- modular and extensible  
+- usable for real development workflows  
 
-It is not a simple chatbot wrapper. The goal is to build a durable coding agent runtime that can evolve over time without constant rewrites.
+This is not a simple chatbot wrapper.
 
-The project is currently being rebuilt with a strong focus on:
+The goal is to build a **durable coding agent runtime** that can evolve over time without constant rewrites.
 
-- clear architectural boundaries
-- low coupling between subsystems
-- explicit runtime behavior
-- long-term maintainability
+The rebuild focuses on:
 
----
-
-## Requirements
-
-- Rust (stable)
-- An interactive terminal
+- clear architectural boundaries  
+- low coupling between subsystems  
+- explicit runtime behavior  
+- long-term maintainability  
 
 ---
 
-## Project structure
+## Current Status
+
+The project is mid-rebuild and developed in controlled phases.
+
+### What is implemented
+
+- explicit runtime loop with tool dispatch  
+- typed tool interface (`ToolInput` / `ToolOutput`)  
+- centralized tool protocol (`runtime/tool_codec.rs`)  
+- session persistence via app layer (`AppContext`, `ActiveSession`)  
+- command parsing isolated in `tui/commands/`  
+- project-root-aware tools via `ToolContext`  
+- consistent path resolution (no reliance on CWD)  
+- model-aware system prompt with project context  
+- clean separation between app, runtime, tools, storage, and UI  
+- test coverage across boundaries  
+
+### What is intentionally not built yet
+
+- write/mutating tools (edit/write)  
+- approval/rejection flow  
+- bash execution  
+- structured tool outputs  
+- logging/observability  
+- memory system  
+- LSP integration  
+- web fetch  
+- advanced session UX  
+
+---
+
+## Architecture
+
+The system follows strict layer separation:
+
+- `app/` — orchestration (runtime + sessions + config)  
+- `runtime/` — execution loop, conversation, tool protocol  
+- `llm/` — backend abstraction and model providers  
+- `storage/` — persistence (sessions and data)  
+- `tools/` — tool registry and implementations  
+- `tui/` — terminal UI, rendering, input, commands  
+
+### Design principles
+
+- explicit over implicit  
+- no hidden coupling  
+- no text-as-API (long-term goal)  
+- modular boundaries  
+- local-first execution  
+- built to evolve without rewrites  
+
+---
+
+## Project Structure
 
 ```
 params-cli/
@@ -41,7 +89,7 @@ params-cli/
 ├── Cargo.toml
 ├── config.toml
 ├── data/
-├── docs/           # Documentation and design notes
+├── docs/
 ├── logs/
 ├── src/
 │   ├── app/        # orchestration, session coordination
@@ -57,8 +105,24 @@ params-cli/
 
 ---
 
+## Running the project
+
+### Requirements
+
+- Rust (stable)
+- Interactive terminal
+
+### Run
+
+```
+cargo run
+```
+
+---
+
 ## Documentation
+
 | Section | Description |
-|---------|-------------|
-| [Architecture](docs/architecture.md) | Overview of the system's modular design and components. |
-| [Setup](docs/setup.md) | Instructions for installing Rust and running the application. |
+|--------|------------|
+| [Architecture](docs/architecture.md) | System design and module boundaries |
+| [Setup](docs/setup.md) | Setup instructions |

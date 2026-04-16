@@ -243,7 +243,8 @@ mod tests {
 
     #[test]
     fn format_tool_result_wraps_body() {
-        use crate::tools::{FileContentsOutput, ToolOutput};
+        use crate::tools::ToolOutput;
+        use crate::tools::types::FileContentsOutput;
         let output = ToolOutput::FileContents(FileContentsOutput {
             path: "x.rs".into(),
             contents: "fn main() {}".into(),

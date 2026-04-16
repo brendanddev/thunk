@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use super::context::ToolContext;
-use super::types::{SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput, ToolSpec};
+use super::types::{SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 /// Maximum number of matches returned in a single search. Prevents context overload.
@@ -37,7 +37,7 @@ impl Tool for SearchCodeTool {
         }
     }
 
-    fn run(&self, input: &ToolInput) -> Result<ToolOutput, ToolError> {
+    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
         let ToolInput::SearchCode { query, path } = input else {
             return Err(ToolError::InvalidInput(
                 "search_code received wrong input variant".into(),
@@ -59,11 +59,13 @@ impl Tool for SearchCodeTool {
 
         let truncated = matches.len() >= MAX_MATCHES;
 
-        Ok(ToolOutput::SearchResults(SearchResultsOutput {
-            query: query.clone(),
-            matches,
-            truncated,
-        }))
+        Ok(ToolRunResult::Immediate(ToolOutput::SearchResults(
+            SearchResultsOutput {
+                query: query.clone(),
+                matches,
+                truncated,
+            },
+        )))
     }
 }
 
@@ -140,7 +142,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn search(query: &str, path: &str) -> Result<ToolOutput, ToolError> {
+    fn search(query: &str, path: &str) -> Result<ToolRunResult, ToolError> {
         SearchCodeTool::new(ToolContext::new(PathBuf::from("."))).run(&ToolInput::SearchCode {
             query: query.to_string(),
             path: Some(path.to_string()),
@@ -153,7 +155,7 @@ mod tests {
         fs::write(tmp.path().join("lib.rs"), "fn foo() {}\nfn bar() {}\n").unwrap();
 
         let out = search("fn foo", tmp.path().to_str().unwrap()).unwrap();
-        let ToolOutput::SearchResults(sr) = out else { panic!("wrong variant") };
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else { panic!("expected Immediate(SearchResults)") };
 
         assert_eq!(sr.matches.len(), 1);
         assert_eq!(sr.matches[0].line_number, 1);
@@ -169,7 +171,7 @@ mod tests {
         fs::write(tmp.path().join("main.rs"), "no match here").unwrap();
 
         let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
-        let ToolOutput::SearchResults(sr) = out else { panic!("wrong variant") };
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else { panic!("expected Immediate(SearchResults)") };
         assert!(sr.matches.is_empty());
     }
 
@@ -189,7 +191,7 @@ mod tests {
         fs::write(sub.join("mod.rs"), "pub fn deep_fn() {}").unwrap();
 
         let out = search("deep_fn", tmp.path().to_str().unwrap()).unwrap();
-        let ToolOutput::SearchResults(sr) = out else { panic!("wrong variant") };
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else { panic!("expected Immediate(SearchResults)") };
         assert_eq!(sr.matches.len(), 1);
     }
 }

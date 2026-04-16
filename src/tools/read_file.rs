@@ -1,7 +1,7 @@
 use std::fs;
 
 use super::context::ToolContext;
-use super::types::{FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolSpec};
+use super::types::{FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 /// Maximum bytes read from a single file before truncation.
@@ -27,7 +27,7 @@ impl Tool for ReadFileTool {
         }
     }
 
-    fn run(&self, input: &ToolInput) -> Result<ToolOutput, ToolError> {
+    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
         let ToolInput::ReadFile { path } = input else {
             return Err(ToolError::InvalidInput(
                 "read_file received wrong input variant".into(),
@@ -48,12 +48,14 @@ impl Tool for ReadFileTool {
 
         let line_count = contents.lines().count();
 
-        Ok(ToolOutput::FileContents(FileContentsOutput {
-            path: path.to_string_lossy().into_owned(),
-            contents,
-            line_count,
-            truncated,
-        }))
+        Ok(ToolRunResult::Immediate(ToolOutput::FileContents(
+            FileContentsOutput {
+                path: path.to_string_lossy().into_owned(),
+                contents,
+                line_count,
+                truncated,
+            },
+        )))
     }
 }
 
@@ -79,7 +81,7 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn read(path: &str) -> Result<ToolOutput, ToolError> {
+    fn read(path: &str) -> Result<ToolRunResult, ToolError> {
         ReadFileTool::new(ToolContext::new(PathBuf::from(".")))
             .run(&ToolInput::ReadFile { path: path.to_string() })
     }
@@ -90,7 +92,7 @@ mod tests {
         writeln!(f, "line one").unwrap();
         writeln!(f, "line two").unwrap();
         let out = read(f.path().to_str().unwrap()).unwrap();
-        let ToolOutput::FileContents(fc) = out else { panic!("wrong variant") };
+        let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else { panic!("expected Immediate(FileContents)") };
         assert!(fc.contents.contains("line one"));
         assert_eq!(fc.line_count, 2);
         assert!(!fc.truncated);

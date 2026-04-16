@@ -1,7 +1,7 @@
 use std::fs;
 
 use super::context::ToolContext;
-use super::types::{DirEntry, DirectoryListingOutput, EntryKind, ToolError, ToolInput, ToolOutput, ToolSpec};
+use super::types::{DirEntry, DirectoryListingOutput, EntryKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 pub struct ListDirTool {
@@ -23,7 +23,7 @@ impl Tool for ListDirTool {
         }
     }
 
-    fn run(&self, input: &ToolInput) -> Result<ToolOutput, ToolError> {
+    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
         let ToolInput::ListDir { path } = input else {
             return Err(ToolError::InvalidInput(
                 "list_dir received wrong input variant".into(),
@@ -66,10 +66,12 @@ impl Tool for ListDirTool {
                 .then_with(|| a.name.cmp(&b.name))
         });
 
-        Ok(ToolOutput::DirectoryListing(DirectoryListingOutput {
-            path: dir.to_string_lossy().into_owned(),
-            entries,
-        }))
+        Ok(ToolRunResult::Immediate(ToolOutput::DirectoryListing(
+            DirectoryListingOutput {
+                path: dir.to_string_lossy().into_owned(),
+                entries,
+            },
+        )))
     }
 }
 
@@ -81,7 +83,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn list(path: &str) -> Result<ToolOutput, ToolError> {
+    fn list(path: &str) -> Result<ToolRunResult, ToolError> {
         ListDirTool::new(ToolContext::new(PathBuf::from("."))).run(&ToolInput::ListDir {
             path: path.to_string(),
         })
@@ -93,8 +95,10 @@ mod tests {
         fs::write(tmp.path().join("a.rs"), "").unwrap();
         fs::create_dir(tmp.path().join("subdir")).unwrap();
 
-        let out = list(tmp.path().to_str().unwrap()).unwrap();
-        let ToolOutput::DirectoryListing(dl) = out else { panic!("wrong variant") };
+        let result = list(tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::DirectoryListing(dl)) = result else {
+            panic!("expected Immediate(DirectoryListing)")
+        };
 
         assert_eq!(dl.entries.len(), 2);
         // Directories come first

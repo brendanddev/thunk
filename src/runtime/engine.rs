@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::app::config::Config;
 use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, ToolRunResult};
 
 use super::conversation::Conversation;
 use super::prompt;
@@ -125,9 +125,13 @@ impl Runtime {
                 let name = input.tool_name().to_string();
                 on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
                 match self.registry.dispatch(input) {
-                    Ok(result) => {
+                    Ok(ToolRunResult::Immediate(output)) => {
                         on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: true });
-                        results_text.push_str(&tool_codec::format_tool_result(&name, &result.output));
+                        results_text.push_str(&tool_codec::format_tool_result(&name, &output));
+                    }
+                    Ok(ToolRunResult::Approval(_)) => {
+                        on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: false });
+                        results_text.push_str(&tool_codec::format_tool_error(&name, "approval required but not yet supported"));
                     }
                     Err(e) => {
                         on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: false });
