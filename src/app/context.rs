@@ -29,7 +29,12 @@ impl AppContext {
         request: RuntimeRequest,
         on_event: &mut dyn FnMut(RuntimeEvent),
     ) -> Result<()> {
-        let is_submit = matches!(request, RuntimeRequest::Submit { .. });
+        // Save after any request that can mutate the conversation. Reset is excluded:
+        // begin_new() handles its own session lifecycle separately.
+        let should_save = matches!(
+            request,
+            RuntimeRequest::Submit { .. } | RuntimeRequest::Approve | RuntimeRequest::Reject
+        );
 
         // Take log out of self so we can borrow self.runtime simultaneously.
         let mut log = self.log.take();
@@ -83,7 +88,7 @@ impl AppContext {
 
         self.log = log;
 
-        if is_submit {
+        if should_save {
             self.session.save(&self.runtime.messages_snapshot())?;
         }
         Ok(())

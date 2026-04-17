@@ -37,10 +37,10 @@ pub trait Tool: Send + Sync {
     /// result. Only mutating tools implement this — read-only tools never produce
     /// Approval outcomes and this method is never called on them.
     fn execute_approved(&self, _payload: &str) -> Result<ToolOutput, ToolError> {
-        unimplemented!(
-            "tool '{}' does not support approved execution — implement execute_approved",
+        Err(ToolError::InvalidInput(format!(
+            "tool '{}' does not support approved execution",
             self.spec().name
-        )
+        )))
     }
 }
 

@@ -28,6 +28,13 @@ const FABRICATION_CORRECTION: &str =
      You must emit ONLY a tool call tag (e.g. [read_file: path]) or answer directly in plain text. \
      Output the tool call tag now, with no other text.";
 
+/// Injected when the model uses a wrong opening tag for a block tool (e.g. [test_file] instead
+/// of [write_file]). Tag names are fixed — the model must use the exact names from the protocol.
+const MALFORMED_BLOCK_CORRECTION: &str =
+    "[runtime:correction] Your response contained a block with an unrecognized opening tag. \
+     Tag names are exact — you must use [write_file], [edit_file], etc. exactly as shown. \
+     Do not rename or abbreviate them. Emit the correct tool call now with no other text.";
+
 /// Returns a stable fingerprint for a tool call, used for consecutive-cycle detection.
 /// Null bytes separate fields; they cannot appear in paths, queries, or file content
 /// on any supported platform, so false matches are impossible.
@@ -157,9 +164,10 @@ impl Runtime {
                 let result_text = tool_codec::format_tool_result(&tool_name, &output);
                 self.conversation.push_user(result_text);
                 self.conversation.trim_tool_exchanges_if_needed();
-                // Approved mutations are terminal — skip follow-up generation.
-                on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolAssisted { rounds: 1 }));
-                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                // Re-enter the generation loop so the model synthesizes a response
+                // confirming what was done — mirrors the Immediate tool path in run_turns.
+                on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+                self.run_turns(1, on_event);
             }
             Err(e) => {
                 on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: None });
@@ -236,6 +244,22 @@ impl Runtime {
                     }
                     on_event(RuntimeEvent::Failed {
                         message: "Model repeatedly produced fabricated tool results. Try rephrasing your request.".to_string(),
+                    });
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    return;
+                }
+                // Malformed block: a known closing tag ([/write_file], [/edit_file], etc.)
+                // is present without the matching opening tag. The model used a wrong tag name.
+                // Attempt one correction before giving up.
+                if tool_codec::contains_malformed_block(&response) {
+                    if corrections < MAX_CORRECTIONS {
+                        corrections += 1;
+                        self.conversation.discard_last_if_assistant();
+                        self.conversation.push_user(MALFORMED_BLOCK_CORRECTION.to_string());
+                        continue;
+                    }
+                    on_event(RuntimeEvent::Failed {
+                        message: "Model used incorrect tool tag names. Try rephrasing your request.".to_string(),
                     });
                     on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
                     return;
@@ -334,7 +358,8 @@ fn run_tool_round(
             Err(e) => {
                 on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: None });
                 accumulated.push_str(&tool_codec::format_tool_error(&name, &e.to_string()));
-                *last_call_key = Some(key);
+                // Do NOT update last_call_key on error: a failed call should not block
+                // an identical retry. Cycle detection applies only to successful executions.
             }
         }
     }
@@ -616,5 +641,90 @@ mod tests {
             .filter(|m| m.role == crate::llm::backend::Role::Assistant)
             .collect();
         assert_eq!(assistant_msgs.len(), 3, "expected two tool calls + synthesis");
+    }
+
+    #[test]
+    fn cycle_detection_allows_retry_after_tool_error() {
+        // A tool fails (bad path), then the model retries with the same args.
+        // The retry must NOT be blocked as a cycle — only successful calls set the key.
+        // list_dir returns an IO error for a non-existent path, then succeeds on ".".
+        // The synthesis response closes the loop.
+        let mut rt = make_runtime(vec!["[list_dir: /nonexistent/path][list_dir: .]", "Done."]);
+        collect_events(&mut rt, RuntimeRequest::Submit { text: "list both".into() });
+
+        let snapshot = rt.messages_snapshot();
+        // The error from the first call must appear
+        assert!(
+            snapshot.iter().any(|m| m.content.contains("[tool_error: list_dir]")),
+            "first call error must be in conversation"
+        );
+        // The successful retry must produce a result — no cycle error
+        assert!(
+            snapshot.iter().any(|m| m.content.contains("[tool_result: list_dir]")),
+            "successful retry must not be blocked by cycle detection"
+        );
+        assert!(
+            !snapshot.iter().any(|m|
+                m.content.contains("identical arguments") &&
+                m.content.contains("[tool_error: list_dir]") &&
+                m.content.contains(".")
+            ),
+            "retry with same args after error must not trigger cycle detection"
+        );
+    }
+
+    #[test]
+    fn approve_synthesizes_after_successful_mutation() {
+        // After approving a write_file call, the model must be re-invoked for synthesis.
+        // The synthesis response closes the loop and becomes the final assistant message.
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Write an existing file so edit_file has something to edit.
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "hello").unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+
+        // edit_file payload: path\x00search\x00replace (null-byte separated)
+        let payload = format!("{}\x00hello\x00world", path);
+
+        // The synthesis response — model confirms what was done.
+        let mut rt = make_runtime(vec!["Done, the edit has been applied."]);
+        let before_count = rt.messages_snapshot().len();
+
+        rt.set_pending_for_test(PendingAction {
+            tool_name: "edit_file".into(),
+            summary: format!("edit {path}"),
+            risk: RiskLevel::Medium,
+            payload,
+        });
+
+        let events = collect_events(&mut rt, RuntimeRequest::Approve);
+        assert!(!has_failed(&events), "approve must not fail: {events:?}");
+
+        // Synthesis must have fired — AssistantMessageChunk is emitted during synthesis.
+        assert!(
+            events.iter().any(|e| matches!(e, RuntimeEvent::AssistantMessageChunk(_))),
+            "approve must trigger synthesis: no AssistantMessageChunk in events"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        // Snapshot must have grown: at minimum tool result + synthesis assistant message.
+        assert!(
+            snapshot.len() > before_count,
+            "snapshot must grow after approve + synthesis"
+        );
+        // Tool result must be present.
+        assert!(
+            snapshot.iter().any(|m| m.content.contains("[tool_result: edit_file]")),
+            "tool result must be in conversation after approve"
+        );
+        // The final assistant message must be the synthesis response, not a tool call.
+        let last_assistant = snapshot.iter().rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant);
+        assert!(
+            last_assistant.map(|m| m.content.contains("Done")).unwrap_or(false),
+            "last assistant message must be the synthesis response"
+        );
     }
 }

@@ -53,7 +53,7 @@ fn handle_key_event(
         (KeyCode::Enter, _) => {
             if let Some(input) = state.submit_input() {
                 if let Some(cmd) = commands::parse(&input) {
-                    handle_command(state, app, cmd)?;
+                    handle_command(stdout, state, app, cmd)?;
                 } else {
                     submit_to_app(stdout, state, app, input)?;
                 }
@@ -102,6 +102,7 @@ fn submit_to_app(
 }
 
 fn handle_command(
+    stdout: &mut io::Stdout,
     state: &mut AppState,
     app: &mut AppContext,
     cmd: commands::Command,
@@ -122,17 +123,37 @@ fn handle_command(
             }
         }
         commands::Command::Approve => {
+            let mut render_error = None;
             if let Err(e) = app.handle(RuntimeRequest::Approve, &mut |event| {
+                if render_error.is_some() {
+                    return;
+                }
                 apply_runtime_event(state, event);
+                if let Err(e) = render(stdout, state) {
+                    render_error = Some(e);
+                }
             }) {
                 apply_runtime_event(state, RuntimeEvent::Failed { message: e.to_string() });
             }
+            if let Some(e) = render_error {
+                return Err(e);
+            }
         }
         commands::Command::Reject => {
+            let mut render_error = None;
             if let Err(e) = app.handle(RuntimeRequest::Reject, &mut |event| {
+                if render_error.is_some() {
+                    return;
+                }
                 apply_runtime_event(state, event);
+                if let Err(e) = render(stdout, state) {
+                    render_error = Some(e);
+                }
             }) {
                 apply_runtime_event(state, RuntimeEvent::Failed { message: e.to_string() });
+            }
+            if let Some(e) = render_error {
+                return Err(e);
             }
         }
     }

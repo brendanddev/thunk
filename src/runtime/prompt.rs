@@ -16,12 +16,24 @@ When you show code, keep it focused on the user's request.",
     );
 
     if !specs.is_empty() {
+        let instructions = tool_codec::format_instructions();
+
+        // Guard: every registered tool must appear in the protocol instructions.
+        // A missing entry means the model is told a tool exists but not how to call it.
+        for spec in specs {
+            debug_assert!(
+                instructions.contains(spec.name),
+                "tool '{}' is registered but its call syntax is missing from format_instructions()",
+                spec.name
+            );
+        }
+
         prompt.push_str("\n\nYou have access to the following tools:\n\n");
         for spec in specs {
             prompt.push_str(&format!("  {}: {}\n", spec.name, spec.description));
         }
         prompt.push('\n');
-        prompt.push_str(tool_codec::format_instructions());
+        prompt.push_str(instructions);
     }
 
     prompt

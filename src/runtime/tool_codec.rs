@@ -17,6 +17,8 @@ const WRITE_OPEN: &str = "[write_file]";
 const WRITE_CLOSE: &str = "[/write_file]";
 const EDIT_OPEN: &str = "[edit_file]";
 const EDIT_CLOSE: &str = "[/edit_file]";
+const SEARCH_CODE_OPEN: &str = "[search_code]";
+const SEARCH_CODE_CLOSE: &str = "[/search_code]";
 
 const SEARCH_DELIM: &str = "---search---";
 const REPLACE_DELIM: &str = "---replace---";
@@ -34,6 +36,7 @@ pub fn parse_all_tool_inputs(text: &str) -> Vec<ToolInput> {
     all.extend(scan_bracket_calls(text));
     all.extend(scan_edit_blocks(text));
     all.extend(scan_write_blocks(text));
+    all.extend(scan_search_code_blocks(text));
     all.sort_by_key(|(pos, _)| *pos);
     all.into_iter().map(|(_, input)| input).collect()
 }
@@ -148,19 +151,85 @@ fn scan_write_blocks(text: &str) -> Vec<(usize, ToolInput)> {
     results
 }
 
+/// Handles the block form `[search_code]\n...\n[/search_code]` that the model
+/// sometimes emits when following the edit/write block pattern.
+/// Extracts the query from `pattern=X`, `query=X`, or the first non-empty line.
+fn scan_search_code_blocks(text: &str) -> Vec<(usize, ToolInput)> {
+    let mut results = Vec::new();
+    let mut remaining = text;
+    let mut offset = 0usize;
+
+    while let Some(open_pos) = remaining.find(SEARCH_CODE_OPEN) {
+        let after_open = &remaining[open_pos + SEARCH_CODE_OPEN.len()..];
+        match after_open.find(SEARCH_CODE_CLOSE) {
+            Some(close_pos) => {
+                let block = &after_open[..close_pos];
+                if let Some(input) = parse_search_code_block(block) {
+                    results.push((offset + open_pos, input));
+                }
+                let advance = open_pos + SEARCH_CODE_OPEN.len() + close_pos + SEARCH_CODE_CLOSE.len();
+                offset += advance;
+                remaining = &remaining[advance..];
+            }
+            None => break,
+        }
+    }
+
+    results
+}
+
+fn parse_search_code_block(block: &str) -> Option<ToolInput> {
+    for line in block.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Accept `pattern=X`, `pattern: X`, `query=X`, `query: X`, or bare text.
+        // Models commonly emit the colon-space form (matching kv-style formatting),
+        // so both separators are tolerated.
+        let query = if let Some(rest) = line.strip_prefix("pattern=") {
+            rest.trim()
+        } else if let Some(rest) = line.strip_prefix("pattern:") {
+            rest.trim()
+        } else if let Some(rest) = line.strip_prefix("query=") {
+            rest.trim()
+        } else if let Some(rest) = line.strip_prefix("query:") {
+            rest.trim()
+        } else {
+            line
+        };
+        if !query.is_empty() {
+            return Some(ToolInput::SearchCode { query: query.to_string(), path: None });
+        }
+    }
+    None
+}
+
 fn parse_edit_block(block: &str) -> Option<ToolInput> {
-    let search_pos = block.find(SEARCH_DELIM)?;
-    let after_search = &block[search_pos + SEARCH_DELIM.len()..];
-    // Use the line-anchored form so ---replace--- embedded mid-line in the search
-    // content (e.g. inside a comment) is not mistaken for the actual delimiter.
-    let replace_nl_offset = after_search.find(REPLACE_LINE)?;
-    let replace_pos = search_pos + SEARCH_DELIM.len() + replace_nl_offset + 1;
+    if let Some(search_pos) = block.find(SEARCH_DELIM) {
+        // Full form: both ---search--- and ---replace--- present.
+        let after_search = &block[search_pos + SEARCH_DELIM.len()..];
+        // Use the line-anchored form so ---replace--- embedded mid-line in the search
+        // content (e.g. inside a comment) is not mistaken for the actual delimiter.
+        let replace_nl_offset = after_search.find(REPLACE_LINE)?;
+        let replace_pos = search_pos + SEARCH_DELIM.len() + replace_nl_offset + 1;
 
-    let path = parse_kvs(&block[..search_pos]).get("path")?.clone();
-    let search = trim_block_content(&after_search[..replace_nl_offset]);
-    let replace = trim_block_content(&block[replace_pos + REPLACE_DELIM.len()..]);
+        let path = parse_kvs(&block[..search_pos]).get("path")?.clone();
+        let search = trim_block_content(&after_search[..replace_nl_offset]);
+        let replace = trim_block_content(&block[replace_pos + REPLACE_DELIM.len()..]);
 
-    Some(ToolInput::EditFile { path, search, replace })
+        Some(ToolInput::EditFile { path, search, replace })
+    } else if let Some(replace_nl_pos) = block.find(REPLACE_LINE) {
+        // Partial form: ---replace--- present but ---search--- absent.
+        // Parse what we can and produce an empty search string. The empty-search
+        // validation in edit_file.run() will surface a clear error into the conversation
+        // rather than silently discarding the block as a non-tool-call.
+        let path = parse_kvs(&block[..replace_nl_pos]).get("path")?.clone();
+        let replace = trim_block_content(&block[replace_nl_pos + REPLACE_LINE.len()..]);
+        Some(ToolInput::EditFile { path, search: String::new(), replace })
+    } else {
+        None
+    }
 }
 
 fn parse_write_block(block: &str) -> Option<ToolInput> {
@@ -311,6 +380,17 @@ pub fn contains_fabricated_exchange(text: &str) -> bool {
     text.contains("[tool_result:") || text.contains("[tool_error:")
 }
 
+/// Returns true if the text contains a known tool CLOSE tag without a matching open tag.
+/// This fingerprints the common drift case where the model uses a wrong opening tag
+/// (e.g. `[test_file]...[/write_file]`) — the open fails to match, the close is present.
+/// Used by the engine to trigger a correction instead of silently accepting the response
+/// as a direct text answer.
+pub fn contains_malformed_block(text: &str) -> bool {
+    (text.contains("[/write_file]") && !text.contains("[write_file]"))
+        || (text.contains("[/edit_file]") && !text.contains("[edit_file]"))
+        || (text.contains("[/search_code]") && !text.contains("[search_code]"))
+}
+
 // Protocol description
 
 /// Returns the format instructions block that prompt.rs includes in the system prompt.
@@ -324,6 +404,8 @@ You do NOT produce file contents, directory listings, or search results yourself
 You do NOT write result blocks. Result blocks are written by the system, not you.
 
 When a tool is needed, your ENTIRE response must be the call tag only — no prose, no prefix, no explanation.
+
+Tag names are EXACT. Do not rename, abbreviate, or invent tag names. Use only the tags shown below.
 
 Request a file read:
 [read_file: path/to/file.rs]
@@ -404,6 +486,75 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(matches!(&calls[0], ToolInput::ReadFile { path } if path == "a.rs"));
         assert!(matches!(&calls[1], ToolInput::ListDir { path } if path == "src/"));
+    }
+
+    // [search_code] block form (model-drift tolerance)
+
+    #[test]
+    fn parses_search_code_block_with_pattern_prefix() {
+        let text = "[search_code]\npattern=logging\n[/search_code]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "logging"));
+    }
+
+    #[test]
+    fn parses_search_code_block_with_pattern_colon_prefix() {
+        // Model emits `pattern: log` (colon-space form) rather than `pattern=log`.
+        let text = "[search_code]\npattern: log\n[/search_code]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "log"));
+    }
+
+    #[test]
+    fn parses_search_code_block_with_query_colon_prefix() {
+        let text = "[search_code]\nquery: fn main\n[/search_code]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "fn main"));
+    }
+
+    #[test]
+    fn parses_search_code_block_with_query_prefix() {
+        let text = "[search_code]\nquery=fn main\n[/search_code]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "fn main"));
+    }
+
+    #[test]
+    fn parses_search_code_block_bare_text() {
+        let text = "[search_code]\nfn main\n[/search_code]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "fn main"));
+    }
+
+    #[test]
+    fn search_code_block_empty_body_is_skipped() {
+        let text = "[search_code]\n   \n[/search_code]";
+        assert!(parse_all_tool_inputs(text).is_empty());
+    }
+
+    #[test]
+    fn search_code_block_missing_close_tag_is_skipped() {
+        let text = "[search_code]\npattern=logging";
+        assert!(parse_all_tool_inputs(text).is_empty());
+    }
+
+    #[test]
+    fn search_code_bracket_and_block_both_parse() {
+        let text = "[search_code: logging]\n[search_code]\npattern=tracing\n[/search_code]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 2);
+        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, .. } if query == "logging"));
+        assert!(matches!(&inputs[1], ToolInput::SearchCode { query, .. } if query == "tracing"));
     }
 
     #[test]
@@ -532,9 +683,15 @@ mod tests {
     }
 
     #[test]
-    fn edit_block_missing_search_delimiter_is_skipped() {
+    fn edit_block_missing_search_delimiter_produces_empty_search() {
+        // When ---search--- is absent but ---replace--- is present, the block is parsed
+        // with an empty search string. The tool's run() then returns a clear error
+        // ("search text must not be empty") rather than silently discarding the block.
         let text = "[edit_file]\npath: src/lib.rs\n---replace---\nfn new() {}\n[/edit_file]";
-        assert!(parse_all_tool_inputs(text).is_empty());
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "src/lib.rs" && search.is_empty() && replace == "fn new() {}"));
     }
 
     #[test]
@@ -706,5 +863,38 @@ mod tests {
         assert!(contains_fabricated_exchange("[tool_error: read_file]\nfailed\n[/tool_error]"));
         assert!(!contains_fabricated_exchange("[read_file: src/main.rs]"));
         assert!(!contains_fabricated_exchange("Here is my answer."));
+    }
+
+    // contains_malformed_block
+
+    #[test]
+    fn malformed_block_detected_when_close_tag_has_no_matching_open() {
+        // The drift case: model used wrong opening tag, correct closing tag
+        assert!(contains_malformed_block("[test_file]\npath: f.txt\n---content---\nhello\n[/write_file]"));
+        assert!(contains_malformed_block("[wrong]\npath: f.rs\n---search---\nx\n---replace---\ny\n[/edit_file]"));
+        assert!(contains_malformed_block("[unknown]\npattern: log\n[/search_code]"));
+    }
+
+    #[test]
+    fn malformed_block_not_triggered_by_correct_blocks() {
+        // Correctly formed blocks have both open and close tags — not malformed
+        assert!(!contains_malformed_block("[write_file]\npath: f.txt\n---content---\nhello\n[/write_file]"));
+        assert!(!contains_malformed_block("[edit_file]\npath: f.rs\n---search---\nx\n---replace---\ny\n[/edit_file]"));
+        assert!(!contains_malformed_block("[search_code]\npattern=log\n[/search_code]"));
+    }
+
+    #[test]
+    fn malformed_block_not_triggered_by_plain_responses() {
+        assert!(!contains_malformed_block("Here is my answer."));
+        assert!(!contains_malformed_block("[read_file: src/main.rs]"));
+    }
+
+    #[test]
+    fn format_instructions_contains_exact_tag_warning() {
+        let instructions = format_instructions();
+        assert!(
+            instructions.contains("Tag names are EXACT"),
+            "must warn the model about exact tag names"
+        );
     }
 }
