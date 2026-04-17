@@ -1,5 +1,7 @@
 use std::path::Path;
+use std::time::Instant;
 
+use crate::logging::SessionLog;
 use crate::runtime::{Runtime, RuntimeEvent, RuntimeRequest};
 use crate::tools::ToolRegistry;
 
@@ -16,6 +18,7 @@ use super::Result;
 pub struct AppContext {
     runtime: Runtime,
     session: ActiveSession,
+    log: Option<SessionLog>,
 }
 
 impl AppContext {
@@ -27,7 +30,54 @@ impl AppContext {
         on_event: &mut dyn FnMut(RuntimeEvent),
     ) -> Result<()> {
         let is_submit = matches!(request, RuntimeRequest::Submit { .. });
-        self.runtime.handle(request, on_event);
+
+        // Take log out of self so we can borrow self.runtime simultaneously.
+        let mut log = self.log.take();
+        if let Some(ref mut l) = log {
+            l.log(&format!("request: {}", request_label(&request)));
+        }
+
+        // Stage timers: track generation and per-tool durations.
+        let mut gen_start: Option<Instant> = None;
+        let mut tool_start: Option<(String, Instant)> = None;
+
+        self.runtime.handle(request, &mut |event| {
+            if let Some(ref mut l) = log {
+                match &event {
+                    RuntimeEvent::AssistantMessageStarted => {
+                        gen_start = Some(Instant::now());
+                        l.log("generation: started");
+                    }
+                    RuntimeEvent::AssistantMessageFinished => {
+                        if let Some(t) = gen_start.take() {
+                            l.log_timed("generation: finished", t.elapsed());
+                        }
+                    }
+                    RuntimeEvent::ToolCallStarted { name } => {
+                        tool_start = Some((name.clone(), Instant::now()));
+                        l.log(&format!("tool started: {name}"));
+                    }
+                    RuntimeEvent::ToolCallFinished { name, summary } => {
+                        if let Some((_, t)) = tool_start.take() {
+                            let label = match summary {
+                                Some(s) => format!("tool done: {name} — {s}"),
+                                None => format!("tool failed: {name}"),
+                            };
+                            l.log_timed(&label, t.elapsed());
+                        }
+                    }
+                    other => {
+                        if let Some(label) = event_label(other) {
+                            l.log(&label);
+                        }
+                    }
+                }
+            }
+            on_event(event);
+        });
+
+        self.log = log;
+
         if is_submit {
             self.session.save(&self.runtime.messages_snapshot())?;
         }
@@ -50,11 +100,38 @@ impl AppContext {
         registry: ToolRegistry,
         session: ActiveSession,
         history: Vec<crate::llm::backend::Message>,
+        log: Option<SessionLog>,
     ) -> Result<Self> {
         let mut runtime = Runtime::new(config, project_root, backend, registry);
         if !history.is_empty() {
             runtime.load_history(history);
         }
-        Ok(Self { runtime, session })
+        Ok(Self { runtime, session, log })
+    }
+}
+
+/// Defines labels for requests and events for logging purposes.
+fn request_label(request: &RuntimeRequest) -> &'static str {
+    match request {
+        RuntimeRequest::Submit { .. } => "submit",
+        RuntimeRequest::Reset => "reset",
+        RuntimeRequest::Approve => "approve",
+        RuntimeRequest::Reject => "reject",
+    }
+}
+
+/// Labels for events that are not already handled with timing in handle().
+fn event_label(event: &RuntimeEvent) -> Option<String> {
+    match event {
+        RuntimeEvent::ActivityChanged(a) => Some(format!("activity: {}", a.label())),
+        RuntimeEvent::AnswerReady(source) => Some(format!("answer ready: {source:?}")),
+        RuntimeEvent::Failed { message } => Some(format!("failed: {message}")),
+        RuntimeEvent::ApprovalRequired(p) => Some(format!("approval required: {}", p.summary)),
+        // Handled with timing in handle():
+        RuntimeEvent::AssistantMessageStarted
+        | RuntimeEvent::AssistantMessageFinished
+        | RuntimeEvent::ToolCallStarted { .. }
+        | RuntimeEvent::ToolCallFinished { .. }
+        | RuntimeEvent::AssistantMessageChunk(_) => None,
     }
 }

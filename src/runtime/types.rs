@@ -52,7 +52,9 @@ pub enum RuntimeEvent {
     AssistantMessageChunk(String),
     AssistantMessageFinished,
     ToolCallStarted { name: String },
-    ToolCallFinished { name: String, success: bool },
+    /// Fired when a tool completes. `summary` is a compact one-line render of the
+    /// result for TUI display. `None` means the tool failed.
+    ToolCallFinished { name: String, summary: Option<String> },
     /// Fired when a mutating tool requires user approval before execution.
     /// The turn is paused until RuntimeRequest::Approve or Reject is received.
     ApprovalRequired(PendingAction),

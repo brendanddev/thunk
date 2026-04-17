@@ -1,5 +1,6 @@
 pub mod app;
 pub(crate) mod llm;
+pub(crate) mod logging;
 pub mod tui;
 pub(crate) mod runtime;
 pub(crate) mod storage;

@@ -10,6 +10,9 @@ use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBac
 use native::{load_model, run_generation, LoadedLlama};
 use prompt::format_messages;
 
+/// The llama.cpp backed implementation of the ModelBackend.
+/// It lazy-loads the model on first use, formats prompts into ChatML, and runs generation 
+/// while streaming events back to the runtime.
 pub struct LlamaCppBackend {
     config: LlamaCppConfig,
     display_name: String,
@@ -17,6 +20,8 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
+
+    // Creates a new LlamaCppBackend with the given configuration. The model is not loaded until generate() is called.
     pub fn new(config: LlamaCppConfig) -> Self {
         let model_name = config
             .model_path
@@ -33,6 +38,7 @@ impl LlamaCppBackend {
         }
     }
 
+    // Lazily loads the model once and caches it for reuse across requests.
     fn ensure_loaded(&mut self) -> Result<&mut LoadedLlama> {
         if self.loaded.is_none() {
             let model_path = self.require_model_path()?;
@@ -45,6 +51,7 @@ impl LlamaCppBackend {
             .ok_or_else(|| AppError::Runtime("llama.cpp model failed to initialize.".to_string()))
     }
 
+    // Retrieves the model path from the config or returns an error if it's not set.
     fn require_model_path(&self) -> Result<PathBuf> {
         self.config.model_path.clone().ok_or_else(|| {
             AppError::Runtime(
@@ -56,10 +63,13 @@ impl LlamaCppBackend {
 }
 
 impl ModelBackend for LlamaCppBackend {
+
+    // Returns the display name of the backend, which includes the model name if available.
     fn name(&self) -> &str {
         &self.display_name
     }
 
+    // Builds the prompt, ensures the model is loaded, and streams generation events.
     fn generate(
         &mut self,
         request: GenerateRequest,

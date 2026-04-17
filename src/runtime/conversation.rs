@@ -1,25 +1,37 @@
 use crate::llm::backend::{Message, Role};
 
+/// Maintains the ordered conversation history sent to the model.
+///
+/// The first message is always the system prompt. User and assistant
+/// messages are appended as the session progresses.
 #[derive(Debug, Clone)]
 pub struct Conversation {
     messages: Vec<Message>,
 }
 
 impl Conversation {
+    /// Starts a new conversation with a system prompt as the first message.
     pub fn new(system_prompt: String) -> Self {
         Self {
             messages: vec![Message::system(system_prompt)],
         }
     }
 
+    /// Appends a user message to the conversation.
     pub fn push_user(&mut self, content: impl Into<String>) {
         self.messages.push(Message::user(content));
     }
 
+    /// Starts a new assistant message so streamed text can be appended to it.
     pub fn begin_assistant_reply(&mut self) {
         self.messages.push(Message::assistant(String::new()));
     }
 
+    /// Appends streamed assistant text to the current assistant message.
+    ///
+    /// If no assistant message is currently open, one is created first.
+    /// This keeps streaming callers simple and ensures chunks always have
+    /// a message to attach to.
     pub fn push_assistant_chunk(&mut self, chunk: &str) {
         match self.messages.last_mut() {
             Some(Message {
@@ -33,6 +45,7 @@ impl Conversation {
         }
     }
 
+    /// Returns a clone of the full conversation history for backend requests or persistence.
     pub fn snapshot(&self) -> Vec<Message> {
         self.messages.clone()
     }

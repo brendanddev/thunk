@@ -109,7 +109,7 @@ fn handle_command(
     match cmd {
         commands::Command::Help => {
             state.add_system_message(
-                "Commands: /help — show this message  |  /clear — clear history  |  /quit — exit",
+                "Commands: /help — show this message  |  /clear — clear history  |  /quit — exit  |  /approve — confirm pending action  |  /reject — cancel pending action",
             );
         }
         commands::Command::Quit => {
@@ -119,6 +119,20 @@ fn handle_command(
             state.clear_messages();
             if let Err(e) = app.reset() {
                 state.add_system_message(format!("session reset failed: {e}"));
+            }
+        }
+        commands::Command::Approve => {
+            if let Err(e) = app.handle(RuntimeRequest::Approve, &mut |event| {
+                apply_runtime_event(state, event);
+            }) {
+                apply_runtime_event(state, RuntimeEvent::Failed { message: e.to_string() });
+            }
+        }
+        commands::Command::Reject => {
+            if let Err(e) = app.handle(RuntimeRequest::Reject, &mut |event| {
+                apply_runtime_event(state, event);
+            }) {
+                apply_runtime_event(state, RuntimeEvent::Failed { message: e.to_string() });
             }
         }
     }
@@ -134,11 +148,10 @@ fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::ToolCallStarted { name } => {
             state.add_tool_message(format!("tool: {name}"));
         }
-        RuntimeEvent::ToolCallFinished { name, success } => {
-            if !success {
-                state.add_tool_message(format!("tool failed: {name}"));
-            }
-        }
+        RuntimeEvent::ToolCallFinished { name, summary } => match summary {
+            Some(s) => state.add_tool_message(s),
+            None => state.add_tool_message(format!("tool failed: {name}")),
+        },
         RuntimeEvent::AnswerReady(source) => {
             if let AnswerSource::ToolLimitReached = source {
                 state.add_system_message("Tool limit reached. Response may be incomplete.");

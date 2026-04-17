@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use super::pending::PendingAction;
 
-// ── Input ─────────────────────────────────────────────────────────────────────
+// Input
 
 /// Typed input for each supported tool. The runtime's tool-call parser converts
 /// raw model output into one of these variants before dispatch.
@@ -53,7 +53,7 @@ impl ToolInput {
     }
 }
 
-// ── Output ────────────────────────────────────────────────────────────────────
+// Output
 
 /// Structured output from a completed tool execution. Callers consume the typed
 /// data; rendering into prompt text happens in the tool loop.
@@ -62,6 +62,8 @@ pub enum ToolOutput {
     FileContents(FileContentsOutput),
     DirectoryListing(DirectoryListingOutput),
     SearchResults(SearchResultsOutput),
+    EditFile(EditFileOutput),
+    WriteFile(WriteFileOutput),
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +110,22 @@ pub struct SearchMatch {
     pub line: String,
 }
 
-// ── Run result ────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct EditFileOutput {
+    pub path: String,
+    /// Number of lines in the search text that was replaced.
+    pub lines_replaced: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteFileOutput {
+    pub path: String,
+    pub bytes_written: usize,
+    /// True when the file was newly created; false when an existing file was overwritten.
+    pub created: bool,
+}
+
+// Run result
 
 /// The outcome of dispatching a tool. Read-only tools always return Immediate.
 /// Mutating tools return Approval, pausing the turn until the user responds.
@@ -118,7 +135,7 @@ pub enum ToolRunResult {
     Approval(PendingAction),
 }
 
-// ── Spec ──────────────────────────────────────────────────────────────────────
+// Spec
 
 /// Static metadata describing a tool. Used to build tool descriptions
 /// for the system prompt.
@@ -129,7 +146,7 @@ pub struct ToolSpec {
     pub input_hint: &'static str,
 }
 
-// ── Error ─────────────────────────────────────────────────────────────────────
+// Error
 
 #[derive(Debug, Error)]
 pub enum ToolError {

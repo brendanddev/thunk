@@ -5,6 +5,8 @@ pub enum Command {
     Help,
     Quit,
     Clear,
+    Approve,
+    Reject,
 }
 
 /// Returns a `Command` if `input` is a recognized slash command, or `None` if
@@ -14,6 +16,8 @@ pub fn parse(input: &str) -> Option<Command> {
         "/help" => Some(Command::Help),
         "/quit" | "/exit" => Some(Command::Quit),
         "/clear" => Some(Command::Clear),
+        "/approve" => Some(Command::Approve),
+        "/reject" => Some(Command::Reject),
         _ => None,
     }
 }
@@ -52,6 +56,16 @@ mod tests {
     #[test]
     fn unknown_slash_command_returns_none() {
         assert_eq!(parse("/unknown"), None);
+    }
+
+    #[test]
+    fn parses_approve() {
+        assert_eq!(parse("/approve"), Some(Command::Approve));
+    }
+
+    #[test]
+    fn parses_reject() {
+        assert_eq!(parse("/reject"), Some(Command::Reject));
     }
 
     #[test]

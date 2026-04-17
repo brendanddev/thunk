@@ -64,6 +64,9 @@ impl Runtime {
         self.conversation.extend_history(messages);
     }
 
+    /// Handles a RuntimeRequest by updating the conversation, invoking the backend,
+    /// and firing RuntimeEvents to drive the UI. Each request type has its own
+    /// handler method for clarity.
     pub fn handle(&mut self, request: RuntimeRequest, on_event: &mut dyn FnMut(RuntimeEvent)) {
         match request {
             RuntimeRequest::Submit { text } => self.handle_submit(text, on_event),
@@ -116,19 +119,23 @@ impl Runtime {
 
         match self.registry.execute_approved(&pending) {
             Ok(output) => {
-                on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), success: true });
+                let summary = tool_codec::render_compact_summary(&output);
+                on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: Some(summary) });
                 let result_text = tool_codec::format_tool_result(&tool_name, &output);
                 self.conversation.push_user(result_text);
+                // Approved mutations are terminal — skip follow-up generation.
+                on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolAssisted { rounds: 1 }));
+                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
             }
             Err(e) => {
-                on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), success: false });
+                on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: None });
                 let error_text = tool_codec::format_tool_error(&tool_name, &e.to_string());
                 self.conversation.push_user(error_text);
+                // On failure, let the model respond — it may want to retry.
+                on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+                self.run_turns(0, on_event);
             }
         }
-
-        on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
-        self.run_turns(0, on_event);
     }
 
     fn handle_reject(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
@@ -143,7 +150,7 @@ impl Runtime {
         };
 
         let tool_name = pending.tool_name.clone();
-        on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), success: false });
+        on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: None });
         let rejection = tool_codec::format_tool_error(&tool_name, "user rejected the proposed change");
         self.conversation.push_user(rejection);
 
@@ -151,7 +158,7 @@ impl Runtime {
         self.run_turns(0, on_event);
     }
 
-    /// Runs the generate → tool-round loop until the model produces a final answer,
+    /// Runs the generate -> tool-round loop until the model produces a final answer,
     /// the tool round limit is reached, or a tool action requires approval.
     /// `tool_rounds` is the count already consumed before this call (0 for a fresh turn).
     fn run_turns(&mut self, mut tool_rounds: usize, on_event: &mut dyn FnMut(RuntimeEvent)) {
@@ -176,7 +183,7 @@ impl Runtime {
                 }
             };
 
-            let calls = tool_codec::parse_tool_calls(&response);
+            let calls = tool_codec::parse_all_tool_inputs(&response);
 
             if calls.is_empty() {
                 let source = if tool_rounds == 0 {
@@ -202,6 +209,9 @@ impl Runtime {
             match run_tool_round(&self.registry, calls, on_event) {
                 ToolRoundOutcome::Completed { results } => {
                     self.conversation.push_user(results);
+                    on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolAssisted { rounds: tool_rounds }));
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    return;
                 }
                 ToolRoundOutcome::ApprovalRequired { accumulated, pending } => {
                     if !accumulated.is_empty() {
@@ -239,14 +249,15 @@ fn run_tool_round(
         on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
         match registry.dispatch(input) {
             Ok(ToolRunResult::Immediate(output)) => {
-                on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: true });
+                let summary = tool_codec::render_compact_summary(&output);
+                on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: Some(summary) });
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
             }
             Ok(ToolRunResult::Approval(pending)) => {
                 return ToolRoundOutcome::ApprovalRequired { accumulated, pending };
             }
             Err(e) => {
-                on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), success: false });
+                on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: None });
                 accumulated.push_str(&tool_codec::format_tool_error(&name, &e.to_string()));
             }
         }

@@ -76,6 +76,7 @@ pub struct LlamaCppConfig {
     pub show_native_logs: bool,
 }
 
+/// Default llama.cpp config with no model path and reasonable defaults for other parameters
 impl Default for LlamaCppConfig {
     fn default() -> Self {
         Self {
@@ -90,6 +91,7 @@ impl Default for LlamaCppConfig {
     }
 }
 
+/// Resolves relative paths in the config to absolute paths based on the provided root directory
 impl Config {
     pub fn resolve_paths(mut self, root_dir: &Path) -> Self {
         self.llama_cpp.resolve_paths(root_dir);
@@ -97,6 +99,7 @@ impl Config {
     }
 }
 
+/// Resolves relative paths in the llama.cpp config to absolute paths based on the provided root directory
 impl LlamaCppConfig {
     fn resolve_paths(&mut self, root_dir: &Path) {
         if let Some(model_path) = self.model_path.as_mut() {
