@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::context::ToolContext;
 use super::pending::{PendingAction, RiskLevel};
-use super::types::{ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec, WriteFileOutput};
+use super::types::{ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec, WriteFileOutput};
 use super::Tool;
 
 pub struct WriteFileTool {
@@ -50,6 +50,8 @@ impl Tool for WriteFileTool {
             name: "write_file",
             description: "Create a new file or overwrite an existing file with the given content.",
             input_hint: "path: path/to/file.rs",
+            execution_kind: ExecutionKind::RequiresApproval,
+            default_risk: Some(RiskLevel::Medium),
         }
     }
 

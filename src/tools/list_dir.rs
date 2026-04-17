@@ -1,7 +1,7 @@
 use std::fs;
 
 use super::context::ToolContext;
-use super::types::{DirEntry, DirectoryListingOutput, EntryKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{DirEntry, DirectoryListingOutput, EntryKind, ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 pub struct ListDirTool {
@@ -20,6 +20,8 @@ impl Tool for ListDirTool {
             name: "list_dir",
             description: "List the immediate contents of a directory.",
             input_hint: "path/to/dir",
+            execution_kind: ExecutionKind::Immediate,
+            default_risk: None,
         }
     }
 

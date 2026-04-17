@@ -1,7 +1,7 @@
 use std::fs;
 
 use super::context::ToolContext;
-use super::types::{FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{ExecutionKind, FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 /// Maximum lines of file content injected into the conversation per read.
@@ -24,6 +24,8 @@ impl Tool for ReadFileTool {
             name: "read_file",
             description: "Read the contents of a file at the given path.",
             input_hint: "path/to/file.rs",
+            execution_kind: ExecutionKind::Immediate,
+            default_risk: None,
         }
     }
 

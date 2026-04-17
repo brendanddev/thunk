@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use super::pending::PendingAction;
+use super::pending::{PendingAction, RiskLevel};
 
 // Input
 
@@ -139,13 +139,26 @@ pub enum ToolRunResult {
 
 // Spec
 
-/// Static metadata describing a tool. Used to build tool descriptions
-/// for the system prompt.
+/// Whether a tool runs immediately or requires explicit user approval before mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionKind {
+    /// Tool completes immediately, no approval step.
+    Immediate,
+    /// Tool proposes a mutation that must be approved before executing.
+    RequiresApproval,
+}
+
+/// Static metadata describing a tool. Used to build the system prompt and to
+/// consult tool behavior (approval, risk) without running the tool.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub input_hint: &'static str,
+    /// Whether this tool requires an approval round before executing.
+    pub execution_kind: ExecutionKind,
+    /// Baseline risk for approval-required tools. `None` for immediate tools.
+    pub default_risk: Option<RiskLevel>,
 }
 
 // Error

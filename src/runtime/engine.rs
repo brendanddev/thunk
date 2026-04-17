@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::app::config::Config;
 use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
-use crate::tools::{PendingAction, ToolInput, ToolRegistry, ToolRunResult};
+use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
 
 use super::conversation::Conversation;
 use super::prompt;
@@ -193,7 +193,11 @@ impl Runtime {
 
         let tool_name = pending.tool_name.clone();
         on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: None });
-        let rejection = tool_codec::format_tool_error(&tool_name, "user rejected the proposed change");
+        let rejection = tool_codec::format_tool_error(
+            &tool_name,
+            "user rejected this action — do not retry or re-propose it. \
+             Acknowledge the cancellation in plain text and wait for the user's next instruction.",
+        );
         self.conversation.push_user(rejection);
 
         on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
@@ -309,7 +313,7 @@ impl Runtime {
     }
 
     #[cfg(test)]
-    fn set_pending_for_test(&mut self, action: PendingAction) {
+    pub(crate) fn set_pending_for_test(&mut self, action: PendingAction) {
         self.pending_action = Some(action);
     }
 }
@@ -347,12 +351,27 @@ fn run_tool_round(
 
         match registry.dispatch(input) {
             Ok(ToolRunResult::Immediate(output)) => {
+                // Guard: spec must agree that this tool is Immediate.
+                // A mismatch means the spec() and run() implementations are out of sync.
+                debug_assert!(
+                    registry.spec_for(&name)
+                        .map(|s| s.execution_kind == ExecutionKind::Immediate)
+                        .unwrap_or(true),
+                    "tool '{name}' returned Immediate but spec declares RequiresApproval"
+                );
                 let summary = tool_codec::render_compact_summary(&output);
                 on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: Some(summary) });
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
                 *last_call_key = Some(key);
             }
             Ok(ToolRunResult::Approval(pending)) => {
+                // Guard: spec must agree that this tool requires approval.
+                debug_assert!(
+                    registry.spec_for(&name)
+                        .map(|s| s.execution_kind == ExecutionKind::RequiresApproval)
+                        .unwrap_or(true),
+                    "tool '{name}' returned Approval but spec declares Immediate"
+                );
                 return ToolRoundOutcome::ApprovalRequired { accumulated, pending };
             }
             Err(e) => {
@@ -641,6 +660,32 @@ mod tests {
             .filter(|m| m.role == crate::llm::backend::Role::Assistant)
             .collect();
         assert_eq!(assistant_msgs.len(), 3, "expected two tool calls + synthesis");
+    }
+
+    #[test]
+    fn malformed_block_triggers_correction_and_retries() {
+        // Model emits [test_file]...[/write_file] — wrong opening tag, correct closing tag.
+        // The engine should detect the malformed block, discard the response, inject
+        // a correction, and re-invoke the model. The synthesis response closes the loop.
+        let malformed = "[test_file]\npath: f.txt\n---content---\nhello\n[/write_file]";
+        let mut rt = make_runtime(vec![malformed, "Done."]);
+        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "create f.txt".into() });
+
+        assert!(!has_failed(&events), "must not fail permanently: {events:?}");
+
+        // The final answer must be the synthesis response, not the malformed block.
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot.iter().rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some("Done."), "last assistant message must be synthesis");
+
+        // The correction message must have been injected into the conversation.
+        assert!(
+            snapshot.iter().any(|m| m.content.starts_with("[runtime:correction]") &&
+                m.content.contains("unrecognized opening tag")),
+            "malformed block correction must be in conversation"
+        );
     }
 
     #[test]

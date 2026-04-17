@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::context::ToolContext;
 use super::pending::{PendingAction, RiskLevel};
-use super::types::{EditFileOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{EditFileOutput, ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 pub struct EditFileTool {
@@ -55,6 +55,8 @@ impl Tool for EditFileTool {
             name: "edit_file",
             description: "Replace an exact block of text in an existing file. The search text must match exactly, including whitespace.",
             input_hint: "path: path/to/file.rs",
+            execution_kind: ExecutionKind::RequiresApproval,
+            default_risk: Some(RiskLevel::Medium),
         }
     }
 
@@ -70,7 +72,9 @@ impl Tool for EditFileTool {
         }
         if search.is_empty() {
             return Err(ToolError::InvalidInput(
-                "search text must not be empty".into(),
+                "missing ---search--- section. The [edit_file] block requires both \
+                 ---search--- (the exact text to find) and ---replace--- (the replacement). \
+                 Re-emit the [edit_file] block with both sections included.".into(),
             ));
         }
 

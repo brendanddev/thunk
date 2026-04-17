@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::pending::PendingAction;
-use super::types::{ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 /// Owns all registered tools. Responsibilities: registration, spec enumeration, dispatch.
@@ -49,6 +49,19 @@ impl ToolRegistry {
         let mut specs: Vec<ToolSpec> = self.tools.values().map(|t| t.spec()).collect();
         specs.sort_by_key(|s| s.name);
         specs
+    }
+
+    /// Returns the spec for a specific tool by name, or `None` if not registered.
+    pub fn spec_for(&self, name: &str) -> Option<ToolSpec> {
+        self.tools.get(name).map(|t| t.spec())
+    }
+
+    /// Returns true if the named tool requires approval before executing.
+    /// Returns false for unknown tools (safe default — caller sees no Approval outcome anyway).
+    pub fn is_approval_required(&self, name: &str) -> bool {
+        self.spec_for(name)
+            .map(|s| s.execution_kind == ExecutionKind::RequiresApproval)
+            .unwrap_or(false)
     }
 }
 
@@ -104,5 +117,48 @@ mod tests {
         let ToolRunResult::Immediate(ToolOutput::DirectoryListing(_)) = result.unwrap() else {
             panic!("expected Immediate(DirectoryListing)");
         };
+    }
+
+    #[test]
+    fn spec_for_returns_spec_for_registered_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ReadFileTool::new(ctx()));
+
+        let spec = registry.spec_for("read_file");
+        assert!(spec.is_some());
+        assert_eq!(spec.unwrap().name, "read_file");
+    }
+
+    #[test]
+    fn spec_for_returns_none_for_unknown_tool() {
+        let registry = ToolRegistry::new();
+        assert!(registry.spec_for("nonexistent").is_none());
+    }
+
+    #[test]
+    fn is_approval_required_true_for_mutating_tools() {
+        use crate::tools::{context::ToolContext, edit_file::EditFileTool, write_file::WriteFileTool};
+        let mut registry = ToolRegistry::new();
+        registry.register(EditFileTool::new(ToolContext::new(PathBuf::from("."))));
+        registry.register(WriteFileTool::new(ToolContext::new(PathBuf::from("."))));
+
+        assert!(registry.is_approval_required("edit_file"));
+        assert!(registry.is_approval_required("write_file"));
+    }
+
+    #[test]
+    fn is_approval_required_false_for_read_only_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ReadFileTool::new(ctx()));
+        registry.register(ListDirTool::new(ctx()));
+
+        assert!(!registry.is_approval_required("read_file"));
+        assert!(!registry.is_approval_required("list_dir"));
+    }
+
+    #[test]
+    fn is_approval_required_false_for_unknown_tool() {
+        let registry = ToolRegistry::new();
+        assert!(!registry.is_approval_required("unknown"));
     }
 }

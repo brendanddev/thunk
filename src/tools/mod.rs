@@ -19,7 +19,7 @@ use write_file::WriteFileTool;
 pub use context::ToolContext;
 pub use pending::{PendingAction, RiskLevel};
 pub use registry::ToolRegistry;
-pub use types::{EntryKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+pub use types::{EntryKind, ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 
 /// The core tool trait. Each implementation handles exactly one ToolInput variant.
 ///

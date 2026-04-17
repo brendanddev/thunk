@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use super::context::ToolContext;
-use super::types::{SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{ExecutionKind, SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 /// Maximum number of matches returned in a single search. Prevents context overload.
@@ -34,6 +34,8 @@ impl Tool for SearchCodeTool {
             name: "search_code",
             description: "Search for a string or pattern across source files in the project.",
             input_hint: "query_string [path/to/scope]",
+            execution_kind: ExecutionKind::Immediate,
+            default_risk: None,
         }
     }
 
