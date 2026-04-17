@@ -126,3 +126,4 @@ cargo run
 |--------|------------|
 | [Architecture](docs/architecture.md) | System design and module boundaries |
 | [Setup](docs/setup.md) | Setup instructions |
+| [Benchmarks](docs/benchmarks.md) | Performance benchmarks |
