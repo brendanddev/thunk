@@ -21,10 +21,31 @@ const MAX_CORRECTIONS: usize = 1;
 
 /// Injected into the conversation when a fabricated tool-result block is detected.
 /// Shown to the model only; not displayed in the TUI.
+/// The [runtime:correction] sentinel prefix lets session restore detect and strip these messages
+/// so they do not pollute future conversation context.
 const FABRICATION_CORRECTION: &str =
-    "Your response contained a result block which is forbidden. \
+    "[runtime:correction] Your response contained a result block which is forbidden. \
      You must emit ONLY a tool call tag (e.g. [read_file: path]) or answer directly in plain text. \
      Output the tool call tag now, with no other text.";
+
+/// Returns a stable fingerprint for a tool call, used for consecutive-cycle detection.
+/// Null bytes separate fields; they cannot appear in paths, queries, or file content
+/// on any supported platform, so false matches are impossible.
+fn call_fingerprint(input: &ToolInput) -> String {
+    match input {
+        ToolInput::ReadFile { path } => format!("read_file\x00{path}"),
+        ToolInput::ListDir { path } => format!("list_dir\x00{path}"),
+        ToolInput::SearchCode { query, path } => {
+            format!("search_code\x00{query}\x00{}", path.as_deref().unwrap_or(""))
+        }
+        ToolInput::EditFile { path, search, replace } => {
+            format!("edit_file\x00{path}\x00{search}\x00{replace}")
+        }
+        ToolInput::WriteFile { path, content } => {
+            format!("write_file\x00{path}\x00{content}")
+        }
+    }
+}
 
 pub struct Runtime {
     conversation: Conversation,
@@ -135,6 +156,7 @@ impl Runtime {
                 on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: Some(summary) });
                 let result_text = tool_codec::format_tool_result(&tool_name, &output);
                 self.conversation.push_user(result_text);
+                self.conversation.trim_tool_exchanges_if_needed();
                 // Approved mutations are terminal — skip follow-up generation.
                 on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolAssisted { rounds: 1 }));
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
@@ -175,6 +197,10 @@ impl Runtime {
     /// `tool_rounds` is the count already consumed before this call (0 for a fresh turn).
     fn run_turns(&mut self, mut tool_rounds: usize, on_event: &mut dyn FnMut(RuntimeEvent)) {
         let mut corrections = 0usize;
+        // Tracks the fingerprint of the last executed tool call within this run.
+        // Resets to None at the start of every run_turns invocation so cycle detection
+        // is scoped to one turn and never blocks calls across separate user submissions.
+        let mut last_call_key: Option<String> = None;
         loop {
             let response = match run_generate_turn(
                 self.backend.as_mut(),
@@ -226,7 +252,7 @@ impl Runtime {
 
             tool_rounds += 1;
 
-            if tool_rounds > MAX_TOOL_ROUNDS {
+            if tool_rounds >= MAX_TOOL_ROUNDS {
                 on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolLimitReached));
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
                 return;
@@ -234,16 +260,20 @@ impl Runtime {
 
             on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
 
-            match run_tool_round(&self.registry, calls, on_event) {
+            match run_tool_round(&self.registry, calls, &mut last_call_key, on_event) {
                 ToolRoundOutcome::Completed { results } => {
                     self.conversation.push_user(results);
-                    on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolAssisted { rounds: tool_rounds }));
-                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                    return;
+                    self.conversation.trim_tool_exchanges_if_needed();
+                    // Signal re-entry before the next generate so the status bar
+                    // transitions cleanly from "executing tools" → "processing" → …
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+                    // Do not return — loop continues so the model is re-invoked
+                    // with the tool results in context to produce a synthesis response.
                 }
                 ToolRoundOutcome::ApprovalRequired { accumulated, pending } => {
                     if !accumulated.is_empty() {
                         self.conversation.push_user(accumulated);
+                        self.conversation.trim_tool_exchanges_if_needed();
                     }
                     self.pending_action = Some(pending.clone());
                     on_event(RuntimeEvent::ApprovalRequired(pending));
@@ -265,21 +295,38 @@ impl Runtime {
 /// accumulated before it alongside the PendingAction.
 /// ToolCallStarted is fired for each tool, but ToolCallFinished is NOT fired
 /// for the approval-requiring tool — handle_approve/reject fires it after resolution.
+///
+/// `last_call_key` carries the fingerprint of the most recently executed call across
+/// rounds. If the current call matches it, a cycle error is injected instead of
+/// dispatching. The key is updated after every non-cycle, non-approval dispatch.
 fn run_tool_round(
     registry: &ToolRegistry,
     calls: Vec<ToolInput>,
+    last_call_key: &mut Option<String>,
     on_event: &mut dyn FnMut(RuntimeEvent),
 ) -> ToolRoundOutcome {
     let mut accumulated = String::new();
 
     for input in calls {
         let name = input.tool_name().to_string();
+        let key = call_fingerprint(&input);
         on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
+
+        if last_call_key.as_deref() == Some(key.as_str()) {
+            let msg = format!("{name} called with identical arguments twice in a row");
+            on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: None });
+            accumulated.push_str(&tool_codec::format_tool_error(&name, &msg));
+            // Do not update last_call_key: keep the same fingerprint so a third
+            // consecutive identical call is also blocked.
+            continue;
+        }
+
         match registry.dispatch(input) {
             Ok(ToolRunResult::Immediate(output)) => {
                 let summary = tool_codec::render_compact_summary(&output);
                 on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: Some(summary) });
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
+                *last_call_key = Some(key);
             }
             Ok(ToolRunResult::Approval(pending)) => {
                 return ToolRoundOutcome::ApprovalRequired { accumulated, pending };
@@ -287,6 +334,7 @@ fn run_tool_round(
             Err(e) => {
                 on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: None });
                 accumulated.push_str(&tool_codec::format_tool_error(&name, &e.to_string()));
+                *last_call_key = Some(key);
             }
         }
     }
@@ -471,5 +519,102 @@ mod tests {
             failed_message(&events).as_deref(),
             Some("No pending action to approve.")
         );
+    }
+
+    #[test]
+    fn cycle_detection_blocks_second_identical_call() {
+        // Model emits the same list_dir call twice in one response.
+        // First call executes; second is blocked with a cycle error.
+        // A synthesis response is provided so the loop can complete normally.
+        let mut rt = make_runtime(vec!["[list_dir: .][list_dir: .]", "Done."]);
+        collect_events(&mut rt, RuntimeRequest::Submit { text: "list it twice".into() });
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| m.content.contains("[tool_result: list_dir]")),
+            "first call must produce a tool result"
+        );
+        assert!(
+            snapshot.iter().any(|m|
+                m.content.contains("[tool_error: list_dir]") &&
+                m.content.contains("identical arguments twice in a row")
+            ),
+            "second identical call must produce a cycle error"
+        );
+    }
+
+    #[test]
+    fn cycle_detection_allows_different_args() {
+        // Two list_dir calls with different paths — neither should be blocked.
+        // A synthesis response is provided so the loop can complete normally.
+        let mut rt = make_runtime(vec!["[list_dir: .][list_dir: src/]", "Listed both."]);
+        collect_events(&mut rt, RuntimeRequest::Submit { text: "list both".into() });
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot.iter().any(|m| m.content.contains("identical arguments twice in a row")),
+            "different args must not trigger cycle detection"
+        );
+    }
+
+    #[test]
+    fn tool_round_followed_by_synthesized_answer() {
+        // After a tool call completes, the model is re-invoked in the same turn.
+        // The synthesis response (no tool calls) produces the final AnswerReady event.
+        let mut rt = make_runtime(vec!["[list_dir: .]", "The root contains several files."]);
+        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "what is in root?".into() });
+
+        assert!(!has_failed(&events), "unexpected failure: {events:?}");
+
+        // AnswerReady must be ToolAssisted from the synthesis response
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e { Some(src.clone()) } else { None }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { rounds: 1 })),
+            "expected ToolAssisted(1), got: {answer_source:?}"
+        );
+
+        // Conversation must contain: user prompt, assistant tool call, user tool result,
+        // assistant synthesis — i.e. two assistant messages.
+        let snapshot = rt.messages_snapshot();
+        let assistant_msgs: Vec<_> = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::Assistant)
+            .collect();
+        assert_eq!(assistant_msgs.len(), 2, "expected tool-call + synthesis, got: {assistant_msgs:?}");
+        assert!(
+            assistant_msgs[1].content.contains("several files"),
+            "synthesis must contain model's response text"
+        );
+    }
+
+    #[test]
+    fn multi_tool_round_synthesizes_after_all_rounds() {
+        // Model calls list_dir twice across two separate rounds, then synthesizes.
+        // tool_rounds must reflect both rounds in the AnswerReady source.
+        let mut rt = make_runtime(vec![
+            "[list_dir: .]",
+            "[list_dir: src/]",
+            "Found everything I need.",
+        ]);
+        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "explore".into() });
+
+        assert!(!has_failed(&events), "unexpected failure: {events:?}");
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e { Some(src.clone()) } else { None }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { rounds: 2 })),
+            "expected ToolAssisted(2), got: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let assistant_msgs: Vec<_> = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::Assistant)
+            .collect();
+        assert_eq!(assistant_msgs.len(), 3, "expected two tool calls + synthesis");
     }
 }

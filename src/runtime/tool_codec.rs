@@ -38,14 +38,17 @@ pub fn parse_all_tool_inputs(text: &str) -> Vec<ToolInput> {
     all.into_iter().map(|(_, input)| input).collect()
 }
 
-/// Scans for single-line bracket calls: [read_file: path], [list_dir: path], [search_code: query].
+/// Scans for single-line bracket calls: [read_file: path], [list_dir: path],
+/// [search_code: query], [write_file: path].
 /// The closing ] must appear on the same line as the opening [.
+/// Note: [write_file: path] creates an empty file. Files with content use the block form.
 fn scan_bracket_calls(text: &str) -> Vec<(usize, ToolInput)> {
     let mut results = Vec::new();
     let named_tools: &[(&str, &str)] = &[
         ("read_file", "[read_file:"),
         ("list_dir", "[list_dir:"),
         ("search_code", "[search_code:"),
+        ("write_file", "[write_file:"),
     ];
 
     for (tool_name, prefix) in named_tools {
@@ -86,6 +89,13 @@ fn make_bracket_input(tool_name: &str, arg: &str) -> Option<ToolInput> {
             query: arg.to_string(),
             path: None,
         }),
+        "write_file" if !arg.is_empty() => {
+            let path = arg.strip_prefix("path=").unwrap_or(arg).trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(ToolInput::WriteFile { path, content: String::new() })
+        }
         _ => None,
     }
 }
@@ -196,9 +206,9 @@ pub fn render_compact_summary(output: &ToolOutput) -> String {
     match output {
         ToolOutput::FileContents(f) => {
             if f.truncated {
-                format!("read {} ({} lines, truncated)", f.path, f.line_count)
+                format!("read {} ({} lines, truncated)", f.path, f.total_lines)
             } else {
-                format!("read {} ({} lines)", f.path, f.line_count)
+                format!("read {} ({} lines)", f.path, f.total_lines)
             }
         }
         ToolOutput::DirectoryListing(d) => {
@@ -237,9 +247,15 @@ fn render_output(output: &ToolOutput) -> String {
     match output {
         ToolOutput::FileContents(f) => {
             if f.truncated {
-                format!("{}\n[file truncated at read limit]", f.contents)
+                let shown = f.contents.lines().count();
+                let remaining = f.total_lines.saturating_sub(shown);
+                format!(
+                    "[{total} lines — showing first {shown}]\n{contents}\n[truncated: {remaining} lines not shown]",
+                    total = f.total_lines,
+                    contents = f.contents,
+                )
             } else {
-                f.contents.clone()
+                format!("[{} lines]\n{}", f.total_lines, f.contents)
             }
         }
         ToolOutput::DirectoryListing(d) => {
@@ -327,7 +343,10 @@ exact text to find
 replacement text
 [/edit_file]
 
-Create or overwrite a file:
+Create an empty file (simple form):
+[write_file: path/to/file.rs]
+
+Create or overwrite a file with content:
 [write_file]
 path: path/to/file.rs
 ---content---
@@ -451,6 +470,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_write_file_bracket_form() {
+        let text = "[write_file: src/new.rs]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::WriteFile { path, content }
+            if path == "src/new.rs" && content.is_empty()));
+    }
+
+    #[test]
+    fn parses_write_file_bracket_form_with_path_prefix() {
+        let text = "[write_file: path=src/new.rs]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(&inputs[0], ToolInput::WriteFile { path, content }
+            if path == "src/new.rs" && content.is_empty()));
+    }
+
+    #[test]
+    fn write_file_bracket_empty_arg_is_skipped() {
+        let text = "[write_file: ]";
+        assert!(parse_all_tool_inputs(text).is_empty());
+    }
+
+    #[test]
+    fn write_file_bracket_path_prefix_only_is_skipped() {
+        let text = "[write_file: path=]";
+        assert!(parse_all_tool_inputs(text).is_empty());
+    }
+
+    #[test]
+    fn write_file_bracket_and_block_coexist() {
+        let text = "[write_file: empty.rs]\n[write_file]\npath: full.rs\n---content---\nhello\n[/write_file]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 2);
+        assert!(matches!(&inputs[0], ToolInput::WriteFile { path, content }
+            if path == "empty.rs" && content.is_empty()));
+        assert!(matches!(&inputs[1], ToolInput::WriteFile { path, content }
+            if path == "full.rs" && content == "hello"));
+    }
+
+    #[test]
     fn write_block_absolute_path_is_accepted() {
         // Regression: model was observed emitting absolute paths.
         let text = "[write_file]\npath: /Users/user/project/test.txt\n---content---\nhello\n[/write_file]";
@@ -550,13 +610,46 @@ mod tests {
         let output = ToolOutput::FileContents(FileContentsOutput {
             path: "x.rs".into(),
             contents: "fn main() {}".into(),
-            line_count: 1,
+            total_lines: 1,
             truncated: false,
         });
         let result = format_tool_result("read_file", &output);
         assert!(result.starts_with("[tool_result: read_file]"));
+        assert!(result.contains("[1 lines]"));
         assert!(result.contains("fn main() {}"));
         assert!(result.contains("[/tool_result]"));
+    }
+
+    #[test]
+    fn render_output_includes_metadata_line_for_untruncated_file() {
+        use crate::tools::ToolOutput;
+        use crate::tools::types::FileContentsOutput;
+        let output = ToolOutput::FileContents(FileContentsOutput {
+            path: "x.rs".into(),
+            contents: "line 1\nline 2".into(),
+            total_lines: 2,
+            truncated: false,
+        });
+        let body = render_output(&output);
+        assert_eq!(body, "[2 lines]\nline 1\nline 2");
+    }
+
+    #[test]
+    fn render_output_includes_truncation_notice_for_large_file() {
+        use crate::tools::ToolOutput;
+        use crate::tools::types::FileContentsOutput;
+        // Simulate a 412-line file where only 200 lines are in contents
+        let shown_content: String = (0..200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let output = ToolOutput::FileContents(FileContentsOutput {
+            path: "big.rs".into(),
+            contents: shown_content,
+            total_lines: 412,
+            truncated: true,
+        });
+        let body = render_output(&output);
+        assert!(body.starts_with("[412 lines — showing first 200]"), "got: {body}");
+        assert!(body.contains("line 0"));
+        assert!(body.ends_with("[truncated: 212 lines not shown]"), "got: {body}");
     }
 
     #[test]
@@ -575,6 +668,7 @@ mod tests {
         assert!(instructions.contains("[search_code:"));
         assert!(instructions.contains("[edit_file]"));
         assert!(instructions.contains("[/edit_file]"));
+        assert!(instructions.contains("[write_file:"));
         assert!(instructions.contains("[write_file]"));
         assert!(instructions.contains("[/write_file]"));
         assert!(instructions.contains("---search---"));

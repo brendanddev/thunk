@@ -20,7 +20,7 @@ impl Role {
 }
 
 /// A single message in the conversation history passed to the model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
     pub content: String,

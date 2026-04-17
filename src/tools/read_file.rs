@@ -4,9 +4,9 @@ use super::context::ToolContext;
 use super::types::{FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
-/// Maximum bytes read from a single file before truncation.
-/// Prevents large files from flooding the model context.
-const MAX_BYTES: usize = 100_000;
+/// Maximum lines of file content injected into the conversation per read.
+/// Files with more lines are truncated; the metadata line reports total vs shown.
+const MAX_LINES: usize = 200;
 
 pub struct ReadFileTool {
     context: ToolContext,
@@ -36,42 +36,27 @@ impl Tool for ReadFileTool {
 
         let path = self.context.resolve(path);
         let raw = fs::read(&path)?;
+        let full = String::from_utf8_lossy(&raw).into_owned();
+        let total_lines = full.lines().count();
 
-        let (contents, truncated) = if raw.len() > MAX_BYTES {
-            let sliced = &raw[..MAX_BYTES];
-            // Back off to the last valid UTF-8 boundary so we don't split a codepoint.
-            let boundary = last_utf8_boundary(sliced);
-            (String::from_utf8_lossy(&raw[..boundary]).into_owned(), true)
+        let (contents, truncated) = if total_lines > MAX_LINES {
+            let shown = full.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n");
+            (shown, true)
         } else {
-            (String::from_utf8_lossy(&raw).into_owned(), false)
+            (full, false)
         };
-
-        let line_count = contents.lines().count();
 
         Ok(ToolRunResult::Immediate(ToolOutput::FileContents(
             FileContentsOutput {
                 path: path.to_string_lossy().into_owned(),
                 contents,
-                line_count,
+                total_lines,
                 truncated,
             },
         )))
     }
 }
 
-/// Returns the largest index <= limit that sits on a UTF-8 character boundary.
-fn last_utf8_boundary(bytes: &[u8]) -> usize {
-    let mut i = bytes.len();
-    while i > 0 && !is_char_boundary(bytes[i - 1]) {
-        i -= 1;
-    }
-    i
-}
-
-/// A byte is a UTF-8 continuation byte if its top two bits are 10.
-fn is_char_boundary(b: u8) -> bool {
-    (b & 0xC0) != 0x80
-}
 
 #[cfg(test)]
 mod tests {
@@ -94,8 +79,25 @@ mod tests {
         let out = read(f.path().to_str().unwrap()).unwrap();
         let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else { panic!("expected Immediate(FileContents)") };
         assert!(fc.contents.contains("line one"));
-        assert_eq!(fc.line_count, 2);
+        assert_eq!(fc.total_lines, 2);
         assert!(!fc.truncated);
+    }
+
+    #[test]
+    fn truncates_at_line_cap_and_reports_total() {
+        let mut f = NamedTempFile::new().unwrap();
+        // Write MAX_LINES + 5 lines (205 total)
+        for i in 0..205 {
+            writeln!(f, "line {i}").unwrap();
+        }
+        let out = read(f.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else { panic!("expected Immediate(FileContents)") };
+        assert!(fc.truncated);
+        assert_eq!(fc.total_lines, 205);
+        // contents must have exactly MAX_LINES lines
+        assert_eq!(fc.contents.lines().count(), MAX_LINES);
+        assert!(fc.contents.contains("line 0"));
+        assert!(!fc.contents.contains("line 200")); // line 200 is the 201st line, beyond cap
     }
 
     #[test]

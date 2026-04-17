@@ -120,9 +120,12 @@ fn from_stored(session: &SavedSession) -> Vec<Message> {
         .collect()
 }
 
-/// Returns true when a user message is a tool result or tool error injected by the runtime.
+/// Returns true when a user message is a tool result, tool error, or runtime correction
+/// injected by the engine — none of which should be re-injected into a restored context.
 fn is_tool_exchange(content: &str) -> bool {
-    content.starts_with("[tool_result:") || content.starts_with("[tool_error:")
+    content.starts_with("[tool_result:")
+        || content.starts_with("[tool_error:")
+        || content.starts_with("[runtime:correction]")
 }
 
 #[cfg(test)]
@@ -252,6 +255,29 @@ mod tests {
         let restored = from_stored(&saved);
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[1].content, "Hi there! How can I help?");
+    }
+
+    #[test]
+    fn from_stored_strips_fabrication_correction_messages() {
+        use crate::storage::session::{SavedSession, SessionMeta, StoredMessage};
+
+        let correction = "[runtime:correction] Your response contained a result block which is forbidden. \
+            You must emit ONLY a tool call tag (e.g. [read_file: path]) or answer directly in plain text. \
+            Output the tool call tag now, with no other text.".to_string();
+
+        let saved = SavedSession {
+            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 3 },
+            messages: vec![
+                StoredMessage { role: "user".into(), content: "list the files".into() },
+                StoredMessage { role: "assistant".into(), content: "[tool_result: list_dir]\nfoo\n[/tool_result]".into() },
+                StoredMessage { role: "user".into(), content: correction },
+            ],
+        };
+
+        let restored = from_stored(&saved);
+        // Original user message survives; correction and fabricated assistant message are stripped
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].content, "list the files");
     }
 
     #[test]

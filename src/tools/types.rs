@@ -69,9 +69,11 @@ pub enum ToolOutput {
 #[derive(Debug, Clone)]
 pub struct FileContentsOutput {
     pub path: String,
+    /// The (possibly truncated) file content injected into the conversation.
     pub contents: String,
-    pub line_count: usize,
-    /// True when the file was larger than the read limit and was cut off.
+    /// Total lines in the file, before any truncation.
+    pub total_lines: usize,
+    /// True when the file exceeded the line cap and contents was cut off.
     pub truncated: bool,
 }
 
