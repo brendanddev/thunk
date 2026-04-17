@@ -14,6 +14,18 @@ use super::types::{Activity, AnswerSource, RuntimeEvent, RuntimeRequest};
 /// producing tool calls without reaching a final answer.
 const MAX_TOOL_ROUNDS: usize = 10;
 
+/// Maximum automatic corrections per turn. One correction is enough — if the
+/// model fabricates twice in a row the prompt fix is insufficient and we surface
+/// the failure rather than looping silently.
+const MAX_CORRECTIONS: usize = 1;
+
+/// Injected into the conversation when a fabricated tool-result block is detected.
+/// Shown to the model only; not displayed in the TUI.
+const FABRICATION_CORRECTION: &str =
+    "Your response contained a result block which is forbidden. \
+     You must emit ONLY a tool call tag (e.g. [read_file: path]) or answer directly in plain text. \
+     Output the tool call tag now, with no other text.";
+
 pub struct Runtime {
     conversation: Conversation,
     backend: Box<dyn ModelBackend>,
@@ -162,6 +174,7 @@ impl Runtime {
     /// the tool round limit is reached, or a tool action requires approval.
     /// `tool_rounds` is the count already consumed before this call (0 for a fresh turn).
     fn run_turns(&mut self, mut tool_rounds: usize, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        let mut corrections = 0usize;
         loop {
             let response = match run_generate_turn(
                 self.backend.as_mut(),
@@ -186,6 +199,21 @@ impl Runtime {
             let calls = tool_codec::parse_all_tool_inputs(&response);
 
             if calls.is_empty() {
+                // Fabricated [tool_result:] / [tool_error:] blocks mean the model bypassed the
+                // protocol. Attempt one automatic correction before surfacing the error.
+                if tool_codec::contains_fabricated_exchange(&response) {
+                    if corrections < MAX_CORRECTIONS {
+                        corrections += 1;
+                        self.conversation.discard_last_if_assistant();
+                        self.conversation.push_user(FABRICATION_CORRECTION.to_string());
+                        continue;
+                    }
+                    on_event(RuntimeEvent::Failed {
+                        message: "Model repeatedly produced fabricated tool results. Try rephrasing your request.".to_string(),
+                    });
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    return;
+                }
                 let source = if tool_rounds == 0 {
                     AnswerSource::Direct
                 } else {
@@ -290,6 +318,9 @@ fn run_generate_turn(
             }
             conversation.push_assistant_chunk(&chunk);
             on_event(RuntimeEvent::AssistantMessageChunk(chunk));
+        }
+        BackendEvent::Timing { stage, elapsed_ms } => {
+            on_event(RuntimeEvent::BackendTiming { stage, elapsed_ms });
         }
         BackendEvent::Finished => {}
     });

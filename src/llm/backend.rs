@@ -74,6 +74,9 @@ pub enum BackendEvent {
     StatusChanged(BackendStatus),
     TextDelta(String),
     Finished,
+    /// Advisory timing event — emitted by backends at key internal stages.
+    /// Consumers may route this to logging; it must not affect control flow.
+    Timing { stage: &'static str, elapsed_ms: u64 },
 }
 
 /// Defines the abstraction over a language model backend.

@@ -60,4 +60,7 @@ pub enum RuntimeEvent {
     ApprovalRequired(PendingAction),
     AnswerReady(AnswerSource),
     Failed { message: String },
+    /// Advisory timing event routed from the backend. Consumed by the logging layer only;
+    /// must not be forwarded to the TUI or drive any control flow.
+    BackendTiming { stage: &'static str, elapsed_ms: u64 },
 }

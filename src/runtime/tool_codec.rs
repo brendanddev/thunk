@@ -285,26 +285,40 @@ fn render_output(output: &ToolOutput) -> String {
     }
 }
 
+// Protocol guard
+
+/// Returns true if the text contains a fabricated tool result or error block.
+/// Assistant output must never contain these — they are runtime-injected only.
+/// Used by the engine to detect and surface model misbehavior rather than
+/// silently accepting a fabricated result as a valid direct answer.
+pub fn contains_fabricated_exchange(text: &str) -> bool {
+    text.contains("[tool_result:") || text.contains("[tool_error:")
+}
+
 // Protocol description
 
 /// Returns the format instructions block that prompt.rs includes in the system prompt.
 /// Keeping this here ensures the prompt's description always matches the actual
 /// formats that the scanners expect and format_tool_result produces.
 pub fn format_instructions() -> &'static str {
-    r#"Use ONLY the exact formats shown below. Any other format is silently ignored.
+    r#"TOOL USE RULES — read carefully:
 
-IMPORTANT: When you need to use a tool, output ONLY the tool call. Do not include any explanation, prefix text, summary, or prose before or after the tool call. After the tool result is returned, the turn ends — do not add a follow-up summary or commentary.
+Your role: emit tool CALL TAGS only. The system executes them and returns results.
+You do NOT produce file contents, directory listings, or search results yourself.
+You do NOT write result blocks. Result blocks are written by the system, not you.
 
-To read a file:
+When a tool is needed, your ENTIRE response must be the call tag only — no prose, no prefix, no explanation.
+
+Request a file read:
 [read_file: path/to/file.rs]
 
-To list a directory:
+List a directory:
 [list_dir: src/]
 
-To search for code:
-[search_code: search query text]
+Search code:
+[search_code: pattern]
 
-To edit an existing file:
+Edit a file:
 [edit_file]
 path: path/to/file.rs
 ---search---
@@ -313,15 +327,14 @@ exact text to find
 replacement text
 [/edit_file]
 
-To create or overwrite a file:
+Create or overwrite a file:
 [write_file]
 path: path/to/file.rs
 ---content---
 full file content
 [/write_file]
 
-Tool results are returned as [tool_result: name]...[/tool_result].
-Only call tools when needed. When you have enough information, respond directly without any tool calls."#
+When you have enough information, respond directly in plain text with no tool tags."#
 }
 
 // Tests
@@ -567,6 +580,37 @@ mod tests {
         assert!(instructions.contains("---search---"));
         assert!(instructions.contains("---replace---"));
         assert!(instructions.contains("---content---"));
-        assert!(instructions.contains("[tool_result:"));
+    }
+
+    #[test]
+    fn format_instructions_does_not_describe_tool_result_format() {
+        // [tool_result:] and [tool_error:] are runtime-only. Describing their format
+        // causes the model to fabricate completed exchanges instead of issuing real calls.
+        let instructions = format_instructions();
+        assert!(
+            !instructions.contains("Tool results are returned as"),
+            "must not document the tool_result format for the model"
+        );
+        assert!(
+            !instructions.contains("[tool_result:"),
+            "must not show [tool_result:] syntax anywhere — even in a prohibition"
+        );
+        assert!(
+            !instructions.contains("[tool_error:"),
+            "must not show [tool_error:] syntax anywhere"
+        );
+        // Role framing must be present.
+        assert!(
+            instructions.contains("You do NOT produce"),
+            "must include explicit role framing"
+        );
+    }
+
+    #[test]
+    fn contains_fabricated_exchange_detects_tool_result_blocks() {
+        assert!(contains_fabricated_exchange("[tool_result: read_file]\nsome content\n[/tool_result]"));
+        assert!(contains_fabricated_exchange("[tool_error: read_file]\nfailed\n[/tool_error]"));
+        assert!(!contains_fabricated_exchange("[read_file: src/main.rs]"));
+        assert!(!contains_fabricated_exchange("Here is my answer."));
     }
 }

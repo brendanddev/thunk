@@ -66,6 +66,11 @@ impl AppContext {
                             l.log_timed(&label, t.elapsed());
                         }
                     }
+                    RuntimeEvent::BackendTiming { stage, elapsed_ms } => {
+                        l.log(&format!("backend: {stage} ({elapsed_ms}ms)"));
+                        // Do not forward — TUI has no use for internal backend timings.
+                        return;
+                    }
                     other => {
                         if let Some(label) = event_label(other) {
                             l.log(&label);
@@ -132,6 +137,7 @@ fn event_label(event: &RuntimeEvent) -> Option<String> {
         | RuntimeEvent::AssistantMessageFinished
         | RuntimeEvent::ToolCallStarted { .. }
         | RuntimeEvent::ToolCallFinished { .. }
-        | RuntimeEvent::AssistantMessageChunk(_) => None,
+        | RuntimeEvent::AssistantMessageChunk(_)
+        | RuntimeEvent::BackendTiming { .. } => None,
     }
 }

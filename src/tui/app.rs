@@ -168,5 +168,7 @@ fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
             ));
             state.set_status("awaiting approval");
         }
+        // Advisory only — absorbed by the logging layer before reaching here.
+        RuntimeEvent::BackendTiming { .. } => {}
     }
 }

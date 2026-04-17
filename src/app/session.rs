@@ -56,6 +56,10 @@ impl ActiveSession {
 // System messages are excluded. The system prompt is reconstructed at runtime
 // from config; storing it would create a stale copy that could diverge.
 
+/// Maximum number of messages to inject into a fresh conversation on restore.
+/// Prevents large accumulated histories from overflowing the model's context window.
+const RESTORE_WINDOW: usize = 10;
+
 /// Converts runtime messages to storable form, excluding system messages.
 fn to_stored(messages: &[Message]) -> Vec<StoredMessage> {
     messages
@@ -68,18 +72,57 @@ fn to_stored(messages: &[Message]) -> Vec<StoredMessage> {
         .collect()
 }
 
-/// Converts stored messages back to runtime form.
-/// Unknown role strings are skipped rather than crashing.
+/// Converts stored messages back to runtime form, applying two rules:
+///
+/// 1. Window trim — only the most recent RESTORE_WINDOW messages are loaded.
+///    Older history stays in the DB but is not injected into context.
+///
+/// 2. Tool exchange stripping — user messages that are runtime tool results or errors
+///    are dropped entirely, along with the immediately preceding assistant message if
+///    it was a pure tool call (starts with `[`). Raw file contents and directory
+///    listings are never re-injected into the context window on restore. Full content
+///    is preserved in storage; only context injection is affected.
+///
+///    Placeholders are intentionally not used: a placeholder that looks like a real
+///    tool result causes the model to believe the exchange already completed, suppressing
+///    fresh tool use when the user re-requests the same operation.
 fn from_stored(session: &SavedSession) -> Vec<Message> {
-    session
-        .messages
+    let total = session.messages.len();
+    let start = total.saturating_sub(RESTORE_WINDOW);
+    let slice = &session.messages[start..];
+    let n = slice.len();
+
+    let mut exclude = vec![false; n];
+    for (i, m) in slice.iter().enumerate() {
+        if m.role == "user" && is_tool_exchange(&m.content) {
+            exclude[i] = true;
+            // Drop the preceding assistant message too if it is a pure tool call
+            // (no conversational text, just a bare bracket call). Without the result
+            // it has no value and would leave an orphaned exchange in context.
+            if i > 0
+                && slice[i - 1].role == "assistant"
+                && slice[i - 1].content.trim_start().starts_with('[')
+            {
+                exclude[i - 1] = true;
+            }
+        }
+    }
+
+    slice
         .iter()
-        .filter_map(|m| match m.role.as_str() {
+        .zip(exclude.iter())
+        .filter(|(_, &ex)| !ex)
+        .filter_map(|(m, _)| match m.role.as_str() {
             "user" => Some(Message::user(m.content.clone())),
             "assistant" => Some(Message::assistant(m.content.clone())),
             _ => None,
         })
         .collect()
+}
+
+/// Returns true when a user message is a tool result or tool error injected by the runtime.
+fn is_tool_exchange(content: &str) -> bool {
+    content.starts_with("[tool_result:") || content.starts_with("[tool_error:")
 }
 
 #[cfg(test)]
@@ -132,6 +175,83 @@ mod tests {
         assert_eq!(restored[0].content, "hello");
         assert_eq!(restored[1].role, Role::Assistant);
         assert_eq!(restored[1].content, "hi there");
+    }
+
+    #[test]
+    fn from_stored_trims_to_restore_window() {
+        use crate::storage::session::{SavedSession, SessionMeta, StoredMessage};
+
+        // Create 14 messages — more than RESTORE_WINDOW (10)
+        let messages: Vec<StoredMessage> = (0..14)
+            .map(|i| StoredMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("msg {i}"),
+            })
+            .collect();
+
+        let saved = SavedSession {
+            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 14 },
+            messages,
+        };
+
+        let restored = from_stored(&saved);
+        assert_eq!(restored.len(), RESTORE_WINDOW);
+        // Should be the last 10 messages (indices 4–13)
+        assert_eq!(restored[0].content, "msg 4");
+        assert_eq!(restored[9].content, "msg 13");
+    }
+
+    #[test]
+    fn from_stored_strips_tool_exchange_user_messages() {
+        use crate::storage::session::{SavedSession, SessionMeta, StoredMessage};
+
+        let tool_result = "[tool_result: read_file]\nsome file content\n[/tool_result]\n\n".to_string();
+
+        let saved = SavedSession {
+            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 1 },
+            messages: vec![StoredMessage { role: "user".into(), content: tool_result }],
+        };
+
+        let restored = from_stored(&saved);
+        assert!(restored.is_empty(), "tool exchange messages must not be injected on restore");
+    }
+
+    #[test]
+    fn from_stored_strips_adjacent_pure_tool_call_assistant_message() {
+        use crate::storage::session::{SavedSession, SessionMeta, StoredMessage};
+
+        // A tool-assisted turn: user prompt → assistant tool call → user tool result
+        let saved = SavedSession {
+            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 3 },
+            messages: vec![
+                StoredMessage { role: "user".into(), content: "read README.md".into() },
+                StoredMessage { role: "assistant".into(), content: "[read_file: README.md]".into() },
+                StoredMessage { role: "user".into(), content: "[tool_result: read_file]\ncontent\n[/tool_result]\n\n".into() },
+            ],
+        };
+
+        let restored = from_stored(&saved);
+        // Only the original user prompt survives; the tool-call assistant and tool result are stripped
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].content, "read README.md");
+    }
+
+    #[test]
+    fn from_stored_keeps_conversational_assistant_messages() {
+        use crate::storage::session::{SavedSession, SessionMeta, StoredMessage};
+
+        // An assistant message that starts with natural language is kept
+        let saved = SavedSession {
+            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 2 },
+            messages: vec![
+                StoredMessage { role: "user".into(), content: "hello".into() },
+                StoredMessage { role: "assistant".into(), content: "Hi there! How can I help?".into() },
+            ],
+        };
+
+        let restored = from_stored(&saved);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[1].content, "Hi there! How can I help?");
     }
 
     #[test]

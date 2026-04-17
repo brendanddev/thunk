@@ -92,6 +92,8 @@ pub(super) fn run_generation(
     prompt: &str,
     on_event: &mut dyn FnMut(BackendEvent),
 ) -> Result<()> {
+    use std::time::Instant;
+
     let context_tokens = config.context_tokens;
     let batch_tokens = config.batch_tokens;
     let max_tokens = config.max_tokens;
@@ -106,16 +108,19 @@ pub(super) fn run_generation(
     // n_ubatch must be <= n_batch. The crate default is n_ubatch=512, n_batch=2048, so
     // any batch_tokens < 512 leaves n_ubatch > n_batch and native context creation fails.
     // Pin n_ubatch = n_batch to keep them consistent at whatever batch size is configured.
+    //
+    // Intentionally omit with_op_offload(false) and with_flash_attention_policy(0) — those
+    // disabled CPU-level SIMD/BLAS and attention optimizations that the old project relied on
+    // via defaults. Let llama.cpp choose the optimal strategy.
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(context_tokens))
         .with_n_batch(batch_tokens)
         .with_n_ubatch(batch_tokens)
         .with_type_k(KvCacheType::F16)
         .with_type_v(KvCacheType::F16)
-        .with_flash_attention_policy(0)
-        .with_offload_kqv(false)
-        .with_op_offload(false);
+        .with_offload_kqv(false);
 
+    let t_ctx_start = Instant::now();
     let mut ctx = {
         // Context creation prints sched_reserve / kv_cache / graph_reserve lines directly to
         // stderr. Always suppress — same reasoning as load_from_file above.
@@ -134,11 +139,20 @@ pub(super) fn run_generation(
                 ))
             })?
     };
+    on_event(BackendEvent::Timing {
+        stage: "ctx_create",
+        elapsed_ms: t_ctx_start.elapsed().as_millis() as u64,
+    });
 
+    let t_tok_start = Instant::now();
     let tokens = loaded
         .model
         .str_to_token(prompt, AddBos::Always)
         .map_err(map_llama_error)?;
+    on_event(BackendEvent::Timing {
+        stage: "tokenize",
+        elapsed_ms: t_tok_start.elapsed().as_millis() as u64,
+    });
 
     let context_limit = if context_tokens == 0 {
         loaded.model.n_ctx_train() as usize
@@ -153,6 +167,12 @@ pub(super) fn run_generation(
             context_limit
         )));
     }
+
+    on_event(BackendEvent::Timing {
+        stage: "prefill_start",
+        elapsed_ms: t_ctx_start.elapsed().as_millis() as u64,
+    });
+    let t_prefill_start = Instant::now();
 
     let mut batch = LlamaBatch::new(batch_tokens as usize, 1);
     let mut consumed = 0usize;
@@ -172,6 +192,11 @@ pub(super) fn run_generation(
         consumed = end;
     }
 
+    on_event(BackendEvent::Timing {
+        stage: "prefill_done",
+        elapsed_ms: t_prefill_start.elapsed().as_millis() as u64,
+    });
+
     let mut sampler = LlamaSampler::chain_simple([
         LlamaSampler::temp(temperature),
         LlamaSampler::dist(0),
@@ -179,6 +204,7 @@ pub(super) fn run_generation(
 
     let mut generated = 0usize;
     let mut current_pos = tokens.len() as i32;
+    let t_gen_start = Instant::now();
 
     loop {
         let next_token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -211,6 +237,10 @@ pub(super) fn run_generation(
         ctx.decode(&mut batch).map_err(map_llama_error)?;
     }
 
+    on_event(BackendEvent::Timing {
+        stage: "generation_done",
+        elapsed_ms: t_gen_start.elapsed().as_millis() as u64,
+    });
     on_event(BackendEvent::Finished);
     Ok(())
 }

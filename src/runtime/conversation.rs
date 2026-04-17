@@ -70,6 +70,14 @@ impl Conversation {
         self.messages.extend(messages);
     }
 
+    /// Removes the last message if it is an assistant message.
+    /// Used to discard a bad assistant response before injecting a correction.
+    pub fn discard_last_if_assistant(&mut self) {
+        if matches!(self.messages.last(), Some(m) if m.role == Role::Assistant) {
+            self.messages.pop();
+        }
+    }
+
     /// Resets the conversation to just the system prompt.
     pub fn reset(&mut self, system_prompt: String) {
         self.messages.clear();
