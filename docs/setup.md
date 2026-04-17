@@ -1,12 +1,18 @@
 # Setup
 
+Provides instructions for setting up the development environment, running the app, and understanding the configuration.
+
+---
+
 ## Requirements
 
-- Rust stable toolchain
-- An interactive terminal (`stdout` must be a TTY and `TERM` cannot be `dumb`)
-- A local GGUF model only if you want to use the `llama_cpp` backend
+- Rust stable
+- An interactive terminal (`stdout` must be a TTY and `TERM` must not be `dumb`)
+- A local `.gguf` model only if you use the `llama_cpp` backend
 
-SQLite does not need to be installed separately; `rusqlite` is built with the bundled feature.
+`rusqlite` is built with the `bundled` feature, so SQLite does not need to be installed separately.
+
+---
 
 ## Run
 
@@ -16,37 +22,41 @@ From the project root:
 cargo run
 ```
 
-At startup the app will:
+On startup the app:
 
-- discover the project root from `config.toml`
-- create `data/` and `logs/` if they do not exist
-- open or restore the most recent session from `data/sessions.db`
+- finds the project root by walking up to `config.toml`
+- creates `data/` and `logs/` if needed
+- opens or restores the most recent session from `data/sessions.db`
+
+---
 
 ## Tests
-
-Run the test suite with:
 
 ```bash
 cargo test
 ```
 
-Most tests live inline inside the Rust modules rather than under `tests/`.
+Most tests live inline in the Rust modules.
 
-## Configuration Notes
+---
 
-Configuration is read from `config.toml`.
+## Config Basics
 
-Relevant keys:
+Configuration lives in `config.toml`.
 
 - `llm.provider = "mock"` uses the built-in mock backend.
 - `llm.provider = "llama_cpp"` uses the local llama.cpp backend.
-- `llama_cpp.model_path` should point to a local `.gguf` model file.
-- Relative model paths are resolved from the project root.
+- `llama_cpp.model_path` must point to a local `.gguf` file.
+- Relative `model_path` values are resolved from the project root.
 
-The current default config in this repo is set to `llama_cpp` and points at:
+This repo currently defaults to:
 
-```text
-data/models/qwen2.5-3b-instruct-q4_k_m.gguf
+```toml
+[llm]
+provider = "llama_cpp"
+
+[llama_cpp]
+model_path = "data/models/qwen2.5-3b-instruct-q4_k_m.gguf"
 ```
 
-If you do not have that model locally, switch `llm.provider` to `mock` or update `llama_cpp.model_path` to a model that exists on your machine.
+If that model is not present locally, either switch to `mock` or update `llama_cpp.model_path`.

@@ -1,0 +1,173 @@
+# Sessions
+
+Describes the current session and persistence model: what is stored, how restore works, and where the key boundaries between runtime and storage live.
+
+---
+
+## Purpose
+
+Sessions make the app durable across launches without coupling the runtime directly to SQLite.
+
+The current design splits that work across two layers:
+
+- `app/session.rs` owns the bridge between runtime messages and stored messages
+- `storage/session/` owns SQLite schema and CRUD
+
+`AppContext` uses those pieces to restore the most recent session at startup and save conversation state after user submissions.
+
+---
+
+## Main Components
+
+### `ActiveSession`
+
+`ActiveSession` in `src/app/session.rs` owns:
+
+- the active `SessionStore`
+- the current session ID
+- conversion between runtime `Message` values and stored message rows
+
+This is the only place that sees both runtime message types and storage message types.
+
+### `SessionStore`
+
+`SessionStore` in `src/storage/session/store.rs` owns the SQLite database handle and the basic session CRUD operations.
+
+### Stored Types
+
+The storage layer defines:
+
+- `SessionId`
+- `SessionMeta`
+- `StoredMessage`
+- `SavedSession`
+
+Storage uses plain strings for roles so it stays decoupled from the runtime’s typed `Role` enum.
+
+---
+
+## Database Layout
+
+The session database lives at `data/sessions.db`.
+
+Current schema:
+
+- `sessions`
+  - `id`
+  - `created_at`
+  - `updated_at`
+  - `msg_count`
+- `session_messages`
+  - `session_id`
+  - `seq`
+  - `role`
+  - `content`
+
+Messages are stored in order by `(session_id, seq)`.
+
+`SessionStore::save()` replaces the stored message set for a session instead of appending deltas.
+
+---
+
+## What Gets Stored
+
+The runtime provides the full in-memory conversation to `ActiveSession::save()`, but `ActiveSession` filters it before writing.
+
+Stored:
+
+- user messages
+- assistant messages
+- runtime-injected tool result and tool error blocks, because they are stored as user messages
+
+Not stored:
+
+- system messages
+- TUI-only status/system lines
+- pending approval state
+
+The system prompt is intentionally not persisted. It is rebuilt from current config and tool specs on each startup.
+
+---
+
+## Startup And Restore
+
+At startup:
+
+1. `app::run()` opens the session DB
+2. `ActiveSession::open_or_restore()` asks `SessionStore` for the most recently updated session
+3. if one exists, stored messages are converted back into runtime messages
+4. if none exists, a new empty session is created
+5. `AppContext::build()` loads the restored history into the runtime after creating a fresh system prompt
+
+Restore is intentionally narrower than storage.
+
+### Restore Window
+
+Only the most recent `10` stored messages are injected back into the runtime.
+
+Older messages stay in SQLite, but they are not reloaded into the live model context.
+
+### Tool Exchange Stripping
+
+Restore also strips runtime-generated tool exchanges:
+
+- user messages starting with `[tool_result:` or `[tool_error:` are dropped
+- if one of those was immediately preceded by a pure assistant tool call that starts with `[`, that assistant message is dropped too
+
+This keeps raw file contents, directory listings, and other tool outputs out of restored context while preserving the full transcript on disk.
+
+### Current UI Gap
+
+Restored history is loaded into the runtime, but it is not replayed into `AppState`.
+
+That means:
+
+- the model has restored context after startup
+- the visible TUI transcript still starts from the fresh welcome message
+
+---
+
+## Saving Behavior
+
+`AppContext::handle()` auto-saves only after `RuntimeRequest::Submit`.
+
+That means the normal submit path is persisted automatically, but two important cases are not:
+
+- `Approve`
+- `Reject`
+
+If the user approves or rejects a pending action and then closes the app before the next submit, those changes may exist only in memory.
+
+---
+
+## Reset Behavior
+
+`/clear` eventually calls `AppContext::reset()`.
+
+That does two things:
+
+- resets the runtime conversation back to the system prompt
+- creates a brand new session ID in storage
+
+The old session remains in SQLite; reset does not delete prior sessions.
+
+---
+
+## IDs And Ordering
+
+Session IDs are generated as short lowercase hex strings.
+
+Sessions are restored by `updated_at` descending, so the app always resumes the most recently updated saved session.
+
+Messages within a session are stored and loaded in ascending `seq` order.
+
+---
+
+## Current Limitations
+
+- Only the most recent session is restored automatically.
+- Pending approvals are not persisted.
+- Autosave does not run after `Approve` or `Reject`.
+- Restore uses a fixed message window rather than token-aware budgeting.
+- The full stored transcript can be larger than the context reloaded into the runtime.
+- The TUI does not yet show restored transcript history on startup.

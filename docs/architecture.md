@@ -1,343 +1,231 @@
 # Architecture
 
+Defines the high-level architecture and design decisions of the app, including the layered structure, data flow, tool execution model, protocol design, persistence model, and known limitations.
+
+---
+
 ## System Overview
 
-`params-cli` is a local-first Rust TUI application built around six main layers:
+`params-cli` is a local-first Rust TUI coding assistant. It runs a conversation loop against a selected model backend, lets the model request a small set of file-system tools through a constrained text protocol, and requires explicit user approval before mutating files.
 
-- `app` bootstraps the system and owns session persistence.
-- `runtime` owns the conversation, model interaction, tool dispatch, and approval state.
-- `tools` exposes typed tool operations behind a registry.
-- `storage` persists sessions in SQLite.
-- `llm` hides model-provider details behind a common backend trait.
-- `tui` handles terminal input, rendering, and control commands.
+At startup, `src/main.rs` calls `app::run()`. The app layer discovers the project root from `config.toml`, loads config, builds the model backend and tool registry, opens optional session logging, restores the most recent session from SQLite, and launches the TUI. After that, the TUI talks only to `AppContext`; `AppContext` forwards requests into the runtime and persists the runtime transcript.
 
-The boot path is straightforward:
+The core problem the project solves is running an AI coding assistant locally without collapsing the system into one text-driven loop. The current implementation keeps model generation, tool execution, approval, persistence, and UI rendering in separate layers with explicit boundaries.
 
-1. `src/main.rs` calls `app::run()`.
-2. `app::run()` discovers the project root from `config.toml`, ensures `data/` and `logs/` exist, loads config, builds the selected model backend, builds the default tool registry, opens logging, restores the most recent session, then launches the TUI.
-3. `AppContext` sits between the TUI and the runtime so the UI never talks to storage or tool implementations directly.
+---
 
-This document follows the current code, not older status notes. In the current implementation, `edit_file`, `write_file`, and approval flow are implemented.
+## Layered Architecture
 
-## Layer Breakdown
+### `app/`
 
-| Layer | Owns | Does Not Own |
-| --- | --- | --- |
-| `app` | startup, path/config discovery, backend + tool assembly, session restore/save, reset, optional session logging | tool parsing, tool execution logic, terminal rendering |
-| `runtime` | conversation state, system prompt, backend generation, tool-call parsing via `tool_codec`, tool dispatch, pending approval state, runtime events | SQLite, TUI state, file rendering |
-| `tools` | typed tool contracts, tool registry, path resolution, read/write/search/edit implementations, approval proposals for mutating tools | parsing raw model text, UI behavior, session storage |
-| `storage` | SQLite schema and session CRUD | runtime/tool semantics, prompt construction |
-| `llm` | `ModelBackend` abstraction, provider selection, model-specific prompt formatting, streaming backend events | tool logic, persistence, UI |
-| `tui` | raw terminal lifecycle, input editing, slash command parsing, rendering transcript and status, mapping runtime events to visible messages | business logic, tool execution, persistence |
+- Responsibilities: startup, project-root discovery, config loading, backend and tool assembly, session restore/save, reset orchestration, optional logging hookup.
+- Owns: `AppContext`, `AppPaths`, `ActiveSession`, and the boot path that constructs `Runtime`.
+- Must not: parse tool syntax, execute tool logic, or render terminal UI.
 
-There is also a small `logging` utility. It is advisory rather than foundational: `AppContext` can attach a per-session log file, but correctness does not depend on it.
+### `runtime/`
 
-## Responsibilities By Layer
+- Responsibilities: system prompt construction, conversation state, backend generation loop, tool-call parsing through `tool_codec`, tool dispatch, approval pause/resume, and runtime events.
+- Owns: `Conversation`, `pending_action`, `RuntimeRequest`, `RuntimeEvent`, and the decision to inject tool results back into the conversation.
+- Must not: talk to SQLite directly, manipulate terminal state, or let tools parse raw model text.
 
-### `app`
+### `tools/`
 
-- Finds the project root by walking upward until `config.toml` is found.
-- Resolves relative config paths, notably `llama_cpp.model_path`, against that root.
-- Creates `AppContext`, which is the boundary object used by the TUI.
-- Auto-saves session history after `RuntimeRequest::Submit`.
-- Starts a new session on reset.
+- Responsibilities: typed tool contracts, tool registry, project-root-aware path resolution, and concrete tool behavior for reading, listing, searching, editing, and writing files.
+- Owns: `ToolInput`, `ToolOutput`, `ToolRunResult`, `PendingAction` payload encoding, and path-safety checks for mutating tools.
+- Must not: parse assistant text, manage approval state after returning a `PendingAction`, render UI, or persist sessions.
 
-`AppContext` deliberately does not execute tools. It forwards `Submit`, `Approve`, `Reject`, and `Reset` into the runtime and handles persistence around that.
+### `storage/`
 
-### `runtime`
+- Responsibilities: SQLite schema management and session CRUD.
+- Owns: `SessionStore`, the `sessions` / `session_messages` tables, and stored session/message types.
+- Must not: know about runtime control flow, tool semantics, prompts, or UI behavior.
 
-- Builds the system prompt from the app name, project root, tool specs, and tool format instructions.
-- Stores the conversation as ordered `Message` values, always starting with the system prompt.
-- Sends conversation snapshots to the active `ModelBackend`.
-- Streams assistant output into the conversation while emitting UI-facing `RuntimeEvent`s.
-- Parses assistant text into typed `ToolInput` values by delegating to `tool_codec`.
-- Dispatches tools through `ToolRegistry`.
-- Owns the single in-memory `pending_action` used for approval flow.
+### `llm/`
 
-The runtime is intentionally unaware of both the TUI and SQLite. It only speaks in `RuntimeRequest` and `RuntimeEvent`.
+- Responsibilities: model backend abstraction, provider selection, provider-specific prompt formatting, streaming backend events, and llama.cpp execution details.
+- Owns: `ModelBackend`, `GenerateRequest`, `BackendEvent`, `BackendStatus`, `mock`, and `llama_cpp`.
+- Must not: know about tools, persistence, slash commands, or terminal rendering.
 
-### `tools`
+### `tui/`
 
-- Define the typed contract: `ToolInput`, `ToolOutput`, `ToolRunResult`, and `ToolSpec`.
-- Register tool implementations in `ToolRegistry`.
-- Use `ToolContext` so relative paths resolve against the project root instead of process CWD.
-- Separate read-only execution from mutating execution.
+- Responsibilities: terminal lifecycle, raw input editing, slash-command parsing, transcript rendering, and mapping `RuntimeEvent`s into visible UI messages.
+- Owns: `AppState`, `/help`, `/clear`, `/quit`, `/approve`, `/reject`, and alternate-screen / raw-mode handling.
+- Must not: execute tools, save sessions, parse tool calls, or contain runtime business logic.
 
-Current default tools:
+### Supporting Utility: `logging/`
 
-- `read_file`
-- `list_dir`
-- `search_code`
-- `edit_file`
-- `write_file`
+- Responsibilities: best-effort per-session log files under `logs/`.
+- Owns: timestamped log creation and elapsed-time logging helpers.
+- Must not: affect correctness; the app continues if logging cannot be opened.
 
-Read-only tools return immediate typed outputs. Mutating tools return approval requests first and only write during `execute_approved()`.
-
-### `storage`
-
-- Stores sessions in `data/sessions.db`.
-- Owns the SQLite schema (`sessions` and `session_messages`).
-- Loads the most recently updated session at startup.
-- Replaces stored messages on save instead of appending deltas.
-
-The explicit conversion between runtime `Message` values and stored records happens in `src/app/session.rs`. That boundary is intentional: storage stays decoupled from runtime message types.
-
-### `llm`
-
-- Defines `ModelBackend`, `GenerateRequest`, and streamed `BackendEvent`s.
-- Supports two providers today: `mock` and `llama_cpp`.
-- Formats `llama_cpp` requests into a ChatML-style prompt.
-- Lazy-loads the llama.cpp model on first generation.
-
-The runtime never knows whether the active backend is mock or llama.cpp.
-
-### `tui`
-
-- Owns terminal setup/teardown and raw-mode lifecycle.
-- Edits the input buffer and cursor state.
-- Parses only control commands: `/help`, `/clear`, `/quit`, `/approve`, `/reject`.
-- Renders assistant streaming, compact tool summaries, approval prompts, and status text.
-
-The TUI intentionally keeps control flow thin. It does not parse tool syntax and does not decide what tools do.
+---
 
 ## Data Flow
 
-### Startup
+1. The user types into the TUI.
+2. Slash commands are handled in `tui/commands`; normal prompts become `RuntimeRequest::Submit`.
+3. `AppContext` forwards the request into `Runtime` and logs request/event timing if a session log is open.
+4. The runtime appends the user message to `Conversation`, snapshots the full message list, and sends it to the active `ModelBackend`.
+5. The backend streams `BackendEvent`s. The runtime converts status updates into `Activity` changes and text deltas into an assistant message in the conversation.
+6. When generation finishes, `tool_codec::parse_all_tool_inputs()` scans the full assistant response and returns typed `ToolInput` values in document order.
+7. `ToolRegistry` dispatches each `ToolInput` to its tool implementation.
+8. Immediate tool results are rendered two ways by the runtime: a compact one-line summary for the TUI, and a `[tool_result: ...]` block appended back into the conversation as a user message.
+9. If a tool returns `Approval(PendingAction)`, the runtime stores that single pending action, emits `ApprovalRequired`, and stops the turn until the user chooses `/approve` or `/reject`.
+10. The TUI renders events only. It never sees typed tool payloads and never calls tool implementations directly.
 
-1. Paths are discovered from the current working directory upward.
-2. Config is loaded from `config.toml`.
-3. The model backend and default tool registry are created.
-4. The most recent session is restored from SQLite.
-5. `Runtime` is built and receives restored history after the freshly built system prompt.
-6. The TUI starts with a fresh `AppState`.
+One important current behavior: after a successful tool round, the runtime ends the turn. It does not automatically call the model again to narrate the result.
 
-One important current-state detail: restored history is loaded into the runtime, but not replayed into the TUI transcript. On startup, the model has prior context immediately, while the visible TUI transcript still starts from the welcome message.
-
-### Normal Submit
-
-1. The user types in the TUI.
-2. Slash commands are handled locally; all other input becomes `RuntimeRequest::Submit`.
-3. `AppContext` forwards the request to `Runtime`.
-4. `Runtime` rejects empty prompts and blocks submission if an approval is already pending.
-5. The user message is appended to `Conversation`.
-6. The backend receives a full snapshot of the conversation and streams text back as `BackendEvent`s.
-7. The runtime appends streamed assistant chunks and emits `RuntimeEvent`s for the TUI.
-8. When generation ends, `tool_codec` parses the assistant text for tool calls.
-9. If no tool calls are found, the assistant message is the final answer.
-10. After the submit finishes, `AppContext` saves the runtime message snapshot to SQLite.
-
-### Tool Round
-
-If the assistant output contains tool calls:
-
-1. `tool_codec::parse_all_tool_inputs()` extracts typed `ToolInput` values in document order.
-2. `ToolRegistry::dispatch()` routes each input to the correct tool.
-3. Read-only tools return `ToolRunResult::Immediate(ToolOutput)`.
-4. The runtime emits a compact `ToolCallFinished` summary for the TUI.
-5. The full tool result is formatted as `[tool_result: name]...[/tool_result]` and appended back into the conversation as a user message.
-
-Current UX rule: after a completed tool round, the runtime ends the turn instead of automatically asking the model for a follow-up answer. This matches the Phase 6 direction in `CLAUDE.md`: tool results are surfaced as UI events rather than immediately triggering another assistant narration.
-
-The runtime is structured as a loop and still has a `MAX_TOOL_ROUNDS` guard of `10`, but in the current implementation a successful tool round ends the turn immediately.
-
-Because generation is streamed before parsing, the raw tool call itself is also present as assistant text in the conversation and visible transcript today. The compact tool summary is an extra UI event layered on top of that.
+---
 
 ## Tool Execution Model
 
-### Core Types
+### `ToolRunResult`
 
-- `ToolInput`: typed request for one tool.
-- `ToolOutput`: typed result of a completed tool.
-- `ToolRunResult::Immediate(ToolOutput)`: no approval needed.
-- `ToolRunResult::Approval(PendingAction)`: mutation proposed but not yet executed.
-- `PendingAction`: `{ tool_name, summary, risk, payload }`.
+`ToolRunResult` is the runtime-facing result of dispatching a tool:
 
-`PendingAction.payload` is opaque to the runtime. The runtime stores it and passes it back to the tool on approval without inspecting it.
+- `Immediate(ToolOutput)` means the tool finished synchronously and no approval is required.
+- `Approval(PendingAction)` means the tool proposed a mutation and the turn must pause.
 
-### Two-Phase Mutation Flow
+### `PendingAction`
 
-Mutating tools (`edit_file` and `write_file`) follow a strict two-step contract:
+`PendingAction` is pure data:
 
-1. `run()`
-   - validates input
-   - checks the current file state
-   - creates a human-readable summary
-   - returns `ToolRunResult::Approval(PendingAction)`
-2. `execute_approved()`
-   - receives the tool-owned payload
-   - re-validates anything that can go stale
-   - performs the file mutation
-   - returns `ToolOutput`
+- `tool_name`
+- `summary`
+- `risk`
+- `payload`
 
-This keeps mutation out of the initial model-driven phase. `run()` proposes; `execute_approved()` mutates.
+The runtime owns the pending action lifecycle, but it does not interpret `payload`. That payload is opaque tool-owned data passed back into `execute_approved()`.
 
 ### Approval Flow
 
-Approval is runtime-owned and TUI-triggered:
+1. A mutating tool returns `Approval(PendingAction)` from `run()`.
+2. The runtime stores it in `pending_action` and emits `RuntimeEvent::ApprovalRequired`.
+3. While `pending_action` is set, `Submit` is rejected.
+4. `/approve` calls `ToolRegistry::execute_approved()`.
+5. `/reject` appends a `[tool_error: ...]` block and lets the model continue.
 
-1. A mutating tool returns `Approval(PendingAction)`.
-2. The runtime stores exactly one pending action and emits `RuntimeEvent::ApprovalRequired`.
-3. While a pending action exists, new submits are rejected.
-4. The user resolves it with `/approve` or `/reject`.
+On approval success, the runtime appends a `[tool_result: ...]` block and ends the turn. On approval failure, it appends a `[tool_error: ...]` block and resumes generation so the model can recover.
 
-If earlier tool calls in the same assistant response already completed immediately, their formatted results are preserved before the pause.
+### Two-Phase Execution
 
-On `/approve`:
+Mutating tools use an explicit two-phase contract:
 
-- `ToolRegistry::execute_approved()` calls the original tool by `tool_name`.
-- Success produces a compact TUI summary and a `[tool_result: ...]` conversation message.
-- The turn ends immediately after the approved mutation; there is no automatic follow-up generation.
+1. `run()`
+   Validates input, inspects current file state, and returns either `Immediate` or `Approval`.
+2. `execute_approved()`
+   Re-validates anything that may have gone stale, performs the mutation, and returns `ToolOutput`.
 
-On `/reject`:
+Current mutating tools:
 
-- The runtime appends a `[tool_error: ...]` block noting user rejection.
-- The runtime does run generation again so the model can react or choose another action.
+- `edit_file` proposes an exact-text replacement, replaces only the first match, and re-checks that the search text still exists at approval time.
+- `write_file` proposes create/overwrite, writes only after approval, and does not create missing parent directories.
 
-On approval execution failure:
+---
 
-- The runtime appends a `[tool_error: ...]` block.
-- The runtime resumes model generation so the model can recover.
+## Tool Protocol
 
-### Current Tool-Specific Behavior
+`runtime/tool_codec.rs` owns the wire protocol between model text and tool execution. It has three jobs:
 
-- `read_file` truncates at `100_000` bytes and preserves UTF-8 boundaries.
-- `search_code` caps results at `50` matches and skips common build/output directories.
-- `edit_file` requires exact search text, replaces only the first occurrence, and re-checks that the search text is still present at approval time.
-- `write_file` does not create missing parent directories.
+- parse assistant text into typed `ToolInput` values
+- format `ToolOutput` / tool errors back into runtime-owned conversation text
+- provide the tool-use instructions embedded in the system prompt
 
-### Path Rules
-
-- Relative tool paths resolve against the discovered project root.
-- Mutating tools reject `..` traversal and reject absolute paths outside the project root.
-- Read-only tools are project-root aware, but absolute paths pass through unchanged.
-
-## Session Persistence Model
-
-Session persistence is simple and transcript-based:
-
-- Storage lives in `data/sessions.db`.
-- `SessionStore::load_most_recent()` restores the latest session on startup.
-- `ActiveSession::save()` writes the full current transcript for the active session.
-- Save replaces prior stored messages for that session instead of appending deltas.
-
-What is stored:
-
-- user messages
-- assistant messages
-
-What is not stored:
-
-- system prompt
-- TUI-only system/status messages
-- pending approval state
-
-The system prompt is rebuilt at runtime from config and tool specs, so storage intentionally avoids keeping a stale copy.
-
-Two current limitations are worth calling out:
-
-- `AppContext` only auto-saves after `Submit`, not after `Approve` or `Reject`. That means approval outcomes and rejection-triggered follow-up messages can exist only in memory until the next submit.
-- Pending approvals are not persisted. Restarting the app clears in-flight approval state.
-
-`/clear` is a real session boundary: it resets the runtime conversation and creates a new session row in SQLite.
-
-## Tool Protocol (`runtime/tool_codec.rs`)
-
-`tool_codec` is the sole owner of the model/tool wire format.
-
-Its responsibilities are:
-
-- parse model text into typed `ToolInput` values
-- format `ToolOutput` back into conversation text
-- define the exact instructions injected into the system prompt
-
-This is a key architectural rule: tools never parse raw model text themselves.
-
-### Inbound Formats
-
-Single-line tools:
+Supported model-facing call formats:
 
 ```text
-[read_file: src/main.rs]
+[read_file: path/to/file.rs]
 [list_dir: src/]
-[search_code: fn main]
-```
+[search_code: pattern]
 
-Multi-line tools:
-
-```text
-[write_file]
-path: src/new.rs
----content---
-full file contents
-[/write_file]
-```
-
-```text
 [edit_file]
-path: src/lib.rs
+path: path/to/file.rs
 ---search---
-exact text to replace
+exact text to find
 ---replace---
 replacement text
 [/edit_file]
+
+[write_file]
+path: path/to/file.rs
+---content---
+full file content
+[/write_file]
 ```
 
-Parser behavior is intentionally strict but small:
+Protocol rules in the current implementation:
 
-- malformed or incomplete calls are skipped rather than heuristically fixed
-- mixed tool call types are returned in document order
-- `list_dir` defaults to `"."` when given an empty argument
-- block parsing trims only the structural newline around content blocks
-- no normalization is done inside tool implementations
+- `tool_codec` is the only parser for raw assistant tool syntax.
+- Single-line bracket calls must close on the same line.
+- Multi-line `edit_file` / `write_file` blocks must contain the required delimiters and closing tag.
+- Malformed or unrecognized tool blocks are skipped silently.
+- Mixed tool-call formats are executed in the order they appear in the assistant response.
 
-### Outbound Formats
+The system prompt tells the model that when a tool is needed, the reply should contain tool call tags only. Direct plain-text answers are still allowed when no tool is needed. Tool results are never model-authored: the runtime injects `[tool_result: ...]` and `[tool_error: ...]` blocks after execution, and those result formats are intentionally not described back to the model.
 
-Successful results:
+---
 
-```text
-[tool_result: read_file]
-...
-[/tool_result]
-```
+## Session & Persistence Model
 
-Errors:
+Sessions are stored in `data/sessions.db` through `storage/session`.
 
-```text
-[tool_error: write_file]
-...
-[/tool_error]
-```
+- `sessions` stores session metadata.
+- `session_messages` stores ordered messages for each session.
+- `SessionStore::load_most_recent()` restores the most recently updated session at startup.
+- `ActiveSession::save()` rewrites the stored messages for the current session instead of appending deltas.
 
-The TUI does not render these full bodies directly. Instead, the runtime also derives a compact one-line summary for display. This keeps the user-facing transcript smaller while still preserving structured tool context inside the runtime conversation.
+The stored transcript is derived from the runtime conversation:
 
-### Current Protocol Gap
+- system messages are never stored
+- user and assistant messages are stored as plain role/content rows
+- runtime-injected tool result/error blocks are stored like any other user message
 
-`ToolInput::SearchCode` supports an optional scoped path, but the current text protocol only exposes `[search_code: query]`. In practice, model-issued `search_code` calls currently search from the project root.
+Restore behavior is intentionally narrower than storage:
 
-## Key Architectural Rules And Invariants
+- only the most recent `RESTORE_WINDOW` messages are injected back into the runtime
+- the current `RESTORE_WINDOW` is `10`
+- user messages that start with `[tool_result:` or `[tool_error:` are stripped during restore
+- if such a stripped tool exchange was preceded by a pure assistant tool call that starts with `[`, that assistant message is stripped too
+- full stored history remains in SQLite even when it is excluded from restored context
 
-- Lower layers do not depend on higher layers.
-- The runtime does not know about the TUI or SQLite.
-- The TUI does not execute tools or contain business logic.
-- Parsing of model tool calls belongs only in `runtime/tool_codec.rs`.
-- Tools operate on typed inputs and outputs, not raw model text.
-- The first runtime message is always the current system prompt.
-- Relative tool paths resolve from project root, not process CWD.
-- There is at most one pending approval at a time.
-- Mutating tools do not perform writes during `run()`.
-- Tool payloads are opaque outside the owning tool.
+Live trimming is limited today:
 
-These rules match the intent in `CLAUDE.md` and are reflected in the current code structure.
+- there is no token-aware budgeting or message trimming before generation
+- every generation request sends the full in-memory conversation snapshot
+- `read_file` truncates file reads at `100_000` bytes
+- `search_code` truncates at `50` matches
+- if the live prompt still exceeds the configured llama.cpp context window, generation fails instead of auto-trimming
 
-## What Is Intentionally Deferred
+Two current persistence gaps matter:
 
-The code and `CLAUDE.md` make a few current boundaries explicit:
+- `AppContext` auto-saves after `Submit`, but not after `Approve` or `Reject`
+- `pending_action` is in-memory only, so restarting the app clears any in-flight approval
 
-- No shell execution, web fetch, LSP integration, or external integrations yet.
-- No memory system beyond persisted conversation transcripts.
-- No persisted pending-action state across restarts.
-- No advanced session UX such as browsing or restoring transcript history in the TUI itself.
-- No rich tool-result UI yet: the TUI shows compact summaries, not previews, diffs, or collapsible content.
-- No fully structured model-facing protocol yet: tool execution is typed internally, but the model boundary is still centralized text via `tool_codec`.
-- No scoped `search_code` syntax in the current wire format.
-- Observability is present only as lightweight per-session file logging, not the fuller structured timing/logging plan described in later phases.
+One current UI/runtime mismatch also matters: restored history is loaded into the runtime, but it is not replayed into `AppState`, so the visible transcript starts fresh each launch even when the model already has restored context.
+
+---
+
+## Runtime Guarantees & Invariants
+
+- At most one `pending_action` exists at a time.
+- New user submissions are rejected while an approval is pending.
+- The runtime owns conversation mutation, tool result injection, and approval state.
+- Raw assistant tool syntax is parsed only in `tool_codec`.
+- Tools return typed data; tools do not append conversation text themselves.
+- Mutating tools do not write during `run()`; writes happen only in `execute_approved()`.
+- The runtime communicates through `RuntimeRequest` and `RuntimeEvent`; it does not depend on the TUI or SQLite.
+- Logging is advisory and does not participate in control flow.
+- Failure paths are explicit: backend failures become `RuntimeEvent::Failed`, tool dispatch/approval failures become runtime-owned `[tool_error: ...]` messages or failed events, and the runtime returns to a defined state instead of silently continuing.
+- There is no global mutable singleton state; root path, config, backend, tools, and session handles are all passed in through construction.
+
+---
+
+## Known Limitations / Deferred Work
+
+- Live context management is incomplete. Restore trimming exists, but there is no proactive token-based budgeting or live conversation trimming before generation.
+- Tool-loop safety is coarse. The runtime has a hard limit of `10` tool rounds, but no cycle detection.
+- Advanced memory is not implemented. There is no embeddings layer, structured memory, or long-term recall.
+- LSP integration is not implemented.
+- The tool surface is still small: `read_file`, `list_dir`, `search_code`, `edit_file`, and `write_file` only.
+- Tool UX is still compact-first. There is no file preview mode, diff visualization, or expandable tool-output UI.
+- Restore UX is incomplete because restored context is not replayed into the visible TUI transcript.

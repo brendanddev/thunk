@@ -1,129 +1,122 @@
 # params-cli
 
-Personal AI coding assistant CLI focused on local-first workflows, modular architecture, privacy, and real coding actions.
-
-> Version 0.8.8 — Focused rebuild
-
----
+Local-first, personal AI coding assistant CLI focused on local-first workflows, modular architecture, privacy, and real coding actions.
+> Version 0.8.8
 
 ## Overview
 
-`params-cli` is a Rust-based AI coding agent designed to be:
+`params-cli` is a Rust-based personal AI coding assistant built around a small, explicit runtime:
 
-- local-first  
-- tool-using  
-- modular and extensible  
-- usable for real development workflows  
+- a terminal UI for chat and control commands
+- a runtime that owns conversation state and tool dispatch
+- a tool layer with typed inputs and outputs
+- SQLite-backed session persistence
+- swappable model backends
 
-This is not a simple chatbot wrapper.
+The project is structured to keep model generation, tool execution, persistence, and UI separate instead of folding everything into one text-driven loop.
 
-The goal is to build a **durable coding agent runtime** that can evolve over time without constant rewrites.
+## What It Does Today
 
-The rebuild focuses on:
+- Runs as a local terminal app with an alternate-screen TUI.
+- Supports two model backends: `mock` and `llama_cpp`.
+- Builds a system prompt from the app name, project root, and registered tool specs.
+- Streams assistant output into the conversation while emitting UI-facing runtime events.
+- Parses tool calls centrally in `src/runtime/tool_codec.rs`.
+- Executes read-only tools immediately and pauses for approval before mutating files.
+- Persists sessions in `data/sessions.db` and restores the most recent session on startup.
+- Writes best-effort per-session logs under `logs/`.
 
-- clear architectural boundaries  
-- low coupling between subsystems  
-- explicit runtime behavior  
-- long-term maintainability  
+Current built-in tools:
 
----
+- `read_file`
+- `list_dir`
+- `search_code`
+- `edit_file`
+- `write_file`
 
-## Current Status
+Current control commands:
 
-The project is mid-rebuild and developed in controlled phases.
+- `/help`
+- `/clear`
+- `/quit`
+- `/approve`
+- `/reject`
 
-### What is implemented
+## Runtime Behavior
 
-- explicit runtime loop with tool dispatch  
-- typed tool interface (`ToolInput` / `ToolOutput`)  
-- centralized tool protocol (`runtime/tool_codec.rs`)  
-- session persistence via app layer (`AppContext`, `ActiveSession`)  
-- command parsing isolated in `tui/commands/`  
-- project-root-aware tools via `ToolContext`  
-- consistent path resolution (no reliance on CWD)  
-- model-aware system prompt with project context  
-- clean separation between app, runtime, tools, storage, and UI  
-- test coverage across boundaries  
+At a high level:
 
-### What is intentionally not built yet
+1. The user submits a prompt in the TUI.
+2. The runtime sends the full in-memory conversation to the active model backend.
+3. The assistant response is scanned for tool calls.
+4. Tool calls are dispatched in document order.
+5. Immediate tool results are injected back into the conversation as runtime-owned result blocks.
+6. If a mutating tool proposes a change, the runtime stores a single `PendingAction` and waits for `/approve` or `/reject`.
 
-- write/mutating tools (edit/write)  
-- approval/rejection flow  
-- bash execution  
-- structured tool outputs  
-- logging/observability  
-- memory system  
-- LSP integration  
-- web fetch  
-- advanced session UX  
-
----
+One important current behavior: after a successful tool round, the runtime stops the turn instead of automatically generating a follow-up assistant explanation.
 
 ## Architecture
 
-The system follows strict layer separation:
+The codebase is split into six main layers:
 
-- `app/` — orchestration (runtime + sessions + config)  
-- `runtime/` — execution loop, conversation, tool protocol  
-- `llm/` — backend abstraction and model providers  
-- `storage/` — persistence (sessions and data)  
-- `tools/` — tool registry and implementations  
-- `tui/` — terminal UI, rendering, input, commands  
+- `src/app/` — startup, config, paths, session orchestration
+- `src/runtime/` — conversation loop, tool parsing, approval state, runtime events
+- `src/tools/` — tool contracts, registry, and implementations
+- `src/storage/` — SQLite session storage
+- `src/llm/` — backend abstraction and providers
+- `src/tui/` — terminal input, rendering, and slash commands
 
-### Design principles
+Key architectural rules reflected in the code:
 
-- explicit over implicit  
-- no hidden coupling  
-- no text-as-API (long-term goal)  
-- modular boundaries  
-- local-first execution  
-- built to evolve without rewrites  
+- parsing of raw tool syntax lives in `runtime/tool_codec.rs`
+- tools operate on typed `ToolInput` / `ToolOutput`, not raw model text
+- mutating tools separate `run()` from `execute_approved()`
+- the runtime does not depend on the TUI or SQLite directly
+- the TUI renders events but does not execute tools
 
----
+## Current Limitations
 
-## Project Structure
+- No shell, git, web, or external integration tools yet.
+- No LSP integration or advanced memory system.
+- No token-aware live context budgeting before generation.
+- No cycle detection in the tool loop; the runtime only has a hard tool-round cap.
+- Pending approvals are not persisted across restarts.
+- Restored session history is loaded into the runtime, but not replayed into the visible TUI transcript.
+- Tool UI is compact and text-based; there is no diff view or expandable preview UI yet.
 
-```
-params-cli/
-├── README.md
-├── Cargo.toml
-├── config.toml
-├── data/
-├── docs/
-├── logs/
-├── src/
-│   ├── app/        # orchestration, session coordination
-│   ├── llm/        # backend abstraction and providers
-│   ├── runtime/    # engine, conversation, tool codec
-│   ├── storage/    # persistence layer
-│   ├── tools/      # tool registry and implementations
-│   ├── tui/        # UI, rendering, commands
-│   ├── lib.rs
-│   └── main.rs
-└── tests/
-```
+## Running
 
----
+Requirements:
 
-## Running the project
+- Rust stable
+- Interactive terminal (`stdout` must be a TTY and `TERM` must not be `dumb`)
+- A local `.gguf` model if using `llama_cpp`
 
-### Requirements
+Run the app:
 
-- Rust (stable)
-- Interactive terminal
-
-### Run
-
-```
+```bash
 cargo run
 ```
 
----
+Run tests:
+
+```bash
+cargo test
+```
+
+Configuration lives in `config.toml`.
+
+- `llm.provider = "mock"` uses the built-in mock backend.
+- `llm.provider = "llama_cpp"` uses the local llama.cpp backend.
+- `llama_cpp.model_path` points to the local `.gguf` file to load.
 
 ## Documentation
 
 | Section | Description |
-|--------|------------|
-| [Architecture](docs/architecture.md) | System design and module boundaries |
-| [Setup](docs/setup.md) | Setup instructions |
-| [Benchmarks](docs/benchmarks.md) | Performance benchmarks |
+| --- | --- |
+| [Architecture](docs/architecture.md) | Code-accurate system architecture and runtime behavior |
+| [Runtime](docs/runtime.md) | Focused overview of the runtime loop, events, and approval flow |
+| [Tools](docs/tools.md) | Current tool contract, registry model, and built-in tool behavior |
+| [Sessions](docs/sessions.md) | Session storage, restore behavior, and persistence limits |
+| [Setup](docs/setup.md) | Requirements, run/test commands, and config basics |
+| [Benchmarks](docs/benchmarks.md) | Performance notes and measurements |
