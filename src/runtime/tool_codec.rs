@@ -31,14 +31,43 @@ const REPLACE_LINE: &str = "\n---replace---";
 
 /// Scans model output for all tool call types and returns typed ToolInput values
 /// in document order. Malformed or unrecognized blocks are silently skipped.
+/// Tool syntax found inside markdown code fences (``` ... ```) is excluded — those
+/// are illustrative examples, not real invocations.
 pub fn parse_all_tool_inputs(text: &str) -> Vec<ToolInput> {
+    let fences = code_fence_ranges(text);
     let mut all: Vec<(usize, ToolInput)> = Vec::new();
     all.extend(scan_bracket_calls(text));
     all.extend(scan_edit_blocks(text));
     all.extend(scan_write_blocks(text));
     all.extend(scan_search_code_blocks(text));
+    if !fences.is_empty() {
+        all.retain(|(pos, _)| !fences.iter().any(|&(s, e)| *pos >= s && *pos < e));
+    }
     all.sort_by_key(|(pos, _)| *pos);
     all.into_iter().map(|(_, input)| input).collect()
+}
+
+/// Returns the byte ranges (start, exclusive end) of markdown code fence blocks (``` ... ```).
+/// Used to exclude tool syntax inside fences from being treated as real invocations.
+fn code_fence_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut pos = 0;
+    while pos < text.len() {
+        let Some(rel) = text[pos..].find("```") else { break };
+        let open = pos + rel;
+        let after_marker = open + 3;
+        // Skip the optional language tag on the opening fence line (e.g. ```rust)
+        let content_start = text[after_marker..]
+            .find('\n')
+            .map(|r| after_marker + r + 1)
+            .unwrap_or(text.len());
+        // Find the closing ``` — take the first one after content_start
+        let Some(close_rel) = text[content_start..].find("```") else { break };
+        let close_end = content_start + close_rel + 3;
+        ranges.push((open, close_end));
+        pos = close_end;
+    }
+    ranges
 }
 
 /// Scans for single-line bracket calls: [read_file: path], [list_dir: path],
@@ -404,6 +433,7 @@ You do NOT produce file contents, directory listings, or search results yourself
 You do NOT write result blocks. Result blocks are written by the system, not you.
 
 When a tool is needed, your ENTIRE response must be the call tag only — no prose, no prefix, no explanation.
+When answering in plain text, never include tool call syntax — if asked about a tool, describe it in words only.
 
 Tag names are EXACT. Do not rename, abbreviate, or invent tag names. Use only the tags shown below.
 
@@ -415,6 +445,12 @@ List a directory:
 
 Search code:
 [search_code: pattern]
+
+Use search_code for any question about where something is, how something works, or what something is called in this project. Do not ask the user — search first.
+Use words from the user's request as-is in the query — do not rephrase them: [search_code: logging] for "where logging is initialized", not [search_code: logger initialize].
+Use short keywords: [search_code: session save] not [search_code: where sessions are saved to disk].
+Emit only one search call at a time. As soon as results arrive, interpret them and respond — do not run more searches.
+Only if results are completely empty, try one different query, then respond.
 
 Edit a file:
 [edit_file]
@@ -443,6 +479,49 @@ When you have enough information, respond directly in plain text with no tool ta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Code fence filtering
+
+    #[test]
+    fn tool_call_inside_code_fence_is_not_executed() {
+        // Model reproduces protocol syntax inside a code fence as an example.
+        // Must not be treated as a real invocation.
+        let text = "Here is how you use it:\n```\n[write_file: path/to/file.rs]\n```\nThat creates a file.";
+        let calls = parse_all_tool_inputs(text);
+        assert!(calls.is_empty(), "tool syntax inside code fence must not execute: {calls:?}");
+    }
+
+    #[test]
+    fn tool_call_inside_fenced_code_block_with_language_tag_is_not_executed() {
+        let text = "Example:\n```rust\n[read_file: src/main.rs]\n```\nDone.";
+        let calls = parse_all_tool_inputs(text);
+        assert!(calls.is_empty(), "tool syntax inside fenced block must not execute: {calls:?}");
+    }
+
+    #[test]
+    fn block_tool_inside_code_fence_is_not_executed() {
+        let text = "Use this form:\n```\n[write_file]\npath: foo.rs\n---content---\nhello\n[/write_file]\n```";
+        let calls = parse_all_tool_inputs(text);
+        assert!(calls.is_empty(), "block tool syntax inside code fence must not execute: {calls:?}");
+    }
+
+    #[test]
+    fn tool_call_outside_code_fence_still_executes() {
+        // A real tool call that appears outside any code fence must still work.
+        let text = "Let me check.\n[read_file: src/main.rs]";
+        let calls = parse_all_tool_inputs(text);
+        assert_eq!(calls.len(), 1, "real tool call outside fence must execute");
+        assert!(matches!(&calls[0], ToolInput::ReadFile { path } if path == "src/main.rs"));
+    }
+
+    #[test]
+    fn tool_call_after_code_fence_executes() {
+        // Tool call appears AFTER a code fence block — not inside it.
+        let text = "Some example:\n```\nfoo bar\n```\nNow for real:\n[list_dir: src/]";
+        let calls = parse_all_tool_inputs(text);
+        assert_eq!(calls.len(), 1, "tool call after fence must execute");
+        assert!(matches!(&calls[0], ToolInput::ListDir { path } if path == "src/"));
+    }
 
     // Single-line bracket calls
 

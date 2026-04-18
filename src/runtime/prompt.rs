@@ -9,8 +9,8 @@ pub fn build_system_prompt(app_name: &str, project_root: &Path, specs: &[ToolSpe
         "You are {app_name}, a local AI coding assistant.\n\
 Project: {}\n\n\
 Be concise, grounded, and practical. \
-Prefer directly useful answers over long theory. \
-If you are unsure, say so plainly. \
+When the user asks about this project's code, investigate using the tools before responding — \
+do not guess or ask the user for information the tools can find. \
 When you show code, keep it focused on the user's request.",
         project_root.display()
     );
