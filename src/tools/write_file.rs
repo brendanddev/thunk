@@ -3,7 +3,9 @@ use std::path::Path;
 
 use super::context::ToolContext;
 use super::pending::{PendingAction, RiskLevel};
-use super::types::{ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec, WriteFileOutput};
+use super::types::{
+    ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec, WriteFileOutput,
+};
 use super::Tool;
 
 pub struct WriteFileTool {
@@ -144,7 +146,7 @@ mod tests {
         })
     }
 
-    // ── run() ────────────────────────────────────────────────────────────────
+    // run()
 
     #[test]
     fn run_returns_approval_for_new_file() {
@@ -170,7 +172,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("existing.rs"), "old content").unwrap();
         let tool = tool_in(&dir);
-        let ToolRunResult::Approval(pa) = run_write(&tool, "existing.rs", "new content").unwrap() else {
+        let ToolRunResult::Approval(pa) = run_write(&tool, "existing.rs", "new content").unwrap()
+        else {
             panic!("expected Approval");
         };
         assert_eq!(pa.risk, RiskLevel::High);
@@ -181,7 +184,9 @@ mod tests {
     fn run_summary_includes_path_and_line_count() {
         let dir = TempDir::new().unwrap();
         let tool = tool_in(&dir);
-        let ToolRunResult::Approval(pa) = run_write(&tool, "out.rs", "line1\nline2\nline3").unwrap() else {
+        let ToolRunResult::Approval(pa) =
+            run_write(&tool, "out.rs", "line1\nline2\nline3").unwrap()
+        else {
             panic!("expected Approval");
         };
         assert!(pa.summary.contains("out.rs"));
@@ -217,7 +222,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = tool_in(&dir);
         let err = tool
-            .run(&ToolInput::ReadFile { path: "f.rs".into() })
+            .run(&ToolInput::ReadFile {
+                path: "f.rs".into(),
+            })
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
     }
@@ -231,7 +238,8 @@ mod tests {
         assert!(!path.exists());
 
         let tool = tool_in(&dir);
-        let ToolRunResult::Approval(pa) = run_write(&tool, "new.rs", "pub fn hello() {}").unwrap() else {
+        let ToolRunResult::Approval(pa) = run_write(&tool, "new.rs", "pub fn hello() {}").unwrap()
+        else {
             panic!("expected Approval");
         };
 

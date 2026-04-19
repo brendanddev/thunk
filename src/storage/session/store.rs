@@ -15,8 +15,7 @@ impl SessionStore {
     /// Opens (or creates) a session database at the given path.
     /// The parent directory must already exist — callers should use AppPaths::ensure_runtime_dirs first.
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| AppError::Storage(e.to_string()))?;
+        let conn = Connection::open(path).map_err(|e| AppError::Storage(e.to_string()))?;
         schema::initialize(&conn)?;
         Ok(Self { conn })
     }
@@ -67,8 +66,7 @@ impl SessionStore {
             .map_err(|e| AppError::Storage(e.to_string()))?;
         }
 
-        tx.commit()
-            .map_err(|e| AppError::Storage(e.to_string()))?;
+        tx.commit().map_err(|e| AppError::Storage(e.to_string()))?;
 
         self.require_meta(id)
     }
@@ -157,8 +155,7 @@ impl SessionStore {
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])
             .map_err(|e| AppError::Storage(e.to_string()))?;
 
-        tx.commit()
-            .map_err(|e| AppError::Storage(e.to_string()))
+        tx.commit().map_err(|e| AppError::Storage(e.to_string()))
     }
 
     fn load_meta(&self, id: &str) -> Result<Option<SessionMeta>> {
@@ -213,8 +210,14 @@ mod tests {
         let meta = store.create().unwrap();
 
         let messages = vec![
-            StoredMessage { role: "user".into(), content: "hello".into() },
-            StoredMessage { role: "assistant".into(), content: "hi there".into() },
+            StoredMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            },
+            StoredMessage {
+                role: "assistant".into(),
+                content: "hi there".into(),
+            },
         ];
         let saved = store.save(&meta.id, &messages).unwrap();
         assert_eq!(saved.message_count, 2);
@@ -230,13 +233,25 @@ mod tests {
         let store = in_memory();
         let meta = store.create().unwrap();
 
-        store.save(&meta.id, &[
-            StoredMessage { role: "user".into(), content: "first".into() },
-        ]).unwrap();
+        store
+            .save(
+                &meta.id,
+                &[StoredMessage {
+                    role: "user".into(),
+                    content: "first".into(),
+                }],
+            )
+            .unwrap();
 
-        store.save(&meta.id, &[
-            StoredMessage { role: "user".into(), content: "replaced".into() },
-        ]).unwrap();
+        store
+            .save(
+                &meta.id,
+                &[StoredMessage {
+                    role: "user".into(),
+                    content: "replaced".into(),
+                }],
+            )
+            .unwrap();
 
         let loaded = store.load(&meta.id).unwrap().unwrap();
         assert_eq!(loaded.messages.len(), 1);
@@ -250,8 +265,24 @@ mod tests {
         let b = store.create().unwrap();
 
         // Save to b last so it is most recent
-        store.save(&a.id, &[StoredMessage { role: "user".into(), content: "a".into() }]).unwrap();
-        store.save(&b.id, &[StoredMessage { role: "user".into(), content: "b".into() }]).unwrap();
+        store
+            .save(
+                &a.id,
+                &[StoredMessage {
+                    role: "user".into(),
+                    content: "a".into(),
+                }],
+            )
+            .unwrap();
+        store
+            .save(
+                &b.id,
+                &[StoredMessage {
+                    role: "user".into(),
+                    content: "b".into(),
+                }],
+            )
+            .unwrap();
 
         let recent = store.load_most_recent().unwrap().unwrap();
         assert_eq!(recent.meta.id, b.id);
@@ -261,9 +292,15 @@ mod tests {
     fn delete_removes_session_and_messages() {
         let store = in_memory();
         let meta = store.create().unwrap();
-        store.save(&meta.id, &[
-            StoredMessage { role: "user".into(), content: "gone".into() },
-        ]).unwrap();
+        store
+            .save(
+                &meta.id,
+                &[StoredMessage {
+                    role: "user".into(),
+                    content: "gone".into(),
+                }],
+            )
+            .unwrap();
 
         store.delete(&meta.id).unwrap();
 

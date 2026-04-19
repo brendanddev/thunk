@@ -31,7 +31,6 @@ pub struct AppState {
 
 /// Defines methods for modifying the input buffer and cursor position in the app state
 impl AppState {
-
     /// Creates a new AppState instance, initializing the message history with a system message based on the provided config and paths
     pub fn new(config: &Config, paths: &AppPaths) -> Self {
         let welcome = format!(

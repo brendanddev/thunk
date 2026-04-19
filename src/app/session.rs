@@ -29,7 +29,13 @@ impl ActiveSession {
             }
             None => {
                 let meta = store.create()?;
-                Ok((Self { store, session_id: meta.id }, vec![]))
+                Ok((
+                    Self {
+                        store,
+                        session_id: meta.id,
+                    },
+                    vec![],
+                ))
             }
         }
     }
@@ -196,7 +202,12 @@ mod tests {
             .collect();
 
         let saved = SavedSession {
-            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 14 },
+            meta: SessionMeta {
+                id: "t".into(),
+                created_at: 0,
+                updated_at: 0,
+                message_count: 14,
+            },
             messages,
         };
 
@@ -211,15 +222,28 @@ mod tests {
     fn from_stored_strips_tool_exchange_user_messages() {
         use crate::storage::session::{SavedSession, SessionMeta, StoredMessage};
 
-        let tool_result = "=== tool_result: read_file ===\nsome file content\n=== /tool_result ===\n\n".to_string();
+        let tool_result =
+            "=== tool_result: read_file ===\nsome file content\n=== /tool_result ===\n\n"
+                .to_string();
 
         let saved = SavedSession {
-            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 1 },
-            messages: vec![StoredMessage { role: "user".into(), content: tool_result }],
+            meta: SessionMeta {
+                id: "t".into(),
+                created_at: 0,
+                updated_at: 0,
+                message_count: 1,
+            },
+            messages: vec![StoredMessage {
+                role: "user".into(),
+                content: tool_result,
+            }],
         };
 
         let restored = from_stored(&saved);
-        assert!(restored.is_empty(), "tool exchange messages must not be injected on restore");
+        assert!(
+            restored.is_empty(),
+            "tool exchange messages must not be injected on restore"
+        );
     }
 
     #[test]
@@ -228,11 +252,26 @@ mod tests {
 
         // A tool-assisted turn: user prompt → assistant tool call → user tool result
         let saved = SavedSession {
-            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 3 },
+            meta: SessionMeta {
+                id: "t".into(),
+                created_at: 0,
+                updated_at: 0,
+                message_count: 3,
+            },
             messages: vec![
-                StoredMessage { role: "user".into(), content: "read README.md".into() },
-                StoredMessage { role: "assistant".into(), content: "[read_file: README.md]".into() },
-                StoredMessage { role: "user".into(), content: "=== tool_result: read_file ===\ncontent\n=== /tool_result ===\n\n".into() },
+                StoredMessage {
+                    role: "user".into(),
+                    content: "read README.md".into(),
+                },
+                StoredMessage {
+                    role: "assistant".into(),
+                    content: "[read_file: README.md]".into(),
+                },
+                StoredMessage {
+                    role: "user".into(),
+                    content: "=== tool_result: read_file ===\ncontent\n=== /tool_result ===\n\n"
+                        .into(),
+                },
             ],
         };
 
@@ -248,10 +287,21 @@ mod tests {
 
         // An assistant message that starts with natural language is kept
         let saved = SavedSession {
-            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 2 },
+            meta: SessionMeta {
+                id: "t".into(),
+                created_at: 0,
+                updated_at: 0,
+                message_count: 2,
+            },
             messages: vec![
-                StoredMessage { role: "user".into(), content: "hello".into() },
-                StoredMessage { role: "assistant".into(), content: "Hi there! How can I help?".into() },
+                StoredMessage {
+                    role: "user".into(),
+                    content: "hello".into(),
+                },
+                StoredMessage {
+                    role: "assistant".into(),
+                    content: "Hi there! How can I help?".into(),
+                },
             ],
         };
 
@@ -269,11 +319,25 @@ mod tests {
             Output the tool call tag now, with no other text.".to_string();
 
         let saved = SavedSession {
-            meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 3 },
+            meta: SessionMeta {
+                id: "t".into(),
+                created_at: 0,
+                updated_at: 0,
+                message_count: 3,
+            },
             messages: vec![
-                StoredMessage { role: "user".into(), content: "list the files".into() },
-                StoredMessage { role: "assistant".into(), content: "=== tool_result: list_dir ===\nfoo\n=== /tool_result ===".into() },
-                StoredMessage { role: "user".into(), content: correction },
+                StoredMessage {
+                    role: "user".into(),
+                    content: "list the files".into(),
+                },
+                StoredMessage {
+                    role: "assistant".into(),
+                    content: "=== tool_result: list_dir ===\nfoo\n=== /tool_result ===".into(),
+                },
+                StoredMessage {
+                    role: "user".into(),
+                    content: correction,
+                },
             ],
         };
 

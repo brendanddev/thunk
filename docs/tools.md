@@ -120,9 +120,10 @@ Current behavior:
 
 - resolves paths against the project root
 - reads raw bytes, then converts to UTF-8 lossily
-- truncates at `100_000` bytes
-- backs off to a valid UTF-8 boundary before truncating
+- truncates to the first `200` lines
 - reports line count and truncation status
+
+Runtime behavior adds one guardrail around failed reads: if `read_file` cannot read the requested file, the runtime injects the tool error and emits a runtime-owned terminal answer instead of asking the model to retry repeatedly.
 
 ### `list_dir`
 
@@ -174,6 +175,8 @@ Current behavior:
 This tool is intentionally exact. It does not do fuzzy patching or diff application.
 
 If the model tries to repair a malformed `edit_file` call after an edit tool error but still omits the required structure, the runtime injects an edit-specific correction and asks for a valid block instead of silently treating the malformed retry as a final answer.
+
+The model-facing form remains the canonical `---search---` / `---replace---` block. For observed local-model drift, `tool_codec` also accepts narrow compatibility forms such as `old content:` / `new content:` labels and generic triple-dash delimiter pairs inside `[edit_file]...[/edit_file]`. Those still become exact `EditFile` inputs and go through normal validation and approval.
 
 ### `write_file`
 

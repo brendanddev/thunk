@@ -2,7 +2,6 @@ use super::state::AppState;
 
 /// Defines methods for modifying the input buffer and cursor position in the app state
 impl AppState {
-
     /// Inserts a character at the current cursor position and moves the cursor forward
     pub fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);

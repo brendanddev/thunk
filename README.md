@@ -2,7 +2,7 @@
 
 Local-first, personal AI coding assistant CLI focused on local-first workflows, modular architecture, privacy, and real coding actions.
 
-> Version 0.8.10
+> Version 0.8.11
 
 ## Overview
 
@@ -25,6 +25,7 @@ The project is structured to keep model generation, tool execution, persistence,
 - Parses tool calls centrally in `src/runtime/tool_codec.rs`.
 - Executes read-only tools immediately and pauses for approval before mutating files.
 - Re-enters model generation after tool results so the assistant can synthesize a grounded same-turn answer.
+- Uses runtime-owned terminal answers when the runtime already knows the outcome, such as rejected mutations or failed file reads.
 - Enforces bounded per-turn `search_code` behavior at runtime instead of relying only on prompt wording.
 - Persists sessions in `data/sessions.db` and restores the most recent session on startup.
 - Writes best-effort per-session logs under `logs/`.
@@ -56,6 +57,8 @@ At a high level:
 5. Immediate tool results are injected back into the conversation as runtime-owned result blocks.
 6. The runtime normally re-enters generation with those results so the model can answer from actual tool output.
 7. If a mutating tool proposes a change, the runtime stores a single `PendingAction` and waits for `/approve` or `/reject`.
+
+Some outcomes are deliberately terminal and runtime-owned: rejecting a pending mutation produces a cancellation answer without asking the model to summarize, and a failed `read_file` can end cleanly without retrying in a loop.
 
 `search_code` is a literal substring search. The runtime now simplifies model-generated search phrases into a single literal keyword and enforces a per-turn budget: one search is allowed, a second search is allowed only when the first returned no matches, and later search attempts are blocked with a correction so the model must answer cleanly.
 

@@ -200,13 +200,21 @@ mod tests {
         let mut c = Conversation::new("system".to_string());
         for _ in 0..tool_pairs {
             // assistant pure tool call
-            c.messages.push(crate::llm::backend::Message::assistant("[read_file: foo.rs]".to_string()));
+            c.messages.push(crate::llm::backend::Message::assistant(
+                "[read_file: foo.rs]".to_string(),
+            ));
             // user tool result
-            c.messages.push(crate::llm::backend::Message::user("=== tool_result: read_file ===\ncontent\n=== /tool_result ===".to_string()));
+            c.messages.push(crate::llm::backend::Message::user(
+                "=== tool_result: read_file ===\ncontent\n=== /tool_result ===".to_string(),
+            ));
         }
         for i in 0..conversational_tail {
-            c.messages.push(crate::llm::backend::Message::user(format!("user msg {i}")));
-            c.messages.push(crate::llm::backend::Message::assistant(format!("assistant reply {i}")));
+            c.messages
+                .push(crate::llm::backend::Message::user(format!("user msg {i}")));
+            c.messages
+                .push(crate::llm::backend::Message::assistant(format!(
+                    "assistant reply {i}"
+                )));
         }
         c
     }
@@ -217,7 +225,11 @@ mod tests {
         let mut c = make_conversation_with_pairs(2, 2);
         let before = c.message_count();
         c.trim_tool_exchanges_if_needed();
-        assert_eq!(c.message_count(), before, "must not trim when below threshold");
+        assert_eq!(
+            c.message_count(),
+            before,
+            "must not trim when below threshold"
+        );
     }
 
     #[test]
@@ -227,8 +239,11 @@ mod tests {
         let mut c = make_conversation_with_pairs(20, 5);
         assert!(c.message_count() > LIVE_TRIM_THRESHOLD);
         c.trim_tool_exchanges_if_needed();
-        assert!(c.message_count() <= LIVE_TRIM_THRESHOLD,
-            "expected <= {LIVE_TRIM_THRESHOLD}, got {}", c.message_count());
+        assert!(
+            c.message_count() <= LIVE_TRIM_THRESHOLD,
+            "expected <= {LIVE_TRIM_THRESHOLD}, got {}",
+            c.message_count()
+        );
     }
 
     #[test]
@@ -236,7 +251,10 @@ mod tests {
         let mut c = make_conversation_with_pairs(20, 5);
         c.trim_tool_exchanges_if_needed();
         let messages = c.snapshot();
-        assert_eq!(messages[0].content, "system", "system prompt must remain at index 0");
+        assert_eq!(
+            messages[0].content, "system",
+            "system prompt must remain at index 0"
+        );
     }
 
     #[test]
@@ -245,13 +263,17 @@ mod tests {
         // The 10 tail messages are the 5 conversational pairs at the end
         let mut c = make_conversation_with_pairs(20, 5);
         let messages_before = c.snapshot();
-        let tail_before: Vec<_> = messages_before[messages_before.len() - LIVE_TRIM_KEEP_RECENT..].to_vec();
+        let tail_before: Vec<_> =
+            messages_before[messages_before.len() - LIVE_TRIM_KEEP_RECENT..].to_vec();
 
         c.trim_tool_exchanges_if_needed();
 
         let messages_after = c.snapshot();
         let tail_after = &messages_after[messages_after.len() - LIVE_TRIM_KEEP_RECENT..];
-        assert_eq!(tail_before, tail_after, "recent tail must be unchanged after trim");
+        assert_eq!(
+            tail_before, tail_after,
+            "recent tail must be unchanged after trim"
+        );
     }
 
     #[test]
@@ -260,12 +282,20 @@ mod tests {
         let mut c = Conversation::new("system".to_string());
         // Fill past threshold with plain user/assistant pairs
         for i in 0..25 {
-            c.messages.push(crate::llm::backend::Message::user(format!("question {i}")));
-            c.messages.push(crate::llm::backend::Message::assistant(format!("answer {i}")));
+            c.messages
+                .push(crate::llm::backend::Message::user(format!("question {i}")));
+            c.messages
+                .push(crate::llm::backend::Message::assistant(format!(
+                    "answer {i}"
+                )));
         }
         let before = c.message_count();
         assert!(before > LIVE_TRIM_THRESHOLD);
         c.trim_tool_exchanges_if_needed();
-        assert_eq!(c.message_count(), before, "conversational messages must never be removed");
+        assert_eq!(
+            c.message_count(),
+            before,
+            "conversational messages must never be removed"
+        );
     }
 }

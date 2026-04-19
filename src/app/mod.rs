@@ -11,7 +11,7 @@ use crate::llm::providers::build_backend;
 use crate::tools::default_registry;
 use crate::tui;
 
-// Bootstraps the application: prepares paths and config, builds the backend and tools, restores session state, 
+// Bootstraps the application: prepares paths and config, builds the backend and tools, restores session state,
 // attaches logging, and starts the TUI.
 pub fn run() -> Result<()> {
     let paths = paths::AppPaths::discover()?;
@@ -23,7 +23,15 @@ pub fn run() -> Result<()> {
     let log = crate::logging::SessionLog::open(&paths.logs_dir);
 
     let (active_session, history) = session::ActiveSession::open_or_restore(&paths.session_db)?;
-    let app = AppContext::build(&config, &paths.root_dir, backend, registry, active_session, history, log)?;
+    let app = AppContext::build(
+        &config,
+        &paths.root_dir,
+        backend,
+        registry,
+        active_session,
+        history,
+        log,
+    )?;
 
     tui::run(&config, &paths, app)
 }

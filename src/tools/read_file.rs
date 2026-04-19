@@ -1,7 +1,9 @@
 use std::fs;
 
 use super::context::ToolContext;
-use super::types::{ExecutionKind, FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{
+    ExecutionKind, FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec,
+};
 use super::Tool;
 
 /// Maximum lines of file content injected into the conversation per read.
@@ -59,7 +61,6 @@ impl Tool for ReadFileTool {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -69,8 +70,9 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn read(path: &str) -> Result<ToolRunResult, ToolError> {
-        ReadFileTool::new(ToolContext::new(PathBuf::from(".")))
-            .run(&ToolInput::ReadFile { path: path.to_string() })
+        ReadFileTool::new(ToolContext::new(PathBuf::from("."))).run(&ToolInput::ReadFile {
+            path: path.to_string(),
+        })
     }
 
     #[test]
@@ -79,7 +81,9 @@ mod tests {
         writeln!(f, "line one").unwrap();
         writeln!(f, "line two").unwrap();
         let out = read(f.path().to_str().unwrap()).unwrap();
-        let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else { panic!("expected Immediate(FileContents)") };
+        let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else {
+            panic!("expected Immediate(FileContents)")
+        };
         assert!(fc.contents.contains("line one"));
         assert_eq!(fc.total_lines, 2);
         assert!(!fc.truncated);
@@ -93,7 +97,9 @@ mod tests {
             writeln!(f, "line {i}").unwrap();
         }
         let out = read(f.path().to_str().unwrap()).unwrap();
-        let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else { panic!("expected Immediate(FileContents)") };
+        let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else {
+            panic!("expected Immediate(FileContents)")
+        };
         assert!(fc.truncated);
         assert_eq!(fc.total_lines, 205);
         // contents must have exactly MAX_LINES lines

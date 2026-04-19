@@ -8,10 +8,10 @@ show_activity = true
 provider = "llama_cpp"
 
 [llama_cpp]
-model_path = "data/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+model_path = "data/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
 gpu_layers = 0
 context_tokens = 8192
 batch_tokens = 2048
 max_tokens = 512
-temperature = 0.7
+temperature = 0.3
 show_native_logs = false

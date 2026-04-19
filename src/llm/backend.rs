@@ -76,11 +76,14 @@ pub enum BackendEvent {
     Finished,
     /// Advisory timing event — emitted by backends at key internal stages.
     /// Consumers may route this to logging; it must not affect control flow.
-    Timing { stage: &'static str, elapsed_ms: u64 },
+    Timing {
+        stage: &'static str,
+        elapsed_ms: u64,
+    },
 }
 
 /// Defines the abstraction over a language model backend.
-/// This is responsible for receiving a structured generation request, streaming output via events, and 
+/// This is responsible for receiving a structured generation request, streaming output via events, and
 /// hiding backend-specific implementation details from the rest of the application.
 pub trait ModelBackend: Send {
     fn name(&self) -> &str;

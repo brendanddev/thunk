@@ -79,8 +79,7 @@ pub(super) fn load_model(config: &LlamaCppConfig, model_path: &Path) -> Result<L
         // shares the terminal with stderr and must never receive raw native bytes regardless
         // of the show_native_logs setting.
         let _suppress = StderrSuppress::new();
-        LlamaModel::load_from_file(&backend, model_path, &model_params)
-            .map_err(map_llama_error)?
+        LlamaModel::load_from_file(&backend, model_path, &model_params).map_err(map_llama_error)?
     };
 
     Ok(LoadedLlama { model, backend })
@@ -197,10 +196,8 @@ pub(super) fn run_generation(
         elapsed_ms: t_prefill_start.elapsed().as_millis() as u64,
     });
 
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::temp(temperature),
-        LlamaSampler::dist(0),
-    ]);
+    let mut sampler =
+        LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(0)]);
 
     let mut generated = 0usize;
     let mut current_pos = tokens.len() as i32;
@@ -256,7 +253,9 @@ fn decode_token_bytes(
     match model.token_to_piece_bytes(token, 8, false, None) {
         Err(TokenToStringError::InsufficientBufferSpace(size)) => model.token_to_piece_bytes(
             token,
-            (-size).try_into().expect("token buffer size should be positive"),
+            (-size)
+                .try_into()
+                .expect("token buffer size should be positive"),
             false,
             None,
         ),

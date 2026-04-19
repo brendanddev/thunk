@@ -11,7 +11,7 @@ use native::{load_model, run_generation, LoadedLlama};
 use prompt::format_messages;
 
 /// The llama.cpp backed implementation of the ModelBackend.
-/// It lazy-loads the model on first use, formats prompts into ChatML, and runs generation 
+/// It lazy-loads the model on first use, formats prompts into ChatML, and runs generation
 /// while streaming events back to the runtime.
 pub struct LlamaCppBackend {
     config: LlamaCppConfig,
@@ -20,7 +20,6 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
-
     // Creates a new LlamaCppBackend with the given configuration. The model is not loaded until generate() is called.
     pub fn new(config: LlamaCppConfig) -> Self {
         let model_name = config
@@ -63,7 +62,6 @@ impl LlamaCppBackend {
 }
 
 impl ModelBackend for LlamaCppBackend {
-
     // Returns the display name of the backend, which includes the model name if available.
     fn name(&self) -> &str {
         &self.display_name
@@ -93,10 +91,7 @@ mod tests {
 
     #[test]
     fn appends_an_open_assistant_turn() {
-        let prompt = format_messages(&[
-            Message::system("system prompt"),
-            Message::user("hello"),
-        ]);
+        let prompt = format_messages(&[Message::system("system prompt"), Message::user("hello")]);
 
         assert!(prompt.contains("<|im_start|>system\nsystem prompt<|im_end|>\n"));
         assert!(prompt.contains("<|im_start|>user\nhello<|im_end|>\n"));

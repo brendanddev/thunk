@@ -124,6 +124,8 @@ After generation finishes, the full assistant response is scanned by `tool_codec
 
 If the round finishes without needing approval, the accumulated result blocks are appended to the conversation as a user message.
 
+Some tool outcomes end with a runtime-owned assistant answer instead of another model generation. Today that terminal path is used when `read_file` fails, so missing-file reads surface the tool error and stop cleanly instead of looping through repeated failed reads.
+
 `search_code` has extra runtime enforcement because prompt-only rules were not reliable enough with small local models:
 
 - the model-facing prompt asks for one plain literal keyword or identifier
@@ -139,7 +141,8 @@ The current runtime behavior keeps tool evidence inside the same user turn:
 
 - successful immediate tool rounds append results and re-enter generation for synthesis
 - approved mutations append the approved result and re-enter generation for synthesis
-- rejected mutations append a terminal tool error and re-enter generation so the model can acknowledge cancellation
+- rejected mutations append a terminal tool error and a runtime-owned cancellation answer without re-entering model generation
+- failed `read_file` calls append a tool error and a runtime-owned failure answer without re-entering model generation
 - approval execution failures append a tool error and re-enter generation so the model can recover
 
 The runtime has a hard cap of `10` tool rounds per turn, plus narrower runtime guards for repeated tool cycles and repeated searches.
@@ -162,13 +165,14 @@ When that happens:
 - calls `ToolRegistry::execute_approved()`
 - appends a runtime-owned tool result block on success
 - appends a runtime-owned tool error block on failure
-- resumes model generation after either outcome
+- resumes model generation after either approved execution outcome
 
 `Reject`:
 
 - clears the pending action
 - appends a runtime-owned tool error block noting user rejection
-- resumes model generation
+- emits a runtime-owned cancellation answer
+- does not ask the model to synthesize the rejection, which prevents false claims that the mutation happened
 
 Only one pending action can exist at a time.
 
@@ -199,6 +203,7 @@ It contains:
 - assistant text
 - runtime-injected tool result and tool error blocks
 - internal correction messages when the model violates the tool protocol
+- runtime-owned terminal assistant answers for outcomes the runtime can state authoritatively
 
 Notable correction paths today:
 
@@ -206,6 +211,8 @@ Notable correction paths today:
 - if the assistant emits a malformed tool block with the wrong opening tag but a recognizable closing tag, the runtime corrects and retries instead of treating the prose as a valid answer
 - if an `edit_file` repair attempt follows an edit tool error but is still malformed, the runtime injects an edit-specific correction instead of silently accepting the malformed retry as a direct answer
 - if `search_code` exceeds the per-turn search budget, the runtime discards that retry from conversation context and injects a search-closed correction
+
+Runtime-owned terminal answers are streamed through the same assistant-message events as model text and currently report `AnswerSource::ToolAssisted`.
 
 ---
 
@@ -233,5 +240,7 @@ The runtime emits `RuntimeEvent`s. The TUI renders them and routes slash command
 
 - The runtime always sends the full in-memory conversation snapshot to the backend.
 - Live context trimming is not implemented before generation.
+- `AnswerSource` does not yet distinguish model synthesis from deterministic runtime-owned terminal answers.
+- `edit_file` may still require multiple model attempts before producing a valid exact edit; that is a model-output quality issue, not a tool-execution correctness issue.
 - Pending approval state is in memory only and is lost on restart.
 - The visible TUI transcript is not rebuilt from restored runtime history on startup.

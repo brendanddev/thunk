@@ -116,7 +116,11 @@ impl AppContext {
         if !history.is_empty() {
             runtime.load_history(history);
         }
-        Ok(Self { runtime, session, log })
+        Ok(Self {
+            runtime,
+            session,
+            log,
+        })
     }
 }
 

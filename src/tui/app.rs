@@ -4,8 +4,8 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::config::Config;
-use crate::app::AppContext;
 use crate::app::paths::AppPaths;
+use crate::app::AppContext;
 use crate::app::Result;
 use crate::runtime::{AnswerSource, RuntimeEvent, RuntimeRequest};
 
@@ -95,7 +95,12 @@ fn submit_to_app(
     }
 
     if let Err(e) = handle_result {
-        apply_runtime_event(state, RuntimeEvent::Failed { message: e.to_string() });
+        apply_runtime_event(
+            state,
+            RuntimeEvent::Failed {
+                message: e.to_string(),
+            },
+        );
     }
 
     Ok(())
@@ -133,7 +138,12 @@ fn handle_command(
                     render_error = Some(e);
                 }
             }) {
-                apply_runtime_event(state, RuntimeEvent::Failed { message: e.to_string() });
+                apply_runtime_event(
+                    state,
+                    RuntimeEvent::Failed {
+                        message: e.to_string(),
+                    },
+                );
             }
             if let Some(e) = render_error {
                 return Err(e);
@@ -150,7 +160,12 @@ fn handle_command(
                     render_error = Some(e);
                 }
             }) {
-                apply_runtime_event(state, RuntimeEvent::Failed { message: e.to_string() });
+                apply_runtime_event(
+                    state,
+                    RuntimeEvent::Failed {
+                        message: e.to_string(),
+                    },
+                );
             }
             if let Some(e) = render_error {
                 return Err(e);

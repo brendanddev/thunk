@@ -2,7 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use super::context::ToolContext;
-use super::types::{ExecutionKind, SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{
+    ExecutionKind, SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput,
+    ToolRunResult, ToolSpec,
+};
 use super::Tool;
 
 /// Maximum number of matches returned in a single search. Prevents context overload.
@@ -13,9 +16,35 @@ const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", ".hg", "dist", "b
 
 /// File extensions treated as text. Everything else is skipped as likely binary.
 const TEXT_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "json", "yaml", "yml", "ts", "tsx", "js", "jsx",
-    "py", "go", "c", "cpp", "h", "hpp", "sh", "bash", "zsh", "fish",
-    "html", "css", "scss", "xml", "sql", "env", "gitignore", "lock",
+    "rs",
+    "toml",
+    "md",
+    "txt",
+    "json",
+    "yaml",
+    "yml",
+    "ts",
+    "tsx",
+    "js",
+    "jsx",
+    "py",
+    "go",
+    "c",
+    "cpp",
+    "h",
+    "hpp",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "html",
+    "css",
+    "scss",
+    "xml",
+    "sql",
+    "env",
+    "gitignore",
+    "lock",
 ];
 
 pub struct SearchCodeTool {
@@ -47,7 +76,9 @@ impl Tool for SearchCodeTool {
         };
 
         if query.is_empty() {
-            return Err(ToolError::InvalidInput("search query cannot be empty".into()));
+            return Err(ToolError::InvalidInput(
+                "search query cannot be empty".into(),
+            ));
         }
 
         let root = match path.as_deref() {
@@ -157,7 +188,9 @@ mod tests {
         fs::write(tmp.path().join("lib.rs"), "fn foo() {}\nfn bar() {}\n").unwrap();
 
         let out = search("fn foo", tmp.path().to_str().unwrap()).unwrap();
-        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else { panic!("expected Immediate(SearchResults)") };
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
 
         assert_eq!(sr.matches.len(), 1);
         assert_eq!(sr.matches[0].line_number, 1);
@@ -173,14 +206,19 @@ mod tests {
         fs::write(tmp.path().join("main.rs"), "no match here").unwrap();
 
         let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
-        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else { panic!("expected Immediate(SearchResults)") };
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
         assert!(sr.matches.is_empty());
     }
 
     #[test]
     fn returns_error_on_empty_query() {
         let err = SearchCodeTool::new(ToolContext::new(PathBuf::from(".")))
-            .run(&ToolInput::SearchCode { query: "".into(), path: None })
+            .run(&ToolInput::SearchCode {
+                query: "".into(),
+                path: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
     }
@@ -193,7 +231,9 @@ mod tests {
         fs::write(sub.join("mod.rs"), "pub fn deep_fn() {}").unwrap();
 
         let out = search("deep_fn", tmp.path().to_str().unwrap()).unwrap();
-        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else { panic!("expected Immediate(SearchResults)") };
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
         assert_eq!(sr.matches.len(), 1);
     }
 }

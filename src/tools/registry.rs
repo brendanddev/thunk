@@ -38,9 +38,12 @@ impl ToolRegistry {
     /// Applies a previously approved mutation by delegating to the correct tool's
     /// execute_approved() method. Returns ToolError::NotFound for unknown tools.
     pub fn execute_approved(&self, pending: &PendingAction) -> Result<ToolOutput, ToolError> {
-        let tool = self.tools.get(pending.tool_name.as_str()).ok_or_else(|| ToolError::NotFound {
-            name: pending.tool_name.clone(),
-        })?;
+        let tool =
+            self.tools
+                .get(pending.tool_name.as_str())
+                .ok_or_else(|| ToolError::NotFound {
+                    name: pending.tool_name.clone(),
+                })?;
         tool.execute_approved(&pending.payload)
     }
 
@@ -137,7 +140,9 @@ mod tests {
 
     #[test]
     fn is_approval_required_true_for_mutating_tools() {
-        use crate::tools::{context::ToolContext, edit_file::EditFileTool, write_file::WriteFileTool};
+        use crate::tools::{
+            context::ToolContext, edit_file::EditFileTool, write_file::WriteFileTool,
+        };
         let mut registry = ToolRegistry::new();
         registry.register(EditFileTool::new(ToolContext::new(PathBuf::from("."))));
         registry.register(WriteFileTool::new(ToolContext::new(PathBuf::from("."))));

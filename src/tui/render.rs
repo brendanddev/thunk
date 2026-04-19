@@ -23,7 +23,10 @@ pub fn render(stdout: &mut io::Stdout, state: &AppState) -> Result<()> {
     draw_transcript(stdout, state, width, transcript_height)?;
     draw_input(stdout, state, width, height)?;
     draw_status(stdout, state, width, height)?;
-    queue!(stdout, MoveTo(input_cursor_x(state, width), height.saturating_sub(2)))?;
+    queue!(
+        stdout,
+        MoveTo(input_cursor_x(state, width), height.saturating_sub(2))
+    )?;
     stdout.flush()?;
     Ok(())
 }
@@ -42,7 +45,7 @@ fn draw_header(stdout: &mut io::Stdout, state: &AppState, width: u16) -> Result<
     Ok(())
 }
 
-/// Draws the transcript of messages, wrapping text as needed and showing only the most recent messages that fit 
+/// Draws the transcript of messages, wrapping text as needed and showing only the most recent messages that fit
 /// in the available space
 fn draw_transcript(
     stdout: &mut io::Stdout,
@@ -70,7 +73,11 @@ fn draw_transcript(
     };
 
     for (idx, line) in visible.iter().enumerate() {
-        queue!(stdout, MoveTo(0, (idx as u16) + 2), Print(fit_line(line, width)))?;
+        queue!(
+            stdout,
+            MoveTo(0, (idx as u16) + 2),
+            Print(fit_line(line, width))
+        )?;
     }
 
     Ok(())
@@ -91,7 +98,10 @@ fn draw_input(stdout: &mut io::Stdout, state: &AppState, width: u16, height: u16
         SetAttribute(Attribute::Bold),
         Print(prefix),
         SetAttribute(Attribute::Reset),
-        Print(fit_line(&visible_input, width.saturating_sub(prefix.len() as u16))),
+        Print(fit_line(
+            &visible_input,
+            width.saturating_sub(prefix.len() as u16)
+        )),
     )?;
 
     Ok(())

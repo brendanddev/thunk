@@ -64,8 +64,7 @@ pub fn run(config: &Config, paths: &AppPaths, mut app: AppContext) -> Result<()>
     match result {
         Ok(result) => result,
         Err(_) => Err(AppError::Tui(
-            "The TUI panicked unexpectedly after startup. Terminal state was restored."
-                .to_string(),
+            "The TUI panicked unexpectedly after startup. Terminal state was restored.".to_string(),
         )),
     }
 }

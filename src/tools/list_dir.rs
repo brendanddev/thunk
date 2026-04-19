@@ -1,7 +1,10 @@
 use std::fs;
 
 use super::context::ToolContext;
-use super::types::{DirEntry, DirectoryListingOutput, EntryKind, ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{
+    DirEntry, DirectoryListingOutput, EntryKind, ExecutionKind, ToolError, ToolInput, ToolOutput,
+    ToolRunResult, ToolSpec,
+};
 use super::Tool;
 
 pub struct ListDirTool {
@@ -63,9 +66,7 @@ impl Tool for ListDirTool {
         entries.sort_by(|a, b| {
             let a_is_dir = a.kind == EntryKind::Dir;
             let b_is_dir = b.kind == EntryKind::Dir;
-            b_is_dir
-                .cmp(&a_is_dir)
-                .then_with(|| a.name.cmp(&b.name))
+            b_is_dir.cmp(&a_is_dir).then_with(|| a.name.cmp(&b.name))
         });
 
         Ok(ToolRunResult::Immediate(ToolOutput::DirectoryListing(

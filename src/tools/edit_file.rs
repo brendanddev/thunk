@@ -3,7 +3,9 @@ use std::path::Path;
 
 use super::context::ToolContext;
 use super::pending::{PendingAction, RiskLevel};
-use super::types::{EditFileOutput, ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{
+    EditFileOutput, ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec,
+};
 use super::Tool;
 
 pub struct EditFileTool {
@@ -61,7 +63,12 @@ impl Tool for EditFileTool {
     }
 
     fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
-        let ToolInput::EditFile { path, search, replace } = input else {
+        let ToolInput::EditFile {
+            path,
+            search,
+            replace,
+        } = input
+        else {
             return Err(ToolError::InvalidInput(
                 "edit_file received wrong input variant".into(),
             ));
@@ -74,7 +81,8 @@ impl Tool for EditFileTool {
             return Err(ToolError::InvalidInput(
                 "missing ---search--- section. The [edit_file] block requires both \
                  ---search--- (the exact text to find) and ---replace--- (the replacement). \
-                 Re-emit the [edit_file] block with both sections included.".into(),
+                 Re-emit the [edit_file] block with both sections included."
+                    .into(),
             ));
         }
 
@@ -172,7 +180,9 @@ mod tests {
         fs::write(&file, "fn a() {}\nfn b() {}").unwrap();
 
         let tool = tool_in(&dir);
-        let ToolRunResult::Approval(pa) = run_edit(&tool, "lib.rs", "fn a() {}\nfn b() {}", "fn c() {}").unwrap() else {
+        let ToolRunResult::Approval(pa) =
+            run_edit(&tool, "lib.rs", "fn a() {}\nfn b() {}", "fn c() {}").unwrap()
+        else {
             panic!("expected Approval");
         };
         assert!(pa.summary.contains("lib.rs"));
@@ -249,7 +259,9 @@ mod tests {
         fs::write(&path, "fn old() {}\n").unwrap();
 
         let tool = tool_in(&dir);
-        let ToolRunResult::Approval(pa) = run_edit(&tool, "f.rs", "fn old() {}", "fn new() {}").unwrap() else {
+        let ToolRunResult::Approval(pa) =
+            run_edit(&tool, "f.rs", "fn old() {}", "fn new() {}").unwrap()
+        else {
             panic!("expected Approval");
         };
 
@@ -271,7 +283,9 @@ mod tests {
         fs::write(&path, "fn original() {}").unwrap();
 
         let tool = tool_in(&dir);
-        let ToolRunResult::Approval(pa) = run_edit(&tool, "f.rs", "fn original() {}", "fn new() {}").unwrap() else {
+        let ToolRunResult::Approval(pa) =
+            run_edit(&tool, "f.rs", "fn original() {}", "fn new() {}").unwrap()
+        else {
             panic!("expected Approval");
         };
 
@@ -323,7 +337,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = tool_in(&dir);
         let err = tool
-            .run(&ToolInput::ReadFile { path: "f.rs".into() })
+            .run(&ToolInput::ReadFile {
+                path: "f.rs".into(),
+            })
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
     }

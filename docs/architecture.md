@@ -71,10 +71,11 @@ The core problem the project solves is running an AI coding assistant locally wi
 7. `ToolRegistry` dispatches each `ToolInput` to its tool implementation.
 8. Immediate tool results are rendered two ways by the runtime: a compact one-line summary for the TUI, and a `=== tool_result: name ===` block appended back into the conversation as a user message.
 9. If a tool returns `Approval(PendingAction)`, the runtime stores that single pending action, emits `ApprovalRequired`, and stops the turn until the user chooses `/approve` or `/reject`.
-10. If no approval is pending, the runtime re-enters generation with the injected tool results so the assistant can produce a same-turn answer grounded in actual tool output.
-11. The TUI renders events only. It never sees typed tool payloads and never calls tool implementations directly.
+10. If no approval is pending, the runtime normally re-enters generation with the injected tool results so the assistant can produce a same-turn answer grounded in actual tool output.
+11. If the runtime already knows the terminal outcome, such as a rejected mutation or failed `read_file`, it can emit a runtime-owned assistant answer instead of asking the model to synthesize.
+12. The TUI renders events only. It never sees typed tool payloads and never calls tool implementations directly.
 
-One important current behavior: successful tool rounds do not end the turn immediately. The runtime normally calls the model again with the tool results so the final answer can synthesize what was actually found or changed.
+One important current behavior: successful tool rounds do not end the turn immediately. The runtime normally calls the model again with the tool results so the final answer can synthesize what was actually found or changed. Terminal runtime-owned answers are reserved for cases where model synthesis would be less reliable than the runtime state, such as rejection or missing-file read failures.
 
 ---
 
@@ -104,9 +105,9 @@ The runtime owns the pending action lifecycle, but it does not interpret `payloa
 2. The runtime stores it in `pending_action` and emits `RuntimeEvent::ApprovalRequired`.
 3. While `pending_action` is set, `Submit` is rejected.
 4. `/approve` calls `ToolRegistry::execute_approved()`.
-5. `/reject` appends a `=== tool_error: name ===` block and lets the model continue.
+5. `/reject` appends a `=== tool_error: name ===` block and emits a runtime-owned cancellation answer.
 
-On approval success, the runtime appends a `=== tool_result: name ===` block and resumes generation for synthesis. On approval failure, it appends a `=== tool_error: name ===` block and resumes generation so the model can recover.
+On approval success, the runtime appends a `=== tool_result: name ===` block and resumes generation for synthesis. On approval failure, it appends a `=== tool_error: name ===` block and resumes generation so the model can recover. On rejection, the runtime does not re-enter model generation because it already knows no mutation occurred.
 
 ### Two-Phase Execution
 
@@ -161,6 +162,8 @@ Protocol rules in the current implementation:
 - Multi-line `edit_file` / `write_file` blocks must contain the required delimiters and closing tag.
 - `search_code` is model-facing as a single literal keyword or identifier, not a regex, method call, or phrase query.
 - `search_code` still accepts narrow legacy block forms such as `pattern:` and `query:` for model-drift tolerance, but those names are parser compatibility only; the tool performs literal substring matching.
+- `search_code` input is simplified by the runtime to one literal token before dispatch when the model emits a phrase or method-shaped query.
+- `edit_file` remains model-facing as the canonical `---search---` / `---replace---` block, but the parser accepts narrow observed drift forms including `old content:` / `new content:` labels and generic triple-dash search/replace delimiter pairs.
 - Malformed wrong-open-tag tool blocks are detected and corrected instead of silently becoming normal assistant prose.
 - Malformed `edit_file` retries after an edit error receive an edit-specific runtime correction instead of being accepted as a final answer.
 - Mixed tool-call formats are executed in the order they appear in the assistant response.
@@ -198,7 +201,7 @@ Live trimming is limited today:
 
 - there is no token-aware budgeting or message trimming before generation
 - every generation request sends the full in-memory conversation snapshot
-- `read_file` truncates file reads at `100_000` bytes
+- `read_file` truncates file reads to the first `200` lines
 - `search_code` truncates at `50` matches
 - if the live prompt still exceeds the configured llama.cpp context window, generation fails instead of auto-trimming
 
@@ -220,6 +223,8 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 - Tools return typed data; tools do not append conversation text themselves.
 - Mutating tools do not write during `run()`; writes happen only in `execute_approved()`.
 - `search_code` executes literal substring searches, and repeated search behavior is bounded per user turn by runtime state.
+- rejected mutations are answered by the runtime without model synthesis, so the assistant cannot claim a rejected write/edit happened
+- failed `read_file` calls can terminate with a runtime-owned answer, so missing-file reads do not loop
 - Malformed `edit_file` repair attempts after edit errors are surfaced back to the model through runtime correction rather than silently ending the turn.
 - The runtime communicates through `RuntimeRequest` and `RuntimeEvent`; it does not depend on the TUI or SQLite.
 - Logging is advisory and does not participate in control flow.
@@ -232,6 +237,8 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 
 - Live context management is incomplete. Restore trimming exists, but there is no proactive token-based budgeting or live conversation trimming before generation.
 - Tool-loop safety still includes a hard limit of `10` tool rounds per turn; search has narrower per-turn runtime enforcement, but broader planning quality is still model-dependent.
+- `AnswerSource` currently reports runtime-owned terminal answers as `ToolAssisted`; it does not yet distinguish deterministic runtime fallback from model synthesis.
+- `edit_file` can still be noisy before a valid exact edit block appears; this is a model-output quality issue, not a correctness issue once a valid tool call is parsed.
 - Advanced memory is not implemented. There is no embeddings layer, structured memory, or long-term recall.
 - LSP integration is not implemented.
 - The tool surface is still small: `read_file`, `list_dir`, `search_code`, `edit_file`, and `write_file` only.

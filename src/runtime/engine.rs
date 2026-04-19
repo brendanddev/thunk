@@ -3,12 +3,14 @@ use std::path::Path;
 use crate::app::config::Config;
 use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
-use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolOutput, ToolRegistry, ToolRunResult};
+use crate::tools::{
+    ExecutionKind, PendingAction, ToolInput, ToolOutput, ToolRegistry, ToolRunResult,
+};
 
 use super::conversation::Conversation;
 use super::prompt;
 use super::tool_codec;
-use super::types::{Activity, AnswerSource, RuntimeEvent, RuntimeRequest};
+use super::types::{Activity, AnswerSource, RuntimeEvent, RuntimeRequest, RuntimeTerminalReason};
 
 /// Maximum tool rounds per turn. Prevents runaway loops when the model keeps
 /// producing tool calls without reaching a final answer.
@@ -37,8 +39,7 @@ const SEARCH_BUDGET_EXCEEDED: &str =
 
 const SEARCH_CLOSED_AFTER_RESULTS: &str =
     "[runtime:correction] Search returned matches. Do not call search_code again this turn. \
-     If the result lines are enough, answer now. If you need detail from one specific file, \
-     emit one read_file call only.";
+     Read one specific matched file with read_file before answering.";
 
 const SEARCH_CLOSED_AFTER_EMPTY_RETRY: &str =
     "[runtime:correction] The allowed search retry also returned no matches. \
@@ -60,6 +61,106 @@ const MALFORMED_BLOCK_CORRECTION: &str =
      Tag names are exact — you must use [write_file], [edit_file], etc. exactly as shown. \
      Do not rename or abbreviate them. Emit the correct tool call now with no other text.";
 
+/// Injected when search returned matches but the model attempts synthesis without reading any file.
+/// One correction is allowed per turn; after that, the runtime terminates with insufficient evidence.
+const READ_BEFORE_ANSWERING: &str =
+    "[runtime:correction] Search returned matches but no matched file has been read this turn. \
+     Read one of the matched files with [read_file: path] before answering.";
+
+/// Injected when the question contains a code identifier but the model attempts a Direct answer
+/// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
+const SEARCH_BEFORE_ANSWERING: &str =
+    "[runtime:correction] This question is about a specific code element. \
+     Use search_code with the identifier as the keyword before answering.";
+
+const READ_ONLY_TOOL_POLICY_ERROR: &str =
+    "mutating tools are not allowed for this read-only informational request. \
+     Do not call write_file or edit_file unless the user explicitly asks to create, write, edit, change, update, or modify a file.";
+
+const READ_REQUEST_TOOL_REQUIRED: &str =
+    "[runtime:correction] The user asked to read a specific file. \
+     Call read_file for that exact path before answering.";
+
+/// Tracks per-turn search → read investigation state.
+/// Resets at the start of each call to run_turns, exactly like SearchBudget.
+struct InvestigationState {
+    /// True once any search_code call this turn returned at least one match.
+    search_produced_results: bool,
+    /// Count of read_file calls that completed successfully this turn.
+    files_read_count: usize,
+    /// File paths from the current non-empty search results.
+    search_candidate_paths: Vec<String>,
+    /// True once read_file successfully read one of the current search result paths.
+    read_from_search_result: bool,
+    /// True after the read-before-answering correction has been issued once.
+    /// Prevents the correction from firing more than once per turn.
+    premature_synthesis_correction_issued: bool,
+    /// True after the search-before-answering correction has been issued once.
+    /// R1 uses its own flag and does NOT increment the shared corrections counter,
+    /// so R1 and R2 can compose sequentially in the same turn.
+    direct_answer_correction_issued: bool,
+}
+
+impl InvestigationState {
+    fn new() -> Self {
+        Self {
+            search_produced_results: false,
+            files_read_count: 0,
+            search_candidate_paths: Vec::new(),
+            read_from_search_result: false,
+            premature_synthesis_correction_issued: false,
+            direct_answer_correction_issued: false,
+        }
+    }
+
+    fn evidence_ready(&self) -> bool {
+        self.search_produced_results && self.read_from_search_result
+    }
+
+    fn record_search_results(&mut self, output: &ToolOutput) -> bool {
+        let ToolOutput::SearchResults(results) = output else {
+            return false;
+        };
+
+        let was_empty = results.matches.is_empty();
+        if !was_empty {
+            self.search_produced_results = true;
+            self.search_candidate_paths.clear();
+            for result in &results.matches {
+                push_unique_path(&mut self.search_candidate_paths, &result.file);
+            }
+            self.read_from_search_result = false;
+        }
+        was_empty
+    }
+
+    fn record_read_result(&mut self, output: &ToolOutput) {
+        let ToolOutput::FileContents(file) = output else {
+            return;
+        };
+
+        self.files_read_count += 1;
+        let read_path = normalize_evidence_path(&file.path);
+        if self
+            .search_candidate_paths
+            .iter()
+            .any(|candidate| normalize_evidence_path(candidate) == read_path)
+        {
+            self.read_from_search_result = true;
+        }
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<String>, path: &str) {
+    if !paths.iter().any(|existing| existing == path) {
+        paths.push(path.to_string());
+    }
+}
+
+fn normalize_evidence_path(path: &str) -> String {
+    path.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
 /// Tracks search_code usage within a single turn.
 /// Rules: 1 search always permitted; a second search is permitted only when the first
 /// returned zero matches; any further searches are blocked.
@@ -70,7 +171,10 @@ struct SearchBudget {
 
 impl SearchBudget {
     fn new() -> Self {
-        Self { calls: 0, last_was_empty: false }
+        Self {
+            calls: 0,
+            last_was_empty: false,
+        }
     }
 
     fn is_allowed(&self) -> bool {
@@ -99,8 +203,24 @@ impl SearchBudget {
 /// single literal keyword that search_code actually supports best.
 fn simplify_search_query(query: &str) -> String {
     const STOPWORDS: &[&str] = &[
-        "a", "an", "and", "are", "fn", "for", "find", "how", "in", "initialized",
-        "initialization", "implemented", "is", "of", "or", "the", "to", "what",
+        "a",
+        "an",
+        "and",
+        "are",
+        "fn",
+        "for",
+        "find",
+        "how",
+        "in",
+        "initialized",
+        "initialization",
+        "implemented",
+        "is",
+        "of",
+        "or",
+        "the",
+        "to",
+        "what",
         "where",
     ];
 
@@ -142,15 +262,226 @@ fn call_fingerprint(input: &ToolInput) -> String {
         ToolInput::ReadFile { path } => format!("read_file\x00{path}"),
         ToolInput::ListDir { path } => format!("list_dir\x00{path}"),
         ToolInput::SearchCode { query, path } => {
-            format!("search_code\x00{query}\x00{}", path.as_deref().unwrap_or(""))
+            format!(
+                "search_code\x00{query}\x00{}",
+                path.as_deref().unwrap_or("")
+            )
         }
-        ToolInput::EditFile { path, search, replace } => {
+        ToolInput::EditFile {
+            path,
+            search,
+            replace,
+        } => {
             format!("edit_file\x00{path}\x00{search}\x00{replace}")
         }
         ToolInput::WriteFile { path, content } => {
             format!("write_file\x00{path}\x00{content}")
         }
     }
+}
+
+fn rejection_final_answer(tool_name: &str) -> &'static str {
+    match tool_name {
+        "write_file" => "Canceled. No file was created or changed.",
+        "edit_file" => "Canceled. No file was changed.",
+        _ => "Canceled. No action was taken.",
+    }
+}
+
+fn read_failure_final_answer(path: &str, error: &str) -> String {
+    format!("I couldn't read `{path}`: {error}. No file contents were read.")
+}
+
+fn read_path_mismatch_final_answer(requested: &str, attempted: &str) -> String {
+    format!(
+        "I couldn't read `{requested}` because the model tried to read `{attempted}` instead. No file contents were read."
+    )
+}
+
+fn unread_requested_file_final_answer(path: &str) -> String {
+    format!("I couldn't read `{path}` because no matching read_file result was produced. No file contents were read.")
+}
+
+fn insufficient_evidence_final_answer() -> &'static str {
+    "I searched for relevant code but found no matches. I don't have enough information to answer."
+}
+
+fn ungrounded_investigation_final_answer() -> &'static str {
+    "I don't have enough grounded file evidence to answer. No final answer was accepted before a matching file was read."
+}
+
+/// Returns true if the prompt contains a token that looks like a code identifier.
+/// Only two structural patterns are checked — no NLP, no heuristics.
+fn prompt_requires_investigation(text: &str) -> bool {
+    for raw in text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ',' | '.'
+                    | '?'
+                    | '!'
+                    | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+            )
+    }) {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if is_snake_case_identifier(token) || is_pascal_case_identifier(token) {
+            return true;
+        }
+    }
+
+    natural_language_code_lookup_requires_investigation(text)
+}
+
+fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_lookup_verb = contains_word(&lower, "find")
+        || contains_word(&lower, "where")
+        || contains_word(&lower, "locate")
+        || contains_word(&lower, "search");
+    if !has_lookup_verb {
+        return false;
+    }
+
+    [
+        "defined",
+        "implemented",
+        "initialized",
+        "initialised",
+        "configured",
+        "saved",
+        "stored",
+        "loaded",
+        "handled",
+        "called",
+        "used",
+    ]
+    .iter()
+    .any(|term| contains_word(&lower, term))
+}
+
+fn contains_word(text: &str, needle: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|token| token == needle)
+}
+
+fn user_requested_mutation(text: &str) -> bool {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ',' | '.'
+                    | '?'
+                    | '!'
+                    | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '/'
+                    | '\\'
+            )
+    })
+    .any(|token| {
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "add"
+                | "change"
+                | "create"
+                | "delete"
+                | "edit"
+                | "modify"
+                | "overwrite"
+                | "replace"
+                | "update"
+                | "write"
+        )
+    })
+}
+
+fn requested_read_path(text: &str) -> Option<String> {
+    let mut tokens = text.split_whitespace();
+    let first = tokens.next()?;
+    if !first.eq_ignore_ascii_case("read") {
+        return None;
+    }
+
+    let mut candidate = tokens.next()?;
+    if candidate.eq_ignore_ascii_case("file") {
+        candidate = tokens.next()?;
+    }
+
+    let path = candidate.trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if looks_like_file_path(path) {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
+fn looks_like_file_path(path: &str) -> bool {
+    !path.is_empty()
+        && (path.contains('/')
+            || path.contains('\\')
+            || path.contains('.')
+            || path.eq_ignore_ascii_case("README"))
+}
+
+fn is_mutating_tool(input: &ToolInput) -> bool {
+    matches!(
+        input,
+        ToolInput::EditFile { .. } | ToolInput::WriteFile { .. }
+    )
+}
+
+/// snake_case: contains underscore, ≥2 segments, each segment ≥2 alphanumeric chars.
+fn is_snake_case_identifier(token: &str) -> bool {
+    if !token.contains('_') {
+        return false;
+    }
+    let segments: Vec<&str> = token.split('_').collect();
+    segments.len() >= 2
+        && segments
+            .iter()
+            .all(|s| s.len() >= 2 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Matches PascalCase/camelCase identifiers.
+/// Note: also intentionally matches ALLCAPS tokens of sufficient length (e.g., DEBUG, README)
+/// for Phase 8.4 structural detection.
+fn is_pascal_case_identifier(token: &str) -> bool {
+    if token.len() < 5 {
+        return false;
+    }
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    token[1..].chars().any(|c| c.is_ascii_uppercase())
 }
 
 pub struct Runtime {
@@ -168,9 +499,19 @@ pub struct Runtime {
 enum ToolRoundOutcome {
     /// All tools in this round completed immediately; results are ready to push.
     Completed { results: String },
+    /// The runtime has enough information to end the turn without asking the model
+    /// for another synthesis pass.
+    TerminalAnswer {
+        results: String,
+        answer: String,
+        reason: RuntimeTerminalReason,
+    },
     /// A tool requested approval. Results accumulated before it are preserved.
     /// The turn is now suspended; the caller must store pending and fire the event.
-    ApprovalRequired { accumulated: String, pending: PendingAction },
+    ApprovalRequired {
+        accumulated: String,
+        pending: PendingAction,
+    },
 }
 
 impl Runtime {
@@ -181,8 +522,7 @@ impl Runtime {
         registry: ToolRegistry,
     ) -> Self {
         let specs = registry.specs();
-        let system_prompt =
-            prompt::build_system_prompt(&config.app.name, project_root, &specs);
+        let system_prompt = prompt::build_system_prompt(&config.app.name, project_root, &specs);
         Self {
             conversation: Conversation::new(system_prompt.clone()),
             backend,
@@ -224,7 +564,9 @@ impl Runtime {
     fn handle_submit(&mut self, text: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
         if self.pending_action.is_some() {
             on_event(RuntimeEvent::Failed {
-                message: "Cannot submit while a tool approval is pending. Use /approve or /reject first.".to_string(),
+                message:
+                    "Cannot submit while a tool approval is pending. Use /approve or /reject first."
+                        .to_string(),
             });
             return;
         }
@@ -259,7 +601,10 @@ impl Runtime {
         match self.registry.execute_approved(&pending) {
             Ok(output) => {
                 let summary = tool_codec::render_compact_summary(&output);
-                on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: Some(summary) });
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: tool_name.clone(),
+                    summary: Some(summary),
+                });
                 let result_text = tool_codec::format_tool_result(&tool_name, &output);
                 self.conversation.push_user(result_text);
                 self.conversation.trim_tool_exchanges_if_needed();
@@ -269,7 +614,10 @@ impl Runtime {
                 self.run_turns(1, on_event);
             }
             Err(e) => {
-                on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: None });
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: tool_name.clone(),
+                    summary: None,
+                });
                 let error_text = tool_codec::format_tool_error(&tool_name, &e.to_string());
                 self.conversation.push_user(error_text);
                 // On failure, let the model respond — it may want to retry.
@@ -291,16 +639,24 @@ impl Runtime {
         };
 
         let tool_name = pending.tool_name.clone();
-        on_event(RuntimeEvent::ToolCallFinished { name: tool_name.clone(), summary: None });
+        on_event(RuntimeEvent::ToolCallFinished {
+            name: tool_name.clone(),
+            summary: None,
+        });
         let rejection = tool_codec::format_tool_error(
             &tool_name,
             "user rejected this action — do not retry or re-propose it. \
              Acknowledge the cancellation in plain text and wait for the user's next instruction.",
         );
         self.conversation.push_user(rejection);
-
-        on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
-        self.run_turns(0, on_event);
+        self.finish_with_runtime_answer(
+            rejection_final_answer(&tool_name),
+            AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::RejectedMutation,
+                rounds: 1,
+            },
+            on_event,
+        );
     }
 
     /// Runs the generate -> tool-round loop until the model produces a final answer,
@@ -310,36 +666,59 @@ impl Runtime {
         let mut corrections = 0usize;
         let mut last_call_key: Option<String> = None;
         let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut requested_read_completed = false;
+        let mut read_request_correction_issued = false;
+        // Computed once from the original user message. Excludes tool result/error injections
+        // and correction messages so the approve-failure path (run_turns(0,...)) is safe.
+        let original_user_prompt = self.conversation.last_user_content().filter(|c| {
+            !c.starts_with("=== tool_result:")
+                && !c.starts_with("=== tool_error:")
+                && !c.starts_with("[runtime:correction]")
+        });
+        let requested_read_path = original_user_prompt.and_then(requested_read_path);
+        let investigation_required = original_user_prompt
+            .map(|prompt| {
+                requested_read_path.is_none()
+                    && !user_requested_mutation(prompt)
+                    && prompt_requires_investigation(prompt)
+            })
+            .unwrap_or(false);
+        let mutation_allowed = original_user_prompt
+            .map(user_requested_mutation)
+            .unwrap_or(false);
         loop {
-            let response = match run_generate_turn(
-                self.backend.as_mut(),
-                &mut self.conversation,
-                on_event,
-            ) {
-                Ok(Some(r)) => r,
-                Ok(None) => {
-                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                    on_event(RuntimeEvent::Failed {
-                        message: format!("{} returned no output.", self.backend.name()),
-                    });
-                    return;
-                }
-                Err(e) => {
-                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                    on_event(RuntimeEvent::Failed { message: e.to_string() });
-                    return;
-                }
-            };
+            let response =
+                match run_generate_turn(self.backend.as_mut(), &mut self.conversation, on_event) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                        on_event(RuntimeEvent::Failed {
+                            message: format!("{} returned no output.", self.backend.name()),
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                        on_event(RuntimeEvent::Failed {
+                            message: e.to_string(),
+                        });
+                        return;
+                    }
+                };
 
             let calls = tool_codec::parse_all_tool_inputs(&response);
 
             if search_budget.is_closed()
-                && calls.iter().any(|c| matches!(c, ToolInput::SearchCode { .. }))
+                && calls
+                    .iter()
+                    .any(|c| matches!(c, ToolInput::SearchCode { .. }))
             {
                 if corrections < MAX_CORRECTIONS {
                     corrections += 1;
                     self.conversation.discard_last_if_assistant();
-                    self.conversation.push_user(search_budget.closed_message().to_string());
+                    self.conversation
+                        .push_user(search_budget.closed_message().to_string());
                     continue;
                 }
                 on_event(RuntimeEvent::Failed {
@@ -359,7 +738,8 @@ impl Runtime {
                 {
                     corrections += 1;
                     self.conversation.discard_last_if_assistant();
-                    self.conversation.push_user(EDIT_REPAIR_CORRECTION.to_string());
+                    self.conversation
+                        .push_user(EDIT_REPAIR_CORRECTION.to_string());
                     continue;
                 }
 
@@ -369,7 +749,8 @@ impl Runtime {
                     if corrections < MAX_CORRECTIONS {
                         corrections += 1;
                         self.conversation.discard_last_if_assistant();
-                        self.conversation.push_user(FABRICATION_CORRECTION.to_string());
+                        self.conversation
+                            .push_user(FABRICATION_CORRECTION.to_string());
                         continue;
                     }
                     on_event(RuntimeEvent::Failed {
@@ -385,20 +766,112 @@ impl Runtime {
                     if corrections < MAX_CORRECTIONS {
                         corrections += 1;
                         self.conversation.discard_last_if_assistant();
-                        self.conversation.push_user(MALFORMED_BLOCK_CORRECTION.to_string());
+                        self.conversation
+                            .push_user(MALFORMED_BLOCK_CORRECTION.to_string());
                         continue;
                     }
                     on_event(RuntimeEvent::Failed {
-                        message: "Model used incorrect tool tag names. Try rephrasing your request.".to_string(),
+                        message:
+                            "Model used incorrect tool tag names. Try rephrasing your request."
+                                .to_string(),
                     });
                     on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
                     return;
                 }
+
+                if let Some(path) = requested_read_path.as_deref() {
+                    if !requested_read_completed {
+                        if !read_request_correction_issued && corrections < MAX_CORRECTIONS {
+                            corrections += 1;
+                            read_request_correction_issued = true;
+                            self.conversation.push_user(format!(
+                                "{READ_REQUEST_TOOL_REQUIRED} Requested path: `{path}`"
+                            ));
+                            continue;
+                        }
+
+                        self.finish_with_runtime_answer(
+                            &unread_requested_file_final_answer(path),
+                            AnswerSource::RuntimeTerminal {
+                                reason: RuntimeTerminalReason::ReadFileFailed,
+                                rounds: tool_rounds,
+                            },
+                            on_event,
+                        );
+                        return;
+                    }
+                }
+
+                // R4: insufficient-evidence terminal.
+                // Search was attempted this turn, all results were empty, and no file
+                // was read. The model cannot have any grounded evidence to synthesize from.
+                // Discard whatever the model produced and emit the runtime-owned answer.
+                if search_budget.calls > 0
+                    && !investigation.search_produced_results
+                    && investigation.files_read_count == 0
+                {
+                    self.finish_with_runtime_answer(
+                        insufficient_evidence_final_answer(),
+                        AnswerSource::RuntimeTerminal {
+                            reason: RuntimeTerminalReason::InsufficientEvidence,
+                            rounds: tool_rounds,
+                        },
+                        on_event,
+                    );
+                    return;
+                }
+
+                if investigation_required && !investigation.evidence_ready() {
+                    if search_budget.calls == 0 {
+                        if !investigation.direct_answer_correction_issued {
+                            investigation.direct_answer_correction_issued = true;
+                            self.conversation
+                                .push_user(SEARCH_BEFORE_ANSWERING.to_string());
+                            continue;
+                        }
+
+                        self.finish_with_runtime_answer(
+                            ungrounded_investigation_final_answer(),
+                            AnswerSource::RuntimeTerminal {
+                                reason: RuntimeTerminalReason::InsufficientEvidence,
+                                rounds: tool_rounds,
+                            },
+                            on_event,
+                        );
+                        return;
+                    }
+
+                    if investigation.search_produced_results {
+                        if !investigation.premature_synthesis_correction_issued
+                            && corrections < MAX_CORRECTIONS
+                        {
+                            corrections += 1;
+                            investigation.premature_synthesis_correction_issued = true;
+                            self.conversation
+                                .push_user(READ_BEFORE_ANSWERING.to_string());
+                            continue;
+                        }
+
+                        self.finish_with_runtime_answer(
+                            ungrounded_investigation_final_answer(),
+                            AnswerSource::RuntimeTerminal {
+                                reason: RuntimeTerminalReason::InsufficientEvidence,
+                                rounds: tool_rounds,
+                            },
+                            on_event,
+                        );
+                        return;
+                    }
+                }
+
                 let source = if tool_rounds == 0 {
                     AnswerSource::Direct
                 } else {
-                    AnswerSource::ToolAssisted { rounds: tool_rounds }
+                    AnswerSource::ToolAssisted {
+                        rounds: tool_rounds,
+                    }
                 };
+                emit_visible_assistant_message(&response, on_event);
                 on_event(RuntimeEvent::AnswerReady(source));
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
                 return;
@@ -414,7 +887,17 @@ impl Runtime {
 
             on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
 
-            match run_tool_round(&self.registry, calls, &mut last_call_key, &mut search_budget, on_event) {
+            match run_tool_round(
+                &self.registry,
+                calls,
+                &mut last_call_key,
+                &mut search_budget,
+                &mut investigation,
+                mutation_allowed,
+                requested_read_path.as_deref(),
+                &mut requested_read_completed,
+                on_event,
+            ) {
                 ToolRoundOutcome::Completed { results } => {
                     self.conversation.push_user(results);
                     self.conversation.trim_tool_exchanges_if_needed();
@@ -424,7 +907,27 @@ impl Runtime {
                     // Do not return — loop continues so the model is re-invoked
                     // with the tool results in context to produce a synthesis response.
                 }
-                ToolRoundOutcome::ApprovalRequired { accumulated, pending } => {
+                ToolRoundOutcome::TerminalAnswer {
+                    results,
+                    answer,
+                    reason,
+                } => {
+                    self.conversation.push_user(results);
+                    self.conversation.trim_tool_exchanges_if_needed();
+                    self.finish_with_runtime_answer(
+                        &answer,
+                        AnswerSource::RuntimeTerminal {
+                            reason,
+                            rounds: tool_rounds,
+                        },
+                        on_event,
+                    );
+                    return;
+                }
+                ToolRoundOutcome::ApprovalRequired {
+                    accumulated,
+                    pending,
+                } => {
                     if !accumulated.is_empty() {
                         self.conversation.push_user(accumulated);
                         self.conversation.trim_tool_exchanges_if_needed();
@@ -436,6 +939,22 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    fn finish_with_runtime_answer(
+        &mut self,
+        answer: &str,
+        source: AnswerSource,
+        on_event: &mut dyn FnMut(RuntimeEvent),
+    ) {
+        on_event(RuntimeEvent::ActivityChanged(Activity::Responding));
+        self.conversation.begin_assistant_reply();
+        on_event(RuntimeEvent::AssistantMessageStarted);
+        self.conversation.push_assistant_chunk(answer);
+        on_event(RuntimeEvent::AssistantMessageChunk(answer.to_string()));
+        on_event(RuntimeEvent::AssistantMessageFinished);
+        on_event(RuntimeEvent::AnswerReady(source));
+        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
     }
 
     #[cfg(test)]
@@ -458,27 +977,74 @@ fn run_tool_round(
     calls: Vec<ToolInput>,
     last_call_key: &mut Option<String>,
     search_budget: &mut SearchBudget,
+    investigation: &mut InvestigationState,
+    mutation_allowed: bool,
+    requested_read_path: Option<&str>,
+    requested_read_completed: &mut bool,
     on_event: &mut dyn FnMut(RuntimeEvent),
 ) -> ToolRoundOutcome {
     let mut accumulated = String::new();
 
     for mut input in calls {
         simplify_search_input(&mut input);
+        let read_path = match &input {
+            ToolInput::ReadFile { path } => Some(path.clone()),
+            _ => None,
+        };
         let name = input.tool_name().to_string();
         let key = call_fingerprint(&input);
         on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
 
+        if is_mutating_tool(&input) && !mutation_allowed {
+            on_event(RuntimeEvent::ToolCallFinished {
+                name: name.clone(),
+                summary: None,
+            });
+            accumulated.push_str(&tool_codec::format_tool_error(
+                &name,
+                READ_ONLY_TOOL_POLICY_ERROR,
+            ));
+            continue;
+        }
+
+        if let (Some(requested), ToolInput::ReadFile { path }) = (requested_read_path, &input) {
+            if normalize_evidence_path(path) != normalize_evidence_path(requested) {
+                let error = format!(
+                    "read_file path `{path}` does not match the requested path `{requested}`"
+                );
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: None,
+                });
+                accumulated.push_str(&tool_codec::format_tool_error(&name, &error));
+                return ToolRoundOutcome::TerminalAnswer {
+                    results: accumulated,
+                    answer: read_path_mismatch_final_answer(requested, path),
+                    reason: RuntimeTerminalReason::ReadFileFailed,
+                };
+            }
+        }
+
         // Per-turn search budget: 1 search always allowed; a second only when the first
         // returned no results; further searches are always blocked.
         if matches!(input, ToolInput::SearchCode { .. }) && !search_budget.is_allowed() {
-            on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: None });
-            accumulated.push_str(&tool_codec::format_tool_error(&name, SEARCH_BUDGET_EXCEEDED));
+            on_event(RuntimeEvent::ToolCallFinished {
+                name: name.clone(),
+                summary: None,
+            });
+            accumulated.push_str(&tool_codec::format_tool_error(
+                &name,
+                SEARCH_BUDGET_EXCEEDED,
+            ));
             continue;
         }
 
         if last_call_key.as_deref() == Some(key.as_str()) {
             let msg = format!("{name} called with identical arguments twice in a row");
-            on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: None });
+            on_event(RuntimeEvent::ToolCallFinished {
+                name: name.clone(),
+                summary: None,
+            });
             accumulated.push_str(&tool_codec::format_tool_error(&name, &msg));
             // Do not update last_call_key: keep the same fingerprint so a third
             // consecutive identical call is also blocked.
@@ -490,21 +1056,40 @@ fn run_tool_round(
                 // Guard: spec must agree that this tool is Immediate.
                 // A mismatch means the spec() and run() implementations are out of sync.
                 debug_assert!(
-                    registry.spec_for(&name)
+                    registry
+                        .spec_for(&name)
                         .map(|s| s.execution_kind == ExecutionKind::Immediate)
                         .unwrap_or(true),
                     "tool '{name}' returned Immediate but spec declares RequiresApproval"
                 );
-                // Record search results against the per-turn budget.
+                // Record search results against the per-turn budget and investigation state.
                 let search_closed_message = if name == "search_code" {
-                    let was_empty = matches!(&output, ToolOutput::SearchResults(r) if r.matches.is_empty());
+                    let was_empty = investigation.record_search_results(&output);
                     search_budget.record(was_empty);
-                    search_budget.is_closed().then(|| search_budget.closed_message())
+                    search_budget
+                        .is_closed()
+                        .then(|| search_budget.closed_message())
                 } else {
                     None
                 };
+                // Track successful file reads for evidence grounding.
+                if name == "read_file" {
+                    investigation.record_read_result(&output);
+                    if let Some(requested) = requested_read_path {
+                        if let Some(read_path) = read_path.as_deref() {
+                            if normalize_evidence_path(read_path)
+                                == normalize_evidence_path(requested)
+                            {
+                                *requested_read_completed = true;
+                            }
+                        }
+                    }
+                }
                 let summary = tool_codec::render_compact_summary(&output);
-                on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: Some(summary) });
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: Some(summary),
+                });
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
                 if let Some(message) = search_closed_message {
                     accumulated.push_str(message);
@@ -515,23 +1100,40 @@ fn run_tool_round(
             Ok(ToolRunResult::Approval(pending)) => {
                 // Guard: spec must agree that this tool requires approval.
                 debug_assert!(
-                    registry.spec_for(&name)
+                    registry
+                        .spec_for(&name)
                         .map(|s| s.execution_kind == ExecutionKind::RequiresApproval)
                         .unwrap_or(true),
                     "tool '{name}' returned Approval but spec declares Immediate"
                 );
-                return ToolRoundOutcome::ApprovalRequired { accumulated, pending };
+                return ToolRoundOutcome::ApprovalRequired {
+                    accumulated,
+                    pending,
+                };
             }
             Err(e) => {
-                on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: None });
-                accumulated.push_str(&tool_codec::format_tool_error(&name, &e.to_string()));
+                let error = e.to_string();
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: None,
+                });
+                accumulated.push_str(&tool_codec::format_tool_error(&name, &error));
+                if let Some(path) = read_path {
+                    return ToolRoundOutcome::TerminalAnswer {
+                        results: accumulated,
+                        answer: read_failure_final_answer(&path, &error),
+                        reason: RuntimeTerminalReason::ReadFileFailed,
+                    };
+                }
                 // Do NOT update last_call_key on error: a failed call should not block
                 // an identical retry. Cycle detection applies only to successful executions.
             }
         }
     }
 
-    ToolRoundOutcome::Completed { results: accumulated }
+    ToolRoundOutcome::Completed {
+        results: accumulated,
+    }
 }
 
 /// Returns true when the most recent user message in the conversation is an edit_file
@@ -545,29 +1147,23 @@ fn last_injected_was_edit_error(conversation: &Conversation) -> bool {
 }
 
 /// Runs a single generation turn: sends the current conversation to the backend,
-/// streams tokens into the conversation and fires events, then returns the
-/// complete assistant response text, or None if the backend produced no output.
+/// buffers the assistant response into conversation history, then returns the
+/// complete response text, or None if the backend produced no output. Assistant
+/// message events are emitted only after runtime admission.
 fn run_generate_turn(
     backend: &mut dyn ModelBackend,
     conversation: &mut Conversation,
     on_event: &mut dyn FnMut(RuntimeEvent),
 ) -> Result<Option<String>> {
     let request = GenerateRequest::new(conversation.snapshot());
-    let mut started = false;
+    let mut response = String::new();
 
     let result = backend.generate(request, &mut |event| match event {
         BackendEvent::StatusChanged(status) => {
             on_event(RuntimeEvent::ActivityChanged(map_backend_status(status)));
         }
         BackendEvent::TextDelta(chunk) => {
-            if !started {
-                started = true;
-                conversation.begin_assistant_reply();
-                on_event(RuntimeEvent::ActivityChanged(Activity::Responding));
-                on_event(RuntimeEvent::AssistantMessageStarted);
-            }
-            conversation.push_assistant_chunk(&chunk);
-            on_event(RuntimeEvent::AssistantMessageChunk(chunk));
+            response.push_str(&chunk);
         }
         BackendEvent::Timing { stage, elapsed_ms } => {
             on_event(RuntimeEvent::BackendTiming { stage, elapsed_ms });
@@ -577,12 +1173,20 @@ fn run_generate_turn(
 
     result?;
 
-    if started {
-        on_event(RuntimeEvent::AssistantMessageFinished);
-        Ok(conversation.last_assistant_content().map(|s| s.to_string()))
-    } else {
+    if response.is_empty() {
         Ok(None)
+    } else {
+        conversation.begin_assistant_reply();
+        conversation.push_assistant_chunk(&response);
+        Ok(Some(response))
     }
+}
+
+fn emit_visible_assistant_message(text: &str, on_event: &mut dyn FnMut(RuntimeEvent)) {
+    on_event(RuntimeEvent::ActivityChanged(Activity::Responding));
+    on_event(RuntimeEvent::AssistantMessageStarted);
+    on_event(RuntimeEvent::AssistantMessageChunk(text.to_string()));
+    on_event(RuntimeEvent::AssistantMessageFinished);
 }
 
 fn map_backend_status(status: BackendStatus) -> Activity {
@@ -624,7 +1228,11 @@ mod tests {
             _request: GenerateRequest,
             on_event: &mut dyn FnMut(BackendEvent),
         ) -> crate::app::Result<()> {
-            let reply = self.responses.get(self.call_count).cloned().unwrap_or_default();
+            let reply = self
+                .responses
+                .get(self.call_count)
+                .cloned()
+                .unwrap_or_default();
             self.call_count += 1;
             if !reply.is_empty() {
                 on_event(BackendEvent::TextDelta(reply));
@@ -659,7 +1267,9 @@ mod tests {
     }
 
     fn has_failed(events: &[RuntimeEvent]) -> bool {
-        events.iter().any(|e| matches!(e, RuntimeEvent::Failed { .. }))
+        events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::Failed { .. }))
     }
 
     fn failed_message(events: &[RuntimeEvent]) -> Option<String> {
@@ -695,6 +1305,64 @@ mod tests {
     }
 
     #[test]
+    fn reject_uses_runtime_cancellation_even_if_model_would_claim_success() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(
+            vec![
+                "[write_file]\npath: reject_test_phase75.txt\n---content---\nshould not exist\n[/write_file]",
+                "I created reject_test_phase75.txt.",
+            ],
+            tmp.path(),
+        );
+
+        let submit_events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Create a file reject_test_phase75.txt with the content should not exist"
+                    .into(),
+            },
+        );
+        assert!(
+            !has_failed(&submit_events),
+            "submit failed: {submit_events:?}"
+        );
+        assert!(
+            submit_events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ApprovalRequired(_))),
+            "write_file must request approval"
+        );
+
+        let reject_events = collect_events(&mut rt, RuntimeRequest::Reject);
+        assert!(
+            !has_failed(&reject_events),
+            "reject failed: {reject_events:?}"
+        );
+        assert!(
+            !tmp.path().join("reject_test_phase75.txt").exists(),
+            "rejected write must not create the file"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("Canceled. No file was created")),
+            "runtime cancellation answer must be recorded"
+        );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("I created reject_test_phase75.txt.")),
+            "backend response after reject must not be used"
+        );
+        assert!(fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
     fn submit_while_pending_fires_failed() {
         let mut rt = make_runtime(vec!["hello"]);
         rt.set_pending_for_test(PendingAction {
@@ -703,14 +1371,17 @@ mod tests {
             risk: RiskLevel::Medium,
             payload: "{}".into(),
         });
-        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "continue".into() });
-        assert!(has_failed(&events), "expected Failed, got: {events:?}");
-        assert!(
-            failed_message(&events)
-                .as_deref()
-                .unwrap_or("")
-                .contains("pending"),
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "continue".into(),
+            },
         );
+        assert!(has_failed(&events), "expected Failed, got: {events:?}");
+        assert!(failed_message(&events)
+            .as_deref()
+            .unwrap_or("")
+            .contains("pending"),);
     }
 
     #[test]
@@ -725,7 +1396,10 @@ mod tests {
         collect_events(&mut rt, RuntimeRequest::Reset);
         // After reset, approve should fail with "no pending" — not "submit blocked"
         let events = collect_events(&mut rt, RuntimeRequest::Approve);
-        assert!(has_failed(&events), "expected Failed after reset, got: {events:?}");
+        assert!(
+            has_failed(&events),
+            "expected Failed after reset, got: {events:?}"
+        );
         assert_eq!(
             failed_message(&events).as_deref(),
             Some("No pending action to approve.")
@@ -738,18 +1412,25 @@ mod tests {
         // First call executes; second is blocked with a cycle error.
         // A synthesis response is provided so the loop can complete normally.
         let mut rt = make_runtime(vec!["[list_dir: .][list_dir: .]", "Done."]);
-        collect_events(&mut rt, RuntimeRequest::Submit { text: "list it twice".into() });
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "list it twice".into(),
+            },
+        );
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m| m.content.contains("=== tool_result: list_dir ===")),
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: list_dir ===")),
             "first call must produce a tool result"
         );
         assert!(
-            snapshot.iter().any(|m|
-                m.content.contains("=== tool_error: list_dir ===") &&
-                m.content.contains("identical arguments twice in a row")
-            ),
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: list_dir ===")
+                    && m.content.contains("identical arguments twice in a row")),
             "second identical call must produce a cycle error"
         );
     }
@@ -759,11 +1440,18 @@ mod tests {
         // Two list_dir calls with different paths — neither should be blocked.
         // A synthesis response is provided so the loop can complete normally.
         let mut rt = make_runtime(vec!["[list_dir: .][list_dir: src/]", "Listed both."]);
-        collect_events(&mut rt, RuntimeRequest::Submit { text: "list both".into() });
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "list both".into(),
+            },
+        );
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            !snapshot.iter().any(|m| m.content.contains("identical arguments twice in a row")),
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("identical arguments twice in a row")),
             "different args must not trigger cycle detection"
         );
     }
@@ -773,16 +1461,28 @@ mod tests {
         // After a tool call completes, the model is re-invoked in the same turn.
         // The synthesis response (no tool calls) produces the final AnswerReady event.
         let mut rt = make_runtime(vec!["[list_dir: .]", "The root contains several files."]);
-        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "what is in root?".into() });
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "what is in root?".into(),
+            },
+        );
 
         assert!(!has_failed(&events), "unexpected failure: {events:?}");
 
         // AnswerReady must be ToolAssisted from the synthesis response
         let answer_source = events.iter().find_map(|e| {
-            if let RuntimeEvent::AnswerReady(src) = e { Some(src.clone()) } else { None }
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
         });
         assert!(
-            matches!(answer_source, Some(AnswerSource::ToolAssisted { rounds: 1 })),
+            matches!(
+                answer_source,
+                Some(AnswerSource::ToolAssisted { rounds: 1 })
+            ),
             "expected ToolAssisted(1), got: {answer_source:?}"
         );
 
@@ -793,7 +1493,11 @@ mod tests {
             .iter()
             .filter(|m| m.role == crate::llm::backend::Role::Assistant)
             .collect();
-        assert_eq!(assistant_msgs.len(), 2, "expected tool-call + synthesis, got: {assistant_msgs:?}");
+        assert_eq!(
+            assistant_msgs.len(),
+            2,
+            "expected tool-call + synthesis, got: {assistant_msgs:?}"
+        );
         assert!(
             assistant_msgs[1].content.contains("several files"),
             "synthesis must contain model's response text"
@@ -809,15 +1513,27 @@ mod tests {
             "[list_dir: src/]",
             "Found everything I need.",
         ]);
-        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "explore".into() });
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "explore".into(),
+            },
+        );
 
         assert!(!has_failed(&events), "unexpected failure: {events:?}");
 
         let answer_source = events.iter().find_map(|e| {
-            if let RuntimeEvent::AnswerReady(src) = e { Some(src.clone()) } else { None }
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
         });
         assert!(
-            matches!(answer_source, Some(AnswerSource::ToolAssisted { rounds: 2 })),
+            matches!(
+                answer_source,
+                Some(AnswerSource::ToolAssisted { rounds: 2 })
+            ),
             "expected ToolAssisted(2), got: {answer_source:?}"
         );
 
@@ -826,7 +1542,11 @@ mod tests {
             .iter()
             .filter(|m| m.role == crate::llm::backend::Role::Assistant)
             .collect();
-        assert_eq!(assistant_msgs.len(), 3, "expected two tool calls + synthesis");
+        assert_eq!(
+            assistant_msgs.len(),
+            3,
+            "expected two tool calls + synthesis"
+        );
     }
 
     #[test]
@@ -836,21 +1556,37 @@ mod tests {
         // a correction, and re-invoke the model. The synthesis response closes the loop.
         let malformed = "[test_file]\npath: f.txt\n---content---\nhello\n[/write_file]";
         let mut rt = make_runtime(vec![malformed, "Done."]);
-        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "create f.txt".into() });
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "create f.txt".into(),
+            },
+        );
 
-        assert!(!has_failed(&events), "must not fail permanently: {events:?}");
+        assert!(
+            !has_failed(&events),
+            "must not fail permanently: {events:?}"
+        );
 
         // The final answer must be the synthesis response, not the malformed block.
         let snapshot = rt.messages_snapshot();
-        let last_assistant = snapshot.iter().rev()
+        let last_assistant = snapshot
+            .iter()
+            .rev()
             .find(|m| m.role == crate::llm::backend::Role::Assistant)
             .map(|m| m.content.as_str());
-        assert_eq!(last_assistant, Some("Done."), "last assistant message must be synthesis");
+        assert_eq!(
+            last_assistant,
+            Some("Done."),
+            "last assistant message must be synthesis"
+        );
 
         // The correction message must have been injected into the conversation.
         assert!(
-            snapshot.iter().any(|m| m.content.starts_with("[runtime:correction]") &&
-                m.content.contains("unrecognized opening tag")),
+            snapshot
+                .iter()
+                .any(|m| m.content.starts_with("[runtime:correction]")
+                    && m.content.contains("unrecognized opening tag")),
             "malformed block correction must be in conversation"
         );
     }
@@ -862,27 +1598,513 @@ mod tests {
         // list_dir returns an IO error for a non-existent path, then succeeds on ".".
         // The synthesis response closes the loop.
         let mut rt = make_runtime(vec!["[list_dir: /nonexistent/path][list_dir: .]", "Done."]);
-        collect_events(&mut rt, RuntimeRequest::Submit { text: "list both".into() });
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "list both".into(),
+            },
+        );
 
         let snapshot = rt.messages_snapshot();
         // The error from the first call must appear
         assert!(
-            snapshot.iter().any(|m| m.content.contains("=== tool_error: list_dir ===")),
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: list_dir ===")),
             "first call error must be in conversation"
         );
         // The successful retry must produce a result — no cycle error
         assert!(
-            snapshot.iter().any(|m| m.content.contains("=== tool_result: list_dir ===")),
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: list_dir ===")),
             "successful retry must not be blocked by cycle detection"
         );
         assert!(
-            !snapshot.iter().any(|m|
-                m.content.contains("identical arguments") &&
-                m.content.contains("=== tool_error: list_dir ===") &&
-                m.content.contains(".")
-            ),
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("identical arguments")
+                    && m.content.contains("=== tool_error: list_dir ===")
+                    && m.content.contains(".")),
             "retry with same args after error must not trigger cycle detection"
         );
+    }
+
+    #[test]
+    fn missing_read_file_error_terminates_without_retry_loop() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: missing_file_phase75.rs]",
+                "[read_file: missing_file_phase75.rs]",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Read missing_file_phase75.rs".into(),
+            },
+        );
+        assert!(
+            !has_failed(&events),
+            "missing read should terminate cleanly: {events:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: read_file ===")),
+            "read_file failure must be surfaced as a tool_error"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("No file contents were read.")),
+            "runtime terminal answer must explain that no contents were read"
+        );
+        let assistant_read_calls = snapshot
+            .iter()
+            .filter(|m| {
+                m.role == crate::llm::backend::Role::Assistant
+                    && m.content.contains("[read_file: missing_file_phase75.rs]")
+            })
+            .count();
+        assert_eq!(
+            assistant_read_calls, 1,
+            "read_file must not be retried in a loop"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::AnswerReady(AnswerSource::ToolLimitReached))),
+            "missing read must not hit the tool-round limit"
+        );
+    }
+
+    #[test]
+    fn snake_case_classifier_accepts_valid_identifiers() {
+        assert!(is_snake_case_identifier("run_turns"));
+        assert!(is_snake_case_identifier("search_code"));
+        assert!(is_snake_case_identifier("read_file"));
+        assert!(is_snake_case_identifier("tool_rounds"));
+        assert!(is_snake_case_identifier("investigation_state"));
+        assert!(is_snake_case_identifier("is_snake_case_identifier"));
+    }
+
+    #[test]
+    fn snake_case_classifier_rejects_non_identifiers() {
+        assert!(!is_snake_case_identifier("word")); // no underscore
+        assert!(!is_snake_case_identifier("a_b")); // segments too short
+        assert!(!is_snake_case_identifier("_leading")); // empty first segment
+        assert!(!is_snake_case_identifier("trailing_")); // empty last segment
+        assert!(!is_snake_case_identifier("has space")); // whitespace
+        assert!(!is_snake_case_identifier("run_turns()")); // non-alphanumeric
+    }
+
+    #[test]
+    fn pascal_case_classifier_accepts_valid_identifiers() {
+        assert!(is_pascal_case_identifier("AnswerSource"));
+        assert!(is_pascal_case_identifier("RuntimeTerminalReason"));
+        assert!(is_pascal_case_identifier("InvestigationState"));
+        assert!(is_pascal_case_identifier("ToolInput"));
+        assert!(is_pascal_case_identifier("SearchBudget"));
+    }
+
+    #[test]
+    fn pascal_case_classifier_rejects_non_identifiers() {
+        assert!(!is_pascal_case_identifier("Hi")); // too short
+        assert!(!is_pascal_case_identifier("Short")); // no second uppercase after first
+        assert!(!is_pascal_case_identifier("allower")); // starts lowercase
+        assert!(!is_pascal_case_identifier("Done")); // 4 chars, too short
+    }
+
+    #[test]
+    fn prompt_requires_investigation_detects_snake_case() {
+        assert!(prompt_requires_investigation("What does run_turns do?"));
+        assert!(prompt_requires_investigation("Explain search_code to me."));
+        assert!(prompt_requires_investigation("Where is read_file defined?"));
+    }
+
+    #[test]
+    fn prompt_requires_investigation_detects_pascal_case() {
+        assert!(prompt_requires_investigation("What is AnswerSource?"));
+        assert!(prompt_requires_investigation("Explain InvestigationState"));
+        assert!(prompt_requires_investigation(
+            "How does RuntimeTerminalReason work?"
+        ));
+    }
+
+    #[test]
+    fn prompt_requires_investigation_detects_natural_language_lookup() {
+        assert!(prompt_requires_investigation(
+            "Find where logging is initialized"
+        ));
+        assert!(prompt_requires_investigation(
+            "Find where sessions are saved"
+        ));
+        assert!(prompt_requires_investigation(
+            "Where is configuration loaded?"
+        ));
+    }
+
+    #[test]
+    fn prompt_requires_investigation_rejects_plain_questions() {
+        assert!(!prompt_requires_investigation("How are you?"));
+        assert!(!prompt_requires_investigation("What time is it?"));
+        assert!(!prompt_requires_investigation(
+            "Can you help me with something?"
+        ));
+        assert!(!prompt_requires_investigation(
+            "What is the purpose of this project?"
+        ));
+    }
+
+    #[test]
+    fn mutation_intent_classifier_ignores_tool_name_mentions() {
+        assert!(!user_requested_mutation("Where is write_file implemented?"));
+        assert!(!user_requested_mutation("How does edit_file recover?"));
+        assert!(user_requested_mutation("Create a file named demo.txt"));
+        assert!(user_requested_mutation(
+            "Edit src/main.rs and change hello to hi"
+        ));
+    }
+
+    #[test]
+    fn requested_read_path_detects_explicit_file_reads() {
+        assert_eq!(
+            requested_read_path("Read missing_file_phase84x.rs").as_deref(),
+            Some("missing_file_phase84x.rs")
+        );
+        assert_eq!(
+            requested_read_path("read file `src/runtime/engine.rs`").as_deref(),
+            Some("src/runtime/engine.rs")
+        );
+        assert_eq!(requested_read_path("Read about logging"), None);
+    }
+
+    #[test]
+    fn premature_investigation_answer_is_not_admitted() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(
+            vec!["run_turns drives the loop.", "It still drives the loop."],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "What does run_turns do?".into(),
+            },
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "premature direct answers must not be admitted: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content == "run_turns drives the loop."),
+            "pre-evidence prose is kept in the trace"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("No final answer was accepted")),
+            "runtime terminal must explain that no grounded answer was accepted"
+        );
+    }
+
+    #[test]
+    fn search_results_require_matched_read_before_synthesis() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: run_turns]",
+                "run_turns is in engine.rs.",
+                "It is definitely in engine.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "What does run_turns do?".into(),
+            },
+        );
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.starts_with("[runtime:correction]")
+                    && m.content.contains("no matched file has been read")
+            }),
+            "runtime must require read_file after non-empty search"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "unread search results must not admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn read_must_come_from_current_search_results() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
+        fs::write(tmp.path().join("notes.rs"), "fn unrelated() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: run_turns]",
+                "[read_file: notes.rs]",
+                "notes.rs explains it.",
+                "Still enough.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "What does run_turns do?".into(),
+            },
+        );
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "unmatched read still executes as normal context"
+        );
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.starts_with("[runtime:correction]")
+                    && m.content.contains("no matched file has been read")
+            }),
+            "unmatched read must not satisfy evidence readiness"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "read outside search candidates must not admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn mutating_tool_is_blocked_on_informational_turn() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("engine.rs"), "fn write_file() {}\n").unwrap();
+        let blocked_path = tmp.path().join("should_not_exist.txt");
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[write_file]\npath: should_not_exist.txt\n---content---\nnope\n[/write_file]",
+                "[search_code: write_file]",
+                "[read_file: engine.rs]",
+                "write_file is implemented in engine.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is write_file implemented?".into(),
+            },
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ApprovalRequired(_))),
+            "read-only informational turn must not create a pending mutation"
+        );
+        assert!(
+            !blocked_path.exists(),
+            "blocked write_file must not create a file"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.contains("=== tool_error: write_file ===")
+                    && m.content.contains("mutating tools are not allowed")
+            }),
+            "blocked mutation must be surfaced as a tool error"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "turn should continue with allowed read-only tools: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_prose_and_tool_call_does_not_admit_prose() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
+        let mut rt = make_runtime_in(
+            vec![
+                "It is probably in engine.rs.\n[search_code: run_turns]",
+                "[read_file: engine.rs]",
+                "run_turns is in engine.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is run_turns defined?".into(),
+            },
+        );
+
+        let answer_ready_count = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AnswerReady(_)))
+            .count();
+        assert_eq!(
+            answer_ready_count, 1,
+            "only final synthesis may be admitted"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("It is probably in engine.rs.")),
+            "mixed pre-evidence prose remains trace context but is not admitted"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "final grounded answer should be tool-assisted: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_pre_evidence_synthesis_is_suppressed_until_read() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "run_turns drives the loop.",
+                "[search_code: run_turns]",
+                "run_turns is in engine.rs.",
+                "[read_file: engine.rs]",
+                "run_turns is grounded in engine.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "What does run_turns do?".into(),
+            },
+        );
+
+        let answer_sources: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let RuntimeEvent::AnswerReady(src) = e {
+                    Some(src.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(answer_sources.len(), 1, "only one answer may be admitted");
+        assert!(
+            matches!(answer_sources[0], AnswerSource::ToolAssisted { .. }),
+            "the single admitted answer must be after evidence-ready"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some("run_turns is grounded in engine.rs."));
     }
 
     #[test]
@@ -903,14 +2125,19 @@ mod tests {
             "[search_code: ToolInput][search_code: EditFile]",
             "Done.",
         ]);
-        collect_events(&mut rt, RuntimeRequest::Submit { text: "search".into() });
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "search".into(),
+            },
+        );
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m|
-                m.content.contains("=== tool_error: search_code ===") &&
-                m.content.contains("search budget exceeded")
-            ),
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: search_code ===")
+                    && m.content.contains("search budget exceeded")),
             "second search must be blocked with budget error when first had results"
         );
     }
@@ -931,11 +2158,20 @@ mod tests {
             ],
             tmp.path(),
         );
-        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "find logging".into() });
-        assert!(!has_failed(&events), "must not fail permanently: {events:?}");
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "find logging".into(),
+            },
+        );
+        assert!(
+            !has_failed(&events),
+            "must not fail permanently: {events:?}"
+        );
 
         let snapshot = rt.messages_snapshot();
-        let all_user: String = snapshot.iter()
+        let all_user: String = snapshot
+            .iter()
             .filter(|m| m.role == crate::llm::backend::Role::User)
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
@@ -950,10 +2186,14 @@ mod tests {
             "closed-search guidance must be injected after the first successful search"
         );
         assert!(
-            !snapshot.iter().any(|m| m.content.contains("Let me try another search")),
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("Let me try another search")),
             "narrated retry assistant message must be discarded from model context"
         );
-        let last_assistant = snapshot.iter().rev()
+        let last_assistant = snapshot
+            .iter()
+            .rev()
             .find(|m| m.role == crate::llm::backend::Role::Assistant)
             .map(|m| m.content.as_str());
         assert_eq!(last_assistant, Some(synthesis));
@@ -961,26 +2201,39 @@ mod tests {
 
     #[test]
     fn search_budget_closes_after_empty_retry_across_rounds() {
+        // Phase 8.3: after two empty searches and the third attempt discarded, the runtime
+        // now emits the insufficient-evidence terminal answer rather than letting the model
+        // synthesize without any grounded evidence.
         use std::fs;
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.rs"), "fn unrelated() {}").unwrap();
-        let synthesis = "No matching code was found for those searches.";
 
         let mut rt = make_runtime_in(
             vec![
                 "[search_code: logging initialization]",
                 "[search_code: logger initialization]",
                 "Trying one more.\n[search_code: tracing]",
-                synthesis,
+                // This response is never consumed — R4 fires before invoking the backend.
+                "No matching code was found for those searches.",
             ],
             tmp.path(),
         );
-        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "find logging".into() });
-        assert!(!has_failed(&events), "must not fail permanently: {events:?}");
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "find logging".into(),
+            },
+        );
+        assert!(
+            !has_failed(&events),
+            "must not fail permanently: {events:?}"
+        );
 
+        // Search budget behavior is unchanged.
         let snapshot = rt.messages_snapshot();
-        let all_user: String = snapshot.iter()
+        let all_user: String = snapshot
+            .iter()
             .filter(|m| m.role == crate::llm::backend::Role::User)
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
@@ -995,13 +2248,36 @@ mod tests {
             "empty-retry terminal guidance must be injected"
         );
         assert!(
-            !snapshot.iter().any(|m| m.content.contains("Trying one more")),
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("Trying one more")),
             "third narrated search must be discarded from model context"
         );
-        let last_assistant = snapshot.iter().rev()
+
+        // Phase 8.3: runtime-owned insufficient-evidence terminal fires instead of model synthesis.
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::InsufficientEvidence, ..
+            })),
+            "empty-search no-read turn must produce InsufficientEvidence terminal: {answer_source:?}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
             .find(|m| m.role == crate::llm::backend::Role::Assistant)
             .map(|m| m.content.as_str());
-        assert_eq!(last_assistant, Some(synthesis));
+        assert_eq!(
+            last_assistant,
+            Some(insufficient_evidence_final_answer()),
+            "last assistant message must be the runtime terminal, not model synthesis"
+        );
     }
 
     #[test]
@@ -1014,18 +2290,29 @@ mod tests {
         fs::write(tmp.path().join("file.rs"), "fn find_me() {}").unwrap();
 
         let mut rt = make_runtime_in(
-            vec!["[search_code: no_match_here][search_code: find_me]", "Found it."],
+            vec![
+                "[search_code: no_match_here][search_code: find_me]",
+                "Found it.",
+            ],
             tmp.path(),
         );
-        collect_events(&mut rt, RuntimeRequest::Submit { text: "search".into() });
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "search".into(),
+            },
+        );
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            !snapshot.iter().any(|m| m.content.contains("search budget exceeded")),
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("search budget exceeded")),
             "second search must be allowed when first returned empty"
         );
         // Both results land in the same accumulated user message, so count occurrences.
-        let all_user: String = snapshot.iter()
+        let all_user: String = snapshot
+            .iter()
             .filter(|m| m.role == crate::llm::backend::Role::User)
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
@@ -1044,14 +2331,24 @@ mod tests {
 
         // first=empty, second=empty (allowed by budget), third=blocked regardless
         let mut rt = make_runtime_in(
-            vec!["[search_code: no_match_a][search_code: no_match_b][search_code: find_me]", "Done."],
+            vec![
+                "[search_code: no_match_a][search_code: no_match_b][search_code: find_me]",
+                "Done.",
+            ],
             tmp.path(),
         );
-        collect_events(&mut rt, RuntimeRequest::Submit { text: "triple search".into() });
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "triple search".into(),
+            },
+        );
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m| m.content.contains("search budget exceeded")),
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("search budget exceeded")),
             "third search must always be blocked regardless of prior results"
         );
     }
@@ -1063,26 +2360,84 @@ mod tests {
         // Engine must inject EDIT_REPAIR_CORRECTION rather than accepting as Direct.
         // Third response: synthesis after correction.
         let bad_edit = "[edit_file]\npath: foo.rs\n---replace---\nnew text\n[/edit_file]";
-        let garbled_repair = "[edit_file]\npath: foo.rs\nFind: old text\nReplace: new text\n[/edit_file]";
+        let garbled_repair =
+            "[edit_file]\npath: foo.rs\nFind: old text\nReplace: new text\n[/edit_file]";
         let synthesis = "I was unable to apply the edit.";
 
         let mut rt = make_runtime(vec![bad_edit, garbled_repair, synthesis]);
-        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "edit foo.rs".into() });
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "edit foo.rs".into(),
+            },
+        );
 
-        assert!(!has_failed(&events), "must not fail permanently: {events:?}");
+        assert!(
+            !has_failed(&events),
+            "must not fail permanently: {events:?}"
+        );
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m|
-                m.content.starts_with("[runtime:correction]") &&
-                m.content.contains("edit_file")
-            ),
+            snapshot
+                .iter()
+                .any(|m| m.content.starts_with("[runtime:correction]")
+                    && m.content.contains("edit_file")),
             "edit repair correction must be injected: {snapshot:?}"
         );
-        let last_assistant = snapshot.iter().rev()
+        let last_assistant = snapshot
+            .iter()
+            .rev()
             .find(|m| m.role == crate::llm::backend::Role::Assistant)
             .map(|m| m.content.as_str());
         assert_eq!(last_assistant, Some(synthesis));
+    }
+
+    #[test]
+    fn edit_old_new_content_format_requests_approval_and_executes() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("test_phase82.txt");
+        fs::write(&file, "hello world").unwrap();
+
+        let edit = "[edit_file]\npath: test_phase82.txt\nold content: hello world\nnew content: hello params\n[/edit_file]";
+        let mut rt = make_runtime_in(vec![edit, "Updated."], tmp.path());
+
+        let submit_events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Edit test_phase82.txt and change hello world to hello params".into(),
+            },
+        );
+        assert!(
+            !has_failed(&submit_events),
+            "submit failed: {submit_events:?}"
+        );
+        assert!(
+            submit_events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ApprovalRequired(p)
+                if p.tool_name == "edit_file")),
+            "edit must request approval instead of falling back to Direct: {submit_events:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
+
+        let approve_events = collect_events(&mut rt, RuntimeRequest::Approve);
+        assert!(
+            !has_failed(&approve_events),
+            "approve failed: {approve_events:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "hello params");
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: edit_file ===")),
+            "approved edit result must be injected: {snapshot:?}"
+        );
     }
 
     #[test]
@@ -1116,7 +2471,9 @@ mod tests {
 
         // Synthesis must have fired — AssistantMessageChunk is emitted during synthesis.
         assert!(
-            events.iter().any(|e| matches!(e, RuntimeEvent::AssistantMessageChunk(_))),
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::AssistantMessageChunk(_))),
             "approve must trigger synthesis: no AssistantMessageChunk in events"
         );
 
@@ -1128,14 +2485,20 @@ mod tests {
         );
         // Tool result must be present.
         assert!(
-            snapshot.iter().any(|m| m.content.contains("=== tool_result: edit_file ===")),
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: edit_file ===")),
             "tool result must be in conversation after approve"
         );
         // The final assistant message must be the synthesis response, not a tool call.
-        let last_assistant = snapshot.iter().rev()
+        let last_assistant = snapshot
+            .iter()
+            .rev()
             .find(|m| m.role == crate::llm::backend::Role::Assistant);
         assert!(
-            last_assistant.map(|m| m.content.contains("Done")).unwrap_or(false),
+            last_assistant
+                .map(|m| m.content.contains("Done"))
+                .unwrap_or(false),
             "last assistant message must be the synthesis response"
         );
     }

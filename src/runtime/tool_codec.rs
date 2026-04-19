@@ -7,7 +7,6 @@
 ///
 /// When the protocol format changes, only this module changes.
 /// engine.rs and prompt.rs are unaffected.
-
 use std::collections::HashMap;
 
 use crate::tools::{EntryKind, ToolInput, ToolOutput};
@@ -23,6 +22,8 @@ const SEARCH_CODE_CLOSE: &str = "[/search_code]";
 const SEARCH_DELIM: &str = "---search---";
 const REPLACE_DELIM: &str = "---replace---";
 const CONTENT_DELIM: &str = "---content---";
+const OLD_CONTENT_LABEL: &str = "old content:";
+const NEW_CONTENT_LABEL: &str = "new content:";
 // Line-anchored form: require delimiter to appear at the start of a line
 // so occurrences embedded mid-line in content are not mistaken for delimiters.
 const REPLACE_LINE: &str = "\n---replace---";
@@ -53,7 +54,9 @@ fn code_fence_ranges(text: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut pos = 0;
     while pos < text.len() {
-        let Some(rel) = text[pos..].find("```") else { break };
+        let Some(rel) = text[pos..].find("```") else {
+            break;
+        };
         let open = pos + rel;
         let after_marker = open + 3;
         // Skip the optional language tag on the opening fence line (e.g. ```rust)
@@ -62,7 +65,9 @@ fn code_fence_ranges(text: &str) -> Vec<(usize, usize)> {
             .map(|r| after_marker + r + 1)
             .unwrap_or(text.len());
         // Find the closing ``` — take the first one after content_start
-        let Some(close_rel) = text[content_start..].find("```") else { break };
+        let Some(close_rel) = text[content_start..].find("```") else {
+            break;
+        };
         let close_end = content_start + close_rel + 3;
         ranges.push((open, close_end));
         pos = close_end;
@@ -86,11 +91,15 @@ fn scan_bracket_calls(text: &str) -> Vec<(usize, ToolInput)> {
     for (tool_name, prefix) in named_tools {
         let mut search_start = 0;
         while search_start < text.len() {
-            let Some(rel) = text[search_start..].find(prefix) else { break };
+            let Some(rel) = text[search_start..].find(prefix) else {
+                break;
+            };
             let open_abs = search_start + rel;
             let after_colon = open_abs + prefix.len();
 
-            let Some(bracket_rel) = text[after_colon..].find(']') else { break };
+            let Some(bracket_rel) = text[after_colon..].find(']') else {
+                break;
+            };
             let bracket_abs = after_colon + bracket_rel;
 
             let arg_text = &text[after_colon..bracket_abs];
@@ -113,9 +122,15 @@ fn scan_bracket_calls(text: &str) -> Vec<(usize, ToolInput)> {
 
 fn make_bracket_input(tool_name: &str, arg: &str) -> Option<ToolInput> {
     match tool_name {
-        "read_file" if !arg.is_empty() => Some(ToolInput::ReadFile { path: arg.to_string() }),
+        "read_file" if !arg.is_empty() => Some(ToolInput::ReadFile {
+            path: arg.to_string(),
+        }),
         "list_dir" => Some(ToolInput::ListDir {
-            path: if arg.is_empty() { ".".to_string() } else { arg.to_string() },
+            path: if arg.is_empty() {
+                ".".to_string()
+            } else {
+                arg.to_string()
+            },
         }),
         "search_code" if !arg.is_empty() => Some(ToolInput::SearchCode {
             query: arg.to_string(),
@@ -126,7 +141,10 @@ fn make_bracket_input(tool_name: &str, arg: &str) -> Option<ToolInput> {
             if path.is_empty() {
                 return None;
             }
-            Some(ToolInput::WriteFile { path, content: String::new() })
+            Some(ToolInput::WriteFile {
+                path,
+                content: String::new(),
+            })
         }
         _ => None,
     }
@@ -196,7 +214,8 @@ fn scan_search_code_blocks(text: &str) -> Vec<(usize, ToolInput)> {
                 if let Some(input) = parse_search_code_block(block) {
                     results.push((offset + open_pos, input));
                 }
-                let advance = open_pos + SEARCH_CODE_OPEN.len() + close_pos + SEARCH_CODE_CLOSE.len();
+                let advance =
+                    open_pos + SEARCH_CODE_OPEN.len() + close_pos + SEARCH_CODE_CLOSE.len();
                 offset += advance;
                 remaining = &remaining[advance..];
             }
@@ -228,7 +247,10 @@ fn parse_search_code_block(block: &str) -> Option<ToolInput> {
             line
         };
         if !query.is_empty() {
-            return Some(ToolInput::SearchCode { query: query.to_string(), path: None });
+            return Some(ToolInput::SearchCode {
+                query: query.to_string(),
+                path: None,
+            });
         }
     }
     None
@@ -247,7 +269,11 @@ fn parse_edit_block(block: &str) -> Option<ToolInput> {
         let search = trim_block_content(&after_search[..replace_nl_offset]);
         let replace = trim_block_content(&block[replace_pos + REPLACE_DELIM.len()..]);
 
-        Some(ToolInput::EditFile { path, search, replace })
+        Some(ToolInput::EditFile {
+            path,
+            search,
+            replace,
+        })
     } else if let Some(replace_nl_pos) = block.find(REPLACE_LINE) {
         // Partial form: ---replace--- present but ---search--- absent.
         // Parse what we can and produce an empty search string. The empty-search
@@ -255,9 +281,16 @@ fn parse_edit_block(block: &str) -> Option<ToolInput> {
         // rather than silently discarding the block as a non-tool-call.
         let path = parse_kvs(&block[..replace_nl_pos]).get("path")?.clone();
         let replace = trim_block_content(&block[replace_nl_pos + REPLACE_LINE.len()..]);
-        Some(ToolInput::EditFile { path, search: String::new(), replace })
+        Some(ToolInput::EditFile {
+            path,
+            search: String::new(),
+            replace,
+        })
     } else if let Some(input) = parse_edit_block_conflict_style(block) {
         // <<<<<<< SEARCH / ======= / >>>>>>> REPLACE (Aider/git conflict style)
+        Some(input)
+    } else if let Some(input) = parse_edit_block_labeled_content(block) {
+        // old content: ... / new content: ... (observed local-model drift)
         Some(input)
     } else {
         // Generic fallback: any ---xxx--- / ---yyy--- delimiter pair.
@@ -281,7 +314,10 @@ fn parse_edit_block_conflict_style(block: &str) -> Option<ToolInput> {
 
     // Skip the rest of the <<<<<<< ... opening line to reach content
     let after_marker = &block[search_marker + "<<<<<<<".len()..];
-    let content_start = after_marker.find('\n').map(|p| &after_marker[p + 1..]).unwrap_or(after_marker);
+    let content_start = after_marker
+        .find('\n')
+        .map(|p| &after_marker[p + 1..])
+        .unwrap_or(after_marker);
 
     // ======= separator must appear at the start of a line
     let sep_pos = content_start.find("\n=======")?;
@@ -294,7 +330,56 @@ fn parse_edit_block_conflict_style(block: &str) -> Option<ToolInput> {
     let replace_end = after_sep.find("\n>>>>>>>").unwrap_or(after_sep.len());
     let replace_text = trim_block_content(&after_sep[..replace_end]);
 
-    Some(ToolInput::EditFile { path, search: search_text, replace: replace_text })
+    Some(ToolInput::EditFile {
+        path,
+        search: search_text,
+        replace: replace_text,
+    })
+}
+
+/// Parses the narrow label style observed from local models:
+///
+///   old content: text to find
+///   new content: replacement text
+///
+/// This is intentionally scoped to `edit_file` and these exact labels. It is not a
+/// general key/value edit parser.
+fn parse_edit_block_labeled_content(block: &str) -> Option<ToolInput> {
+    let (old_line_start, old_value_start) = find_label_line(block, OLD_CONTENT_LABEL, 0)?;
+    let (new_line_start, new_value_start) =
+        find_label_line(block, NEW_CONTENT_LABEL, old_value_start)?;
+    let path = parse_kvs(&block[..old_line_start]).get("path")?.clone();
+    let search_text = trim_labeled_content(&block[old_value_start..new_line_start]);
+    let replace_text = trim_labeled_content(&block[new_value_start..]);
+    Some(ToolInput::EditFile {
+        path,
+        search: search_text,
+        replace: replace_text,
+    })
+}
+
+fn find_label_line(block: &str, label: &str, start_at: usize) -> Option<(usize, usize)> {
+    let mut pos = 0usize;
+    for raw_line in block.split_inclusive('\n') {
+        if pos < start_at {
+            pos += raw_line.len();
+            continue;
+        }
+
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let trimmed = line.trim_start();
+        let leading = line.len() - trimmed.len();
+        if trimmed.starts_with(label) {
+            return Some((pos, pos + leading + label.len()));
+        }
+        pos += raw_line.len();
+    }
+    None
+}
+
+fn trim_labeled_content(s: &str) -> String {
+    let s = s.trim_start_matches(|c| c == ' ' || c == '\t');
+    trim_block_content(s)
 }
 
 /// Returns true for lines of the form `---word(s)---` that are not the canonical
@@ -337,7 +422,11 @@ fn parse_edit_block_generic_delimiters(block: &str) -> Option<ToolInput> {
     let search_text = trim_block_content(&block[search_start..d2_start]);
     let replace_start = (d2_end + 1).min(block.len());
     let replace_text = trim_block_content(&block[replace_start..]);
-    Some(ToolInput::EditFile { path, search: search_text, replace: replace_text })
+    Some(ToolInput::EditFile {
+        path,
+        search: search_text,
+        replace: replace_text,
+    })
 }
 
 fn parse_write_block(block: &str) -> Option<ToolInput> {
@@ -577,21 +666,30 @@ mod tests {
         // Must not be treated as a real invocation.
         let text = "Here is how you use it:\n```\n[write_file: path/to/file.rs]\n```\nThat creates a file.";
         let calls = parse_all_tool_inputs(text);
-        assert!(calls.is_empty(), "tool syntax inside code fence must not execute: {calls:?}");
+        assert!(
+            calls.is_empty(),
+            "tool syntax inside code fence must not execute: {calls:?}"
+        );
     }
 
     #[test]
     fn tool_call_inside_fenced_code_block_with_language_tag_is_not_executed() {
         let text = "Example:\n```rust\n[read_file: src/main.rs]\n```\nDone.";
         let calls = parse_all_tool_inputs(text);
-        assert!(calls.is_empty(), "tool syntax inside fenced block must not execute: {calls:?}");
+        assert!(
+            calls.is_empty(),
+            "tool syntax inside fenced block must not execute: {calls:?}"
+        );
     }
 
     #[test]
     fn block_tool_inside_code_fence_is_not_executed() {
         let text = "Use this form:\n```\n[write_file]\npath: foo.rs\n---content---\nhello\n[/write_file]\n```";
         let calls = parse_all_tool_inputs(text);
-        assert!(calls.is_empty(), "block tool syntax inside code fence must not execute: {calls:?}");
+        assert!(
+            calls.is_empty(),
+            "block tool syntax inside code fence must not execute: {calls:?}"
+        );
     }
 
     #[test]
@@ -643,8 +741,10 @@ mod tests {
         let text = "[search_code: fn main]";
         let calls = parse_all_tool_inputs(text);
         assert_eq!(calls.len(), 1);
-        assert!(matches!(&calls[0], ToolInput::SearchCode { query, path: None }
-            if query == "fn main"));
+        assert!(
+            matches!(&calls[0], ToolInput::SearchCode { query, path: None }
+            if query == "fn main")
+        );
     }
 
     #[test]
@@ -663,8 +763,10 @@ mod tests {
         let text = "[search_code]\npattern=logging\n[/search_code]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
-            if query == "logging"));
+        assert!(
+            matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "logging")
+        );
     }
 
     #[test]
@@ -673,8 +775,10 @@ mod tests {
         let text = "[search_code]\npattern: log\n[/search_code]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
-            if query == "log"));
+        assert!(
+            matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "log")
+        );
     }
 
     #[test]
@@ -682,8 +786,10 @@ mod tests {
         let text = "[search_code]\nquery: fn main\n[/search_code]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
-            if query == "fn main"));
+        assert!(
+            matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "fn main")
+        );
     }
 
     #[test]
@@ -691,8 +797,10 @@ mod tests {
         let text = "[search_code]\nquery=fn main\n[/search_code]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
-            if query == "fn main"));
+        assert!(
+            matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "fn main")
+        );
     }
 
     #[test]
@@ -700,8 +808,10 @@ mod tests {
         let text = "[search_code]\nfn main\n[/search_code]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        assert!(matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
-            if query == "fn main"));
+        assert!(
+            matches!(&inputs[0], ToolInput::SearchCode { query, path: None }
+            if query == "fn main")
+        );
     }
 
     #[test]
@@ -756,7 +866,8 @@ mod tests {
 
     #[test]
     fn parses_valid_write_block() {
-        let text = "[write_file]\npath: src/new.rs\n---content---\npub fn hello() {}\n[/write_file]";
+        let text =
+            "[write_file]\npath: src/new.rs\n---content---\npub fn hello() {}\n[/write_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
         assert!(matches!(&inputs[0], ToolInput::WriteFile { path, content }
@@ -832,7 +943,8 @@ mod tests {
     #[test]
     fn write_block_absolute_path_is_accepted() {
         // Regression: model was observed emitting absolute paths.
-        let text = "[write_file]\npath: /Users/user/project/test.txt\n---content---\nhello\n[/write_file]";
+        let text =
+            "[write_file]\npath: /Users/user/project/test.txt\n---content---\nhello\n[/write_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
         assert!(matches!(&inputs[0], ToolInput::WriteFile { path, .. }
@@ -846,8 +958,10 @@ mod tests {
         let text = "[edit_file]\npath: src/lib.rs\n---search---\nfn old() {}\n---replace---\nfn new() {}\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        assert!(matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
-            if path == "src/lib.rs" && search == "fn old() {}" && replace == "fn new() {}"));
+        assert!(
+            matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "src/lib.rs" && search == "fn old() {}" && replace == "fn new() {}")
+        );
     }
 
     #[test]
@@ -858,8 +972,10 @@ mod tests {
         let text = "[edit_file]\npath: src/lib.rs\n---replace---\nfn new() {}\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        assert!(matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
-            if path == "src/lib.rs" && search.is_empty() && replace == "fn new() {}"));
+        assert!(
+            matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "src/lib.rs" && search.is_empty() && replace == "fn new() {}")
+        );
     }
 
     #[test]
@@ -880,7 +996,10 @@ mod tests {
         let text = "[edit_file]\npath: src/lib.rs\n---search---\n// see ---replace--- below\n---replace---\n// fixed\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        let ToolInput::EditFile { search, replace, .. } = &inputs[0] else {
+        let ToolInput::EditFile {
+            search, replace, ..
+        } = &inputs[0]
+        else {
             panic!("expected EditFile");
         };
         assert_eq!(search, "// see ---replace--- below");
@@ -893,9 +1012,15 @@ mod tests {
         // The parser must accept this and extract search/replace correctly.
         let text = "[edit_file]\npath: src/lib.rs\n<<<<<<< SEARCH\nfn old() {}\n=======\nfn new() {}\n>>>>>>> REPLACE\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
-        assert_eq!(inputs.len(), 1, "conflict-style edit block must parse: {inputs:?}");
-        assert!(matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
-            if path == "src/lib.rs" && search == "fn old() {}" && replace == "fn new() {}"));
+        assert_eq!(
+            inputs.len(),
+            1,
+            "conflict-style edit block must parse: {inputs:?}"
+        );
+        assert!(
+            matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "src/lib.rs" && search == "fn old() {}" && replace == "fn new() {}")
+        );
     }
 
     #[test]
@@ -903,9 +1028,36 @@ mod tests {
         let text = "[edit_file]\npath: src/lib.rs\n<<<<<<< SEARCH\nfn old() {\n    1\n}\n=======\nfn new() {\n    2\n}\n>>>>>>> REPLACE\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        let ToolInput::EditFile { search, replace, .. } = &inputs[0] else { panic!() };
+        let ToolInput::EditFile {
+            search, replace, ..
+        } = &inputs[0]
+        else {
+            panic!()
+        };
         assert!(search.contains("fn old()") && search.contains("1"));
         assert!(replace.contains("fn new()") && replace.contains("2"));
+    }
+
+    #[test]
+    fn edit_block_old_new_content_labels_are_accepted() {
+        let text = "[edit_file]\npath: test_phase82.txt\nold content: hello world\nnew content: hello params\n[/edit_file]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(
+            matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "test_phase82.txt" && search == "hello world" && replace == "hello params")
+        );
+    }
+
+    #[test]
+    fn edit_block_old_new_content_labels_support_multiline_values() {
+        let text = "[edit_file]\npath: src/lib.rs\nold content:\nfn old() {\n    println!(\"old\");\n}\nnew content:\nfn new() {\n    println!(\"new\");\n}\n[/edit_file]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        assert!(
+            matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "src/lib.rs" && search.contains("println!(\"old\")") && replace.contains("println!(\"new\")"))
+        );
     }
 
     #[test]
@@ -914,9 +1066,15 @@ mod tests {
         // the canonical ---search---/---replace--- markers. Must still parse correctly.
         let text = "[edit_file]\npath: test_phase82.txt\n---text to find---\nhello world\n---replacement text---\nhello params\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
-        assert_eq!(inputs.len(), 1, "generic delimiter edit block must parse: {inputs:?}");
-        assert!(matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
-            if path == "test_phase82.txt" && search == "hello world" && replace == "hello params"));
+        assert_eq!(
+            inputs.len(),
+            1,
+            "generic delimiter edit block must parse: {inputs:?}"
+        );
+        assert!(
+            matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "test_phase82.txt" && search == "hello world" && replace == "hello params")
+        );
     }
 
     #[test]
@@ -924,7 +1082,12 @@ mod tests {
         let text = "[edit_file]\npath: src/lib.rs\n---find---\nfn old() {\n    1\n}\n---with---\nfn new() {\n    2\n}\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        let ToolInput::EditFile { search, replace, .. } = &inputs[0] else { panic!() };
+        let ToolInput::EditFile {
+            search, replace, ..
+        } = &inputs[0]
+        else {
+            panic!()
+        };
         assert!(search.contains("fn old()") && search.contains("1"));
         assert!(replace.contains("fn new()") && replace.contains("2"));
     }
@@ -941,7 +1104,10 @@ mod tests {
         let text = "[edit_file]\npath: src/lib.rs\n---search---\nfn old() {\n    println!(\"old\");\n}\n---replace---\nfn new() {\n    println!(\"new\");\n}\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
-        let ToolInput::EditFile { search, replace, .. } = &inputs[0] else {
+        let ToolInput::EditFile {
+            search, replace, ..
+        } = &inputs[0]
+        else {
             panic!("expected EditFile");
         };
         assert!(search.contains("println!(\"old\")"));
@@ -979,8 +1145,8 @@ mod tests {
 
     #[test]
     fn format_tool_result_wraps_body() {
-        use crate::tools::ToolOutput;
         use crate::tools::types::FileContentsOutput;
+        use crate::tools::ToolOutput;
         let output = ToolOutput::FileContents(FileContentsOutput {
             path: "x.rs".into(),
             contents: "fn main() {}".into(),
@@ -996,8 +1162,8 @@ mod tests {
 
     #[test]
     fn render_output_includes_metadata_line_for_untruncated_file() {
-        use crate::tools::ToolOutput;
         use crate::tools::types::FileContentsOutput;
+        use crate::tools::ToolOutput;
         let output = ToolOutput::FileContents(FileContentsOutput {
             path: "x.rs".into(),
             contents: "line 1\nline 2".into(),
@@ -1010,10 +1176,13 @@ mod tests {
 
     #[test]
     fn render_output_includes_truncation_notice_for_large_file() {
-        use crate::tools::ToolOutput;
         use crate::tools::types::FileContentsOutput;
+        use crate::tools::ToolOutput;
         // Simulate a 412-line file where only 200 lines are in contents
-        let shown_content: String = (0..200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let shown_content: String = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let output = ToolOutput::FileContents(FileContentsOutput {
             path: "big.rs".into(),
             contents: shown_content,
@@ -1021,9 +1190,15 @@ mod tests {
             truncated: true,
         });
         let body = render_output(&output);
-        assert!(body.starts_with("[412 lines — showing first 200]"), "got: {body}");
+        assert!(
+            body.starts_with("[412 lines — showing first 200]"),
+            "got: {body}"
+        );
         assert!(body.contains("line 0"));
-        assert!(body.ends_with("[truncated: 212 lines not shown]"), "got: {body}");
+        assert!(
+            body.ends_with("[truncated: 212 lines not shown]"),
+            "got: {body}"
+        );
     }
 
     #[test]
@@ -1084,8 +1259,12 @@ mod tests {
 
     #[test]
     fn contains_fabricated_exchange_detects_tool_result_blocks() {
-        assert!(contains_fabricated_exchange("=== tool_result: read_file ===\nsome content\n=== /tool_result ==="));
-        assert!(contains_fabricated_exchange("=== tool_error: read_file ===\nfailed\n=== /tool_error ==="));
+        assert!(contains_fabricated_exchange(
+            "=== tool_result: read_file ===\nsome content\n=== /tool_result ==="
+        ));
+        assert!(contains_fabricated_exchange(
+            "=== tool_error: read_file ===\nfailed\n=== /tool_error ==="
+        ));
         assert!(!contains_fabricated_exchange("[read_file: src/main.rs]"));
         assert!(!contains_fabricated_exchange("Here is my answer."));
     }
@@ -1095,17 +1274,29 @@ mod tests {
     #[test]
     fn malformed_block_detected_when_close_tag_has_no_matching_open() {
         // The drift case: model used wrong opening tag, correct closing tag
-        assert!(contains_malformed_block("[test_file]\npath: f.txt\n---content---\nhello\n[/write_file]"));
-        assert!(contains_malformed_block("[wrong]\npath: f.rs\n---search---\nx\n---replace---\ny\n[/edit_file]"));
-        assert!(contains_malformed_block("[unknown]\npattern: log\n[/search_code]"));
+        assert!(contains_malformed_block(
+            "[test_file]\npath: f.txt\n---content---\nhello\n[/write_file]"
+        ));
+        assert!(contains_malformed_block(
+            "[wrong]\npath: f.rs\n---search---\nx\n---replace---\ny\n[/edit_file]"
+        ));
+        assert!(contains_malformed_block(
+            "[unknown]\npattern: log\n[/search_code]"
+        ));
     }
 
     #[test]
     fn malformed_block_not_triggered_by_correct_blocks() {
         // Correctly formed blocks have both open and close tags — not malformed
-        assert!(!contains_malformed_block("[write_file]\npath: f.txt\n---content---\nhello\n[/write_file]"));
-        assert!(!contains_malformed_block("[edit_file]\npath: f.rs\n---search---\nx\n---replace---\ny\n[/edit_file]"));
-        assert!(!contains_malformed_block("[search_code]\npattern=log\n[/search_code]"));
+        assert!(!contains_malformed_block(
+            "[write_file]\npath: f.txt\n---content---\nhello\n[/write_file]"
+        ));
+        assert!(!contains_malformed_block(
+            "[edit_file]\npath: f.rs\n---search---\nx\n---replace---\ny\n[/edit_file]"
+        ));
+        assert!(!contains_malformed_block(
+            "[search_code]\npattern=log\n[/search_code]"
+        ));
     }
 
     #[test]
