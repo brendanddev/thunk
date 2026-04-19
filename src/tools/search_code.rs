@@ -32,7 +32,7 @@ impl Tool for SearchCodeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search_code",
-            description: "Search for a string or pattern across source files in the project.",
+            description: "Search for a literal substring across source files in the project.",
             input_hint: "query_string [path/to/scope]",
             execution_kind: ExecutionKind::Immediate,
             default_risk: None,

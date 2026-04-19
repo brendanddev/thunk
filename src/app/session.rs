@@ -96,14 +96,17 @@ fn from_stored(session: &SavedSession) -> Vec<Message> {
     for (i, m) in slice.iter().enumerate() {
         if m.role == "user" && is_tool_exchange(&m.content) {
             exclude[i] = true;
-            // Drop the preceding assistant message too if it is a pure tool call
-            // (no conversational text, just a bare bracket call). Without the result
+            // Drop the preceding assistant message too if it contains no conversational
+            // text — only a bare tool call or fabricated result block. Without the result
             // it has no value and would leave an orphaned exchange in context.
-            if i > 0
-                && slice[i - 1].role == "assistant"
-                && slice[i - 1].content.trim_start().starts_with('[')
-            {
-                exclude[i - 1] = true;
+            if i > 0 && slice[i - 1].role == "assistant" {
+                let prev = slice[i - 1].content.trim_start();
+                let is_bare_action = prev.starts_with('[')
+                    || prev.starts_with("=== tool_result:")
+                    || prev.starts_with("=== tool_error:");
+                if is_bare_action {
+                    exclude[i - 1] = true;
+                }
             }
         }
     }
@@ -123,8 +126,8 @@ fn from_stored(session: &SavedSession) -> Vec<Message> {
 /// Returns true when a user message is a tool result, tool error, or runtime correction
 /// injected by the engine — none of which should be re-injected into a restored context.
 fn is_tool_exchange(content: &str) -> bool {
-    content.starts_with("[tool_result:")
-        || content.starts_with("[tool_error:")
+    content.starts_with("=== tool_result:")
+        || content.starts_with("=== tool_error:")
         || content.starts_with("[runtime:correction]")
 }
 
@@ -208,7 +211,7 @@ mod tests {
     fn from_stored_strips_tool_exchange_user_messages() {
         use crate::storage::session::{SavedSession, SessionMeta, StoredMessage};
 
-        let tool_result = "[tool_result: read_file]\nsome file content\n[/tool_result]\n\n".to_string();
+        let tool_result = "=== tool_result: read_file ===\nsome file content\n=== /tool_result ===\n\n".to_string();
 
         let saved = SavedSession {
             meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 1 },
@@ -229,7 +232,7 @@ mod tests {
             messages: vec![
                 StoredMessage { role: "user".into(), content: "read README.md".into() },
                 StoredMessage { role: "assistant".into(), content: "[read_file: README.md]".into() },
-                StoredMessage { role: "user".into(), content: "[tool_result: read_file]\ncontent\n[/tool_result]\n\n".into() },
+                StoredMessage { role: "user".into(), content: "=== tool_result: read_file ===\ncontent\n=== /tool_result ===\n\n".into() },
             ],
         };
 
@@ -269,7 +272,7 @@ mod tests {
             meta: SessionMeta { id: "t".into(), created_at: 0, updated_at: 0, message_count: 3 },
             messages: vec![
                 StoredMessage { role: "user".into(), content: "list the files".into() },
-                StoredMessage { role: "assistant".into(), content: "[tool_result: list_dir]\nfoo\n[/tool_result]".into() },
+                StoredMessage { role: "assistant".into(), content: "=== tool_result: list_dir ===\nfoo\n=== /tool_result ===".into() },
                 StoredMessage { role: "user".into(), content: correction },
             ],
         };

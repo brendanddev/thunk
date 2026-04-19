@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::app::config::Config;
 use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
-use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
+use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolOutput, ToolRegistry, ToolRunResult};
 
 use super::conversation::Conversation;
 use super::prompt;
@@ -28,12 +28,111 @@ const FABRICATION_CORRECTION: &str =
      You must emit ONLY a tool call tag (e.g. [read_file: path]) or answer directly in plain text. \
      Output the tool call tag now, with no other text.";
 
+/// Injected when a search_code call is blocked by the per-turn search budget.
+/// The budget allows 1 search, plus 1 retry only if the first returned no results.
+const SEARCH_BUDGET_EXCEEDED: &str =
+    "[runtime:correction] search budget exceeded — you have already searched once this turn. \
+     A second search is only permitted when the first returned no results. \
+     Do not search again. Answer based on the information you already have.";
+
+const SEARCH_CLOSED_AFTER_RESULTS: &str =
+    "[runtime:correction] Search returned matches. Do not call search_code again this turn. \
+     If the result lines are enough, answer now. If you need detail from one specific file, \
+     emit one read_file call only.";
+
+const SEARCH_CLOSED_AFTER_EMPTY_RETRY: &str =
+    "[runtime:correction] The allowed search retry also returned no matches. \
+     Do not call search_code again this turn. Answer directly that no matching code was found \
+     for the searched literal keywords.";
+
+/// Injected when an edit_file failed and the repair response contained [edit_file] tags
+/// but could not be parsed (unrecognized delimiters, missing delimiters, etc.).
+const EDIT_REPAIR_CORRECTION: &str =
+    "[runtime:correction] Your edit_file block could not be parsed. \
+     The block requires: path: followed by ---search--- with the exact text to find, \
+     then ---replace--- with the replacement text. \
+     Emit the corrected [edit_file]...[/edit_file] block now with no other text.";
+
 /// Injected when the model uses a wrong opening tag for a block tool (e.g. [test_file] instead
 /// of [write_file]). Tag names are fixed — the model must use the exact names from the protocol.
 const MALFORMED_BLOCK_CORRECTION: &str =
     "[runtime:correction] Your response contained a block with an unrecognized opening tag. \
      Tag names are exact — you must use [write_file], [edit_file], etc. exactly as shown. \
      Do not rename or abbreviate them. Emit the correct tool call now with no other text.";
+
+/// Tracks search_code usage within a single turn.
+/// Rules: 1 search always permitted; a second search is permitted only when the first
+/// returned zero matches; any further searches are blocked.
+struct SearchBudget {
+    calls: usize,
+    last_was_empty: bool,
+}
+
+impl SearchBudget {
+    fn new() -> Self {
+        Self { calls: 0, last_was_empty: false }
+    }
+
+    fn is_allowed(&self) -> bool {
+        self.calls == 0 || (self.calls == 1 && self.last_was_empty)
+    }
+
+    fn record(&mut self, was_empty: bool) {
+        self.calls += 1;
+        self.last_was_empty = was_empty;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.calls >= 2 || (self.calls == 1 && !self.last_was_empty)
+    }
+
+    fn closed_message(&self) -> &'static str {
+        if self.calls >= 2 && self.last_was_empty {
+            SEARCH_CLOSED_AFTER_EMPTY_RETRY
+        } else {
+            SEARCH_CLOSED_AFTER_RESULTS
+        }
+    }
+}
+
+/// Converts model-generated search phrases or regex/method-shaped text into the
+/// single literal keyword that search_code actually supports best.
+fn simplify_search_query(query: &str) -> String {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "fn", "for", "find", "how", "in", "initialized",
+        "initialization", "implemented", "is", "of", "or", "the", "to", "what",
+        "where",
+    ];
+
+    let trimmed = query.trim();
+    for raw in trimmed.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\\' | '(' | ')' | '[' | ']' | '{' | '}' | '.' | ',' | ';' | ':' | '"' | '\'' | '`'
+            )
+    }) {
+        let token = raw.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+        if token.is_empty() {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if !STOPWORDS.contains(&lower.as_str()) {
+            return token.to_string();
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn simplify_search_input(input: &mut ToolInput) {
+    if let ToolInput::SearchCode { query, .. } = input {
+        let simplified = simplify_search_query(query);
+        if !simplified.is_empty() && simplified != *query {
+            *query = simplified;
+        }
+    }
+}
 
 /// Returns a stable fingerprint for a tool call, used for consecutive-cycle detection.
 /// Null bytes separate fields; they cannot appear in paths, queries, or file content
@@ -209,10 +308,8 @@ impl Runtime {
     /// `tool_rounds` is the count already consumed before this call (0 for a fresh turn).
     fn run_turns(&mut self, mut tool_rounds: usize, on_event: &mut dyn FnMut(RuntimeEvent)) {
         let mut corrections = 0usize;
-        // Tracks the fingerprint of the last executed tool call within this run.
-        // Resets to None at the start of every run_turns invocation so cycle detection
-        // is scoped to one turn and never blocks calls across separate user submissions.
         let mut last_call_key: Option<String> = None;
+        let mut search_budget = SearchBudget::new();
         loop {
             let response = match run_generate_turn(
                 self.backend.as_mut(),
@@ -236,7 +333,36 @@ impl Runtime {
 
             let calls = tool_codec::parse_all_tool_inputs(&response);
 
+            if search_budget.is_closed()
+                && calls.iter().any(|c| matches!(c, ToolInput::SearchCode { .. }))
+            {
+                if corrections < MAX_CORRECTIONS {
+                    corrections += 1;
+                    self.conversation.discard_last_if_assistant();
+                    self.conversation.push_user(search_budget.closed_message().to_string());
+                    continue;
+                }
+                on_event(RuntimeEvent::Failed {
+                    message: "Model kept searching after the search budget was closed.".to_string(),
+                });
+                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                return;
+            }
+
             if calls.is_empty() {
+                // If the previous tool round ended in an edit_file error and the model's repair
+                // attempt contains edit_file tag syntax but produced no parseable tool calls,
+                // inject a targeted correction rather than silently accepting as Direct.
+                if tool_codec::contains_edit_attempt(&response)
+                    && last_injected_was_edit_error(&self.conversation)
+                    && corrections < MAX_CORRECTIONS
+                {
+                    corrections += 1;
+                    self.conversation.discard_last_if_assistant();
+                    self.conversation.push_user(EDIT_REPAIR_CORRECTION.to_string());
+                    continue;
+                }
+
                 // Fabricated [tool_result:] / [tool_error:] blocks mean the model bypassed the
                 // protocol. Attempt one automatic correction before surfacing the error.
                 if tool_codec::contains_fabricated_exchange(&response) {
@@ -288,7 +414,7 @@ impl Runtime {
 
             on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
 
-            match run_tool_round(&self.registry, calls, &mut last_call_key, on_event) {
+            match run_tool_round(&self.registry, calls, &mut last_call_key, &mut search_budget, on_event) {
                 ToolRoundOutcome::Completed { results } => {
                     self.conversation.push_user(results);
                     self.conversation.trim_tool_exchanges_if_needed();
@@ -331,14 +457,24 @@ fn run_tool_round(
     registry: &ToolRegistry,
     calls: Vec<ToolInput>,
     last_call_key: &mut Option<String>,
+    search_budget: &mut SearchBudget,
     on_event: &mut dyn FnMut(RuntimeEvent),
 ) -> ToolRoundOutcome {
     let mut accumulated = String::new();
 
-    for input in calls {
+    for mut input in calls {
+        simplify_search_input(&mut input);
         let name = input.tool_name().to_string();
         let key = call_fingerprint(&input);
         on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
+
+        // Per-turn search budget: 1 search always allowed; a second only when the first
+        // returned no results; further searches are always blocked.
+        if matches!(input, ToolInput::SearchCode { .. }) && !search_budget.is_allowed() {
+            on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: None });
+            accumulated.push_str(&tool_codec::format_tool_error(&name, SEARCH_BUDGET_EXCEEDED));
+            continue;
+        }
 
         if last_call_key.as_deref() == Some(key.as_str()) {
             let msg = format!("{name} called with identical arguments twice in a row");
@@ -359,9 +495,21 @@ fn run_tool_round(
                         .unwrap_or(true),
                     "tool '{name}' returned Immediate but spec declares RequiresApproval"
                 );
+                // Record search results against the per-turn budget.
+                let search_closed_message = if name == "search_code" {
+                    let was_empty = matches!(&output, ToolOutput::SearchResults(r) if r.matches.is_empty());
+                    search_budget.record(was_empty);
+                    search_budget.is_closed().then(|| search_budget.closed_message())
+                } else {
+                    None
+                };
                 let summary = tool_codec::render_compact_summary(&output);
                 on_event(RuntimeEvent::ToolCallFinished { name: name.clone(), summary: Some(summary) });
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
+                if let Some(message) = search_closed_message {
+                    accumulated.push_str(message);
+                    accumulated.push_str("\n\n");
+                }
                 *last_call_key = Some(key);
             }
             Ok(ToolRunResult::Approval(pending)) => {
@@ -384,6 +532,16 @@ fn run_tool_round(
     }
 
     ToolRoundOutcome::Completed { results: accumulated }
+}
+
+/// Returns true when the most recent user message in the conversation is an edit_file
+/// tool error injected by the runtime. Used to detect the edit-repair failure pattern:
+/// model emits garbled edit syntax after a failed edit, producing zero parsed tool calls.
+fn last_injected_was_edit_error(conversation: &Conversation) -> bool {
+    conversation
+        .last_user_content()
+        .map(|c| c.starts_with("=== tool_error: edit_file ==="))
+        .unwrap_or(false)
 }
 
 /// Runs a single generation turn: sends the current conversation to the backend,
@@ -485,6 +643,15 @@ mod tests {
         )
     }
 
+    fn make_runtime_in(responses: Vec<impl Into<String>>, root: &std::path::Path) -> Runtime {
+        Runtime::new(
+            &Config::default(),
+            root,
+            Box::new(TestBackend::new(responses)),
+            default_registry(root.to_path_buf()),
+        )
+    }
+
     fn collect_events(runtime: &mut Runtime, request: RuntimeRequest) -> Vec<RuntimeEvent> {
         let mut events = Vec::new();
         runtime.handle(request, &mut |e| events.push(e));
@@ -575,12 +742,12 @@ mod tests {
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m| m.content.contains("[tool_result: list_dir]")),
+            snapshot.iter().any(|m| m.content.contains("=== tool_result: list_dir ===")),
             "first call must produce a tool result"
         );
         assert!(
             snapshot.iter().any(|m|
-                m.content.contains("[tool_error: list_dir]") &&
+                m.content.contains("=== tool_error: list_dir ===") &&
                 m.content.contains("identical arguments twice in a row")
             ),
             "second identical call must produce a cycle error"
@@ -700,22 +867,222 @@ mod tests {
         let snapshot = rt.messages_snapshot();
         // The error from the first call must appear
         assert!(
-            snapshot.iter().any(|m| m.content.contains("[tool_error: list_dir]")),
+            snapshot.iter().any(|m| m.content.contains("=== tool_error: list_dir ===")),
             "first call error must be in conversation"
         );
         // The successful retry must produce a result — no cycle error
         assert!(
-            snapshot.iter().any(|m| m.content.contains("[tool_result: list_dir]")),
+            snapshot.iter().any(|m| m.content.contains("=== tool_result: list_dir ===")),
             "successful retry must not be blocked by cycle detection"
         );
         assert!(
             !snapshot.iter().any(|m|
                 m.content.contains("identical arguments") &&
-                m.content.contains("[tool_error: list_dir]") &&
+                m.content.contains("=== tool_error: list_dir ===") &&
                 m.content.contains(".")
             ),
             "retry with same args after error must not trigger cycle detection"
         );
+    }
+
+    #[test]
+    fn search_query_simplification_prefers_single_literal_keyword() {
+        assert_eq!(simplify_search_query("logging initialization"), "logging");
+        assert_eq!(simplify_search_query("logger initialization"), "logger");
+        assert_eq!(simplify_search_query("write_file()"), "write_file");
+        assert_eq!(simplify_search_query("sessions saved"), "sessions");
+        assert_eq!(simplify_search_query("fn main"), "main");
+        assert_eq!(simplify_search_query(r"logging\.init\(\)"), "logging");
+    }
+
+    #[test]
+    fn search_budget_blocks_second_search_when_first_had_results() {
+        // Both searches in one response. "ToolInput" is present in many source files,
+        // so the first search will produce matches — the second must be budget-blocked.
+        let mut rt = make_runtime(vec![
+            "[search_code: ToolInput][search_code: EditFile]",
+            "Done.",
+        ]);
+        collect_events(&mut rt, RuntimeRequest::Submit { text: "search".into() });
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m|
+                m.content.contains("=== tool_error: search_code ===") &&
+                m.content.contains("search budget exceeded")
+            ),
+            "second search must be blocked with budget error when first had results"
+        );
+    }
+
+    #[test]
+    fn search_budget_closes_after_first_search_with_results_across_rounds() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("logging.rs"), "fn logging() {}").unwrap();
+        let synthesis = "Logging appears in logging.rs.";
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging initialization]",
+                "Let me try another search.\n[search_code: logger initialization]",
+                synthesis,
+            ],
+            tmp.path(),
+        );
+        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "find logging".into() });
+        assert!(!has_failed(&events), "must not fail permanently: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot.iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            1,
+            "second search must be intercepted before another tool result"
+        );
+        assert!(
+            all_user.contains("Search returned matches"),
+            "closed-search guidance must be injected after the first successful search"
+        );
+        assert!(
+            !snapshot.iter().any(|m| m.content.contains("Let me try another search")),
+            "narrated retry assistant message must be discarded from model context"
+        );
+        let last_assistant = snapshot.iter().rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(synthesis));
+    }
+
+    #[test]
+    fn search_budget_closes_after_empty_retry_across_rounds() {
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("file.rs"), "fn unrelated() {}").unwrap();
+        let synthesis = "No matching code was found for those searches.";
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging initialization]",
+                "[search_code: logger initialization]",
+                "Trying one more.\n[search_code: tracing]",
+                synthesis,
+            ],
+            tmp.path(),
+        );
+        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "find logging".into() });
+        assert!(!has_failed(&events), "must not fail permanently: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot.iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            2,
+            "first empty search and one retry should execute"
+        );
+        assert!(
+            all_user.contains("allowed search retry also returned no matches"),
+            "empty-retry terminal guidance must be injected"
+        );
+        assert!(
+            !snapshot.iter().any(|m| m.content.contains("Trying one more")),
+            "third narrated search must be discarded from model context"
+        );
+        let last_assistant = snapshot.iter().rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(synthesis));
+    }
+
+    #[test]
+    fn search_budget_allows_second_search_when_first_empty() {
+        // Controlled temp dir: no file matches "no_match_here" but one matches "find_me".
+        // First search returns empty → second search must be allowed.
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("file.rs"), "fn find_me() {}").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec!["[search_code: no_match_here][search_code: find_me]", "Found it."],
+            tmp.path(),
+        );
+        collect_events(&mut rt, RuntimeRequest::Submit { text: "search".into() });
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot.iter().any(|m| m.content.contains("search budget exceeded")),
+            "second search must be allowed when first returned empty"
+        );
+        // Both results land in the same accumulated user message, so count occurrences.
+        let all_user: String = snapshot.iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result_count = all_user.matches("=== tool_result: search_code ===").count();
+        assert_eq!(result_count, 2, "both searches must have tool results");
+    }
+
+    #[test]
+    fn search_budget_blocks_third_search_regardless() {
+        // Controlled temp dir: first two searches return empty, third must still be blocked.
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("file.rs"), "fn find_me() {}").unwrap();
+
+        // first=empty, second=empty (allowed by budget), third=blocked regardless
+        let mut rt = make_runtime_in(
+            vec!["[search_code: no_match_a][search_code: no_match_b][search_code: find_me]", "Done."],
+            tmp.path(),
+        );
+        collect_events(&mut rt, RuntimeRequest::Submit { text: "triple search".into() });
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| m.content.contains("search budget exceeded")),
+            "third search must always be blocked regardless of prior results"
+        );
+    }
+
+    #[test]
+    fn edit_repair_correction_injected_on_garbled_repair_after_failure() {
+        // First response: edit_file with empty search text — produces an Immediate tool error.
+        // Second response: [edit_file] tags present but unrecognized delimiters (zero parse).
+        // Engine must inject EDIT_REPAIR_CORRECTION rather than accepting as Direct.
+        // Third response: synthesis after correction.
+        let bad_edit = "[edit_file]\npath: foo.rs\n---replace---\nnew text\n[/edit_file]";
+        let garbled_repair = "[edit_file]\npath: foo.rs\nFind: old text\nReplace: new text\n[/edit_file]";
+        let synthesis = "I was unable to apply the edit.";
+
+        let mut rt = make_runtime(vec![bad_edit, garbled_repair, synthesis]);
+        let events = collect_events(&mut rt, RuntimeRequest::Submit { text: "edit foo.rs".into() });
+
+        assert!(!has_failed(&events), "must not fail permanently: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m|
+                m.content.starts_with("[runtime:correction]") &&
+                m.content.contains("edit_file")
+            ),
+            "edit repair correction must be injected: {snapshot:?}"
+        );
+        let last_assistant = snapshot.iter().rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(synthesis));
     }
 
     #[test]
@@ -761,7 +1128,7 @@ mod tests {
         );
         // Tool result must be present.
         assert!(
-            snapshot.iter().any(|m| m.content.contains("[tool_result: edit_file]")),
+            snapshot.iter().any(|m| m.content.contains("=== tool_result: edit_file ===")),
             "tool result must be in conversation after approve"
         );
         // The final assistant message must be the synthesis response, not a tool call.

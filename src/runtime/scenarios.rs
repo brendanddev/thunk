@@ -144,7 +144,7 @@ mod tests {
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m| m.content.contains("[tool_result: search_code]")),
+            snapshot.iter().any(|m| m.content.contains("=== tool_result: search_code ===")),
             "search_code must produce a tool_result"
         );
     }
@@ -170,7 +170,7 @@ mod tests {
         let snapshot = rt.messages_snapshot();
         assert!(
             snapshot.iter().any(|m| {
-                m.content.contains("[tool_error: edit_file]")
+                m.content.contains("=== tool_error: edit_file ===")
                     && m.content.contains("---search---")
             }),
             "tool_error must contain ---search--- guidance"
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn fabrication_triggers_correction_then_normal_answer() {
         let dir = TempDir::new().unwrap();
-        let fabricated = "[tool_result: read_file]\nsome fake content\n[/tool_result]";
+        let fabricated = "=== tool_result: read_file ===\nsome fake content\n=== /tool_result ===";
         let mut rt = make_runtime(&dir, vec![fabricated, "Let me answer directly."]);
 
         let events =
@@ -263,11 +263,11 @@ mod tests {
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m| m.content.contains("[tool_error: list_dir]")),
+            snapshot.iter().any(|m| m.content.contains("=== tool_error: list_dir ===")),
             "failed call must produce a tool_error"
         );
         assert!(
-            snapshot.iter().any(|m| m.content.contains("[tool_result: list_dir]")),
+            snapshot.iter().any(|m| m.content.contains("=== tool_result: list_dir ===")),
             "retry after error must not be blocked"
         );
         assert!(
@@ -314,7 +314,7 @@ mod tests {
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m| m.content.contains("[tool_result: edit_file]")),
+            snapshot.iter().any(|m| m.content.contains("=== tool_result: edit_file ===")),
             "tool result must be in conversation after approve"
         );
         let last_assistant = snapshot

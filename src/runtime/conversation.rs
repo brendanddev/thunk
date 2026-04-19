@@ -55,6 +55,16 @@ impl Conversation {
         self.messages.clone()
     }
 
+    /// Returns the content of the most recently added user message, if any.
+    /// Used by the engine to inspect the last injected tool result or error.
+    pub fn last_user_content(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content.as_str())
+    }
+
     /// Returns the content of the most recently added assistant message, if any.
     pub fn last_assistant_content(&self) -> Option<&str> {
         self.messages
@@ -161,8 +171,8 @@ impl Conversation {
 /// Returns true for user messages injected by the runtime (tool results, errors,
 /// and fabrication corrections). These are the result halves of tool-exchange pairs.
 fn is_runtime_injected(content: &str) -> bool {
-    content.starts_with("[tool_result:")
-        || content.starts_with("[tool_error:")
+    content.starts_with("=== tool_result:")
+        || content.starts_with("=== tool_error:")
         || content.starts_with("[runtime:correction]")
 }
 
@@ -192,7 +202,7 @@ mod tests {
             // assistant pure tool call
             c.messages.push(crate::llm::backend::Message::assistant("[read_file: foo.rs]".to_string()));
             // user tool result
-            c.messages.push(crate::llm::backend::Message::user("[tool_result: read_file]\ncontent\n[/tool_result]".to_string()));
+            c.messages.push(crate::llm::backend::Message::user("=== tool_result: read_file ===\ncontent\n=== /tool_result ===".to_string()));
         }
         for i in 0..conversational_tail {
             c.messages.push(crate::llm::backend::Message::user(format!("user msg {i}")));

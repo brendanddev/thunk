@@ -18,7 +18,7 @@ pub enum ToolInput {
         path: String,
     },
     SearchCode {
-        /// Literal string or pattern to search for.
+        /// Literal substring to search for.
         query: String,
         /// Optional sub-path to restrict the search. Searches entire tree if None.
         path: Option<String>,

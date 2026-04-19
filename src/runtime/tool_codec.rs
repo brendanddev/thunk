@@ -256,9 +256,88 @@ fn parse_edit_block(block: &str) -> Option<ToolInput> {
         let path = parse_kvs(&block[..replace_nl_pos]).get("path")?.clone();
         let replace = trim_block_content(&block[replace_nl_pos + REPLACE_LINE.len()..]);
         Some(ToolInput::EditFile { path, search: String::new(), replace })
+    } else if let Some(input) = parse_edit_block_conflict_style(block) {
+        // <<<<<<< SEARCH / ======= / >>>>>>> REPLACE (Aider/git conflict style)
+        Some(input)
     } else {
-        None
+        // Generic fallback: any ---xxx--- / ---yyy--- delimiter pair.
+        // Models sometimes derive delimiter names from the prompt's placeholder text
+        // (e.g. ---text to find--- / ---replacement text---). Accept any valid
+        // ---word(s)--- pair rather than silently falling through as a Direct response.
+        parse_edit_block_generic_delimiters(block)
     }
+}
+
+/// Parses the conflict-marker style that many models emit instead of ---search---/---replace---:
+///
+///   <<<<<<< SEARCH
+///   text to find
+///   =======
+///   replacement text
+///   >>>>>>> REPLACE
+fn parse_edit_block_conflict_style(block: &str) -> Option<ToolInput> {
+    let search_marker = block.find("<<<<<<<")?;
+    let path = parse_kvs(&block[..search_marker]).get("path")?.clone();
+
+    // Skip the rest of the <<<<<<< ... opening line to reach content
+    let after_marker = &block[search_marker + "<<<<<<<".len()..];
+    let content_start = after_marker.find('\n').map(|p| &after_marker[p + 1..]).unwrap_or(after_marker);
+
+    // ======= separator must appear at the start of a line
+    let sep_pos = content_start.find("\n=======")?;
+    let search_text = trim_block_content(&content_start[..sep_pos]);
+
+    let after_sep = &content_start[sep_pos + "\n=======".len()..];
+    let after_sep = after_sep.strip_prefix('\n').unwrap_or(after_sep);
+
+    // >>>>>>> end marker — stop before it; trailing text after >>>>>>> is ignored
+    let replace_end = after_sep.find("\n>>>>>>>").unwrap_or(after_sep.len());
+    let replace_text = trim_block_content(&after_sep[..replace_end]);
+
+    Some(ToolInput::EditFile { path, search: search_text, replace: replace_text })
+}
+
+/// Returns true for lines of the form `---word(s)---` that are not the canonical
+/// `---search---`, `---replace---`, or `---content---` delimiters (those are handled
+/// by the primary branches of `parse_edit_block`). The inner text must be non-empty
+/// and must not itself contain `---`, which would indicate a nested or malformed marker.
+fn is_triple_dash_delimiter(line: &str) -> bool {
+    if !line.starts_with("---") || !line.ends_with("---") || line.len() <= 6 {
+        return false;
+    }
+    let inner = &line[3..line.len() - 3];
+    !inner.trim().is_empty() && !inner.contains("---")
+}
+
+/// Fallback parser for edit blocks that use arbitrary `---xxx---` / `---yyy---` delimiters.
+///
+/// Models sometimes derive delimiter names from the prompt's placeholder text rather than
+/// using the canonical `---search---`/`---replace---` markers exactly as shown. For example,
+/// a model might emit `---text to find---` / `---replacement text---` after reading the
+/// `exact text to find` / `replacement text` examples in the instructions. This function
+/// accepts any valid `---word(s)---` pair as search/replace delimiters so those blocks
+/// are not silently dropped as Direct responses.
+fn parse_edit_block_generic_delimiters(block: &str) -> Option<ToolInput> {
+    // Collect (line_start, line_end_excl_newline) for each triple-dash delimiter line.
+    let mut delimiters: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    for line in block.split('\n') {
+        if is_triple_dash_delimiter(line.trim()) {
+            delimiters.push((pos, pos + line.len()));
+        }
+        pos += line.len() + 1; // +1 for the '\n' consumed by split
+    }
+    if delimiters.len() < 2 {
+        return None;
+    }
+    let (d1_start, d1_end) = delimiters[0];
+    let (d2_start, d2_end) = delimiters[1];
+    let path = parse_kvs(&block[..d1_start]).get("path")?.clone();
+    let search_start = (d1_end + 1).min(block.len());
+    let search_text = trim_block_content(&block[search_start..d2_start]);
+    let replace_start = (d2_end + 1).min(block.len());
+    let replace_text = trim_block_content(&block[replace_start..]);
+    Some(ToolInput::EditFile { path, search: search_text, replace: replace_text })
 }
 
 fn parse_write_block(block: &str) -> Option<ToolInput> {
@@ -331,14 +410,16 @@ pub fn render_compact_summary(output: &ToolOutput) -> String {
 }
 
 /// Formats a successful tool result for insertion into the conversation.
+/// Uses === delimiters rather than bracket tags so the result format is visually
+/// distinct from executable call syntax ([tool_name: arg]).
 pub fn format_tool_result(name: &str, output: &ToolOutput) -> String {
     let body = render_output(output);
-    format!("[tool_result: {name}]\n{body}\n[/tool_result]\n\n")
+    format!("=== tool_result: {name} ===\n{body}\n=== /tool_result ===\n\n")
 }
 
 /// Formats a tool dispatch error for insertion into the conversation.
 pub fn format_tool_error(name: &str, error: &str) -> String {
-    format!("[tool_error: {name}]\n{error}\n[/tool_error]\n\n")
+    format!("=== tool_error: {name} ===\n{error}\n=== /tool_error ===\n\n")
 }
 
 fn render_output(output: &ToolOutput) -> String {
@@ -406,7 +487,16 @@ fn render_output(output: &ToolOutput) -> String {
 /// Used by the engine to detect and surface model misbehavior rather than
 /// silently accepting a fabricated result as a valid direct answer.
 pub fn contains_fabricated_exchange(text: &str) -> bool {
-    text.contains("[tool_result:") || text.contains("[tool_error:")
+    text.contains("=== tool_result:") || text.contains("=== tool_error:")
+}
+
+/// Returns true when an assistant response contains edit_file tag syntax (both open and close
+/// tags are present) but the block could not be parsed into a valid ToolInput. This fingerprints
+/// garbled edit repair attempts where the model included `[edit_file]...[/edit_file]` but used
+/// unrecognized delimiter names or no delimiters at all. Used by the engine to inject a targeted
+/// correction rather than silently accepting the response as a Direct answer.
+pub fn contains_edit_attempt(text: &str) -> bool {
+    text.contains("[edit_file]") && text.contains("[/edit_file]")
 }
 
 /// Returns true if the text contains a known tool CLOSE tag without a matching open tag.
@@ -432,8 +522,7 @@ Your role: emit tool CALL TAGS only. The system executes them and returns result
 You do NOT produce file contents, directory listings, or search results yourself.
 You do NOT write result blocks. Result blocks are written by the system, not you.
 
-When a tool is needed, your ENTIRE response must be the call tag only — no prose, no prefix, no explanation.
-When answering in plain text, never include tool call syntax — if asked about a tool, describe it in words only.
+When a tool is needed, your ENTIRE response must be the call tag only — no prose, no fences, no explanation.
 
 Tag names are EXACT. Do not rename, abbreviate, or invent tag names. Use only the tags shown below.
 
@@ -444,21 +533,21 @@ List a directory:
 [list_dir: src/]
 
 Search code:
-[search_code: pattern]
+[search_code: keyword]
 
 Use search_code for any question about where something is, how something works, or what something is called in this project. Do not ask the user — search first.
-Use words from the user's request as-is in the query — do not rephrase them: [search_code: logging] for "where logging is initialized", not [search_code: logger initialize].
-Use short keywords: [search_code: session save] not [search_code: where sessions are saved to disk].
-Emit only one search call at a time. As soon as results arrive, interpret them and respond — do not run more searches.
-Only if results are completely empty, try one different query, then respond.
+Use exactly one plain literal keyword or identifier, such as logging, write_file, SessionLog, or sessions.
+Do not use phrases, dots, parentheses, backslashes, regex syntax, or method-call syntax.
+Emit only one search call at a time. If the results point to a specific file but do not show enough detail, read that file once with read_file, then respond. Never emit a second search_code.
+Only if results are completely empty, try one different single keyword, then stop searching and respond.
 
 Edit a file:
 [edit_file]
 path: path/to/file.rs
 ---search---
-exact text to find
+old content
 ---replace---
-replacement text
+new content
 [/edit_file]
 
 Create an empty file (simple form):
@@ -799,6 +888,55 @@ mod tests {
     }
 
     #[test]
+    fn edit_block_conflict_style_markers_are_accepted() {
+        // Model emits <<<<<<< SEARCH / ======= / >>>>>>> REPLACE instead of ---search---/---replace---.
+        // The parser must accept this and extract search/replace correctly.
+        let text = "[edit_file]\npath: src/lib.rs\n<<<<<<< SEARCH\nfn old() {}\n=======\nfn new() {}\n>>>>>>> REPLACE\n[/edit_file]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1, "conflict-style edit block must parse: {inputs:?}");
+        assert!(matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "src/lib.rs" && search == "fn old() {}" && replace == "fn new() {}"));
+    }
+
+    #[test]
+    fn edit_block_conflict_style_multiline() {
+        let text = "[edit_file]\npath: src/lib.rs\n<<<<<<< SEARCH\nfn old() {\n    1\n}\n=======\nfn new() {\n    2\n}\n>>>>>>> REPLACE\n[/edit_file]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        let ToolInput::EditFile { search, replace, .. } = &inputs[0] else { panic!() };
+        assert!(search.contains("fn old()") && search.contains("1"));
+        assert!(replace.contains("fn new()") && replace.contains("2"));
+    }
+
+    #[test]
+    fn edit_block_generic_delimiters_accepted() {
+        // Model derived delimiter names from prompt placeholder text instead of using
+        // the canonical ---search---/---replace--- markers. Must still parse correctly.
+        let text = "[edit_file]\npath: test_phase82.txt\n---text to find---\nhello world\n---replacement text---\nhello params\n[/edit_file]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1, "generic delimiter edit block must parse: {inputs:?}");
+        assert!(matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
+            if path == "test_phase82.txt" && search == "hello world" && replace == "hello params"));
+    }
+
+    #[test]
+    fn edit_block_generic_delimiters_multiline_content() {
+        let text = "[edit_file]\npath: src/lib.rs\n---find---\nfn old() {\n    1\n}\n---with---\nfn new() {\n    2\n}\n[/edit_file]";
+        let inputs = parse_all_tool_inputs(text);
+        assert_eq!(inputs.len(), 1);
+        let ToolInput::EditFile { search, replace, .. } = &inputs[0] else { panic!() };
+        assert!(search.contains("fn old()") && search.contains("1"));
+        assert!(replace.contains("fn new()") && replace.contains("2"));
+    }
+
+    #[test]
+    fn edit_block_generic_delimiters_single_delimiter_is_skipped() {
+        // Only one triple-dash delimiter — cannot determine search vs replace boundary.
+        let text = "[edit_file]\npath: src/lib.rs\n---find---\nhello\n[/edit_file]";
+        assert!(parse_all_tool_inputs(text).is_empty());
+    }
+
+    #[test]
     fn edit_block_preserves_multiline_content() {
         let text = "[edit_file]\npath: src/lib.rs\n---search---\nfn old() {\n    println!(\"old\");\n}\n---replace---\nfn new() {\n    println!(\"new\");\n}\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
@@ -850,10 +988,10 @@ mod tests {
             truncated: false,
         });
         let result = format_tool_result("read_file", &output);
-        assert!(result.starts_with("[tool_result: read_file]"));
+        assert!(result.starts_with("=== tool_result: read_file ==="));
         assert!(result.contains("[1 lines]"));
         assert!(result.contains("fn main() {}"));
-        assert!(result.contains("[/tool_result]"));
+        assert!(result.contains("=== /tool_result ==="));
     }
 
     #[test]
@@ -891,9 +1029,9 @@ mod tests {
     #[test]
     fn format_tool_error_wraps_message() {
         let result = format_tool_error("read_file", "file not found");
-        assert!(result.starts_with("[tool_error: read_file]"));
+        assert!(result.starts_with("=== tool_error: read_file ==="));
         assert!(result.contains("file not found"));
-        assert!(result.contains("[/tool_error]"));
+        assert!(result.contains("=== /tool_error ==="));
     }
 
     #[test]
@@ -914,20 +1052,28 @@ mod tests {
 
     #[test]
     fn format_instructions_does_not_describe_tool_result_format() {
-        // [tool_result:] and [tool_error:] are runtime-only. Describing their format
-        // causes the model to fabricate completed exchanges instead of issuing real calls.
+        // Result/error wrappers are runtime-only. Describing their format causes the model
+        // to fabricate completed exchanges instead of issuing real calls.
         let instructions = format_instructions();
         assert!(
             !instructions.contains("Tool results are returned as"),
-            "must not document the tool_result format for the model"
+            "must not document the result format for the model"
         );
         assert!(
             !instructions.contains("[tool_result:"),
-            "must not show [tool_result:] syntax anywhere — even in a prohibition"
+            "must not show old bracket tool_result syntax in instructions"
         );
         assert!(
             !instructions.contains("[tool_error:"),
-            "must not show [tool_error:] syntax anywhere"
+            "must not show old bracket tool_error syntax in instructions"
+        );
+        assert!(
+            !instructions.contains("=== tool_result:"),
+            "must not show result wrapper format in instructions — model must not learn to fabricate it"
+        );
+        assert!(
+            !instructions.contains("=== tool_error:"),
+            "must not show error wrapper format in instructions"
         );
         // Role framing must be present.
         assert!(
@@ -938,8 +1084,8 @@ mod tests {
 
     #[test]
     fn contains_fabricated_exchange_detects_tool_result_blocks() {
-        assert!(contains_fabricated_exchange("[tool_result: read_file]\nsome content\n[/tool_result]"));
-        assert!(contains_fabricated_exchange("[tool_error: read_file]\nfailed\n[/tool_error]"));
+        assert!(contains_fabricated_exchange("=== tool_result: read_file ===\nsome content\n=== /tool_result ==="));
+        assert!(contains_fabricated_exchange("=== tool_error: read_file ===\nfailed\n=== /tool_error ==="));
         assert!(!contains_fabricated_exchange("[read_file: src/main.rs]"));
         assert!(!contains_fabricated_exchange("Here is my answer."));
     }
