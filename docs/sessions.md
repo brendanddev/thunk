@@ -13,7 +13,7 @@ The current design splits that work across two layers:
 - `app/session.rs` owns the bridge between runtime messages and stored messages
 - `storage/session/` owns SQLite schema and CRUD
 
-`AppContext` uses those pieces to restore the most recent session at startup and save conversation state after user submissions.
+`AppContext` uses those pieces to restore the most recent session at startup and save conversation state after completed submit, approve, and reject requests.
 
 ---
 
@@ -111,7 +111,7 @@ Older messages stay in SQLite, but they are not reloaded into the live model con
 
 Restore also strips runtime-generated tool exchanges:
 
-- user messages starting with `[tool_result:` or `[tool_error:` are dropped
+- user messages starting with `=== tool_result:`, `=== tool_error:`, or `[runtime:correction]` are dropped
 - if one of those was immediately preceded by a pure assistant tool call that starts with `[`, that assistant message is dropped too
 
 This keeps raw file contents, directory listings, and other tool outputs out of restored context while preserving the full transcript on disk.
@@ -129,14 +129,13 @@ That means:
 
 ## Saving Behavior
 
-`AppContext::handle()` auto-saves only after `RuntimeRequest::Submit`.
+`AppContext::handle()` auto-saves after:
 
-That means the normal submit path is persisted automatically, but two important cases are not:
+- `RuntimeRequest::Submit`
+- `RuntimeRequest::Approve`
+- `RuntimeRequest::Reject`
 
-- `Approve`
-- `Reject`
-
-If the user approves or rejects a pending action and then closes the app before the next submit, those changes may exist only in memory.
+This means normal prompt turns and approval decisions are persisted after the runtime finishes handling them. Pending approvals are still in-memory only until the user approves or rejects.
 
 ---
 
@@ -167,7 +166,6 @@ Messages within a session are stored and loaded in ascending `seq` order.
 
 - Only the most recent session is restored automatically.
 - Pending approvals are not persisted.
-- Autosave does not run after `Approve` or `Reject`.
 - Restore uses a fixed message window rather than token-aware budgeting.
 - The full stored transcript can be larger than the context reloaded into the runtime.
 - The TUI does not yet show restored transcript history on startup.

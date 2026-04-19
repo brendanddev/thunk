@@ -1,7 +1,8 @@
 # params-cli
 
 Local-first, personal AI coding assistant CLI focused on local-first workflows, modular architecture, privacy, and real coding actions.
-> Version 0.8.9
+
+> Version 0.8.10
 
 ## Overview
 
@@ -23,6 +24,8 @@ The project is structured to keep model generation, tool execution, persistence,
 - Streams assistant output into the conversation while emitting UI-facing runtime events.
 - Parses tool calls centrally in `src/runtime/tool_codec.rs`.
 - Executes read-only tools immediately and pauses for approval before mutating files.
+- Re-enters model generation after tool results so the assistant can synthesize a grounded same-turn answer.
+- Enforces bounded per-turn `search_code` behavior at runtime instead of relying only on prompt wording.
 - Persists sessions in `data/sessions.db` and restores the most recent session on startup.
 - Writes best-effort per-session logs under `logs/`.
 
@@ -51,9 +54,10 @@ At a high level:
 3. The assistant response is scanned for tool calls.
 4. Tool calls are dispatched in document order.
 5. Immediate tool results are injected back into the conversation as runtime-owned result blocks.
-6. If a mutating tool proposes a change, the runtime stores a single `PendingAction` and waits for `/approve` or `/reject`.
+6. The runtime normally re-enters generation with those results so the model can answer from actual tool output.
+7. If a mutating tool proposes a change, the runtime stores a single `PendingAction` and waits for `/approve` or `/reject`.
 
-One important current behavior: after a successful tool round, the runtime stops the turn instead of automatically generating a follow-up assistant explanation.
+`search_code` is a literal substring search. The runtime now simplifies model-generated search phrases into a single literal keyword and enforces a per-turn budget: one search is allowed, a second search is allowed only when the first returned no matches, and later search attempts are blocked with a correction so the model must answer cleanly.
 
 ## Architecture
 
@@ -79,7 +83,6 @@ Key architectural rules reflected in the code:
 - No shell, git, web, or external integration tools yet.
 - No LSP integration or advanced memory system.
 - No token-aware live context budgeting before generation.
-- No cycle detection in the tool loop; the runtime only has a hard tool-round cap.
 - Pending approvals are not persisted across restarts.
 - Restored session history is loaded into the runtime, but not replayed into the visible TUI transcript.
 - Tool UI is compact and text-based; there is no diff view or expandable preview UI yet.

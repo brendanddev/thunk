@@ -137,7 +137,7 @@ Current behavior:
 
 ### `search_code`
 
-Searches recursively for lines containing a query string.
+Searches recursively for lines containing a literal substring.
 
 Current behavior:
 
@@ -147,8 +147,16 @@ Current behavior:
 - searches only a fixed set of text-like extensions
 - returns matching file path, line number, and line text
 - truncates at `50` matches
+- does not interpret the query as regex or semantic search
 
 The typed input supports an optional scoped path, but the current model-facing wire format does not expose that scoped form yet.
+
+Runtime behavior adds guardrails around the tool because prompt-only guidance was not enough for live local-model behavior:
+
+- model-facing instructions ask for one plain literal keyword or identifier
+- runtime simplifies phrase-like or method-like model queries to one literal token before dispatch
+- each user turn gets one search, plus one retry only if the first search returned no matches
+- after search is closed, additional `search_code` attempts are blocked by runtime correction
 
 ### `edit_file`
 
@@ -164,6 +172,8 @@ Current behavior:
 - replaces only the first occurrence
 
 This tool is intentionally exact. It does not do fuzzy patching or diff application.
+
+If the model tries to repair a malformed `edit_file` call after an edit tool error but still omits the required structure, the runtime injects an edit-specific correction and asks for a valid block instead of silently treating the malformed retry as a final answer.
 
 ### `write_file`
 
@@ -199,7 +209,7 @@ Those responsibilities belong to the runtime, app/storage, and TUI layers.
 
 - There are only five built-in tools.
 - There is no shell, git, web, or external integration tool yet.
-- `search_code` uses a simple line substring search, not regex or semantic search.
+- `search_code` uses a simple literal line substring search, not regex or semantic search.
 - `edit_file` only replaces the first exact match.
 - `write_file` does not create parent directories.
 - Tool result rendering is optimized for the runtime and TUI, not for rich previews or diffs.

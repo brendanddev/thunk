@@ -69,11 +69,12 @@ The core problem the project solves is running an AI coding assistant locally wi
 5. The backend streams `BackendEvent`s. The runtime converts status updates into `Activity` changes and text deltas into an assistant message in the conversation.
 6. When generation finishes, `tool_codec::parse_all_tool_inputs()` scans the full assistant response and returns typed `ToolInput` values in document order.
 7. `ToolRegistry` dispatches each `ToolInput` to its tool implementation.
-8. Immediate tool results are rendered two ways by the runtime: a compact one-line summary for the TUI, and a `[tool_result: ...]` block appended back into the conversation as a user message.
+8. Immediate tool results are rendered two ways by the runtime: a compact one-line summary for the TUI, and a `=== tool_result: name ===` block appended back into the conversation as a user message.
 9. If a tool returns `Approval(PendingAction)`, the runtime stores that single pending action, emits `ApprovalRequired`, and stops the turn until the user chooses `/approve` or `/reject`.
-10. The TUI renders events only. It never sees typed tool payloads and never calls tool implementations directly.
+10. If no approval is pending, the runtime re-enters generation with the injected tool results so the assistant can produce a same-turn answer grounded in actual tool output.
+11. The TUI renders events only. It never sees typed tool payloads and never calls tool implementations directly.
 
-One important current behavior: after a successful tool round, the runtime ends the turn. It does not automatically call the model again to narrate the result.
+One important current behavior: successful tool rounds do not end the turn immediately. The runtime normally calls the model again with the tool results so the final answer can synthesize what was actually found or changed.
 
 ---
 
@@ -103,9 +104,9 @@ The runtime owns the pending action lifecycle, but it does not interpret `payloa
 2. The runtime stores it in `pending_action` and emits `RuntimeEvent::ApprovalRequired`.
 3. While `pending_action` is set, `Submit` is rejected.
 4. `/approve` calls `ToolRegistry::execute_approved()`.
-5. `/reject` appends a `[tool_error: ...]` block and lets the model continue.
+5. `/reject` appends a `=== tool_error: name ===` block and lets the model continue.
 
-On approval success, the runtime appends a `[tool_result: ...]` block and ends the turn. On approval failure, it appends a `[tool_error: ...]` block and resumes generation so the model can recover.
+On approval success, the runtime appends a `=== tool_result: name ===` block and resumes generation for synthesis. On approval failure, it appends a `=== tool_error: name ===` block and resumes generation so the model can recover.
 
 ### Two-Phase Execution
 
@@ -136,14 +137,14 @@ Supported model-facing call formats:
 ```text
 [read_file: path/to/file.rs]
 [list_dir: src/]
-[search_code: pattern]
+[search_code: keyword]
 
 [edit_file]
 path: path/to/file.rs
 ---search---
-exact text to find
+old content
 ---replace---
-replacement text
+new content
 [/edit_file]
 
 [write_file]
@@ -158,10 +159,15 @@ Protocol rules in the current implementation:
 - `tool_codec` is the only parser for raw assistant tool syntax.
 - Single-line bracket calls must close on the same line.
 - Multi-line `edit_file` / `write_file` blocks must contain the required delimiters and closing tag.
-- Malformed or unrecognized tool blocks are skipped silently.
+- `search_code` is model-facing as a single literal keyword or identifier, not a regex, method call, or phrase query.
+- `search_code` still accepts narrow legacy block forms such as `pattern:` and `query:` for model-drift tolerance, but those names are parser compatibility only; the tool performs literal substring matching.
+- Malformed wrong-open-tag tool blocks are detected and corrected instead of silently becoming normal assistant prose.
+- Malformed `edit_file` retries after an edit error receive an edit-specific runtime correction instead of being accepted as a final answer.
 - Mixed tool-call formats are executed in the order they appear in the assistant response.
 
-The system prompt tells the model that when a tool is needed, the reply should contain tool call tags only. Direct plain-text answers are still allowed when no tool is needed. Tool results are never model-authored: the runtime injects `[tool_result: ...]` and `[tool_error: ...]` blocks after execution, and those result formats are intentionally not described back to the model.
+The system prompt tells the model that when a tool is needed, the reply should contain tool call tags only. Direct plain-text answers are still allowed when no tool is needed. Tool results are never model-authored: the runtime injects `=== tool_result: name ===` and `=== tool_error: name ===` blocks after execution, and those result formats are intentionally not described back to the model.
+
+Prompt-only behavioral rules are not treated as sufficient for loop safety. For `search_code`, the runtime also enforces a per-turn budget: one search is always allowed, one retry is allowed only if the first search returned no matches, and later search attempts are blocked with a runtime correction.
 
 ---
 
@@ -184,7 +190,7 @@ Restore behavior is intentionally narrower than storage:
 
 - only the most recent `RESTORE_WINDOW` messages are injected back into the runtime
 - the current `RESTORE_WINDOW` is `10`
-- user messages that start with `[tool_result:` or `[tool_error:` are stripped during restore
+- user messages that start with `=== tool_result:`, `=== tool_error:`, or `[runtime:correction]` are stripped during restore
 - if such a stripped tool exchange was preceded by a pure assistant tool call that starts with `[`, that assistant message is stripped too
 - full stored history remains in SQLite even when it is excluded from restored context
 
@@ -196,10 +202,10 @@ Live trimming is limited today:
 - `search_code` truncates at `50` matches
 - if the live prompt still exceeds the configured llama.cpp context window, generation fails instead of auto-trimming
 
-Two current persistence gaps matter:
+Current persistence behavior:
 
-- `AppContext` auto-saves after `Submit`, but not after `Approve` or `Reject`
-- `pending_action` is in-memory only, so restarting the app clears any in-flight approval
+- `AppContext` auto-saves after `Submit`, `Approve`, and `Reject`
+- `pending_action` is still in-memory only, so restarting the app clears any in-flight approval
 
 One current UI/runtime mismatch also matters: restored history is loaded into the runtime, but it is not replayed into `AppState`, so the visible transcript starts fresh each launch even when the model already has restored context.
 
@@ -213,9 +219,11 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 - Raw assistant tool syntax is parsed only in `tool_codec`.
 - Tools return typed data; tools do not append conversation text themselves.
 - Mutating tools do not write during `run()`; writes happen only in `execute_approved()`.
+- `search_code` executes literal substring searches, and repeated search behavior is bounded per user turn by runtime state.
+- Malformed `edit_file` repair attempts after edit errors are surfaced back to the model through runtime correction rather than silently ending the turn.
 - The runtime communicates through `RuntimeRequest` and `RuntimeEvent`; it does not depend on the TUI or SQLite.
 - Logging is advisory and does not participate in control flow.
-- Failure paths are explicit: backend failures become `RuntimeEvent::Failed`, tool dispatch/approval failures become runtime-owned `[tool_error: ...]` messages or failed events, and the runtime returns to a defined state instead of silently continuing.
+- Failure paths are explicit: backend failures become `RuntimeEvent::Failed`, tool dispatch/approval failures become runtime-owned `=== tool_error: name ===` messages or failed events, and the runtime returns to a defined state instead of silently continuing.
 - There is no global mutable singleton state; root path, config, backend, tools, and session handles are all passed in through construction.
 
 ---
@@ -223,7 +231,7 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 ## Known Limitations / Deferred Work
 
 - Live context management is incomplete. Restore trimming exists, but there is no proactive token-based budgeting or live conversation trimming before generation.
-- Tool-loop safety is coarse. The runtime has a hard limit of `10` tool rounds, but no cycle detection.
+- Tool-loop safety still includes a hard limit of `10` tool rounds per turn; search has narrower per-turn runtime enforcement, but broader planning quality is still model-dependent.
 - Advanced memory is not implemented. There is no embeddings layer, structured memory, or long-term recall.
 - LSP integration is not implemented.
 - The tool surface is still small: `read_file`, `list_dir`, `search_code`, `edit_file`, and `write_file` only.
