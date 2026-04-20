@@ -94,6 +94,15 @@ fn config_read_recovery_correction(path: &str) -> String {
     )
 }
 
+fn initialization_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] This is an initialization lookup. The file just read did not show \
+         an initialization match, but a matched initialization candidate exists. \
+         Read this exact initialization file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
 /// Injected when the question contains a code identifier but the model attempts a Direct answer
 /// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
 const SEARCH_BEFORE_ANSWERING: &str =
@@ -182,6 +191,9 @@ enum InvestigationMode {
     /// Prompt signals a config lookup (where X is configured/configuration).
     /// Source-file reads are structurally insufficient when config-file candidates exist.
     ConfigLookup,
+    /// Prompt signals a narrow initialization lookup.
+    /// Non-initialization reads are structurally insufficient when initialization candidates exist.
+    InitializationLookup,
 }
 
 impl InvestigationMode {
@@ -191,6 +203,7 @@ impl InvestigationMode {
             InvestigationMode::UsageLookup => "UsageLookup",
             InvestigationMode::DefinitionLookup => "DefinitionLookup",
             InvestigationMode::ConfigLookup => "ConfigLookup",
+            InvestigationMode::InitializationLookup => "InitializationLookup",
         }
     }
 }
@@ -204,6 +217,8 @@ enum RecoveryKind {
     ImportOnly,
     /// The file was a non-config source file on a config lookup when config-file candidates exist.
     ConfigFile,
+    /// The file lacked initialization matches when initialization candidates exist.
+    Initialization,
 }
 
 impl RecoveryKind {
@@ -212,6 +227,7 @@ impl RecoveryKind {
             RecoveryKind::DefinitionOnly => "DefinitionOnly",
             RecoveryKind::ImportOnly => "ImportOnly",
             RecoveryKind::ConfigFile => "ConfigFile",
+            RecoveryKind::Initialization => "Initialization",
         }
     }
 }
@@ -267,6 +283,14 @@ struct InvestigationState {
     has_non_config_candidates: bool,
     /// True after the config-file recovery correction has been issued once this turn.
     config_correction_issued: bool,
+    /// Candidate paths where at least one matched line contains an initialization term.
+    /// Populated during record_search_results alongside search_candidate_paths.
+    initialization_candidates: HashSet<String>,
+    /// True if at least one candidate in the current search results has no matched
+    /// initialization line.
+    has_non_initialization_candidates: bool,
+    /// True after the initialization recovery correction has been issued once this turn.
+    initialization_correction_issued: bool,
 }
 
 impl InvestigationState {
@@ -288,6 +312,9 @@ impl InvestigationState {
             config_file_candidates: HashSet::new(),
             has_non_config_candidates: false,
             config_correction_issued: false,
+            initialization_candidates: HashSet::new(),
+            has_non_initialization_candidates: false,
+            initialization_correction_issued: false,
         }
     }
 
@@ -315,24 +342,31 @@ impl InvestigationState {
             self.has_non_import_candidates = false;
             self.config_file_candidates.clear();
             self.has_non_config_candidates = false;
+            self.initialization_candidates.clear();
+            self.has_non_initialization_candidates = false;
             self.read_useful_candidate = false;
 
             for result in &results.matches {
                 push_unique_path(&mut self.search_candidate_paths, &result.file);
             }
 
-            // Classify each candidate file along three structural axes.
+            // Classify each candidate file along four structural axes.
             // definition-only: every matched line looks like a definition site (line-content).
             // import-only: every matched line looks like an import declaration (line-content).
             // config-file: the file's extension identifies it as a config file (path-based).
+            // initialization: at least one matched line contains an exact initialization term.
             let mut file_has_non_def: HashSet<String> = HashSet::new();
             let mut file_has_non_import: HashSet<String> = HashSet::new();
+            let mut file_has_initialization: HashSet<String> = HashSet::new();
             for m in &results.matches {
                 if !tool_codec::looks_like_definition(&m.line) {
                     file_has_non_def.insert(m.file.clone());
                 }
                 if !looks_like_import(&m.line) {
                     file_has_non_import.insert(m.file.clone());
+                }
+                if contains_initialization_term(&m.line) {
+                    file_has_initialization.insert(m.file.clone());
                 }
             }
             for path in &self.search_candidate_paths {
@@ -350,6 +384,11 @@ impl InvestigationState {
                     self.config_file_candidates.insert(path.clone());
                 } else {
                     self.has_non_config_candidates = true;
+                }
+                if file_has_initialization.contains(path) {
+                    self.initialization_candidates.insert(path.clone());
+                } else {
+                    self.has_non_initialization_candidates = true;
                 }
             }
         }
@@ -379,6 +418,14 @@ impl InvestigationState {
                     self.config_file_candidates.len().to_string(),
                 ),
                 ("has_non_config", self.has_non_config_candidates.to_string()),
+                (
+                    "initialization_files",
+                    self.initialization_candidates.len().to_string(),
+                ),
+                (
+                    "has_non_initialization",
+                    self.has_non_initialization_candidates.to_string(),
+                ),
             ],
         );
         was_empty
@@ -414,6 +461,10 @@ impl InvestigationState {
                 .any(|c| normalize_evidence_path(c) == read_path);
             let is_config_candidate = self
                 .config_file_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
+            let is_initialization_candidate = self
+                .initialization_candidates
                 .iter()
                 .any(|c| normalize_evidence_path(c) == read_path);
 
@@ -491,6 +542,45 @@ impl InvestigationState {
                     ],
                 );
                 // Correction already issued: fall through without accepting.
+            }
+            // Gate 3 (InitializationLookup): non-initialization reads are structurally
+            // insufficient when initialization candidates exist. Fire once; fallback
+            // accepts if no initialization candidates exist.
+            else if matches!(mode, InvestigationMode::InitializationLookup)
+                && !is_initialization_candidate
+                && !self.initialization_candidates.is_empty()
+            {
+                if !self.initialization_correction_issued {
+                    self.initialization_correction_issued = true;
+                    let suggested_path = self.first_initialization_candidate().map(str::to_string);
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", read_path.clone()),
+                            ("accepted", "false".into()),
+                            (
+                                "reason",
+                                "initialization_non_initialization_candidate".into(),
+                            ),
+                            (
+                                "recovery_path",
+                                suggested_path.clone().unwrap_or_else(|| "none".into()),
+                            ),
+                        ],
+                    );
+                    return suggested_path.map(|p| (p, RecoveryKind::Initialization));
+                }
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "false".into()),
+                        ("reason", "initialization_recovery_already_issued".into()),
+                    ],
+                );
+                // Correction already issued: fall through without accepting.
             } else {
                 // Candidate would normally be accepted. Check import-only before committing.
                 // Import-only candidates are structurally insufficient when substantive
@@ -554,6 +644,10 @@ impl InvestigationState {
         if matches!(mode, InvestigationMode::ConfigLookup) && self.config_file_candidates.is_empty()
         {
             "config_fallback_no_config_candidates".into()
+        } else if matches!(mode, InvestigationMode::InitializationLookup)
+            && self.initialization_candidates.is_empty()
+        {
+            "initialization_fallback_no_initialization_candidates".into()
         } else if matches!(mode, InvestigationMode::UsageLookup)
             && is_def_only
             && !self.has_non_definition_candidates
@@ -584,6 +678,13 @@ impl InvestigationState {
         self.search_candidate_paths
             .iter()
             .find(|path| self.config_file_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_initialization_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| self.initialization_candidates.contains(*path))
             .map(String::as_str)
     }
 }
@@ -694,6 +795,7 @@ fn simplify_search_query(query: &str) -> String {
         "find",
         "how",
         "in",
+        "initialize",
         "initialized",
         "initialization",
         "implemented",
@@ -847,7 +949,9 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
     [
         "defined",
         "implemented",
+        "initialize",
         "initialized",
+        "initialization",
         "initialised",
         "configured",
         "saved",
@@ -871,7 +975,7 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
 
 /// Detects the structural investigation mode from the prompt text.
 /// Evaluated in priority order so each prompt maps to exactly one mode.
-/// Priority: UsageLookup > ConfigLookup > DefinitionLookup > General.
+/// Priority: UsageLookup > ConfigLookup > InitializationLookup > DefinitionLookup > General.
 fn detect_investigation_mode(text: &str) -> InvestigationMode {
     let lower = text.to_ascii_lowercase();
     if [
@@ -900,6 +1004,9 @@ fn detect_investigation_mode(text: &str) -> InvestigationMode {
     {
         return InvestigationMode::ConfigLookup;
     }
+    if contains_initialization_term(&lower) {
+        return InvestigationMode::InitializationLookup;
+    }
     if [
         "defined",
         "definition",
@@ -913,6 +1020,13 @@ fn detect_investigation_mode(text: &str) -> InvestigationMode {
         return InvestigationMode::DefinitionLookup;
     }
     InvestigationMode::General
+}
+
+const INITIALIZATION_TERMS: &[&str] = &["initialize", "initialized", "initialization"];
+
+fn contains_initialization_term(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    INITIALIZATION_TERMS.iter().any(|term| lower.contains(term))
 }
 
 fn contains_word(text: &str, needle: &str) -> bool {
@@ -1912,6 +2026,9 @@ fn run_tool_round(
                         RecoveryKind::DefinitionOnly => usage_read_recovery_correction(&path),
                         RecoveryKind::ImportOnly => import_read_recovery_correction(&path),
                         RecoveryKind::ConfigFile => config_read_recovery_correction(&path),
+                        RecoveryKind::Initialization => {
+                            initialization_read_recovery_correction(&path)
+                        }
                     };
                     accumulated.push_str(&correction);
                     accumulated.push_str("\n\n");
@@ -4580,6 +4697,26 @@ mod tests {
     }
 
     #[test]
+    fn detect_investigation_mode_returns_initialization_lookup() {
+        assert!(matches!(
+            detect_investigation_mode("Find where logging is initialized"),
+            InvestigationMode::InitializationLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find logging initialization"),
+            InvestigationMode::InitializationLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find code that can initialize logging"),
+            InvestigationMode::InitializationLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find where logging is initialised"),
+            InvestigationMode::General
+        ));
+    }
+
+    #[test]
     fn detect_investigation_mode_returns_definition_lookup() {
         assert!(matches!(
             detect_investigation_mode("Where is TaskStatus defined?"),
@@ -4617,6 +4754,14 @@ mod tests {
     }
 
     #[test]
+    fn detect_investigation_mode_usage_priority_over_initialization() {
+        assert!(matches!(
+            detect_investigation_mode("Where is logging initialization used?"),
+            InvestigationMode::UsageLookup
+        ));
+    }
+
+    #[test]
     fn detect_investigation_mode_config_priority_over_definition() {
         assert!(matches!(
             detect_investigation_mode("Where is config defined?"),
@@ -4626,6 +4771,34 @@ mod tests {
             detect_investigation_mode("Find config for logging"),
             InvestigationMode::ConfigLookup
         ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_config_priority_over_initialization() {
+        assert!(matches!(
+            detect_investigation_mode("Find where logging configuration is initialized"),
+            InvestigationMode::ConfigLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_initialization_priority_over_definition() {
+        assert!(matches!(
+            detect_investigation_mode("Where is initialization defined?"),
+            InvestigationMode::InitializationLookup
+        ));
+    }
+
+    #[test]
+    fn contains_initialization_term_matches_exact_allowed_substrings_only() {
+        assert!(contains_initialization_term("def initialize_logging():"));
+        assert!(contains_initialization_term(
+            "# logging is initialized here"
+        ));
+        assert!(contains_initialization_term("logging initialization entry"));
+        assert!(!contains_initialization_term("setup_logging()"));
+        assert!(!contains_initialization_term("bootstrap logging"));
+        assert!(!contains_initialization_term("logging is initialised here"));
     }
 
     #[test]
@@ -4854,6 +5027,295 @@ mod tests {
         assert_eq!(
             last_assistant,
             Some("The database connection is set up in services/database.py.")
+        );
+    }
+
+    // Phase 9.2.2 — Narrow Action-Specific Lookup Satisfaction: Initialization Lookup
+
+    #[test]
+    fn initialization_lookup_non_initialization_read_triggers_recovery() {
+        // Initialization lookup: two source candidates, but only one matched line
+        // contains an exact initialization term. Reading the other candidate first
+        // must trigger one bounded recovery to the initialization candidate.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("logging_factory.py"),
+            "logger = logging.getLogger(__name__)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("logging_setup.py"),
+            "def initialize_logging():\n    logging.basicConfig(level=logging.INFO)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging]",
+                "[read_file: services/logging_factory.py]",
+                "[read_file: services/logging_setup.py]",
+                "Logging is initialized in services/logging_setup.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where logging is initialized".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "initialization recovery + initialization read must admit synthesis: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let expected_recovery_path = tmp
+            .path()
+            .join("services")
+            .join("logging_setup.py")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.contains("This is an initialization lookup")
+                    && m.content
+                        .contains(&format!("[read_file: {expected_recovery_path}]"))
+            }),
+            "runtime must inject bounded initialization recovery"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Logging is initialized in services/logging_setup.py.")
+        );
+    }
+
+    #[test]
+    fn initialization_lookup_second_non_initialization_after_recovery_is_not_accepted() {
+        // Initialization lookup: initialization candidate exists, but the model ignores
+        // recovery and reads a second non-initialization candidate. That second read must
+        // remain insufficient; after two candidate reads the runtime terminates cleanly.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("logging_factory.py"),
+            "logger = logging.getLogger(__name__)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("logging_reader.py"),
+            "logging.getLogger(\"reader\")\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("logging_setup.py"),
+            "def initialize_logging():\n    logging.basicConfig(level=logging.INFO)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging]",
+                "[read_file: services/logging_factory.py]",
+                "[read_file: services/logging_reader.py]",
+                "Logging is initialized in services/logging_reader.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where logging is initialized".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must terminate cleanly: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "second non-initialization candidate must not satisfy evidence: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(ungrounded_investigation_final_answer()),
+            "last assistant must be the runtime terminal, not model synthesis"
+        );
+    }
+
+    #[test]
+    fn initialization_lookup_no_initialization_candidates_degrades_cleanly() {
+        // Initialization lookup triggered, but no matched line contains an exact
+        // initialization term. Gate 3 does not fire — existing candidate-read
+        // behavior is preserved.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("logging_factory.py"),
+            "logger = logging.getLogger(__name__)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging]",
+                "[read_file: services/logging_factory.py]",
+                "Logging is handled in services/logging_factory.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where logging is initialized".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "initialization lookup with no initialization candidates must degrade: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Logging is handled in services/logging_factory.py.")
+        );
+    }
+
+    #[test]
+    fn initialization_lookup_path_scope_keeps_candidates_inside_scope() {
+        // Prompt scope must remain the upper bound. The out-of-scope initialization
+        // file is stronger-looking but must not appear in search candidates.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/other")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("sandbox/services")
+                .join("logging_factory.py"),
+            "logger = logging.getLogger(__name__)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services").join("logging_setup.py"),
+            "def initialize_logging():\n    logging.basicConfig(level=logging.INFO)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/other").join("logging_setup.py"),
+            "def initialize_logging():\n    logging.basicConfig(level=logging.DEBUG)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging]",
+                "[read_file: sandbox/services/logging_factory.py]",
+                "[read_file: sandbox/services/logging_setup.py]",
+                "Logging is initialized in sandbox/services/logging_setup.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where logging is initialized in sandbox/services/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            search_result.contains("sandbox/services/logging_factory.py"),
+            "scoped search must include in-scope non-initialization candidate: {search_result}"
+        );
+        assert!(
+            search_result.contains("sandbox/services/logging_setup.py"),
+            "scoped search must include in-scope initialization candidate: {search_result}"
+        );
+        assert!(
+            !search_result.contains("sandbox/other/logging_setup.py"),
+            "scoped search must exclude out-of-scope initialization candidate: {search_result}"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Logging is initialized in sandbox/services/logging_setup.py.")
         );
     }
 }
