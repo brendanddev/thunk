@@ -517,6 +517,148 @@ pub fn format_tool_error(name: &str, error: &str) -> String {
     format!("=== tool_error: {name} ===\n{error}\n=== /tool_error ===\n\n")
 }
 
+/// Maximum number of match lines shown per file in grouped search output.
+/// Files with more hits show this many lines plus a "(N more not shown)" note.
+/// Kept small so a single high-match file cannot crowd out other files in the window.
+const MAX_LINES_PER_FILE: usize = 3;
+
+/// Returns true if the file path belongs to the source tier.
+/// Mirrors the tier-0 set from search_code::file_class_priority without importing it.
+fn is_source_tier(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    matches!(
+        ext,
+        "rs" | "go"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "py"
+            | "h"
+            | "hpp"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "html"
+            | "css"
+            | "scss"
+            | "sql"
+            | "xml"
+    )
+}
+
+/// Returns true if the line (after stripping leading whitespace) looks like a symbol definition.
+/// Coverage: Rust, Python, Go, TypeScript, JavaScript.
+/// C/C++ patterns are excluded — too many false positives without a type parser.
+/// No regex, no scoring — prefix matching only.
+pub fn looks_like_definition(line: &str) -> bool {
+    let t = line.trim_start();
+    // Rust
+    t.starts_with("pub enum ")
+        || t.starts_with("pub struct ")
+        || t.starts_with("pub fn ")
+        || t.starts_with("pub type ")
+        || t.starts_with("pub trait ")
+        || t.starts_with("pub const ")
+        || t.starts_with("pub static ")
+        || t.starts_with("enum ")
+        || t.starts_with("struct ")
+        || t.starts_with("fn ")
+        || t.starts_with("type ")
+        || t.starts_with("const ")
+        || t.starts_with("trait ")
+        || t.starts_with("impl ")
+        // Python / TypeScript / JavaScript (shared keywords)
+        || t.starts_with("class ")
+        // Python
+        || t.starts_with("def ")
+        // Go
+        || t.starts_with("func ")
+        // TypeScript / JavaScript
+        || t.starts_with("function ")
+        || t.starts_with("interface ")
+}
+
+/// Returns the path of the one source-tier file whose match lines contain a definition,
+/// or None if zero or more than one such file exists.
+/// The single-file guard keeps the hint conservative: suppress when ambiguous.
+fn definition_site_file<'a>(
+    groups: &[(&'a str, Vec<&crate::tools::types::SearchMatch>)],
+) -> Option<&'a str> {
+    let mut found: Option<&'a str> = None;
+    for (file, matches) in groups {
+        if !is_source_tier(file) {
+            continue;
+        }
+        if matches.iter().any(|m| looks_like_definition(&m.line)) {
+            if found.is_some() {
+                // More than one candidate — ambiguous; suppress the hint.
+                return None;
+            }
+            found = Some(file);
+        }
+    }
+    found
+}
+
+fn render_search_results_grouped(s: &crate::tools::types::SearchResultsOutput) -> String {
+    use crate::tools::types::SearchMatch;
+
+    let mut lines: Vec<String> = Vec::new();
+
+    if s.truncated {
+        lines.push(format!(
+            "[showing first {} of {} matches — read a specific matched file with read_file]",
+            s.matches.len(),
+            s.total_matches
+        ));
+    }
+
+    // Group consecutive matches that share the same file path.
+    // Matches arrive in tier-sorted, then within-tier alphabetical order (Phase 9.0.1),
+    // so same-file matches are already adjacent — a single linear pass suffices.
+    let mut groups: Vec<(&str, Vec<&SearchMatch>)> = Vec::new();
+    for m in &s.matches {
+        match groups.last_mut() {
+            Some((file, group_matches)) if *file == m.file.as_str() => {
+                group_matches.push(m);
+            }
+            _ => groups.push((m.file.as_str(), vec![m])),
+        }
+    }
+
+    // If exactly one source-tier file has a definition-like line, prepend a directive
+    // so the model reads the definition site rather than a high-match usage file.
+    if let Some(def_file) = definition_site_file(&groups) {
+        lines.push(format!(
+            "[definition found in {} — read this file first]",
+            def_file
+        ));
+    }
+
+    for (file, group_matches) in groups {
+        let total_in_file = group_matches.len();
+        let shown = total_in_file.min(MAX_LINES_PER_FILE);
+        if shown < total_in_file {
+            lines.push(format!(
+                "{} ({} matches, showing {})",
+                file, total_in_file, shown
+            ));
+        } else {
+            lines.push(format!("{} ({} matches)", file, total_in_file));
+        }
+        for m in &group_matches[..shown] {
+            lines.push(format!("  {}: {}", m.line_number, m.line));
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn render_output(output: &ToolOutput) -> String {
     match output {
         ToolOutput::FileContents(f) => {
@@ -554,20 +696,7 @@ fn render_output(output: &ToolOutput) -> String {
             if s.matches.is_empty() {
                 "No matches found.".to_string()
             } else {
-                let mut lines: Vec<String> = Vec::new();
-                if s.truncated {
-                    lines.push(format!(
-                        "[showing first {} of {} matches — read a specific matched file with read_file]",
-                        s.matches.len(),
-                        s.total_matches
-                    ));
-                }
-                lines.extend(
-                    s.matches
-                        .iter()
-                        .map(|m| format!("{}:{}: {}", m.file, m.line_number, m.line)),
-                );
-                lines.join("\n")
+                render_search_results_grouped(s)
             }
         }
         ToolOutput::EditFile(e) => {
@@ -1218,6 +1347,312 @@ mod tests {
         assert!(result.starts_with("=== tool_error: read_file ==="));
         assert!(result.contains("file not found"));
         assert!(result.contains("=== /tool_error ==="));
+    }
+
+    // SearchResults grouped rendering
+
+    fn make_match(file: &str, line_number: usize, line: &str) -> crate::tools::types::SearchMatch {
+        crate::tools::types::SearchMatch {
+            file: file.to_string(),
+            line_number,
+            line: line.to_string(),
+        }
+    }
+
+    fn make_search_output(
+        matches: Vec<crate::tools::types::SearchMatch>,
+        total_matches: usize,
+    ) -> ToolOutput {
+        use crate::tools::types::SearchResultsOutput;
+        let truncated = total_matches > matches.len();
+        ToolOutput::SearchResults(SearchResultsOutput {
+            query: "q".into(),
+            matches,
+            total_matches,
+            truncated,
+        })
+    }
+
+    #[test]
+    fn search_results_grouped_single_file_within_cap() {
+        let output = make_search_output(
+            vec![
+                make_match("src/lib.rs", 10, "fn needle() {}"),
+                make_match("src/lib.rs", 20, "let needle = 1;"),
+            ],
+            2,
+        );
+        let body = render_output(&output);
+        // Header shows file with count, no "showing K" because within cap.
+        assert!(
+            body.contains("src/lib.rs (2 matches)"),
+            "expected file header with count; got:\n{body}"
+        );
+        assert!(!body.contains("showing"), "no 'showing' annotation needed");
+        assert!(body.contains("  10: fn needle() {}"));
+        assert!(body.contains("  20: let needle = 1;"));
+    }
+
+    #[test]
+    fn search_results_grouped_single_file_exceeds_per_file_cap() {
+        let matches = (1..=5)
+            .map(|i| make_match("src/lib.rs", i, &format!("needle line {i}")))
+            .collect();
+        let output = make_search_output(matches, 5);
+        let body = render_output(&output);
+        // 5 matches, cap is MAX_LINES_PER_FILE (3) → header says "showing 3".
+        assert!(
+            body.contains("src/lib.rs (5 matches, showing 3)"),
+            "got:\n{body}"
+        );
+        assert!(body.contains("  1: needle line 1"));
+        assert!(body.contains("  3: needle line 3"));
+        assert!(!body.contains("  4: needle line 4"), "lines beyond cap must not appear");
+    }
+
+    #[test]
+    fn search_results_grouped_multiple_files_separate_groups() {
+        let output = make_search_output(
+            vec![
+                make_match("src/types.rs", 47, "pub enum TaskStatus {"),
+                make_match("src/engine.rs", 312, "let task = Task::new();"),
+                make_match("README.md", 12, "A task is a unit"),
+            ],
+            3,
+        );
+        let body = render_output(&output);
+        assert!(body.contains("src/types.rs (1 matches)"), "got:\n{body}");
+        assert!(body.contains("src/engine.rs (1 matches)"), "got:\n{body}");
+        assert!(body.contains("README.md (1 matches)"), "got:\n{body}");
+        // types.rs must appear before engine.rs, which must appear before README.md.
+        let pos_types = body.find("src/types.rs").unwrap();
+        let pos_engine = body.find("src/engine.rs").unwrap();
+        let pos_readme = body.find("README.md").unwrap();
+        assert!(pos_types < pos_engine, "file order must be preserved");
+        assert!(pos_engine < pos_readme, "file order must be preserved");
+    }
+
+    #[test]
+    fn search_results_grouped_truncation_notice_present_when_truncated() {
+        let matches: Vec<_> = (1..=3)
+            .map(|i| make_match("src/lib.rs", i, "needle"))
+            .collect();
+        // total_matches = 20 but only 3 are in the shown set → truncated.
+        let output = make_search_output(matches, 20);
+        let body = render_output(&output);
+        assert!(
+            body.contains("[showing first 3 of 20 matches"),
+            "truncation notice must appear; got:\n{body}"
+        );
+        assert!(body.contains("src/lib.rs (3 matches)"));
+    }
+
+    #[test]
+    fn search_results_grouped_no_matches_returns_sentinel() {
+        use crate::tools::types::SearchResultsOutput;
+        let output = ToolOutput::SearchResults(SearchResultsOutput {
+            query: "q".into(),
+            matches: vec![],
+            total_matches: 0,
+            truncated: false,
+        });
+        let body = render_output(&output);
+        assert_eq!(body, "No matches found.");
+    }
+
+    #[test]
+    fn search_results_grouped_within_file_line_order_preserved() {
+        // Lines must appear in ascending line_number order within the file.
+        let output = make_search_output(
+            vec![
+                make_match("src/lib.rs", 5, "first"),
+                make_match("src/lib.rs", 12, "second"),
+                make_match("src/lib.rs", 99, "third"),
+            ],
+            3,
+        );
+        let body = render_output(&output);
+        let pos_first = body.find("  5: first").unwrap();
+        let pos_second = body.find("  12: second").unwrap();
+        let pos_third = body.find("  99: third").unwrap();
+        assert!(pos_first < pos_second && pos_second < pos_third);
+    }
+
+    // Phase 9.2.1 — Definition Lookup Mode
+
+    #[test]
+    fn looks_like_definition_matches_rust_keywords() {
+        assert!(looks_like_definition("pub enum TaskStatus {"));
+        assert!(looks_like_definition("pub struct Config {"));
+        assert!(looks_like_definition("pub fn run_turns("));
+        assert!(looks_like_definition("pub type Result<T> ="));
+        assert!(looks_like_definition("pub trait Backend {"));
+        assert!(looks_like_definition("pub const MAX: usize = 10;"));
+        assert!(looks_like_definition("pub static INSTANCE: Lazy<Foo>"));
+        assert!(looks_like_definition("enum State {"));
+        assert!(looks_like_definition("struct Inner {"));
+        assert!(looks_like_definition("fn helper("));
+        assert!(looks_like_definition("type Alias = u32;"));
+        assert!(looks_like_definition("const CAP: usize = 50;"));
+        assert!(looks_like_definition("trait Render {"));
+        assert!(looks_like_definition("impl TaskStatus {"));
+        // leading whitespace stripped
+        assert!(looks_like_definition("    pub fn method("));
+        assert!(looks_like_definition("\tfn indented("));
+    }
+
+    #[test]
+    fn looks_like_definition_matches_other_languages() {
+        assert!(looks_like_definition("def my_function(self):"));
+        assert!(looks_like_definition("class MyService:"));
+        assert!(looks_like_definition("func HandleRequest("));
+        assert!(looks_like_definition("function onClick("));
+        assert!(looks_like_definition("interface UserRepo {"));
+        assert!(looks_like_definition("class Component extends React.Component {"));
+        assert!(looks_like_definition("type Config = {"));
+        assert!(looks_like_definition("const handler = ("));
+    }
+
+    #[test]
+    fn looks_like_definition_rejects_usage_lines() {
+        assert!(!looks_like_definition("let x = TaskStatus::Running;"));
+        assert!(!looks_like_definition("task.execute();"));
+        assert!(!looks_like_definition("use crate::tools::types::SearchMatch;"));
+        assert!(!looks_like_definition("// pub fn commented_out("));
+        assert!(!looks_like_definition("println!(\"fn not a definition\");"));
+        assert!(!looks_like_definition("x.fn_call()"));
+        assert!(!looks_like_definition("result = some_fn(a, b)"));
+    }
+
+    #[test]
+    fn definition_preamble_fires_for_single_definition_file() {
+        // One source file has a definition line; one has only usage lines.
+        // Preamble must fire for the definition file.
+        let output = make_search_output(
+            vec![
+                make_match("src/types.rs", 47, "pub enum TaskStatus {"),
+                make_match("src/engine.rs", 312, "let status = TaskStatus::Running;"),
+                make_match("src/engine.rs", 415, "task.set_status(status);"),
+            ],
+            3,
+        );
+        let body = render_output(&output);
+        assert!(
+            body.contains("[definition found in src/types.rs — read this file first]"),
+            "preamble must fire for the single definition file; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_preamble_suppressed_when_multiple_definition_files() {
+        // Two source files both have definition lines → ambiguous → no preamble.
+        let output = make_search_output(
+            vec![
+                make_match("src/types.rs", 10, "pub enum TaskStatus {"),
+                make_match("src/models.rs", 5, "pub struct Task {"),
+            ],
+            2,
+        );
+        let body = render_output(&output);
+        assert!(
+            !body.contains("[definition found in"),
+            "preamble must be suppressed when multiple files have definitions; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_preamble_suppressed_when_no_definition_lines() {
+        // All match lines are usage sites — no definition patterns → no preamble.
+        let output = make_search_output(
+            vec![
+                make_match("src/engine.rs", 100, "task.execute();"),
+                make_match("src/engine.rs", 200, "let t = Task::new();"),
+            ],
+            2,
+        );
+        let body = render_output(&output);
+        assert!(
+            !body.contains("[definition found in"),
+            "preamble must not fire when no definition lines exist; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_preamble_suppressed_for_docs_tier_only() {
+        // README.md mentions a class definition in prose — docs tier, not source tier.
+        // Preamble must not fire.
+        let output = make_search_output(
+            vec![make_match(
+                "README.md",
+                5,
+                "class MyService handles all requests",
+            )],
+            1,
+        );
+        let body = render_output(&output);
+        assert!(
+            !body.contains("[definition found in"),
+            "preamble must not fire for docs-tier files; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_preamble_correct_when_definition_and_usage_in_source_tier() {
+        // types.rs: definition line. engine.rs: usage lines only. Both source tier.
+        // Preamble must name types.rs, not engine.rs.
+        let output = make_search_output(
+            vec![
+                make_match("src/types.rs", 47, "pub struct Config {"),
+                make_match("src/engine.rs", 88, "let c = Config::default();"),
+                make_match("src/engine.rs", 200, "config.apply();"),
+                make_match("README.md", 3, "Config is the main configuration type."),
+            ],
+            4,
+        );
+        let body = render_output(&output);
+        assert!(
+            body.contains("[definition found in src/types.rs — read this file first]"),
+            "preamble must name the definition file, not usage files; got:\n{body}"
+        );
+        assert!(!body.contains("src/engine.rs — read this file first"));
+    }
+
+    #[test]
+    fn definition_preamble_present_with_truncated_results() {
+        // total_matches > shown → truncation notice fires.
+        // If the shown set includes a definition, preamble must still fire.
+        let matches = vec![
+            make_match("src/types.rs", 10, "pub fn important()"),
+            make_match("src/engine.rs", 50, "important();"),
+            make_match("src/engine.rs", 60, "important();"),
+        ];
+        let output = make_search_output(matches, 50); // total=50, shown=3 → truncated
+        let body = render_output(&output);
+        assert!(
+            body.contains("[showing first 3 of 50 matches"),
+            "truncation notice must be present"
+        );
+        assert!(
+            body.contains("[definition found in src/types.rs — read this file first]"),
+            "preamble must fire even when results are truncated; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_preamble_does_not_alter_group_rendering() {
+        // The preamble is additive — existing group headers and match lines must still appear.
+        let output = make_search_output(
+            vec![
+                make_match("src/types.rs", 47, "pub enum Status {"),
+                make_match("src/engine.rs", 10, "status.run();"),
+            ],
+            2,
+        );
+        let body = render_output(&output);
+        assert!(body.contains("src/types.rs (1 matches)"), "group header must still appear");
+        assert!(body.contains("src/engine.rs (1 matches)"), "group header must still appear");
+        assert!(body.contains("  47: pub enum Status {"), "match line must still appear");
+        assert!(body.contains("  10: status.run();"), "match line must still appear");
     }
 
     #[test]

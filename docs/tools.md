@@ -147,8 +147,21 @@ Current behavior:
 - skips hidden directories and common build/output directories such as `target`, `node_modules`, `.git`, `dist`, and `build`
 - searches only a fixed set of text-like extensions
 - returns matching file path, line number, and line text
-- truncates at `50` matches
+- collects up to `50` matches internally
+- orders collected matches by file class before truncation: source files, then config/data files, then docs/text/unknown files
+- preserves deterministic ordering within each file class
+- shows up to `15` matches in the conversation output
 - does not interpret the query as regex or semantic search
+
+Rendered search output is grouped by file for model readability:
+
+- each file group shows the file path and match count
+- each file group shows up to `MAX_LINES_PER_FILE = 3` representative matching lines
+- files with more shown matches include a per-file "showing" count
+
+This grouping is presentation-only in `tool_codec`. The underlying typed data remains the same:
+`SearchMatch` and `SearchResultsOutput` are unchanged, and runtime behavior does not depend on
+parsing the grouped text.
 
 The typed input supports an optional scoped path, but the current model-facing wire format does not expose that scoped form yet.
 

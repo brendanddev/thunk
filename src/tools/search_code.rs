@@ -95,6 +95,7 @@ impl Tool for SearchCodeTool {
 
         let mut matches = Vec::new();
         walk_and_search(root, query, &mut matches)?;
+        matches.sort_by_key(|m| file_class_priority(&m.file));
 
         let total_matches = matches.len();
         let truncated = total_matches > MAX_RESULTS_SHOWN;
@@ -174,6 +175,26 @@ fn is_text_file(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| TEXT_EXTENSIONS.contains(&ext))
         .unwrap_or(false)
+}
+
+/// Returns a sort key that places source code files before config/data files,
+/// and both before documentation/text files.  Within each class the existing
+/// alphabetical walk order is preserved (sort_by_key is stable).
+///
+/// 0 — source:  rs go ts tsx js jsx py c cpp h hpp sh bash zsh fish html css scss sql xml
+/// 1 — config:  toml json yaml yml env
+/// 2 — docs:    md txt gitignore lock (and anything unrecognised)
+fn file_class_priority(path: &str) -> u8 {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rs" | "go" | "ts" | "tsx" | "js" | "jsx" | "py" | "c" | "cpp" | "h" | "hpp"
+        | "sh" | "bash" | "zsh" | "fish" | "html" | "css" | "scss" | "sql" | "xml" => 0,
+        "toml" | "json" | "yaml" | "yml" | "env" => 1,
+        _ => 2,
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +289,100 @@ mod tests {
             panic!("expected Immediate(SearchResults)")
         };
         assert_eq!(sr.matches.len(), 1);
+    }
+
+    #[test]
+    fn source_files_ranked_before_docs() {
+        // README.md and lib.rs both match — source file must appear first.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("README.md"), "needle in docs").unwrap();
+        fs::write(tmp.path().join("lib.rs"), "fn needle() {}").unwrap();
+
+        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(sr.matches.len(), 2);
+        assert!(
+            sr.matches[0].file.ends_with("lib.rs"),
+            "source file must appear before doc file; got: {:?}",
+            sr.matches.iter().map(|m| &m.file).collect::<Vec<_>>()
+        );
+        assert!(
+            sr.matches[1].file.ends_with("README.md"),
+            "doc file must appear after source file"
+        );
+    }
+
+    #[test]
+    fn config_files_ranked_between_source_and_docs() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("README.md"), "needle note").unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "needle = true").unwrap();
+        fs::write(tmp.path().join("lib.rs"), "fn needle() {}").unwrap();
+
+        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(sr.matches.len(), 3);
+        let files: Vec<&str> = sr.matches.iter().map(|m| m.file.as_str()).collect();
+        let rs_pos = files.iter().position(|f| f.ends_with("lib.rs")).unwrap();
+        let toml_pos = files.iter().position(|f| f.ends_with("Cargo.toml")).unwrap();
+        let md_pos = files.iter().position(|f| f.ends_with("README.md")).unwrap();
+
+        assert!(rs_pos < toml_pos, "source must come before config");
+        assert!(toml_pos < md_pos, "config must come before docs");
+    }
+
+    #[test]
+    fn within_class_order_is_stable() {
+        // Two source files: alphabetically a.rs < b.rs — within-class order must be preserved.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn needle() {}").unwrap();
+        fs::write(tmp.path().join("b.rs"), "fn needle() {}").unwrap();
+
+        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(sr.matches.len(), 2);
+        assert!(
+            sr.matches[0].file.ends_with("a.rs"),
+            "alphabetical order must be preserved within source class"
+        );
+        assert!(sr.matches[1].file.ends_with("b.rs"));
+    }
+
+    #[test]
+    fn docs_only_results_are_unaffected() {
+        // When only doc files match, they must still be returned (no filtering).
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("README.md"), "needle in readme").unwrap();
+        fs::write(tmp.path().join("NOTES.md"), "needle in notes").unwrap();
+
+        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(sr.matches.len(), 2, "doc-only results must not be filtered");
+    }
+
+    #[test]
+    fn file_class_priority_assigns_correct_tiers() {
+        assert_eq!(file_class_priority("src/lib.rs"), 0);
+        assert_eq!(file_class_priority("main.go"), 0);
+        assert_eq!(file_class_priority("app.ts"), 0);
+        assert_eq!(file_class_priority("Cargo.toml"), 1);
+        assert_eq!(file_class_priority("config.json"), 1);
+        assert_eq!(file_class_priority("settings.yaml"), 1);
+        assert_eq!(file_class_priority("README.md"), 2);
+        assert_eq!(file_class_priority("notes.txt"), 2);
+        assert_eq!(file_class_priority("Cargo.lock"), 2);
+        assert_eq!(file_class_priority("no_extension"), 2);
     }
 }

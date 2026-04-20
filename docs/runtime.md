@@ -124,6 +124,11 @@ After generation finishes, the full assistant response is scanned by `tool_codec
 
 If the round finishes without needing approval, the accumulated result blocks are appended to the conversation as a user message.
 
+Search result blocks are rendered by `tool_codec` before they are appended. Current `search_code`
+results are grouped by file in that rendered text, with per-file match counts and up to
+`MAX_LINES_PER_FILE = 3` representative lines per file. This is presentation-only: the runtime still
+receives typed `SearchResultsOutput` data and does not parse grouped text for decisions.
+
 Some tool outcomes end with a runtime-owned assistant answer instead of another model generation. Today that terminal path is used when `read_file` fails, so missing-file reads surface the tool error and stop cleanly instead of looping through repeated failed reads.
 
 `search_code` has extra runtime enforcement because prompt-only rules were not reliable enough with small local models:
@@ -187,6 +192,7 @@ That module is responsible for:
 - parsing assistant text into typed `ToolInput` values
 - formatting `ToolOutput` and tool failures back into conversation text
 - providing the protocol instructions inserted into the system prompt
+- shaping model-facing tool output for readability, such as grouped `search_code` result rendering
 
 This keeps tool parsing centralized and keeps individual tools text-free.
 

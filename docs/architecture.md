@@ -133,6 +133,11 @@ Current mutating tools:
 - format `ToolOutput` / tool errors back into runtime-owned conversation text
 - provide the tool-use instructions embedded in the system prompt
 
+It also owns model-facing output shaping for tool results. For example, `search_code` returns typed
+search matches, while `tool_codec` renders those matches grouped by file with per-file match counts
+and a small per-file line cap. That grouping is for model interpretability only; it does not change
+the typed search result data or runtime orchestration.
+
 Supported model-facing call formats:
 
 ```text
