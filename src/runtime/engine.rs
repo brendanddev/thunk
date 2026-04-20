@@ -76,6 +76,15 @@ fn usage_read_recovery_correction(path: &str) -> String {
     )
 }
 
+fn import_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] The file just read contained only import matches for this identifier. \
+         A matched file with substantive usage or definition exists. \
+         Read this exact file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
 /// Injected when the question contains a code identifier but the model attempts a Direct answer
 /// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
 const SEARCH_BEFORE_ANSWERING: &str =
@@ -104,12 +113,26 @@ const DUPLICATE_READ_REJECTED: &str =
 /// 2-3 accommodates a reasonable follow-up read without runaway context expansion.
 const MAX_READS_PER_TURN: usize = 3;
 
+/// Maximum number of distinct search-candidate files that may be read in a single
+/// investigation turn.  After two candidate reads, if evidence is still not ready,
+/// the runtime terminates cleanly rather than allowing another correction cycle.
+const MAX_CANDIDATE_READS_PER_INVESTIGATION: usize = 2;
+
 /// Injected when the model exceeds MAX_READS_PER_TURN in one turn.
 const READ_CAP_EXCEEDED: &str =
     "read limit for this turn reached. Answer from the file evidence already in context.";
 
 const LIST_DIR_BEFORE_SEARCH_BLOCKED: &str =
     "[runtime: code investigation questions require search_code, not list_dir.\nUse search_code with a keyword from the question — a function name, variable, or concept.]";
+
+/// Distinguishes which structural insufficiency caused a candidate read to be rejected.
+/// Used by the caller in run_tool_round to select the appropriate correction message.
+enum RecoveryKind {
+    /// The file was definition-only on a usage lookup with usage candidates available.
+    DefinitionOnly,
+    /// The file had only import-declaration matches with substantive candidates available.
+    ImportOnly,
+}
 
 /// Tracks per-turn search → read investigation state.
 /// Resets at the start of each call to run_turns, exactly like SearchBudget.
@@ -140,6 +163,20 @@ struct InvestigationState {
     /// True once any search_code call has completed this turn, even with no matches.
     /// Used to block list_dir before search on investigation-required turns.
     search_attempted: bool,
+    /// Count of distinct search-candidate files successfully read this turn.
+    /// Bounded investigation: a second candidate read is allowed when the first was
+    /// insufficient; after two candidate reads the runtime terminates cleanly if
+    /// evidence_ready() is still false.
+    candidate_reads_count: usize,
+    /// Candidate paths where every matched line looks like an import declaration.
+    /// Populated during record_search_results alongside search_candidate_paths.
+    import_only_candidates: HashSet<String>,
+    /// True if at least one candidate in the current search results has a non-import
+    /// match line (i.e. a file with substantive usage or definition is available).
+    has_non_import_candidates: bool,
+    /// True after the import-only recovery correction has been issued once this turn.
+    /// Uses its own flag so it does not consume the premature_synthesis correction slot.
+    import_correction_issued: bool,
 }
 
 impl InvestigationState {
@@ -154,6 +191,10 @@ impl InvestigationState {
             premature_synthesis_correction_issued: false,
             direct_answer_correction_issued: false,
             search_attempted: false,
+            candidate_reads_count: 0,
+            import_only_candidates: HashSet::new(),
+            has_non_import_candidates: false,
+            import_correction_issued: false,
         }
     }
 
@@ -173,19 +214,27 @@ impl InvestigationState {
             self.search_candidate_paths.clear();
             self.definition_only_candidates.clear();
             self.has_non_definition_candidates = false;
+            self.import_only_candidates.clear();
+            self.has_non_import_candidates = false;
             self.read_useful_candidate = false;
 
             for result in &results.matches {
                 push_unique_path(&mut self.search_candidate_paths, &result.file);
             }
 
-            // Classify each candidate file: definition-only if every matched line looks
-            // like a definition site, usage-bearing otherwise.
-            // Uses tool_codec::looks_like_definition as a predicate only — no rendering.
+            // Classify each candidate file along two structural axes.
+            // definition-only: every matched line looks like a definition site.
+            // import-only: every matched line looks like an import declaration.
+            // Both use tool_codec::looks_like_definition and the local looks_like_import
+            // as predicates only — no rendering.
             let mut file_has_non_def: HashSet<String> = HashSet::new();
+            let mut file_has_non_import: HashSet<String> = HashSet::new();
             for m in &results.matches {
                 if !tool_codec::looks_like_definition(&m.line) {
                     file_has_non_def.insert(m.file.clone());
+                }
+                if !looks_like_import(&m.line) {
+                    file_has_non_import.insert(m.file.clone());
                 }
             }
             for path in &self.search_candidate_paths {
@@ -193,6 +242,11 @@ impl InvestigationState {
                     self.has_non_definition_candidates = true;
                 } else {
                     self.definition_only_candidates.insert(path.clone());
+                }
+                if file_has_non_import.contains(path) {
+                    self.has_non_import_candidates = true;
+                } else {
+                    self.import_only_candidates.insert(path.clone());
                 }
             }
         }
@@ -203,7 +257,7 @@ impl InvestigationState {
         &mut self,
         output: &ToolOutput,
         usage_lookup_required: bool,
-    ) -> Option<String> {
+    ) -> Option<(String, RecoveryKind)> {
         let ToolOutput::FileContents(file) = output else {
             return None;
         };
@@ -217,22 +271,42 @@ impl InvestigationState {
             .any(|candidate| normalize_evidence_path(candidate) == read_path);
 
         if is_search_candidate {
+            self.candidate_reads_count += 1;
             let is_def_only = self
                 .definition_only_candidates
                 .iter()
                 .any(|c| normalize_evidence_path(c) == read_path);
-            // On usage lookups, a definition-only file satisfies evidence only
-            // when no usage candidates exist in the current result set.
-            // On non-usage lookups (including definition questions), any matched
-            // candidate remains useful evidence.
-            if !usage_lookup_required || !is_def_only || !self.has_non_definition_candidates {
-                self.read_useful_candidate = true;
-            } else if !self.premature_synthesis_correction_issued {
-                let suggested_path = self.first_non_definition_candidate().map(str::to_string);
-                if suggested_path.is_some() {
-                    self.premature_synthesis_correction_issued = true;
+            let is_import_only = self
+                .import_only_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
+
+            // On usage lookups, a definition-only file satisfies evidence only when no
+            // usage candidates exist. On non-usage or non-def-only reads, proceed to
+            // the acceptance branch where import-only is checked.
+            if usage_lookup_required && is_def_only && self.has_non_definition_candidates {
+                if !self.premature_synthesis_correction_issued {
+                    let suggested_path = self.first_non_definition_candidate().map(str::to_string);
+                    if suggested_path.is_some() {
+                        self.premature_synthesis_correction_issued = true;
+                    }
+                    return suggested_path.map(|p| (p, RecoveryKind::DefinitionOnly));
                 }
-                return suggested_path;
+                // Correction already issued: fall through without accepting.
+            } else {
+                // Candidate would normally be accepted. Check import-only before committing.
+                // Import-only candidates are structurally insufficient when substantive
+                // (non-import) candidates exist in the current result set.
+                if is_import_only
+                    && self.has_non_import_candidates
+                    && !self.import_correction_issued
+                {
+                    self.import_correction_issued = true;
+                    return self
+                        .first_non_import_candidate()
+                        .map(|p| (p.to_string(), RecoveryKind::ImportOnly));
+                }
+                self.read_useful_candidate = true;
             }
         }
         None
@@ -242,6 +316,13 @@ impl InvestigationState {
         self.search_candidate_paths
             .iter()
             .find(|path| !self.definition_only_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_non_import_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| !self.import_only_candidates.contains(*path))
             .map(String::as_str)
     }
 }
@@ -254,6 +335,23 @@ fn push_unique_path(paths: &mut Vec<String>, path: &str) {
 
 fn normalize_evidence_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+/// Returns true when `model_path` is within (equal to or narrower than) `scope`.
+///
+/// Both paths are normalized before comparison. Trailing slashes are stripped so
+/// "sandbox/services/" and "sandbox/services" compare identically. The boundary
+/// guard (`get(s.len()) == Some(&b'/')`) prevents "sandbox/service_extra" from
+/// falsely matching scope "sandbox/service".
+///
+/// Absolute paths (e.g. emitted by the model as "/abs/path/") are never within
+/// a relative scope and will always return false, causing the caller to clamp.
+fn path_is_within_scope(model_path: &str, scope: &str) -> bool {
+    let p = normalize_evidence_path(model_path);
+    let s = normalize_evidence_path(scope);
+    let p = p.trim_end_matches('/');
+    let s = s.trim_end_matches('/');
+    p.starts_with(s) && (p.len() == s.len() || p.as_bytes().get(s.len()) == Some(&b'/'))
 }
 
 /// Tracks search_code usage within a single turn.
@@ -548,6 +646,61 @@ fn user_requested_mutation(text: &str) -> bool {
     })
 }
 
+/// Extracts a single relative path scope from an investigation prompt.
+///
+/// Fires only on the conservative pattern `in <token>` or `within <token>` where
+/// the token contains `/`, has no whitespace, and is not a URL. Trailing punctuation
+/// that is not part of a path is stripped. Returns `None` when the pattern is absent
+/// or ambiguous (multiple qualifying tokens, empty token after stripping, etc.).
+///
+/// Examples that match:
+///   "Where is TaskStatus handled in sandbox/cli/" → Some("sandbox/cli/")
+///   "Find logging in sandbox/services/"           → Some("sandbox/services/")
+///
+/// Examples that do not match:
+///   "Find X in the application"  → None  (no `/` in token)
+///   "Find X in context"          → None  (no `/`)
+///   "Find X in https://…"        → None  (URL rejected)
+fn extract_investigation_path_scope(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let lower_words: Vec<&str> = lower.split_whitespace().collect();
+
+    let mut found: Option<String> = None;
+
+    for (i, lw) in lower_words.iter().enumerate() {
+        if (*lw == "in" || *lw == "within") && i + 1 < words.len() {
+            let raw = words[i + 1];
+            // Strip trailing punctuation that cannot be part of a relative path.
+            let stripped = raw.trim_end_matches(|c: char| {
+                matches!(c, '.' | ',' | '?' | '!' | ';' | ':' | ')' | ']' | '}' | '"' | '\'')
+            });
+            if stripped.is_empty() {
+                continue;
+            }
+            // Require at least one `/` — distinguishes paths from plain words.
+            if !stripped.contains('/') {
+                continue;
+            }
+            // Reject URLs.
+            if stripped.starts_with("http://") || stripped.starts_with("https://") {
+                continue;
+            }
+            // Reject anything with embedded whitespace (shouldn't happen after split, but be safe).
+            if stripped.contains(|c: char| c.is_whitespace()) {
+                continue;
+            }
+            // More than one qualifying token → ambiguous; return None.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(normalize_evidence_path(stripped));
+        }
+    }
+
+    found
+}
+
 fn requested_read_path(text: &str) -> Option<String> {
     let mut tokens = text.split_whitespace();
     let first = tokens.next()?;
@@ -571,6 +724,19 @@ fn requested_read_path(text: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Returns true if the line (after stripping leading whitespace) is an import declaration.
+/// Coverage: Python (`import X`, `from X import Y`) and Java/Go/TypeScript (`import X`).
+/// Rust `use` statements and C `#include` are intentionally excluded — too many false positives
+/// from identifiers like `use` appearing in natural language or in assertion-style code.
+/// No regex, no scoring — prefix matching only, same style as looks_like_definition.
+fn looks_like_import(line: &str) -> bool {
+    let t = line.trim_start();
+    // `import X` — Python, Java, Go, TypeScript, JavaScript
+    t.starts_with("import ")
+        // `from X import Y` — Python
+        || (t.starts_with("from ") && t.contains(" import "))
 }
 
 fn looks_like_file_path(path: &str) -> bool {
@@ -822,6 +988,11 @@ impl Runtime {
         let usage_lookup_required = original_user_prompt
             .map(prompt_requests_usage_lookup)
             .unwrap_or(false);
+        let investigation_path_scope: Option<String> = if investigation_required {
+            original_user_prompt.and_then(extract_investigation_path_scope)
+        } else {
+            None
+        };
         loop {
             let response =
                 match run_generate_turn(self.backend.as_mut(), &mut self.conversation, on_event) {
@@ -977,6 +1148,22 @@ impl Runtime {
                     }
 
                     if investigation.search_produced_results {
+                        // Both candidate-read slots exhausted and evidence is still not ready.
+                        // Do not attempt another correction cycle — terminate cleanly.
+                        if investigation.candidate_reads_count
+                            >= MAX_CANDIDATE_READS_PER_INVESTIGATION
+                        {
+                            self.finish_with_runtime_answer(
+                                ungrounded_investigation_final_answer(),
+                                AnswerSource::RuntimeTerminal {
+                                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                                    rounds: tool_rounds,
+                                },
+                                on_event,
+                            );
+                            return;
+                        }
+
                         if !investigation.premature_synthesis_correction_issued
                             && corrections < MAX_CORRECTIONS
                         {
@@ -1035,6 +1222,7 @@ impl Runtime {
                 usage_lookup_required,
                 requested_read_path.as_deref(),
                 &mut requested_read_completed,
+                investigation_path_scope.as_deref(),
                 on_event,
             ) {
                 ToolRoundOutcome::Completed { results } => {
@@ -1123,12 +1311,28 @@ fn run_tool_round(
     usage_lookup_required: bool,
     requested_read_path: Option<&str>,
     requested_read_completed: &mut bool,
+    investigation_path_scope: Option<&str>,
     on_event: &mut dyn FnMut(RuntimeEvent),
 ) -> ToolRoundOutcome {
     let mut accumulated = String::new();
 
     for mut input in calls {
         simplify_search_input(&mut input);
+        // Enforce the prompt-derived path scope as an upper bound on search dispatch.
+        // None → inject scope (9.1.2 behavior).
+        // Some(p) within scope → keep; model narrowed correctly.
+        // Some(p) broader than or orthogonal to scope → clamp silently to scope.
+        if let (Some(scope), ToolInput::SearchCode { path, .. }) =
+            (investigation_path_scope, &mut input)
+        {
+            match path {
+                None => *path = Some(scope.to_string()),
+                Some(ref p) if !path_is_within_scope(p, scope) => {
+                    *path = Some(scope.to_string());
+                }
+                _ => {}
+            }
+        }
         let read_path = match &input {
             ToolInput::ReadFile { path } => Some(path.clone()),
             _ => None,
@@ -1258,8 +1462,8 @@ fn run_tool_round(
                     None
                 };
                 // Track successful file reads for evidence grounding and dedup.
-                let usage_read_recovery_path = if name == "read_file" {
-                    let recovery_path =
+                let read_recovery = if name == "read_file" {
+                    let recovery =
                         investigation.record_read_result(&output, usage_lookup_required);
                     if let Some(requested) = requested_read_path {
                         if let Some(rp) = read_path.as_deref() {
@@ -1272,7 +1476,7 @@ fn run_tool_round(
                     if let Some(rp) = read_path.as_deref() {
                         reads_this_turn.insert(normalize_evidence_path(rp));
                     }
-                    recovery_path
+                    recovery
                 } else {
                     None
                 };
@@ -1282,8 +1486,12 @@ fn run_tool_round(
                     summary: Some(summary),
                 });
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
-                if let Some(path) = usage_read_recovery_path {
-                    accumulated.push_str(&usage_read_recovery_correction(&path));
+                if let Some((path, kind)) = read_recovery {
+                    let correction = match kind {
+                        RecoveryKind::DefinitionOnly => usage_read_recovery_correction(&path),
+                        RecoveryKind::ImportOnly => import_read_recovery_correction(&path),
+                    };
+                    accumulated.push_str(&correction);
                     accumulated.push_str("\n\n");
                 }
                 if let Some(message) = search_closed_message {
@@ -2282,7 +2490,7 @@ mod tests {
         let events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "Where are completed tasks filtered in sandbox/".into(),
+                text: "Where are completed tasks filtered?".into(),
             },
         );
 
@@ -2341,7 +2549,7 @@ mod tests {
         let events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "Where is TaskStatus used in sandbox/".into(),
+                text: "Where is TaskStatus used?".into(),
             },
         );
 
@@ -2403,7 +2611,7 @@ mod tests {
         let events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "Where is TaskStatus used in sandbox/".into(),
+                text: "Where is TaskStatus used?".into(),
             },
         );
 
@@ -2453,7 +2661,7 @@ mod tests {
         let events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "Where is TaskStatus used in sandbox/".into(),
+                text: "Where is TaskStatus used?".into(),
             },
         );
 
@@ -2509,7 +2717,7 @@ mod tests {
         let events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "Where is TaskStatus defined in sandbox/".into(),
+                text: "Where is TaskStatus defined?".into(),
             },
         );
 
@@ -3204,6 +3412,608 @@ mod tests {
                 .map(|m| m.content.contains("Done"))
                 .unwrap_or(false),
             "last assistant message must be the synthesis response"
+        );
+    }
+
+    // Phase 9.1.1 — bounded multi-step investigation
+
+    #[test]
+    fn two_candidate_reads_second_satisfies_evidence_admits_synthesis() {
+        // Usage lookup: two search candidates (definition + usage).
+        // First read is definition-only → recovery correction fires.
+        // Second read is a usage candidate → evidence ready → synthesis admitted.
+        // Validates that candidate_reads_count reaching 2 does not prematurely terminate
+        // when the second read satisfies evidence.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "class TaskStatus(str, Enum):\n    PENDING = \"pending\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("runner.py"),
+            "from models.enums import TaskStatus\nif task.status == TaskStatus.PENDING:\n    run()\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                // Round 2: reads definition file first (definition-only candidate).
+                // Runtime injects recovery correction pointing to runner.py.
+                "[read_file: models/enums.py]",
+                // Round 3: model follows correction and reads the usage file.
+                "[read_file: services/runner.py]",
+                "TaskStatus is used in services/runner.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "second candidate read satisfying evidence must admit synthesis: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("TaskStatus is used in services/runner.py.")
+        );
+    }
+
+    #[test]
+    fn two_candidate_reads_both_insufficient_terminates_cleanly() {
+        // Usage lookup: three search candidates (two definition-only + one usage).
+        // First read is definition-only → recovery correction fires pointing to usage file.
+        // Model ignores correction and reads a second definition-only file.
+        // After two candidate reads with evidence still not ready the runtime must
+        // terminate cleanly with InsufficientEvidence — no further correction cycles.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "class TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("models").join("alt_enums.py"),
+            "class TaskStatus:\n    DONE = \"done\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_service.py"),
+            "from models.enums import TaskStatus\nif task.status == TaskStatus.TODO:\n    pass\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                // Round 2: reads first definition file.
+                // Runtime injects recovery correction pointing to task_service.py.
+                "[read_file: models/enums.py]",
+                // Round 3: model ignores correction and reads second definition file.
+                // candidate_reads_count reaches 2, evidence still not ready.
+                "[read_file: models/alt_enums.py]",
+                // Round 4: model tries to synthesize without reading usage evidence.
+                // Runtime must terminate with InsufficientEvidence — not fire another correction.
+                "TaskStatus is defined in models/enums.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must terminate cleanly: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "two insufficient candidate reads must produce InsufficientEvidence: {answer_source:?}"
+        );
+
+        // The model's premature synthesis must not appear as the last assistant message.
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(ungrounded_investigation_final_answer()),
+            "last assistant must be the runtime terminal, not model synthesis"
+        );
+    }
+
+    // Phase 9.1.2 — Path-Scoped Investigation
+
+    #[test]
+    fn extract_investigation_path_scope_detects_in_pattern() {
+        assert_eq!(
+            extract_investigation_path_scope("Where is TaskStatus handled in sandbox/cli/"),
+            Some("sandbox/cli/".into())
+        );
+        assert_eq!(
+            extract_investigation_path_scope("Find where logging is initialized in sandbox/services/"),
+            Some("sandbox/services/".into())
+        );
+        assert_eq!(
+            extract_investigation_path_scope("Where is TaskStatus used in sandbox/"),
+            Some("sandbox/".into())
+        );
+    }
+
+    #[test]
+    fn extract_investigation_path_scope_detects_within_pattern() {
+        assert_eq!(
+            extract_investigation_path_scope("Find TaskStatus within sandbox/cli/"),
+            Some("sandbox/cli/".into())
+        );
+    }
+
+    #[test]
+    fn extract_investigation_path_scope_rejects_plain_words() {
+        // "in" followed by a token with no "/" → None
+        assert_eq!(
+            extract_investigation_path_scope("Find X in the application"),
+            None
+        );
+        assert_eq!(
+            extract_investigation_path_scope("Where is X used in context"),
+            None
+        );
+        assert_eq!(
+            extract_investigation_path_scope("What does run_turns do?"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_investigation_path_scope_rejects_urls() {
+        assert_eq!(
+            extract_investigation_path_scope("Find X in https://example.com/path"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_investigation_path_scope_returns_none_for_ambiguous_multiple_paths() {
+        // Two qualifying path tokens → ambiguous → None
+        assert_eq!(
+            extract_investigation_path_scope("Find X in sandbox/a/ and in sandbox/b/"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_investigation_path_scope_strips_trailing_punctuation() {
+        assert_eq!(
+            extract_investigation_path_scope("Where is TaskStatus in sandbox/cli?"),
+            Some("sandbox/cli".into())
+        );
+        assert_eq!(
+            extract_investigation_path_scope("Find X in sandbox/services/."),
+            Some("sandbox/services/".into())
+        );
+    }
+
+    #[test]
+    fn path_scope_narrows_search_to_specified_directory() {
+        // Files exist both inside and outside sandbox/cli/.
+        // The query scopes to sandbox/cli/.
+        // search_code must only receive candidates from sandbox/cli/,
+        // so the file outside that directory never becomes a candidate.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/cli")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/models")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/cli/handler.py"),
+            "if task.status == TaskStatus.PENDING:\n    handle(task)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/models/enums.py"),
+            "class TaskStatus(str, Enum):\n    PENDING = \"pending\"\n",
+        )
+        .unwrap();
+
+        // Model searches (no path in tool call — runtime injects sandbox/cli/).
+        // Only sandbox/cli/handler.py matches; sandbox/models/enums.py is outside scope.
+        // Model reads handler.py → evidence ready → synthesis admitted.
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: sandbox/cli/handler.py]",
+                "TaskStatus is handled in sandbox/cli/handler.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus handled in sandbox/cli/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+
+        // Search result must be present.
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: search_code ===")),
+            "search must have executed"
+        );
+
+        // The scoped search must not surface the out-of-scope enums.py as a candidate.
+        // Verify by checking that the read of handler.py satisfied evidence (ToolAssisted).
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "scoped search + read must admit synthesis: {answer_source:?}"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("TaskStatus is handled in sandbox/cli/handler.py.")
+        );
+    }
+
+    // Phase 9.1.4 — Prompt Scope as Search Upper Bound
+
+    #[test]
+    fn path_is_within_scope_exact_match() {
+        assert!(path_is_within_scope("sandbox/services/", "sandbox/services/"));
+        assert!(path_is_within_scope("sandbox/services", "sandbox/services"));
+        // trailing-slash variants must compare identically
+        assert!(path_is_within_scope("sandbox/services/", "sandbox/services"));
+        assert!(path_is_within_scope("sandbox/services", "sandbox/services/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_narrower_path_accepted() {
+        assert!(path_is_within_scope(
+            "sandbox/services/tasks/",
+            "sandbox/services/"
+        ));
+        assert!(path_is_within_scope("sandbox/cli/handlers/", "sandbox/cli/"));
+        assert!(path_is_within_scope("sandbox/", "sandbox/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_broader_path_rejected() {
+        assert!(!path_is_within_scope("sandbox/", "sandbox/services/"));
+        assert!(!path_is_within_scope("src/", "sandbox/services/"));
+        assert!(!path_is_within_scope(".", "sandbox/services/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_orthogonal_path_rejected() {
+        assert!(!path_is_within_scope("src/runtime/", "sandbox/services/"));
+        assert!(!path_is_within_scope("models/", "services/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_boundary_guard_prevents_prefix_collision() {
+        // "sandbox/service_extra" must NOT match scope "sandbox/service"
+        assert!(!path_is_within_scope(
+            "sandbox/service_extra/",
+            "sandbox/service/"
+        ));
+        assert!(!path_is_within_scope(
+            "sandbox/services_extended/",
+            "sandbox/services/"
+        ));
+        // Legitimate subdirectory still passes
+        assert!(path_is_within_scope(
+            "sandbox/services/sub/",
+            "sandbox/services/"
+        ));
+    }
+
+    #[test]
+    fn path_is_within_scope_absolute_path_rejected() {
+        // Absolute paths can never be within a relative scope — always clamped.
+        assert!(!path_is_within_scope(
+            "/Users/project/sandbox/services/",
+            "sandbox/services/"
+        ));
+        assert!(!path_is_within_scope("/abs/path/", "sandbox/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_dotslash_normalization() {
+        // ./sandbox/services/ normalizes to sandbox/services/ — should match.
+        assert!(path_is_within_scope(
+            "./sandbox/services/",
+            "sandbox/services/"
+        ));
+        assert!(path_is_within_scope(
+            "sandbox/services/",
+            "./sandbox/services/"
+        ));
+    }
+
+    #[test]
+    fn scope_upper_bound_clamps_broader_model_path() {
+        // Verifies end-to-end that when a prompt scope is extracted and the search
+        // produces results only within the scope, synthesis is admitted (ToolAssisted).
+        // The injection (9.1.2 None arm) and the clamping guard (9.1.4 Some arm) both
+        // live in the same match block; this test exercises the combined path.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_service.py"),
+            "if task.status == TaskStatus.TODO:\n    pass\n",
+        )
+        .unwrap();
+        // This file exists but is outside the prompt scope — must not appear as candidate.
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "class TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                // Model issues search without a path; scope injection fires.
+                "[search_code: TaskStatus]",
+                "[read_file: services/task_service.py]",
+                "TaskStatus is used in services/task_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used in services/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "scoped search must admit synthesis: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("TaskStatus is used in services/task_service.py.")
+        );
+    }
+
+    // Phase 9.1.3 — Candidate Selection Quality (import-only weak candidate rejection)
+
+    #[test]
+    fn looks_like_import_accepts_simple_import() {
+        assert!(looks_like_import("import logging"));
+        assert!(looks_like_import("import os, sys"));
+        assert!(looks_like_import("  import logging"));
+    }
+
+    #[test]
+    fn looks_like_import_accepts_from_import() {
+        assert!(looks_like_import("from models.enums import TaskStatus"));
+        assert!(looks_like_import("from . import utils"));
+        assert!(looks_like_import("  from models.enums import TaskStatus"));
+    }
+
+    #[test]
+    fn looks_like_import_rejects_usage_lines() {
+        assert!(!looks_like_import(
+            "if task.status == TaskStatus.TODO: pass"
+        ));
+        assert!(!looks_like_import("result = TaskStatus.COMPLETED"));
+        assert!(!looks_like_import(
+            "logger = logging.getLogger(__name__)"
+        ));
+    }
+
+    #[test]
+    fn looks_like_import_rejects_definition_lines() {
+        assert!(!looks_like_import("class TaskStatus(str, Enum):"));
+        assert!(!looks_like_import("def get_status(task):"));
+    }
+
+    #[test]
+    fn import_only_candidate_rejected_when_non_import_candidate_exists() {
+        // File A: only an import line → classified import-only.
+        // File B: a usage line → classified as non-import candidate.
+        // Model reads A first → correction fires pointing to B.
+        // Model reads B → evidence ready → ToolAssisted.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("init")).unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("init").join("header.py"),
+            "from models.enums import TaskStatus\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_service.py"),
+            "if task.status == TaskStatus.TODO:\n    pass\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                // Round 2: reads import-only file first.
+                // Runtime injects import-only correction pointing to task_service.py.
+                "[read_file: init/header.py]",
+                // Round 3: model follows correction and reads the usage file.
+                "[read_file: services/task_service.py]",
+                "TaskStatus is used in services/task_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "import-only rejection + non-import read must admit synthesis: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("TaskStatus is used in services/task_service.py.")
+        );
+    }
+
+    #[test]
+    fn import_only_fallback_accepts_when_all_candidates_are_import_only() {
+        // Single candidate: only an import line.
+        // has_non_import_candidates == false → import-only gate does not fire.
+        // File is accepted as evidence → ToolAssisted.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "from models.enums import TaskStatus\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: models/enums.py]",
+                "TaskStatus is imported from models.enums.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "all-import-only candidates must fall back to accepting the read: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("TaskStatus is imported from models.enums.")
         );
     }
 }
