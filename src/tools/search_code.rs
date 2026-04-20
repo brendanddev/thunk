@@ -8,8 +8,14 @@ use super::types::{
 };
 use super::Tool;
 
-/// Maximum number of matches returned in a single search. Prevents context overload.
-const MAX_MATCHES: usize = 50;
+/// Internal upper bound on how many matches the walk collects.
+/// Kept at 50 so total_matches is accurate up to that count without full-walk cost.
+const MAX_COLLECT: usize = 50;
+
+/// Maximum number of matches injected into the conversation as a single search result.
+/// Each match adds one `file:line: content` line. 15 gives the model enough signal to
+/// identify which file to read without the 50-match bulk that was causing long prefill.
+const MAX_RESULTS_SHOWN: usize = 15;
 
 /// Directory names that are always skipped during the recursive walk.
 const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", ".hg", "dist", "build"];
@@ -90,12 +96,15 @@ impl Tool for SearchCodeTool {
         let mut matches = Vec::new();
         walk_and_search(root, query, &mut matches)?;
 
-        let truncated = matches.len() >= MAX_MATCHES;
+        let total_matches = matches.len();
+        let truncated = total_matches > MAX_RESULTS_SHOWN;
+        matches.truncate(MAX_RESULTS_SHOWN);
 
         Ok(ToolRunResult::Immediate(ToolOutput::SearchResults(
             SearchResultsOutput {
                 query: query.clone(),
                 matches,
+                total_matches,
                 truncated,
             },
         )))
@@ -107,7 +116,7 @@ fn walk_and_search(
     query: &str,
     matches: &mut Vec<SearchMatch>,
 ) -> Result<(), ToolError> {
-    if matches.len() >= MAX_MATCHES {
+    if matches.len() >= MAX_COLLECT {
         return Ok(());
     }
 
@@ -121,7 +130,7 @@ fn walk_and_search(
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
-        if matches.len() >= MAX_MATCHES {
+        if matches.len() >= MAX_COLLECT {
             break;
         }
 
@@ -147,7 +156,7 @@ fn search_in_file(path: &Path, query: &str, matches: &mut Vec<SearchMatch>) {
     };
 
     for (idx, line) in contents.lines().enumerate() {
-        if matches.len() >= MAX_MATCHES {
+        if matches.len() >= MAX_COLLECT {
             break;
         }
         if line.contains(query) {
@@ -221,6 +230,30 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn truncates_to_match_cap_and_preserves_total_count() {
+        let tmp = TempDir::new().unwrap();
+        // 20 matching lines — exceeds MAX_RESULTS_SHOWN (15) but under MAX_COLLECT (50)
+        let content: String = (0..20).map(|i| format!("needle line {i}\n")).collect();
+        fs::write(tmp.path().join("matches.rs"), content).unwrap();
+
+        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(
+            sr.matches.len(),
+            MAX_RESULTS_SHOWN,
+            "matches must be capped at MAX_RESULTS_SHOWN"
+        );
+        assert_eq!(
+            sr.total_matches, 20,
+            "total_matches must reflect all collected before truncation"
+        );
+        assert!(sr.truncated, "truncated must be true when results exceed the cap");
     }
 
     #[test]

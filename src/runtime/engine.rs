@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::app::config::Config;
@@ -80,6 +81,24 @@ const READ_ONLY_TOOL_POLICY_ERROR: &str =
 const READ_REQUEST_TOOL_REQUIRED: &str =
     "[runtime:correction] The user asked to read a specific file. \
      Call read_file for that exact path before answering.";
+
+/// Injected when the model tries to read a file that was already read earlier in the same turn.
+/// The file's contents are already in the conversation context; re-reading adds no new evidence
+/// and only inflates the prompt.
+const DUPLICATE_READ_REJECTED: &str =
+    "this file was already read this turn. The contents are already in context — \
+     use the existing evidence to answer.";
+
+/// Maximum number of successful read_file calls allowed in a single turn.
+/// Each read injects up to MAX_LINES lines into the prompt; this cap bounds worst-case
+/// context growth when the model reads speculatively or drifts into repeated reads.
+/// 3 is conservative: a correct investigation needs 1 (search → read → answer);
+/// 2-3 accommodates a reasonable follow-up read without runaway context expansion.
+const MAX_READS_PER_TURN: usize = 3;
+
+/// Injected when the model exceeds MAX_READS_PER_TURN in one turn.
+const READ_CAP_EXCEEDED: &str =
+    "read limit for this turn reached. Answer from the file evidence already in context.";
 
 /// Tracks per-turn search → read investigation state.
 /// Resets at the start of each call to run_turns, exactly like SearchBudget.
@@ -355,6 +374,13 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
         return false;
     }
 
+    // "search" is a self-sufficient trigger — it is an explicit request to run the search tool.
+    // "find/where/locate" still require a secondary condition to avoid false positives on
+    // conversational phrasing like "find a good approach".
+    if contains_word(&lower, "search") {
+        return true;
+    }
+
     [
         "defined",
         "implemented",
@@ -367,6 +393,13 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
         "handled",
         "called",
         "used",
+        // occurrence/appearance phrasing: "find all occurrences of X", "where it appears"
+        "occur",
+        "occurs",
+        "occurrence",
+        "occurrences",
+        "appear",
+        "appears",
     ]
     .iter()
     .any(|term| contains_word(&lower, term))
@@ -667,6 +700,7 @@ impl Runtime {
         let mut last_call_key: Option<String> = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
+        let mut reads_this_turn: HashSet<String> = HashSet::new();
         let mut requested_read_completed = false;
         let mut read_request_correction_issued = false;
         // Computed once from the original user message. Excludes tool result/error injections
@@ -847,6 +881,7 @@ impl Runtime {
                         {
                             corrections += 1;
                             investigation.premature_synthesis_correction_issued = true;
+                            self.conversation.discard_last_if_assistant();
                             self.conversation
                                 .push_user(READ_BEFORE_ANSWERING.to_string());
                             continue;
@@ -893,6 +928,7 @@ impl Runtime {
                 &mut last_call_key,
                 &mut search_budget,
                 &mut investigation,
+                &mut reads_this_turn,
                 mutation_allowed,
                 requested_read_path.as_deref(),
                 &mut requested_read_completed,
@@ -978,6 +1014,7 @@ fn run_tool_round(
     last_call_key: &mut Option<String>,
     search_budget: &mut SearchBudget,
     investigation: &mut InvestigationState,
+    reads_this_turn: &mut HashSet<String>,
     mutation_allowed: bool,
     requested_read_path: Option<&str>,
     requested_read_completed: &mut bool,
@@ -1039,6 +1076,34 @@ fn run_tool_round(
             continue;
         }
 
+        // Dedup: block re-reads of the same file within the same turn.
+        // The file's contents are already in context; re-reading only inflates the prompt.
+        if let Some(rp) = read_path.as_deref() {
+            let normalized = normalize_evidence_path(rp);
+            if reads_this_turn.contains(&normalized) {
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: None,
+                });
+                accumulated.push_str(&tool_codec::format_tool_error(
+                    &name,
+                    DUPLICATE_READ_REJECTED,
+                ));
+                continue;
+            }
+        }
+
+        // Per-turn read cap: block new reads once MAX_READS_PER_TURN unique files have been read.
+        // reads_this_turn.len() counts only successful reads, so the cap is exact.
+        if read_path.is_some() && reads_this_turn.len() >= MAX_READS_PER_TURN {
+            on_event(RuntimeEvent::ToolCallFinished {
+                name: name.clone(),
+                summary: None,
+            });
+            accumulated.push_str(&tool_codec::format_tool_error(&name, READ_CAP_EXCEEDED));
+            continue;
+        }
+
         if last_call_key.as_deref() == Some(key.as_str()) {
             let msg = format!("{name} called with identical arguments twice in a row");
             on_event(RuntimeEvent::ToolCallFinished {
@@ -1072,17 +1137,19 @@ fn run_tool_round(
                 } else {
                     None
                 };
-                // Track successful file reads for evidence grounding.
+                // Track successful file reads for evidence grounding and dedup.
                 if name == "read_file" {
                     investigation.record_read_result(&output);
                     if let Some(requested) = requested_read_path {
-                        if let Some(read_path) = read_path.as_deref() {
-                            if normalize_evidence_path(read_path)
-                                == normalize_evidence_path(requested)
-                            {
+                        if let Some(rp) = read_path.as_deref() {
+                            if normalize_evidence_path(rp) == normalize_evidence_path(requested) {
                                 *requested_read_completed = true;
                             }
                         }
+                    }
+                    // Record path so a repeat read in the same turn is blocked.
+                    if let Some(rp) = read_path.as_deref() {
+                        reads_this_turn.insert(normalize_evidence_path(rp));
                     }
                 }
                 let summary = tool_codec::render_compact_summary(&output);
@@ -1753,6 +1820,35 @@ mod tests {
     }
 
     #[test]
+    fn prompt_requires_investigation_detects_search_verb() {
+        // "search" is a self-sufficient trigger — no secondary condition needed.
+        assert!(prompt_requires_investigation(
+            "Search for 'task' in sandbox/ and explain what parts of the system use it."
+        ));
+        assert!(prompt_requires_investigation("Search for task in sandbox/"));
+        assert!(prompt_requires_investigation(
+            "search the codebase for SessionLog"
+        ));
+    }
+
+    #[test]
+    fn prompt_requires_investigation_detects_occurrence_phrasing() {
+        // "find/where" + occurrence/appearance words trigger investigation.
+        assert!(prompt_requires_investigation(
+            "Find all occurrences of 'logging' in sandbox/ and summarize where it appears."
+        ));
+        assert!(prompt_requires_investigation(
+            "Find all occurrences of logging in sandbox/"
+        ));
+        assert!(prompt_requires_investigation(
+            "Where does TaskStatus appear in the codebase?"
+        ));
+        assert!(prompt_requires_investigation(
+            "Find where the error occurs in this module."
+        ));
+    }
+
+    #[test]
     fn prompt_requires_investigation_rejects_plain_questions() {
         assert!(!prompt_requires_investigation("How are you?"));
         assert!(!prompt_requires_investigation("What time is it?"));
@@ -1761,6 +1857,13 @@ mod tests {
         ));
         assert!(!prompt_requires_investigation(
             "What is the purpose of this project?"
+        ));
+        // "find" alone without a secondary condition must not trigger
+        assert!(!prompt_requires_investigation(
+            "Find a good approach to this problem."
+        ));
+        assert!(!prompt_requires_investigation(
+            "Find the best way to structure this."
         ));
     }
 
@@ -1885,6 +1988,82 @@ mod tests {
                 })
             ),
             "unread search results must not admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn read_before_answering_correction_discards_premature_synthesis() {
+        // After search returns matches, the model synthesizes without reading (premature).
+        // The READ_BEFORE_ANSWERING correction must fire AND discard the premature synthesis
+        // from context before injecting the correction message.
+        // Verified by checking: no premature synthesis message remains in the conversation.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: run_turns]",
+                // Round 2: model synthesizes without reading — premature.
+                "run_turns is the main driver.",
+                // Round 3: after correction, model reads and then synthesizes.
+                "[read_file: engine.rs]",
+                "run_turns drives the main event loop.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "What does run_turns do?".into(),
+            },
+        );
+
+        let snapshot = rt.messages_snapshot();
+
+        // The correction must have fired.
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.starts_with("[runtime:correction]")
+                    && m.content.contains("no matched file has been read")
+            }),
+            "READ_BEFORE_ANSWERING correction must be injected: {snapshot:?}"
+        );
+
+        // The premature synthesis must NOT remain in context — it was discarded.
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content == "run_turns is the main driver."),
+            "premature synthesis must be discarded from context before correction"
+        );
+
+        // The grounded final answer must be present.
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("run_turns drives the main event loop."),
+            "grounded synthesis must be the last assistant message"
+        );
+
+        // Turn completes successfully as ToolAssisted.
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "turn must complete as ToolAssisted after evidence-ready synthesis: {answer_source:?}"
         );
     }
 
@@ -2350,6 +2529,122 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("search budget exceeded")),
             "third search must always be blocked regardless of prior results"
+        );
+    }
+
+    #[test]
+    fn read_cap_blocks_reads_beyond_limit() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(tmp.path().join("b.rs"), "fn b() {}\n").unwrap();
+        fs::write(tmp.path().join("c.rs"), "fn c() {}\n").unwrap();
+        fs::write(tmp.path().join("d.rs"), "fn d() {}\n").unwrap();
+
+        // Reads a, b, c all succeed (within MAX_READS_PER_TURN = 3).
+        // Read d is the first beyond the cap and must be blocked.
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: a.rs]",
+                "[read_file: b.rs]",
+                "[read_file: c.rs]",
+                "[read_file: d.rs]",
+                "I have read enough files.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "explore the files".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must complete without failure: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, RuntimeEvent::AnswerReady(_))),
+            "turn must complete with AnswerReady: {events:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            all_user.matches("=== tool_result: read_file ===").count(),
+            3,
+            "exactly three reads must succeed (a, b, c)"
+        );
+        assert!(
+            all_user.contains("=== tool_error: read_file ===")
+                && all_user.contains("read limit for this turn"),
+            "fourth read must be blocked with the cap tool error"
+        );
+    }
+
+    #[test]
+    fn duplicate_read_is_blocked_within_same_turn() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
+
+        // Round 1: first read succeeds.
+        // Round 2: model tries to read the same path again — must be blocked.
+        // Round 3: model synthesizes from the evidence already in context.
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: engine.rs]",
+                "[read_file: engine.rs]",
+                "I already have the file contents in context.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "What is in engine.rs?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must complete without failure: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, RuntimeEvent::AnswerReady(_))),
+            "turn must complete with AnswerReady: {events:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+
+        // First read must produce a tool result.
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "first read must succeed and inject a tool result"
+        );
+
+        // Second read must be blocked with a tool error containing the dedup message.
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.contains("=== tool_error: read_file ===")
+                    && m.content.contains("already read this turn")
+            }),
+            "duplicate read must be blocked with the dedup tool error"
         );
     }
 

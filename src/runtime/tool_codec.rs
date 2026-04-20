@@ -481,11 +481,17 @@ pub fn render_compact_summary(output: &ToolOutput) -> String {
             format!("listed {} ({} entries)", d.path, d.entries.len())
         }
         ToolOutput::SearchResults(s) => {
-            let count = s.matches.len();
-            if count == 0 {
+            if s.total_matches == 0 {
                 format!("no matches for '{}'", s.query)
+            } else if s.truncated {
+                format!(
+                    "found {} match(es) for '{}' (showing {})",
+                    s.total_matches,
+                    s.query,
+                    s.matches.len()
+                )
             } else {
-                format!("found {} match(es) for '{}'", count, s.query)
+                format!("found {} match(es) for '{}'", s.total_matches, s.query)
             }
         }
         ToolOutput::EditFile(e) => {
@@ -548,14 +554,19 @@ fn render_output(output: &ToolOutput) -> String {
             if s.matches.is_empty() {
                 "No matches found.".to_string()
             } else {
-                let mut lines: Vec<String> = s
-                    .matches
-                    .iter()
-                    .map(|m| format!("{}:{}: {}", m.file, m.line_number, m.line))
-                    .collect();
+                let mut lines: Vec<String> = Vec::new();
                 if s.truncated {
-                    lines.push("[results truncated at match limit]".to_string());
+                    lines.push(format!(
+                        "[showing first {} of {} matches — read a specific matched file with read_file]",
+                        s.matches.len(),
+                        s.total_matches
+                    ));
                 }
+                lines.extend(
+                    s.matches
+                        .iter()
+                        .map(|m| format!("{}:{}: {}", m.file, m.line_number, m.line)),
+                );
                 lines.join("\n")
             }
         }

@@ -101,7 +101,10 @@ pub enum EntryKind {
 pub struct SearchResultsOutput {
     pub query: String,
     pub matches: Vec<SearchMatch>,
-    /// True when the result set was cut at the match limit.
+    /// Total matches collected by the walk before the output cap was applied.
+    /// May be less than the true total when the walk itself hit MAX_COLLECT.
+    pub total_matches: usize,
+    /// True when the result list was capped at MAX_RESULTS_SHOWN.
     pub truncated: bool,
 }
 

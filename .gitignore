@@ -14,6 +14,9 @@ logs/
 ## Private documentation
 docs/private/
 
+## Sandbox project
+sandbox/
+
 # Local files (.local is legacy)
 .local/
 .claude/
