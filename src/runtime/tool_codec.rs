@@ -589,26 +589,20 @@ pub fn looks_like_definition(line: &str) -> bool {
 fn definition_site_file<'a>(
     groups: &[(&'a str, Vec<&crate::tools::types::SearchMatch>)],
 ) -> Option<&'a str> {
-    // Collect all source-tier files in the result set.
-    let source_files: Vec<(&'a str, bool)> = groups
-        .iter()
-        .filter(|(file, _)| is_source_tier(file))
-        .map(|(file, matches)| {
-            (
-                *file,
-                matches.iter().any(|m| looks_like_definition(&m.line)),
-            )
-        })
-        .collect();
-
-    // Only hint when exactly one source-tier file exists and it contains a definition line.
-    // If other source-tier files (usage files) are also present, the model has enough
-    // information from the grouped output to choose without being steered toward the
-    // definition file — which would be wrong for usage queries.
-    match source_files.as_slice() {
-        [(file, true)] => Some(file),
-        _ => None,
+    let mut found: Option<&'a str> = None;
+    for (file, matches) in groups {
+        if !is_source_tier(file) {
+            continue;
+        }
+        if matches.iter().any(|m| looks_like_definition(&m.line)) {
+            if found.is_some() {
+                // More than one candidate — ambiguous; suppress the hint.
+                return None;
+            }
+            found = Some(file);
+        }
     }
+    found
 }
 
 fn render_search_results_grouped(s: &crate::tools::types::SearchResultsOutput) -> String {
@@ -1556,10 +1550,10 @@ mod tests {
     }
 
     #[test]
-    fn definition_preamble_suppressed_when_usage_files_also_present() {
+    fn definition_preamble_fires_for_single_definition_file_with_usage_files() {
         // One source file has a definition line; another source file has only usage lines.
-        // Two source-tier files total → preamble must be suppressed to avoid steering
-        // usage queries toward the definition file.
+        // The runtime usage-evidence gate prevents this hint from admitting definition-only
+        // evidence for usage lookups, but definition/location lookups still benefit from it.
         let output = make_search_output(
             vec![
                 make_match("src/types.rs", 47, "pub enum TaskStatus {"),
@@ -1570,8 +1564,8 @@ mod tests {
         );
         let body = render_output(&output);
         assert!(
-            !body.contains("[definition found in"),
-            "preamble must be suppressed when usage source files are also present; got:\n{body}"
+            body.contains("[definition found in src/types.rs — read this file first]"),
+            "preamble must fire for the single definition file; got:\n{body}"
         );
     }
 
@@ -1629,9 +1623,9 @@ mod tests {
     }
 
     #[test]
-    fn definition_preamble_suppressed_when_definition_and_usage_in_source_tier() {
+    fn definition_preamble_correct_when_definition_and_usage_in_source_tier() {
         // types.rs: definition line. engine.rs: usage lines only. Both source tier.
-        // Two source-tier files → preamble suppressed regardless of which has the definition.
+        // Preamble must name types.rs, not engine.rs.
         let output = make_search_output(
             vec![
                 make_match("src/types.rs", 47, "pub struct Config {"),
@@ -1643,15 +1637,16 @@ mod tests {
         );
         let body = render_output(&output);
         assert!(
-            !body.contains("[definition found in"),
-            "preamble must be suppressed when usage source files are also present; got:\n{body}"
+            body.contains("[definition found in src/types.rs — read this file first]"),
+            "preamble must name the definition file, not usage files; got:\n{body}"
         );
+        assert!(!body.contains("src/engine.rs — read this file first"));
     }
 
     #[test]
-    fn definition_preamble_suppressed_with_truncated_results_and_multiple_source_files() {
+    fn definition_preamble_present_with_truncated_results() {
         // total_matches > shown → truncation notice fires.
-        // Two source-tier files in the shown set → preamble suppressed even with truncation.
+        // If the shown set includes a single definition file, preamble must still fire.
         let matches = vec![
             make_match("src/types.rs", 10, "pub fn important()"),
             make_match("src/engine.rs", 50, "important();"),
@@ -1664,8 +1659,8 @@ mod tests {
             "truncation notice must be present"
         );
         assert!(
-            !body.contains("[definition found in"),
-            "preamble must be suppressed when usage source files are also present; got:\n{body}"
+            body.contains("[definition found in src/types.rs — read this file first]"),
+            "preamble must fire even when results are truncated; got:\n{body}"
         );
     }
 

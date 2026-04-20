@@ -178,6 +178,8 @@ The system prompt tells the model that when a tool is needed, the reply should c
 
 Prompt-only behavioral rules are not treated as sufficient for loop safety. For `search_code`, the runtime also enforces a per-turn budget: one search is always allowed, one retry is allowed only if the first search returned no matches, and later search attempts are blocked with a runtime correction.
 
+For investigation-required turns, runtime-owned evidence rules also apply. `list_dir` is blocked before `search_code`, because directory listings are not sufficient evidence for code-location questions. Non-empty search results require a `read_file` from the current search candidate set before synthesis. Usage lookups add a narrower guard: if a definition-only file is read while usage-bearing candidates exist, that read does not satisfy evidence, and the runtime can inject a bounded correction naming a concrete matched usage file. Definition lookups still accept reading the definition file as sufficient evidence.
+
 ---
 
 ## Session & Persistence Model
@@ -229,6 +231,7 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 - Tools return typed data; tools do not append conversation text themselves.
 - Mutating tools do not write during `run()`; writes happen only in `execute_approved()`.
 - `search_code` executes literal substring searches, and repeated search behavior is bounded per user turn by runtime state.
+- investigation-required turns block `list_dir` before search, require a matched read before synthesis, and use runtime-owned usage-aware evidence gating.
 - rejected mutations are answered by the runtime without model synthesis, so the assistant cannot claim a rejected write/edit happened
 - failed `read_file` calls can terminate with a runtime-owned answer, so missing-file reads do not loop
 - Malformed `edit_file` repair attempts after edit errors are surfaced back to the model through runtime correction rather than silently ending the turn.
@@ -243,7 +246,6 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 
 - Live context management is incomplete. Restore trimming exists, but there is no proactive token-based budgeting or live conversation trimming before generation.
 - Tool-loop safety still includes a hard limit of `10` tool rounds per turn; search has narrower per-turn runtime enforcement, but broader planning quality is still model-dependent.
-- `AnswerSource` currently reports runtime-owned terminal answers as `ToolAssisted`; it does not yet distinguish deterministic runtime fallback from model synthesis.
 - `edit_file` can still be noisy before a valid exact edit block appears; this is a model-output quality issue, not a correctness issue once a valid tool call is parsed.
 - Advanced memory is not implemented. There is no embeddings layer, structured memory, or long-term recall.
 - LSP integration is not implemented.

@@ -136,6 +136,8 @@ Current behavior:
 - sorts directories before files
 - sorts alphabetically within each group
 
+Runtime investigation behavior can block `list_dir` before `search_code` on code-location questions. Directory listings are still useful as a read-only tool, but they are not accepted as the first evidence step for investigation-required prompts.
+
 ### `search_code`
 
 Searches recursively for lines containing a literal substring.
@@ -180,6 +182,10 @@ Runtime behavior adds guardrails around the tool because prompt-only guidance wa
 - runtime simplifies phrase-like or method-like model queries to one literal token before dispatch
 - each user turn gets one search, plus one retry only if the first search returned no matches
 - after search is closed, additional `search_code` attempts are blocked by runtime correction
+- investigation-required turns must read a file from the current search candidates before synthesis
+- usage lookups reject definition-only reads as sufficient evidence when usage candidates exist
+- after a definition-only read on a usage lookup, runtime can inject a bounded correction naming a concrete matched usage file
+- definition lookups still accept a definition-file read as sufficient evidence
 
 ### `edit_file`
 

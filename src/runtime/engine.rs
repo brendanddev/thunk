@@ -68,6 +68,14 @@ const READ_BEFORE_ANSWERING: &str =
     "[runtime:correction] Search returned matches but no matched file has been read this turn. \
      Read one of the matched files with [read_file: path] before answering.";
 
+fn usage_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] This is a usage lookup. The file just read only showed definition matches, \
+         but a matched usage candidate exists. Read this exact matched usage file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
 /// Injected when the question contains a code identifier but the model attempts a Direct answer
 /// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
 const SEARCH_BEFORE_ANSWERING: &str =
@@ -100,6 +108,9 @@ const MAX_READS_PER_TURN: usize = 3;
 const READ_CAP_EXCEEDED: &str =
     "read limit for this turn reached. Answer from the file evidence already in context.";
 
+const LIST_DIR_BEFORE_SEARCH_BLOCKED: &str =
+    "[runtime: code investigation questions require search_code, not list_dir.\nUse search_code with a keyword from the question — a function name, variable, or concept.]";
+
 /// Tracks per-turn search → read investigation state.
 /// Resets at the start of each call to run_turns, exactly like SearchBudget.
 struct InvestigationState {
@@ -126,6 +137,9 @@ struct InvestigationState {
     /// R1 uses its own flag and does NOT increment the shared corrections counter,
     /// so R1 and R2 can compose sequentially in the same turn.
     direct_answer_correction_issued: bool,
+    /// True once any search_code call has completed this turn, even with no matches.
+    /// Used to block list_dir before search on investigation-required turns.
+    search_attempted: bool,
 }
 
 impl InvestigationState {
@@ -139,6 +153,7 @@ impl InvestigationState {
             read_useful_candidate: false,
             premature_synthesis_correction_issued: false,
             direct_answer_correction_issued: false,
+            search_attempted: false,
         }
     }
 
@@ -151,6 +166,7 @@ impl InvestigationState {
             return false;
         };
 
+        self.search_attempted = true;
         let was_empty = results.matches.is_empty();
         if !was_empty {
             self.search_produced_results = true;
@@ -183,9 +199,13 @@ impl InvestigationState {
         was_empty
     }
 
-    fn record_read_result(&mut self, output: &ToolOutput) {
+    fn record_read_result(
+        &mut self,
+        output: &ToolOutput,
+        usage_lookup_required: bool,
+    ) -> Option<String> {
         let ToolOutput::FileContents(file) = output else {
-            return;
+            return None;
         };
 
         self.files_read_count += 1;
@@ -201,12 +221,28 @@ impl InvestigationState {
                 .definition_only_candidates
                 .iter()
                 .any(|c| normalize_evidence_path(c) == read_path);
-            // A definition-only file satisfies evidence only when no usage candidates
-            // exist in the current result set.
-            if !is_def_only || !self.has_non_definition_candidates {
+            // On usage lookups, a definition-only file satisfies evidence only
+            // when no usage candidates exist in the current result set.
+            // On non-usage lookups (including definition questions), any matched
+            // candidate remains useful evidence.
+            if !usage_lookup_required || !is_def_only || !self.has_non_definition_candidates {
                 self.read_useful_candidate = true;
+            } else if !self.premature_synthesis_correction_issued {
+                let suggested_path = self.first_non_definition_candidate().map(str::to_string);
+                if suggested_path.is_some() {
+                    self.premature_synthesis_correction_issued = true;
+                }
+                return suggested_path;
             }
         }
+        None
+    }
+
+    fn first_non_definition_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| !self.definition_only_candidates.contains(*path))
+            .map(String::as_str)
     }
 }
 
@@ -434,6 +470,28 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
         "called",
         "used",
         // occurrence/appearance phrasing: "find all occurrences of X", "where it appears"
+        "occur",
+        "occurs",
+        "occurrence",
+        "occurrences",
+        "appear",
+        "appears",
+        "filtered",
+    ]
+    .iter()
+    .any(|term| contains_word(&lower, term))
+}
+
+fn prompt_requests_usage_lookup(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "use",
+        "used",
+        "uses",
+        "usage",
+        "reference",
+        "referenced",
+        "references",
         "occur",
         "occurs",
         "occurrence",
@@ -761,6 +819,9 @@ impl Runtime {
         let mutation_allowed = original_user_prompt
             .map(user_requested_mutation)
             .unwrap_or(false);
+        let usage_lookup_required = original_user_prompt
+            .map(prompt_requests_usage_lookup)
+            .unwrap_or(false);
         loop {
             let response =
                 match run_generate_turn(self.backend.as_mut(), &mut self.conversation, on_event) {
@@ -970,6 +1031,8 @@ impl Runtime {
                 &mut investigation,
                 &mut reads_this_turn,
                 mutation_allowed,
+                investigation_required,
+                usage_lookup_required,
                 requested_read_path.as_deref(),
                 &mut requested_read_completed,
                 on_event,
@@ -1056,6 +1119,8 @@ fn run_tool_round(
     investigation: &mut InvestigationState,
     reads_this_turn: &mut HashSet<String>,
     mutation_allowed: bool,
+    investigation_required: bool,
+    usage_lookup_required: bool,
     requested_read_path: Option<&str>,
     requested_read_completed: &mut bool,
     on_event: &mut dyn FnMut(RuntimeEvent),
@@ -1080,6 +1145,21 @@ fn run_tool_round(
             accumulated.push_str(&tool_codec::format_tool_error(
                 &name,
                 READ_ONLY_TOOL_POLICY_ERROR,
+            ));
+            continue;
+        }
+
+        if matches!(input, ToolInput::ListDir { .. })
+            && investigation_required
+            && !investigation.search_attempted
+        {
+            on_event(RuntimeEvent::ToolCallFinished {
+                name: name.clone(),
+                summary: None,
+            });
+            accumulated.push_str(&tool_codec::format_tool_error(
+                &name,
+                LIST_DIR_BEFORE_SEARCH_BLOCKED,
             ));
             continue;
         }
@@ -1178,8 +1258,9 @@ fn run_tool_round(
                     None
                 };
                 // Track successful file reads for evidence grounding and dedup.
-                if name == "read_file" {
-                    investigation.record_read_result(&output);
+                let usage_read_recovery_path = if name == "read_file" {
+                    let recovery_path =
+                        investigation.record_read_result(&output, usage_lookup_required);
                     if let Some(requested) = requested_read_path {
                         if let Some(rp) = read_path.as_deref() {
                             if normalize_evidence_path(rp) == normalize_evidence_path(requested) {
@@ -1191,13 +1272,20 @@ fn run_tool_round(
                     if let Some(rp) = read_path.as_deref() {
                         reads_this_turn.insert(normalize_evidence_path(rp));
                     }
-                }
+                    recovery_path
+                } else {
+                    None
+                };
                 let summary = tool_codec::render_compact_summary(&output);
                 on_event(RuntimeEvent::ToolCallFinished {
                     name: name.clone(),
                     summary: Some(summary),
                 });
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
+                if let Some(path) = usage_read_recovery_path {
+                    accumulated.push_str(&usage_read_recovery_correction(&path));
+                    accumulated.push_str("\n\n");
+                }
                 if let Some(message) = search_closed_message {
                     accumulated.push_str(message);
                     accumulated.push_str("\n\n");
@@ -1886,6 +1974,9 @@ mod tests {
         assert!(prompt_requires_investigation(
             "Find where the error occurs in this module."
         ));
+        assert!(prompt_requires_investigation(
+            "Where are completed tasks filtered in sandbox/"
+        ));
     }
 
     #[test]
@@ -2167,6 +2258,58 @@ mod tests {
     }
 
     #[test]
+    fn list_dir_before_search_is_blocked_for_filtered_investigation() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("task_service.py"),
+            "def completed_tasks(tasks):\n    filtered = [task for task in tasks if task.done]\n    return filtered\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[list_dir: .]",
+                "[search_code: filtered]",
+                "[read_file: task_service.py]",
+                "Completed tasks are filtered in task_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are completed tasks filtered in sandbox/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.contains("=== tool_error: list_dir ===")
+                    && m.content.contains("require search_code")
+            }),
+            "list_dir before search must be blocked on investigation-required turns"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: search_code ===")),
+            "model must recover by searching"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "model must read a matched file before answering"
+        );
+    }
+
+    #[test]
     fn usage_lookup_definition_only_read_does_not_satisfy_evidence_when_usage_candidates_exist() {
         use std::fs;
         use tempfile::TempDir;
@@ -2189,7 +2332,6 @@ mod tests {
             vec![
                 "[search_code: TaskStatus]",
                 "[read_file: models/enums.py]",
-                "TaskStatus is defined in models/enums.py.",
                 "[read_file: services/task_service.py]",
                 "TaskStatus is used in services/task_service.py.",
             ],
@@ -2207,16 +2349,11 @@ mod tests {
         let snapshot = rt.messages_snapshot();
         assert!(
             snapshot.iter().any(|m| {
-                m.content.starts_with("[runtime:correction]")
-                    && m.content.contains("no matched file has been read")
+                m.content
+                    .contains("[runtime:correction] This is a usage lookup")
+                    && m.content.contains("services/task_service.py]")
             }),
-            "definition-only read must not satisfy usage evidence before a usage file is read"
-        );
-        assert!(
-            !snapshot
-                .iter()
-                .any(|m| m.content == "TaskStatus is defined in models/enums.py."),
-            "premature synthesis after definition-only read must be discarded"
+            "definition-only read must trigger a targeted usage-file recovery correction"
         );
 
         let answer_source = events.iter().find_map(|e| {
@@ -2338,6 +2475,63 @@ mod tests {
         assert!(
             matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
             "mixed candidate read must admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn definition_lookup_accepts_definition_read_when_usage_candidates_exist() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "from enum import Enum\n\nclass TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_service.py"),
+            "from models.enums import TaskStatus\n\nif task.status == TaskStatus.TODO:\n    pass\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: models/enums.py]",
+                "TaskStatus is defined in models/enums.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus defined in sandbox/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot.iter().any(|m| {
+                m.content.starts_with("[runtime:correction]")
+                    && m.content.contains("no matched file has been read")
+            }),
+            "definition lookup must accept the definition read as useful evidence"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "definition lookup should complete after reading the definition: {answer_source:?}"
         );
     }
 
