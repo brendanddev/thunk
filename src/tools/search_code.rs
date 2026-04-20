@@ -190,8 +190,8 @@ fn file_class_priority(path: &str) -> u8 {
         .and_then(|e| e.to_str())
         .unwrap_or("");
     match ext {
-        "rs" | "go" | "ts" | "tsx" | "js" | "jsx" | "py" | "c" | "cpp" | "h" | "hpp"
-        | "sh" | "bash" | "zsh" | "fish" | "html" | "css" | "scss" | "sql" | "xml" => 0,
+        "rs" | "go" | "ts" | "tsx" | "js" | "jsx" | "py" | "c" | "cpp" | "h" | "hpp" | "sh"
+        | "bash" | "zsh" | "fish" | "html" | "css" | "scss" | "sql" | "xml" => 0,
         "toml" | "json" | "yaml" | "yml" | "env" => 1,
         _ => 2,
     }
@@ -274,7 +274,10 @@ mod tests {
             sr.total_matches, 20,
             "total_matches must reflect all collected before truncation"
         );
-        assert!(sr.truncated, "truncated must be true when results exceed the cap");
+        assert!(
+            sr.truncated,
+            "truncated must be true when results exceed the cap"
+        );
     }
 
     #[test]
@@ -330,7 +333,10 @@ mod tests {
         assert_eq!(sr.matches.len(), 3);
         let files: Vec<&str> = sr.matches.iter().map(|m| m.file.as_str()).collect();
         let rs_pos = files.iter().position(|f| f.ends_with("lib.rs")).unwrap();
-        let toml_pos = files.iter().position(|f| f.ends_with("Cargo.toml")).unwrap();
+        let toml_pos = files
+            .iter()
+            .position(|f| f.ends_with("Cargo.toml"))
+            .unwrap();
         let md_pos = files.iter().position(|f| f.ends_with("README.md")).unwrap();
 
         assert!(rs_pos < toml_pos, "source must come before config");

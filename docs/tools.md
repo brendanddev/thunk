@@ -159,9 +159,18 @@ Rendered search output is grouped by file for model readability:
 - each file group shows up to `MAX_LINES_PER_FILE = 3` representative matching lines
 - files with more shown matches include a per-file "showing" count
 
-This grouping is presentation-only in `tool_codec`. The underlying typed data remains the same:
-`SearchMatch` and `SearchResultsOutput` are unchanged, and runtime behavior does not depend on
-parsing the grouped text.
+When exactly one source-tier file has a definition-like matching line, `tool_codec` prepends:
+
+```text
+[definition found in <file> — read this file first]
+```
+
+Definition detection is based on match content, not the search query. If zero or multiple source
+files contain definition-like lines, no hint is rendered.
+
+This grouping and hinting are presentation-only in `tool_codec`. The underlying typed data remains
+the same: `SearchMatch` and `SearchResultsOutput` are unchanged, and runtime behavior does not
+depend on parsing the grouped text. This is not a broad ranking system or query-intent classifier.
 
 The typed input supports an optional scoped path, but the current model-facing wire format does not expose that scoped form yet.
 

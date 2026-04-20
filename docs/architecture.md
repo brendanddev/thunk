@@ -135,8 +135,9 @@ Current mutating tools:
 
 It also owns model-facing output shaping for tool results. For example, `search_code` returns typed
 search matches, while `tool_codec` renders those matches grouped by file with per-file match counts
-and a small per-file line cap. That grouping is for model interpretability only; it does not change
-the typed search result data or runtime orchestration.
+and a small per-file line cap. It can also add a conservative definition-site hint when exactly one
+source-tier file contains a definition-like matching line. That shaping is for model
+interpretability only; it does not change the typed search result data or runtime orchestration.
 
 Supported model-facing call formats:
 

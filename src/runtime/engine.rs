@@ -109,8 +109,16 @@ struct InvestigationState {
     files_read_count: usize,
     /// File paths from the current non-empty search results.
     search_candidate_paths: Vec<String>,
-    /// True once read_file successfully read one of the current search result paths.
-    read_from_search_result: bool,
+    /// Candidate paths where every matched line looks like a definition site.
+    /// Populated during record_search_results alongside search_candidate_paths.
+    definition_only_candidates: HashSet<String>,
+    /// True if at least one candidate in the current search results has a
+    /// non-definition match line (i.e. a usage file is available).
+    has_non_definition_candidates: bool,
+    /// True once a search candidate has been read that provides useful evidence.
+    /// Definition-only files are useful only when no non-definition candidates
+    /// exist in the current result set.
+    read_useful_candidate: bool,
     /// True after the read-before-answering correction has been issued once.
     /// Prevents the correction from firing more than once per turn.
     premature_synthesis_correction_issued: bool,
@@ -126,14 +134,16 @@ impl InvestigationState {
             search_produced_results: false,
             files_read_count: 0,
             search_candidate_paths: Vec::new(),
-            read_from_search_result: false,
+            definition_only_candidates: HashSet::new(),
+            has_non_definition_candidates: false,
+            read_useful_candidate: false,
             premature_synthesis_correction_issued: false,
             direct_answer_correction_issued: false,
         }
     }
 
     fn evidence_ready(&self) -> bool {
-        self.search_produced_results && self.read_from_search_result
+        self.search_produced_results && self.read_useful_candidate
     }
 
     fn record_search_results(&mut self, output: &ToolOutput) -> bool {
@@ -145,10 +155,30 @@ impl InvestigationState {
         if !was_empty {
             self.search_produced_results = true;
             self.search_candidate_paths.clear();
+            self.definition_only_candidates.clear();
+            self.has_non_definition_candidates = false;
+            self.read_useful_candidate = false;
+
             for result in &results.matches {
                 push_unique_path(&mut self.search_candidate_paths, &result.file);
             }
-            self.read_from_search_result = false;
+
+            // Classify each candidate file: definition-only if every matched line looks
+            // like a definition site, usage-bearing otherwise.
+            // Uses tool_codec::looks_like_definition as a predicate only — no rendering.
+            let mut file_has_non_def: HashSet<String> = HashSet::new();
+            for m in &results.matches {
+                if !tool_codec::looks_like_definition(&m.line) {
+                    file_has_non_def.insert(m.file.clone());
+                }
+            }
+            for path in &self.search_candidate_paths {
+                if file_has_non_def.contains(path) {
+                    self.has_non_definition_candidates = true;
+                } else {
+                    self.definition_only_candidates.insert(path.clone());
+                }
+            }
         }
         was_empty
     }
@@ -160,12 +190,22 @@ impl InvestigationState {
 
         self.files_read_count += 1;
         let read_path = normalize_evidence_path(&file.path);
-        if self
+
+        let is_search_candidate = self
             .search_candidate_paths
             .iter()
-            .any(|candidate| normalize_evidence_path(candidate) == read_path)
-        {
-            self.read_from_search_result = true;
+            .any(|candidate| normalize_evidence_path(candidate) == read_path);
+
+        if is_search_candidate {
+            let is_def_only = self
+                .definition_only_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
+            // A definition-only file satisfies evidence only when no usage candidates
+            // exist in the current result set.
+            if !is_def_only || !self.has_non_definition_candidates {
+                self.read_useful_candidate = true;
+            }
         }
     }
 }
@@ -2123,6 +2163,181 @@ mod tests {
                 })
             ),
             "read outside search candidates must not admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn usage_lookup_definition_only_read_does_not_satisfy_evidence_when_usage_candidates_exist() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "from enum import Enum\n\nclass TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_service.py"),
+            "from models.enums import TaskStatus\n\nif task.status == TaskStatus.TODO:\n    pass\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: models/enums.py]",
+                "TaskStatus is defined in models/enums.py.",
+                "[read_file: services/task_service.py]",
+                "TaskStatus is used in services/task_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used in sandbox/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.starts_with("[runtime:correction]")
+                    && m.content.contains("no matched file has been read")
+            }),
+            "definition-only read must not satisfy usage evidence before a usage file is read"
+        );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content == "TaskStatus is defined in models/enums.py."),
+            "premature synthesis after definition-only read must be discarded"
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "turn should complete after the usage file is read: {answer_source:?}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("TaskStatus is used in services/task_service.py.")
+        );
+    }
+
+    #[test]
+    fn usage_lookup_all_definition_candidates_fallback_allows_definition_read() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "from enum import Enum\n\nclass TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: models/enums.py]",
+                "Only the TaskStatus definition was found.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used in sandbox/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content.starts_with("[runtime:correction]")),
+            "definition-only fallback should not inject a correction when no usage candidates exist"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "definition-only fallback must admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn usage_lookup_mixed_definition_and_usage_file_is_useful_immediately() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::write(
+            tmp.path().join("models").join("task_status.py"),
+            "class TaskStatus:\n    TODO = \"todo\"\n\nDEFAULT_STATUS = TaskStatus.TODO\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: models/task_status.py]",
+                "TaskStatus is defined and used in models/task_status.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used in sandbox/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content.starts_with("[runtime:correction]")),
+            "mixed definition+usage file should satisfy usage evidence immediately"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "mixed candidate read must admit synthesis: {answer_source:?}"
         );
     }
 

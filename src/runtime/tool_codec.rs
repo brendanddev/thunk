@@ -589,20 +589,26 @@ pub fn looks_like_definition(line: &str) -> bool {
 fn definition_site_file<'a>(
     groups: &[(&'a str, Vec<&crate::tools::types::SearchMatch>)],
 ) -> Option<&'a str> {
-    let mut found: Option<&'a str> = None;
-    for (file, matches) in groups {
-        if !is_source_tier(file) {
-            continue;
-        }
-        if matches.iter().any(|m| looks_like_definition(&m.line)) {
-            if found.is_some() {
-                // More than one candidate — ambiguous; suppress the hint.
-                return None;
-            }
-            found = Some(file);
-        }
+    // Collect all source-tier files in the result set.
+    let source_files: Vec<(&'a str, bool)> = groups
+        .iter()
+        .filter(|(file, _)| is_source_tier(file))
+        .map(|(file, matches)| {
+            (
+                *file,
+                matches.iter().any(|m| looks_like_definition(&m.line)),
+            )
+        })
+        .collect();
+
+    // Only hint when exactly one source-tier file exists and it contains a definition line.
+    // If other source-tier files (usage files) are also present, the model has enough
+    // information from the grouped output to choose without being steered toward the
+    // definition file — which would be wrong for usage queries.
+    match source_files.as_slice() {
+        [(file, true)] => Some(file),
+        _ => None,
     }
-    found
 }
 
 fn render_search_results_grouped(s: &crate::tools::types::SearchResultsOutput) -> String {
@@ -764,8 +770,8 @@ List a directory:
 Search code:
 [search_code: keyword]
 
-Use search_code for any question about where something is, how something works, or what something is called in this project. Do not ask the user — search first.
-Use exactly one plain literal keyword or identifier, such as logging, write_file, SessionLog, or sessions.
+Use search_code for any question about where something is, how something works, or what something is called in this project. Do not ask the user — search first. To find code, use search_code directly — do not list directories first.
+Use exactly one plain literal keyword or identifier, such as logging, write_file, SessionLog, or sessions. Search using a meaningful keyword from the question (e.g., a function name, variable, or concept) — not a directory name or file path.
 Do not use phrases, dots, parentheses, backslashes, regex syntax, or method-call syntax.
 Emit only one search call at a time. If the results point to a specific file but do not show enough detail, read that file once with read_file, then respond. Never emit a second search_code.
 Only if results are completely empty, try one different single keyword, then stop searching and respond.
@@ -1407,7 +1413,10 @@ mod tests {
         );
         assert!(body.contains("  1: needle line 1"));
         assert!(body.contains("  3: needle line 3"));
-        assert!(!body.contains("  4: needle line 4"), "lines beyond cap must not appear");
+        assert!(
+            !body.contains("  4: needle line 4"),
+            "lines beyond cap must not appear"
+        );
     }
 
     #[test]
@@ -1508,7 +1517,9 @@ mod tests {
         assert!(looks_like_definition("func HandleRequest("));
         assert!(looks_like_definition("function onClick("));
         assert!(looks_like_definition("interface UserRepo {"));
-        assert!(looks_like_definition("class Component extends React.Component {"));
+        assert!(looks_like_definition(
+            "class Component extends React.Component {"
+        ));
         assert!(looks_like_definition("type Config = {"));
         assert!(looks_like_definition("const handler = ("));
     }
@@ -1517,7 +1528,9 @@ mod tests {
     fn looks_like_definition_rejects_usage_lines() {
         assert!(!looks_like_definition("let x = TaskStatus::Running;"));
         assert!(!looks_like_definition("task.execute();"));
-        assert!(!looks_like_definition("use crate::tools::types::SearchMatch;"));
+        assert!(!looks_like_definition(
+            "use crate::tools::types::SearchMatch;"
+        ));
         assert!(!looks_like_definition("// pub fn commented_out("));
         assert!(!looks_like_definition("println!(\"fn not a definition\");"));
         assert!(!looks_like_definition("x.fn_call()"));
@@ -1525,9 +1538,28 @@ mod tests {
     }
 
     #[test]
-    fn definition_preamble_fires_for_single_definition_file() {
-        // One source file has a definition line; one has only usage lines.
-        // Preamble must fire for the definition file.
+    fn definition_preamble_fires_for_only_source_file() {
+        // Exactly one source-tier file in the results and it has a definition line.
+        // No other source files present — preamble must fire.
+        let output = make_search_output(
+            vec![
+                make_match("src/types.rs", 47, "pub enum TaskStatus {"),
+                make_match("README.md", 3, "TaskStatus represents the task state."),
+            ],
+            2,
+        );
+        let body = render_output(&output);
+        assert!(
+            body.contains("[definition found in src/types.rs — read this file first]"),
+            "preamble must fire when types.rs is the only source-tier file; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_preamble_suppressed_when_usage_files_also_present() {
+        // One source file has a definition line; another source file has only usage lines.
+        // Two source-tier files total → preamble must be suppressed to avoid steering
+        // usage queries toward the definition file.
         let output = make_search_output(
             vec![
                 make_match("src/types.rs", 47, "pub enum TaskStatus {"),
@@ -1538,8 +1570,8 @@ mod tests {
         );
         let body = render_output(&output);
         assert!(
-            body.contains("[definition found in src/types.rs — read this file first]"),
-            "preamble must fire for the single definition file; got:\n{body}"
+            !body.contains("[definition found in"),
+            "preamble must be suppressed when usage source files are also present; got:\n{body}"
         );
     }
 
@@ -1597,9 +1629,9 @@ mod tests {
     }
 
     #[test]
-    fn definition_preamble_correct_when_definition_and_usage_in_source_tier() {
+    fn definition_preamble_suppressed_when_definition_and_usage_in_source_tier() {
         // types.rs: definition line. engine.rs: usage lines only. Both source tier.
-        // Preamble must name types.rs, not engine.rs.
+        // Two source-tier files → preamble suppressed regardless of which has the definition.
         let output = make_search_output(
             vec![
                 make_match("src/types.rs", 47, "pub struct Config {"),
@@ -1611,16 +1643,15 @@ mod tests {
         );
         let body = render_output(&output);
         assert!(
-            body.contains("[definition found in src/types.rs — read this file first]"),
-            "preamble must name the definition file, not usage files; got:\n{body}"
+            !body.contains("[definition found in"),
+            "preamble must be suppressed when usage source files are also present; got:\n{body}"
         );
-        assert!(!body.contains("src/engine.rs — read this file first"));
     }
 
     #[test]
-    fn definition_preamble_present_with_truncated_results() {
+    fn definition_preamble_suppressed_with_truncated_results_and_multiple_source_files() {
         // total_matches > shown → truncation notice fires.
-        // If the shown set includes a definition, preamble must still fire.
+        // Two source-tier files in the shown set → preamble suppressed even with truncation.
         let matches = vec![
             make_match("src/types.rs", 10, "pub fn important()"),
             make_match("src/engine.rs", 50, "important();"),
@@ -1633,8 +1664,28 @@ mod tests {
             "truncation notice must be present"
         );
         assert!(
+            !body.contains("[definition found in"),
+            "preamble must be suppressed when usage source files are also present; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_preamble_fires_with_truncated_results_and_only_source_file() {
+        // total_matches > shown → truncation. Exactly one source-tier file in shown set.
+        // Preamble must still fire.
+        let matches = vec![
+            make_match("src/types.rs", 10, "pub fn important()"),
+            make_match("README.md", 20, "important is a key function"),
+        ];
+        let output = make_search_output(matches, 50); // total=50, shown=2 → truncated
+        let body = render_output(&output);
+        assert!(
+            body.contains("[showing first 2 of 50 matches"),
+            "truncation notice must be present"
+        );
+        assert!(
             body.contains("[definition found in src/types.rs — read this file first]"),
-            "preamble must fire even when results are truncated; got:\n{body}"
+            "preamble must fire when types.rs is the only source-tier file; got:\n{body}"
         );
     }
 
@@ -1649,10 +1700,22 @@ mod tests {
             2,
         );
         let body = render_output(&output);
-        assert!(body.contains("src/types.rs (1 matches)"), "group header must still appear");
-        assert!(body.contains("src/engine.rs (1 matches)"), "group header must still appear");
-        assert!(body.contains("  47: pub enum Status {"), "match line must still appear");
-        assert!(body.contains("  10: status.run();"), "match line must still appear");
+        assert!(
+            body.contains("src/types.rs (1 matches)"),
+            "group header must still appear"
+        );
+        assert!(
+            body.contains("src/engine.rs (1 matches)"),
+            "group header must still appear"
+        );
+        assert!(
+            body.contains("  47: pub enum Status {"),
+            "match line must still appear"
+        );
+        assert!(
+            body.contains("  10: status.run();"),
+            "match line must still appear"
+        );
     }
 
     #[test]
