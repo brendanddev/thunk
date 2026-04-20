@@ -47,6 +47,12 @@ impl AppContext {
         let mut tool_start: Option<(String, Instant)> = None;
 
         self.runtime.handle(request, &mut |event| {
+            if let RuntimeEvent::RuntimeTrace(line) = &event {
+                if let Some(ref mut l) = log {
+                    l.log(line);
+                }
+                return;
+            }
             if let Some(ref mut l) = log {
                 match &event {
                     RuntimeEvent::AssistantMessageStarted => {
@@ -147,6 +153,7 @@ fn event_label(event: &RuntimeEvent) -> Option<String> {
         | RuntimeEvent::ToolCallStarted { .. }
         | RuntimeEvent::ToolCallFinished { .. }
         | RuntimeEvent::AssistantMessageChunk(_)
-        | RuntimeEvent::BackendTiming { .. } => None,
+        | RuntimeEvent::BackendTiming { .. }
+        | RuntimeEvent::RuntimeTrace(_) => None,
     }
 }

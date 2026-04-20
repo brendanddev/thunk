@@ -89,4 +89,7 @@ pub enum RuntimeEvent {
         stage: &'static str,
         elapsed_ms: u64,
     },
+    /// Advisory runtime decision trace. Consumed by the application logging layer only;
+    /// must not be forwarded to the TUI or drive any control flow.
+    RuntimeTrace(String),
 }

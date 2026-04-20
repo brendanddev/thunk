@@ -85,6 +85,15 @@ fn import_read_recovery_correction(path: &str) -> String {
     )
 }
 
+fn config_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] This is a config lookup. The file just read is a source file, \
+         but a matched config file exists. \
+         Read this exact config file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
 /// Injected when the question contains a code identifier but the model attempts a Direct answer
 /// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
 const SEARCH_BEFORE_ANSWERING: &str =
@@ -125,6 +134,67 @@ const READ_CAP_EXCEEDED: &str =
 const LIST_DIR_BEFORE_SEARCH_BLOCKED: &str =
     "[runtime: code investigation questions require search_code, not list_dir.\nUse search_code with a keyword from the question — a function name, variable, or concept.]";
 
+const RUNTIME_TRACE_ENV: &str = "PARAMS_TRACE_RUNTIME";
+
+fn trace_runtime_decision(
+    on_event: &mut dyn FnMut(RuntimeEvent),
+    event: &str,
+    fields: &[(&str, String)],
+) {
+    if std::env::var_os(RUNTIME_TRACE_ENV).is_none() {
+        return;
+    }
+
+    let mut line = format!("[runtime:trace] event={event}");
+    for (key, value) in fields {
+        line.push(' ');
+        line.push_str(key);
+        line.push('=');
+        line.push_str(&trace_field_value(value));
+    }
+    on_event(RuntimeEvent::RuntimeTrace(line));
+}
+
+fn trace_field_value(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("{value:?}")
+    }
+}
+
+/// Structural mode for the current investigation turn.
+/// Computed once from the user prompt before the tool loop starts.
+/// Controls which evidence-acceptance gates are active for this turn.
+#[derive(Copy, Clone)]
+enum InvestigationMode {
+    /// No mode-specific gating. Any search-candidate read satisfies evidence.
+    General,
+    /// Prompt signals a usage lookup (where X is used/referenced/appears).
+    /// Definition-only reads are structurally insufficient when usage candidates exist.
+    UsageLookup,
+    /// Prompt signals a definition lookup (where X is defined/declared).
+    /// No mode-specific gating beyond General — definition reads are always accepted.
+    DefinitionLookup,
+    /// Prompt signals a config lookup (where X is configured/configuration).
+    /// Source-file reads are structurally insufficient when config-file candidates exist.
+    ConfigLookup,
+}
+
+impl InvestigationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            InvestigationMode::General => "General",
+            InvestigationMode::UsageLookup => "UsageLookup",
+            InvestigationMode::DefinitionLookup => "DefinitionLookup",
+            InvestigationMode::ConfigLookup => "ConfigLookup",
+        }
+    }
+}
+
 /// Distinguishes which structural insufficiency caused a candidate read to be rejected.
 /// Used by the caller in run_tool_round to select the appropriate correction message.
 enum RecoveryKind {
@@ -132,6 +202,18 @@ enum RecoveryKind {
     DefinitionOnly,
     /// The file had only import-declaration matches with substantive candidates available.
     ImportOnly,
+    /// The file was a non-config source file on a config lookup when config-file candidates exist.
+    ConfigFile,
+}
+
+impl RecoveryKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RecoveryKind::DefinitionOnly => "DefinitionOnly",
+            RecoveryKind::ImportOnly => "ImportOnly",
+            RecoveryKind::ConfigFile => "ConfigFile",
+        }
+    }
 }
 
 /// Tracks per-turn search → read investigation state.
@@ -177,6 +259,14 @@ struct InvestigationState {
     /// True after the import-only recovery correction has been issued once this turn.
     /// Uses its own flag so it does not consume the premature_synthesis correction slot.
     import_correction_issued: bool,
+    /// Candidate paths whose file extension identifies them as a config file
+    /// (e.g. .yaml, .toml, .json, .env).  Populated during record_search_results.
+    config_file_candidates: HashSet<String>,
+    /// True if at least one candidate in the current search results is NOT a config file
+    /// (i.e. a source or other non-config file was also matched).
+    has_non_config_candidates: bool,
+    /// True after the config-file recovery correction has been issued once this turn.
+    config_correction_issued: bool,
 }
 
 impl InvestigationState {
@@ -195,6 +285,9 @@ impl InvestigationState {
             import_only_candidates: HashSet::new(),
             has_non_import_candidates: false,
             import_correction_issued: false,
+            config_file_candidates: HashSet::new(),
+            has_non_config_candidates: false,
+            config_correction_issued: false,
         }
     }
 
@@ -202,7 +295,11 @@ impl InvestigationState {
         self.search_produced_results && self.read_useful_candidate
     }
 
-    fn record_search_results(&mut self, output: &ToolOutput) -> bool {
+    fn record_search_results(
+        &mut self,
+        output: &ToolOutput,
+        on_event: &mut dyn FnMut(RuntimeEvent),
+    ) -> bool {
         let ToolOutput::SearchResults(results) = output else {
             return false;
         };
@@ -216,17 +313,18 @@ impl InvestigationState {
             self.has_non_definition_candidates = false;
             self.import_only_candidates.clear();
             self.has_non_import_candidates = false;
+            self.config_file_candidates.clear();
+            self.has_non_config_candidates = false;
             self.read_useful_candidate = false;
 
             for result in &results.matches {
                 push_unique_path(&mut self.search_candidate_paths, &result.file);
             }
 
-            // Classify each candidate file along two structural axes.
-            // definition-only: every matched line looks like a definition site.
-            // import-only: every matched line looks like an import declaration.
-            // Both use tool_codec::looks_like_definition and the local looks_like_import
-            // as predicates only — no rendering.
+            // Classify each candidate file along three structural axes.
+            // definition-only: every matched line looks like a definition site (line-content).
+            // import-only: every matched line looks like an import declaration (line-content).
+            // config-file: the file's extension identifies it as a config file (path-based).
             let mut file_has_non_def: HashSet<String> = HashSet::new();
             let mut file_has_non_import: HashSet<String> = HashSet::new();
             for m in &results.matches {
@@ -248,15 +346,49 @@ impl InvestigationState {
                 } else {
                     self.import_only_candidates.insert(path.clone());
                 }
+                if is_config_file(path) {
+                    self.config_file_candidates.insert(path.clone());
+                } else {
+                    self.has_non_config_candidates = true;
+                }
             }
         }
+        trace_runtime_decision(
+            on_event,
+            "search_candidates_classified",
+            &[
+                ("shown_matches", results.matches.len().to_string()),
+                ("total_matches", results.total_matches.to_string()),
+                ("truncated", results.truncated.to_string()),
+                (
+                    "candidate_files",
+                    self.search_candidate_paths.len().to_string(),
+                ),
+                (
+                    "definition_only",
+                    self.definition_only_candidates.len().to_string(),
+                ),
+                (
+                    "has_non_definition",
+                    self.has_non_definition_candidates.to_string(),
+                ),
+                ("import_only", self.import_only_candidates.len().to_string()),
+                ("has_non_import", self.has_non_import_candidates.to_string()),
+                (
+                    "config_files",
+                    self.config_file_candidates.len().to_string(),
+                ),
+                ("has_non_config", self.has_non_config_candidates.to_string()),
+            ],
+        );
         was_empty
     }
 
     fn record_read_result(
         &mut self,
         output: &ToolOutput,
-        usage_lookup_required: bool,
+        mode: InvestigationMode,
+        on_event: &mut dyn FnMut(RuntimeEvent),
     ) -> Option<(String, RecoveryKind)> {
         let ToolOutput::FileContents(file) = output else {
             return None;
@@ -280,18 +412,84 @@ impl InvestigationState {
                 .import_only_candidates
                 .iter()
                 .any(|c| normalize_evidence_path(c) == read_path);
+            let is_config_candidate = self
+                .config_file_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
 
-            // On usage lookups, a definition-only file satisfies evidence only when no
-            // usage candidates exist. On non-usage or non-def-only reads, proceed to
-            // the acceptance branch where import-only is checked.
-            if usage_lookup_required && is_def_only && self.has_non_definition_candidates {
+            // Gate 1 (UsageLookup): definition-only reads are structurally insufficient
+            // when usage candidates exist. Fire once; subsequent reads fall through ungated.
+            if matches!(mode, InvestigationMode::UsageLookup)
+                && is_def_only
+                && self.has_non_definition_candidates
+            {
                 if !self.premature_synthesis_correction_issued {
                     let suggested_path = self.first_non_definition_candidate().map(str::to_string);
                     if suggested_path.is_some() {
                         self.premature_synthesis_correction_issued = true;
                     }
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", read_path.clone()),
+                            ("accepted", "false".into()),
+                            ("reason", "usage_definition_only_candidate".into()),
+                            (
+                                "recovery_path",
+                                suggested_path.clone().unwrap_or_else(|| "none".into()),
+                            ),
+                        ],
+                    );
                     return suggested_path.map(|p| (p, RecoveryKind::DefinitionOnly));
                 }
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "false".into()),
+                        (
+                            "reason",
+                            "usage_definition_only_recovery_already_issued".into(),
+                        ),
+                    ],
+                );
+                // Correction already issued: fall through without accepting.
+            }
+            // Gate 2 (ConfigLookup): non-config reads are structurally insufficient when
+            // config-file candidates exist. Fire once; fallback accepts if no config candidates.
+            else if matches!(mode, InvestigationMode::ConfigLookup)
+                && !is_config_candidate
+                && !self.config_file_candidates.is_empty()
+            {
+                if !self.config_correction_issued {
+                    self.config_correction_issued = true;
+                    let suggested_path = self.first_config_candidate().map(str::to_string);
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", read_path.clone()),
+                            ("accepted", "false".into()),
+                            ("reason", "config_non_config_candidate".into()),
+                            (
+                                "recovery_path",
+                                suggested_path.clone().unwrap_or_else(|| "none".into()),
+                            ),
+                        ],
+                    );
+                    return suggested_path.map(|p| (p, RecoveryKind::ConfigFile));
+                }
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "false".into()),
+                        ("reason", "config_non_config_recovery_already_issued".into()),
+                    ],
+                );
                 // Correction already issued: fall through without accepting.
             } else {
                 // Candidate would normally be accepted. Check import-only before committing.
@@ -302,14 +500,70 @@ impl InvestigationState {
                     && !self.import_correction_issued
                 {
                     self.import_correction_issued = true;
-                    return self
-                        .first_non_import_candidate()
-                        .map(|p| (p.to_string(), RecoveryKind::ImportOnly));
+                    let suggested_path = self.first_non_import_candidate().map(str::to_string);
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", read_path.clone()),
+                            ("accepted", "false".into()),
+                            ("reason", "import_only_candidate".into()),
+                            (
+                                "recovery_path",
+                                suggested_path.clone().unwrap_or_else(|| "none".into()),
+                            ),
+                        ],
+                    );
+                    return suggested_path.map(|p| (p, RecoveryKind::ImportOnly));
                 }
                 self.read_useful_candidate = true;
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "true".into()),
+                        (
+                            "reason",
+                            self.acceptance_reason(mode, is_def_only, is_import_only),
+                        ),
+                        ("candidate_reads", self.candidate_reads_count.to_string()),
+                    ],
+                );
             }
+        } else {
+            trace_runtime_decision(
+                on_event,
+                "read_evidence",
+                &[
+                    ("path", read_path),
+                    ("accepted", "false".into()),
+                    ("reason", "not_search_candidate".into()),
+                ],
+            );
         }
         None
+    }
+
+    fn acceptance_reason(
+        &self,
+        mode: InvestigationMode,
+        is_def_only: bool,
+        is_import_only: bool,
+    ) -> String {
+        if matches!(mode, InvestigationMode::ConfigLookup) && self.config_file_candidates.is_empty()
+        {
+            "config_fallback_no_config_candidates".into()
+        } else if matches!(mode, InvestigationMode::UsageLookup)
+            && is_def_only
+            && !self.has_non_definition_candidates
+        {
+            "usage_fallback_no_usage_candidates".into()
+        } else if is_import_only && !self.has_non_import_candidates {
+            "import_fallback_all_import_candidates".into()
+        } else {
+            "search_candidate".into()
+        }
     }
 
     fn first_non_definition_candidate(&self) -> Option<&str> {
@@ -323,6 +577,13 @@ impl InvestigationState {
         self.search_candidate_paths
             .iter()
             .find(|path| !self.import_only_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_config_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| self.config_file_candidates.contains(*path))
             .map(String::as_str)
     }
 }
@@ -390,6 +651,34 @@ impl SearchBudget {
             SEARCH_CLOSED_AFTER_RESULTS
         }
     }
+}
+
+fn trace_insufficient_evidence_terminal(
+    reason: &str,
+    tool_rounds: usize,
+    search_budget: &SearchBudget,
+    investigation: &InvestigationState,
+    on_event: &mut dyn FnMut(RuntimeEvent),
+) {
+    trace_runtime_decision(
+        on_event,
+        "terminal_insufficient_evidence",
+        &[
+            ("reason", reason.to_string()),
+            ("rounds", tool_rounds.to_string()),
+            ("search_calls", search_budget.calls.to_string()),
+            (
+                "search_produced_results",
+                investigation.search_produced_results.to_string(),
+            ),
+            ("files_read", investigation.files_read_count.to_string()),
+            (
+                "candidate_reads",
+                investigation.candidate_reads_count.to_string(),
+            ),
+            ("evidence_ready", investigation.evidence_ready().to_string()),
+        ],
+    );
 }
 
 /// Converts model-generated search phrases or regex/method-shaped text into the
@@ -580,9 +869,12 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
     .any(|term| contains_word(&lower, term))
 }
 
-fn prompt_requests_usage_lookup(text: &str) -> bool {
+/// Detects the structural investigation mode from the prompt text.
+/// Evaluated in priority order so each prompt maps to exactly one mode.
+/// Priority: UsageLookup > ConfigLookup > DefinitionLookup > General.
+fn detect_investigation_mode(text: &str) -> InvestigationMode {
     let lower = text.to_ascii_lowercase();
-    [
+    if [
         "use",
         "used",
         "uses",
@@ -599,6 +891,28 @@ fn prompt_requests_usage_lookup(text: &str) -> bool {
     ]
     .iter()
     .any(|term| contains_word(&lower, term))
+    {
+        return InvestigationMode::UsageLookup;
+    }
+    if ["config", "configured", "configuration", "configure"]
+        .iter()
+        .any(|term| contains_word(&lower, term))
+    {
+        return InvestigationMode::ConfigLookup;
+    }
+    if [
+        "defined",
+        "definition",
+        "declared",
+        "declares",
+        "declaration",
+    ]
+    .iter()
+    .any(|term| contains_word(&lower, term))
+    {
+        return InvestigationMode::DefinitionLookup;
+    }
+    InvestigationMode::General
 }
 
 fn contains_word(text: &str, needle: &str) -> bool {
@@ -648,14 +962,16 @@ fn user_requested_mutation(text: &str) -> bool {
 
 /// Extracts a single relative path scope from an investigation prompt.
 ///
-/// Fires only on the conservative pattern `in <token>` or `within <token>` where
-/// the token contains `/`, has no whitespace, and is not a URL. Trailing punctuation
+/// Fires only on the conservative pattern `in <token>` / `within <token>`, with
+/// an optional `the` before the token, where the token contains `/`, has no
+/// whitespace, and is not a URL. Trailing punctuation
 /// that is not part of a path is stripped. Returns `None` when the pattern is absent
 /// or ambiguous (multiple qualifying tokens, empty token after stripping, etc.).
 ///
 /// Examples that match:
-///   "Where is TaskStatus handled in sandbox/cli/" → Some("sandbox/cli/")
-///   "Find logging in sandbox/services/"           → Some("sandbox/services/")
+///   "Where is TaskStatus handled in sandbox/cli/"     → Some("sandbox/cli/")
+///   "Find logging in sandbox/services/"               → Some("sandbox/services/")
+///   "Find where database is configured in the sandbox/ folder" → Some("sandbox/")
 ///
 /// Examples that do not match:
 ///   "Find X in the application"  → None  (no `/` in token)
@@ -670,10 +986,19 @@ fn extract_investigation_path_scope(text: &str) -> Option<String> {
 
     for (i, lw) in lower_words.iter().enumerate() {
         if (*lw == "in" || *lw == "within") && i + 1 < words.len() {
-            let raw = words[i + 1];
+            let next = i + 1;
+            let path_index = if lower_words[next] == "the" && next + 1 < words.len() {
+                next + 1
+            } else {
+                next
+            };
+            let raw = words[path_index];
             // Strip trailing punctuation that cannot be part of a relative path.
             let stripped = raw.trim_end_matches(|c: char| {
-                matches!(c, '.' | ',' | '?' | '!' | ';' | ':' | ')' | ']' | '}' | '"' | '\'')
+                matches!(
+                    c,
+                    '.' | ',' | '?' | '!' | ';' | ':' | ')' | ']' | '}' | '"' | '\''
+                )
             });
             if stripped.is_empty() {
                 continue;
@@ -724,6 +1049,28 @@ fn requested_read_path(text: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Returns true if the path's file extension identifies it as a config file.
+/// Classification is purely extension-based — no content analysis or filename heuristics.
+/// Handles the exact `.env` dotfile explicitly since `Path::extension()` returns None for it.
+fn is_config_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let p = Path::new(&lower);
+    if matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some("yaml" | "yml" | "toml" | "json" | "ini" | "cfg" | "conf" | "properties")
+    ) {
+        return true;
+    }
+    // `.env` is part of the allowed config extension set; `.env.*` is intentionally
+    // excluded because its actual extension is something else.
+    if let Some(filename) = p.file_name().and_then(|f| f.to_str()) {
+        if filename == ".env" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns true if the line (after stripping leading whitespace) is an import declaration.
@@ -985,14 +1332,33 @@ impl Runtime {
         let mutation_allowed = original_user_prompt
             .map(user_requested_mutation)
             .unwrap_or(false);
-        let usage_lookup_required = original_user_prompt
-            .map(prompt_requests_usage_lookup)
-            .unwrap_or(false);
+        let investigation_mode = original_user_prompt
+            .map(detect_investigation_mode)
+            .unwrap_or(InvestigationMode::General);
         let investigation_path_scope: Option<String> = if investigation_required {
             original_user_prompt.and_then(extract_investigation_path_scope)
         } else {
             None
         };
+        trace_runtime_decision(
+            on_event,
+            "investigation_mode_detected",
+            &[
+                ("mode", investigation_mode.as_str().into()),
+                ("required", investigation_required.to_string()),
+            ],
+        );
+        trace_runtime_decision(
+            on_event,
+            "investigation_path_scope",
+            &[(
+                "scope",
+                investigation_path_scope
+                    .as_deref()
+                    .unwrap_or("none")
+                    .to_string(),
+            )],
+        );
         loop {
             let response =
                 match run_generate_turn(self.backend.as_mut(), &mut self.conversation, on_event) {
@@ -1116,6 +1482,13 @@ impl Runtime {
                     && !investigation.search_produced_results
                     && investigation.files_read_count == 0
                 {
+                    trace_insufficient_evidence_terminal(
+                        "empty_search_no_read",
+                        tool_rounds,
+                        &search_budget,
+                        &investigation,
+                        on_event,
+                    );
                     self.finish_with_runtime_answer(
                         insufficient_evidence_final_answer(),
                         AnswerSource::RuntimeTerminal {
@@ -1136,6 +1509,13 @@ impl Runtime {
                             continue;
                         }
 
+                        trace_insufficient_evidence_terminal(
+                            "no_search_after_direct_answer_correction",
+                            tool_rounds,
+                            &search_budget,
+                            &investigation,
+                            on_event,
+                        );
                         self.finish_with_runtime_answer(
                             ungrounded_investigation_final_answer(),
                             AnswerSource::RuntimeTerminal {
@@ -1153,6 +1533,13 @@ impl Runtime {
                         if investigation.candidate_reads_count
                             >= MAX_CANDIDATE_READS_PER_INVESTIGATION
                         {
+                            trace_insufficient_evidence_terminal(
+                                "candidate_read_limit_exhausted",
+                                tool_rounds,
+                                &search_budget,
+                                &investigation,
+                                on_event,
+                            );
                             self.finish_with_runtime_answer(
                                 ungrounded_investigation_final_answer(),
                                 AnswerSource::RuntimeTerminal {
@@ -1175,6 +1562,13 @@ impl Runtime {
                             continue;
                         }
 
+                        trace_insufficient_evidence_terminal(
+                            "read_required_correction_unavailable",
+                            tool_rounds,
+                            &search_budget,
+                            &investigation,
+                            on_event,
+                        );
                         self.finish_with_runtime_answer(
                             ungrounded_investigation_final_answer(),
                             AnswerSource::RuntimeTerminal {
@@ -1219,7 +1613,7 @@ impl Runtime {
                 &mut reads_this_turn,
                 mutation_allowed,
                 investigation_required,
-                usage_lookup_required,
+                investigation_mode,
                 requested_read_path.as_deref(),
                 &mut requested_read_completed,
                 investigation_path_scope.as_deref(),
@@ -1308,7 +1702,7 @@ fn run_tool_round(
     reads_this_turn: &mut HashSet<String>,
     mutation_allowed: bool,
     investigation_required: bool,
-    usage_lookup_required: bool,
+    investigation_mode: InvestigationMode,
     requested_read_path: Option<&str>,
     requested_read_completed: &mut bool,
     investigation_path_scope: Option<&str>,
@@ -1326,8 +1720,30 @@ fn run_tool_round(
             (investigation_path_scope, &mut input)
         {
             match path {
-                None => *path = Some(scope.to_string()),
+                None => {
+                    trace_runtime_decision(
+                        on_event,
+                        "search_scope_applied",
+                        &[
+                            ("action", "inject".into()),
+                            ("original_path", "none".into()),
+                            ("scope", scope.to_string()),
+                            ("final_path", scope.to_string()),
+                        ],
+                    );
+                    *path = Some(scope.to_string());
+                }
                 Some(ref p) if !path_is_within_scope(p, scope) => {
+                    trace_runtime_decision(
+                        on_event,
+                        "search_scope_applied",
+                        &[
+                            ("action", "clamp".into()),
+                            ("original_path", p.to_string()),
+                            ("scope", scope.to_string()),
+                            ("final_path", scope.to_string()),
+                        ],
+                    );
                     *path = Some(scope.to_string());
                 }
                 _ => {}
@@ -1453,7 +1869,7 @@ fn run_tool_round(
                 );
                 // Record search results against the per-turn budget and investigation state.
                 let search_closed_message = if name == "search_code" {
-                    let was_empty = investigation.record_search_results(&output);
+                    let was_empty = investigation.record_search_results(&output, on_event);
                     search_budget.record(was_empty);
                     search_budget
                         .is_closed()
@@ -1464,7 +1880,7 @@ fn run_tool_round(
                 // Track successful file reads for evidence grounding and dedup.
                 let read_recovery = if name == "read_file" {
                     let recovery =
-                        investigation.record_read_result(&output, usage_lookup_required);
+                        investigation.record_read_result(&output, investigation_mode, on_event);
                     if let Some(requested) = requested_read_path {
                         if let Some(rp) = read_path.as_deref() {
                             if normalize_evidence_path(rp) == normalize_evidence_path(requested) {
@@ -1487,9 +1903,15 @@ fn run_tool_round(
                 });
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
                 if let Some((path, kind)) = read_recovery {
+                    trace_runtime_decision(
+                        on_event,
+                        "recovery_issued",
+                        &[("kind", kind.as_str().into()), ("path", path.clone())],
+                    );
                     let correction = match kind {
                         RecoveryKind::DefinitionOnly => usage_read_recovery_correction(&path),
                         RecoveryKind::ImportOnly => import_read_recovery_correction(&path),
+                        RecoveryKind::ConfigFile => config_read_recovery_correction(&path),
                     };
                     accumulated.push_str(&correction);
                     accumulated.push_str("\n\n");
@@ -3185,7 +3607,9 @@ mod tests {
             "turn must complete without failure: {events:?}"
         );
         assert!(
-            events.iter().any(|e| matches!(e, RuntimeEvent::AnswerReady(_))),
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::AnswerReady(_))),
             "turn must complete with AnswerReady: {events:?}"
         );
 
@@ -3241,7 +3665,9 @@ mod tests {
             "turn must complete without failure: {events:?}"
         );
         assert!(
-            events.iter().any(|e| matches!(e, RuntimeEvent::AnswerReady(_))),
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::AnswerReady(_))),
             "turn must complete with AnswerReady: {events:?}"
         );
 
@@ -3537,7 +3963,10 @@ mod tests {
             },
         );
 
-        assert!(!has_failed(&events), "turn must terminate cleanly: {events:?}");
+        assert!(
+            !has_failed(&events),
+            "turn must terminate cleanly: {events:?}"
+        );
         let answer_source = events.iter().find_map(|e| {
             if let RuntimeEvent::AnswerReady(src) = e {
                 Some(src.clone())
@@ -3579,11 +4008,23 @@ mod tests {
             Some("sandbox/cli/".into())
         );
         assert_eq!(
-            extract_investigation_path_scope("Find where logging is initialized in sandbox/services/"),
+            extract_investigation_path_scope(
+                "Find where logging is initialized in sandbox/services/"
+            ),
             Some("sandbox/services/".into())
         );
         assert_eq!(
             extract_investigation_path_scope("Where is TaskStatus used in sandbox/"),
+            Some("sandbox/".into())
+        );
+    }
+
+    #[test]
+    fn extract_investigation_path_scope_detects_the_before_path() {
+        assert_eq!(
+            extract_investigation_path_scope(
+                "Find where database is configured in the sandbox/ folder"
+            ),
             Some("sandbox/".into())
         );
     }
@@ -3721,15 +4162,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn path_scope_after_list_dir_failure_keeps_search_candidates_inside_scope() {
+        // Manual regression: "in the sandbox/ folder" must still produce sandbox/
+        // as the prompt-derived upper bound after an initial list_dir failure.
+        // The model later reads an out-of-scope matched-looking file; that read must
+        // not satisfy evidence because it was never a scoped search candidate.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+        fs::create_dir_all(tmp.path().join("src/app")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox").join("database.yaml"),
+            "database:\n  url: sqlite:///sandbox.db\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("src/app").join("session.rs"),
+            "/// Owns the active database handle and current session ID.\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[list_dir: .]",
+                "[search_code: database]",
+                "[read_file: src/app/session.rs]",
+                "The database is configured in src/app/session.rs.",
+                "[read_file: sandbox/database.yaml]",
+                "The database is configured in sandbox/database.yaml.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where database is configured in the sandbox/ folder".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.contains("=== tool_error: list_dir ===")
+                    && m.content.contains("require search_code")
+            }),
+            "list_dir before scoped search must be blocked"
+        );
+
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            search_result.contains("sandbox/database.yaml"),
+            "scoped search must include the sandbox config candidate: {search_result}"
+        );
+        assert!(
+            !search_result.contains("src/app/session.rs"),
+            "scoped search must not include out-of-scope candidates: {search_result}"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("The database is configured in sandbox/database.yaml.")
+        );
+    }
+
     // Phase 9.1.4 — Prompt Scope as Search Upper Bound
 
     #[test]
     fn path_is_within_scope_exact_match() {
-        assert!(path_is_within_scope("sandbox/services/", "sandbox/services/"));
+        assert!(path_is_within_scope(
+            "sandbox/services/",
+            "sandbox/services/"
+        ));
         assert!(path_is_within_scope("sandbox/services", "sandbox/services"));
         // trailing-slash variants must compare identically
-        assert!(path_is_within_scope("sandbox/services/", "sandbox/services"));
-        assert!(path_is_within_scope("sandbox/services", "sandbox/services/"));
+        assert!(path_is_within_scope(
+            "sandbox/services/",
+            "sandbox/services"
+        ));
+        assert!(path_is_within_scope(
+            "sandbox/services",
+            "sandbox/services/"
+        ));
     }
 
     #[test]
@@ -3738,7 +4265,10 @@ mod tests {
             "sandbox/services/tasks/",
             "sandbox/services/"
         ));
-        assert!(path_is_within_scope("sandbox/cli/handlers/", "sandbox/cli/"));
+        assert!(path_is_within_scope(
+            "sandbox/cli/handlers/",
+            "sandbox/cli/"
+        ));
         assert!(path_is_within_scope("sandbox/", "sandbox/"));
     }
 
@@ -3883,9 +4413,7 @@ mod tests {
             "if task.status == TaskStatus.TODO: pass"
         ));
         assert!(!looks_like_import("result = TaskStatus.COMPLETED"));
-        assert!(!looks_like_import(
-            "logger = logging.getLogger(__name__)"
-        ));
+        assert!(!looks_like_import("logger = logging.getLogger(__name__)"));
     }
 
     #[test]
@@ -4014,6 +4542,318 @@ mod tests {
         assert_eq!(
             last_assistant,
             Some("TaskStatus is imported from models.enums.")
+        );
+    }
+
+    // Phase 9.2.1 — InvestigationMode enum + Config lookup mode
+
+    #[test]
+    fn detect_investigation_mode_returns_usage_lookup() {
+        assert!(matches!(
+            detect_investigation_mode("Where is TaskStatus used?"),
+            InvestigationMode::UsageLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find all references to build_report"),
+            InvestigationMode::UsageLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Where does TaskStatus appear?"),
+            InvestigationMode::UsageLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_returns_config_lookup() {
+        assert!(matches!(
+            detect_investigation_mode("Where is the database configured?"),
+            InvestigationMode::ConfigLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find where logging configuration lives"),
+            InvestigationMode::ConfigLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("How is the connection configured?"),
+            InvestigationMode::ConfigLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_returns_definition_lookup() {
+        assert!(matches!(
+            detect_investigation_mode("Where is TaskStatus defined?"),
+            InvestigationMode::DefinitionLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Where is the TaskRunner declared?"),
+            InvestigationMode::DefinitionLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_returns_general() {
+        assert!(matches!(
+            detect_investigation_mode("What does run_turns do?"),
+            InvestigationMode::General
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Explain the TaskRunner"),
+            InvestigationMode::General
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_usage_priority_over_config() {
+        // "configured" + "used" in same prompt — UsageLookup wins (higher priority).
+        assert!(matches!(
+            detect_investigation_mode("Where is the configured value used?"),
+            InvestigationMode::UsageLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Where is configuration used?"),
+            InvestigationMode::UsageLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_config_priority_over_definition() {
+        assert!(matches!(
+            detect_investigation_mode("Where is config defined?"),
+            InvestigationMode::ConfigLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find config for logging"),
+            InvestigationMode::ConfigLookup
+        ));
+    }
+
+    #[test]
+    fn is_config_file_accepts_standard_extensions() {
+        assert!(is_config_file("config/database.yaml"));
+        assert!(is_config_file("config/app.yml"));
+        assert!(is_config_file("Cargo.toml"));
+        assert!(is_config_file("config/settings.json"));
+        assert!(is_config_file("config/app.ini"));
+        assert!(is_config_file("deploy/app.cfg"));
+        assert!(is_config_file("config/logging.conf"));
+        assert!(is_config_file("config/db.properties"));
+    }
+
+    #[test]
+    fn is_config_file_accepts_env_dotfiles() {
+        assert!(is_config_file(".env"));
+        assert!(is_config_file("config/.env"));
+        assert!(!is_config_file(".env.local"));
+        assert!(!is_config_file(".env.production"));
+    }
+
+    #[test]
+    fn is_config_file_rejects_source_files() {
+        assert!(!is_config_file("services/task_service.py"));
+        assert!(!is_config_file("src/runtime/engine.rs"));
+        assert!(!is_config_file("models/enums.py"));
+        assert!(!is_config_file("main.go"));
+    }
+
+    #[test]
+    fn config_lookup_non_config_read_triggers_recovery_to_config_file() {
+        // Config lookup: two candidates — a source file and a config file.
+        // Model reads the source file first → runtime injects config recovery pointing to YAML.
+        // Model follows recovery and reads the config file → evidence ready → ToolAssisted.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("config")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("database.py"),
+            "DATABASE_URL = os.getenv(\"DATABASE_URL\")\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("config").join("database.yaml"),
+            "database:\n  url: postgres://localhost/mydb\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: database]",
+                // Round 2: model reads source file first.
+                // Runtime injects config recovery pointing to database.yaml.
+                "[read_file: services/database.py]",
+                // Round 3: model follows recovery and reads the config file.
+                "[read_file: config/database.yaml]",
+                "The database is configured in config/database.yaml.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is the database configured?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "config recovery + config read must admit synthesis: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("The database is configured in config/database.yaml.")
+        );
+    }
+
+    #[test]
+    fn config_lookup_second_non_config_candidate_after_recovery_is_not_accepted() {
+        // Config lookup: config candidate exists, but the model ignores the config recovery
+        // and reads a second non-config candidate. The second read must remain insufficient;
+        // after two candidate reads the bounded investigation terminates cleanly.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("config")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("database.py"),
+            "database = os.getenv(\"DATABASE_URL\")\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("database_alt.py"),
+            "database = load_from_environment()\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("config").join("database.yaml"),
+            "database:\n  url: postgres://localhost/mydb\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: database]",
+                "[read_file: services/database.py]",
+                "[read_file: services/database_alt.py]",
+                "The database is configured in services/database_alt.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is the database configured?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must terminate cleanly: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "second non-config candidate must not satisfy config evidence: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(ungrounded_investigation_final_answer()),
+            "last assistant must be the runtime terminal, not model synthesis"
+        );
+    }
+
+    #[test]
+    fn config_lookup_no_config_candidates_degrades_cleanly() {
+        // Config lookup triggered, but no config-file candidates exist (source files only).
+        // has_non_config_candidates = true, config_file_candidates is empty.
+        // Gate 2 does not fire — source file read is accepted → ToolAssisted.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("database.py"),
+            "DATABASE_URL = os.getenv(\"DATABASE_URL\")\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: database]",
+                "[read_file: services/database.py]",
+                "The database connection is set up in services/database.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is the database configured?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "config lookup with no config candidates must degrade to acceptance: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("The database connection is set up in services/database.py.")
         );
     }
 }
