@@ -8,6 +8,7 @@ use crate::tools::{
     ExecutionKind, PendingAction, ToolInput, ToolOutput, ToolRegistry, ToolRunResult,
 };
 
+use super::anchors::{is_last_read_file_anchor_prompt, is_last_search_anchor_prompt, AnchorState};
 use super::conversation::Conversation;
 use super::prompt;
 use super::tool_codec;
@@ -1590,41 +1591,6 @@ fn requested_read_path(text: &str) -> Option<String> {
     }
 }
 
-fn is_last_read_file_anchor_prompt(text: &str) -> bool {
-    let normalized = normalize_anchor_prompt(text);
-    matches!(
-        normalized.as_str(),
-        "read that file"
-            | "read that file again"
-            | "read the last file"
-            | "open that file"
-            | "open that file again"
-            | "open the last file"
-    )
-}
-
-fn is_last_search_anchor_prompt(text: &str) -> bool {
-    let normalized = normalize_anchor_prompt(text);
-    matches!(
-        normalized.as_str(),
-        "search that again"
-            | "repeat that search"
-            | "repeat the last search"
-            | "run that search again"
-            | "run the last search again"
-            | "search the last query"
-            | "search the last query again"
-    )
-}
-
-fn normalize_anchor_prompt(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_matches(|c: char| matches!(c, '.' | '?' | '!' | ',' | ';' | ':'))
-        .to_ascii_lowercase()
-}
-
 /// Returns true if the path's file extension identifies it as a config file.
 /// Classification is purely extension-based — no content analysis or filename heuristics.
 /// Handles the exact `.env` dotfile explicitly since `Path::extension()` returns None for it.
@@ -1673,50 +1639,6 @@ fn is_mutating_tool(input: &ToolInput) -> bool {
         input,
         ToolInput::EditFile { .. } | ToolInput::WriteFile { .. }
     )
-}
-
-#[derive(Debug, Clone, Default)]
-struct AnchorState {
-    last_read_file: Option<String>,
-    last_search_query: Option<String>,
-    last_search_scope: Option<String>,
-}
-
-impl AnchorState {
-    fn clear(&mut self) {
-        self.last_read_file = None;
-        self.last_search_query = None;
-        self.last_search_scope = None;
-    }
-
-    fn record_successful_read(&mut self, output: &ToolOutput) -> Option<String> {
-        if let ToolOutput::FileContents(file) = output {
-            let path = file.path.clone();
-            self.last_read_file = Some(path.clone());
-            return Some(path);
-        }
-        None
-    }
-
-    fn record_successful_search(
-        &mut self,
-        output: &ToolOutput,
-        query: String,
-        scope: Option<String>,
-    ) -> Option<(String, Option<String>)> {
-        if matches!(output, ToolOutput::SearchResults(_)) {
-            self.last_search_query = Some(query.clone());
-            self.last_search_scope = scope.clone();
-            return Some((query, scope));
-        }
-        None
-    }
-
-    fn last_search(&self) -> Option<(String, Option<String>)> {
-        self.last_search_query
-            .clone()
-            .map(|query| (query, self.last_search_scope.clone()))
-    }
 }
 
 /// snake_case: contains underscore, ≥2 segments, each segment ≥2 alphanumeric chars.
@@ -1864,7 +1786,7 @@ impl Runtime {
                 "anchor_prompt_matched",
                 &[("kind", "last_read_file".into())],
             );
-            if let Some(path) = self.anchors.last_read_file.clone() {
+            if let Some(path) = self.anchors.last_read_file().map(str::to_string) {
                 trace_runtime_decision(
                     on_event,
                     "anchor_resolved",
@@ -3616,10 +3538,7 @@ mod tests {
             .join("src/runtime/engine.rs")
             .to_string_lossy()
             .into_owned();
-        assert_eq!(
-            rt.anchors.last_read_file.as_deref(),
-            Some(expected_path.as_str())
-        );
+        assert_eq!(rt.anchors.last_read_file(), Some(expected_path.as_str()));
     }
 
     #[test]
@@ -3754,10 +3673,10 @@ mod tests {
                 text: "read src/reset.rs".into(),
             },
         );
-        assert!(rt.anchors.last_read_file.is_some());
+        assert!(rt.anchors.last_read_file().is_some());
 
         collect_events(&mut rt, RuntimeRequest::Reset);
-        assert_eq!(rt.anchors.last_read_file, None);
+        assert_eq!(rt.anchors.last_read_file(), None);
 
         let events = collect_events(
             &mut rt,
@@ -3798,7 +3717,7 @@ mod tests {
                 text: "read src/good.rs".into(),
             },
         );
-        let anchored_path = rt.anchors.last_read_file.clone();
+        let anchored_path = rt.anchors.last_read_file().map(str::to_string);
         assert!(anchored_path.is_some());
 
         collect_events(
@@ -3808,7 +3727,8 @@ mod tests {
             },
         );
         assert_eq!(
-            rt.anchors.last_read_file, anchored_path,
+            rt.anchors.last_read_file().map(str::to_string),
+            anchored_path,
             "failed reads must not replace the last successful read anchor"
         );
     }
@@ -3884,7 +3804,7 @@ mod tests {
                 text: "read src/anchor.rs".into(),
             },
         );
-        assert!(rt.anchors.last_read_file.is_some());
+        assert!(rt.anchors.last_read_file().is_some());
 
         for phrase in ["open it", "read that", "open the second result"] {
             let events = collect_events(
@@ -3986,8 +3906,8 @@ mod tests {
         );
 
         assert!(!has_failed(&events), "unexpected failure: {events:?}");
-        assert_eq!(rt.anchors.last_search_query.as_deref(), Some("needle"));
-        assert_eq!(rt.anchors.last_search_scope, None);
+        assert_eq!(rt.anchors.last_search_query(), Some("needle"));
+        assert_eq!(rt.anchors.last_search_scope(), None);
     }
 
     #[test]
@@ -4059,7 +3979,7 @@ mod tests {
                 text: "tool check".into(),
             },
         );
-        assert_eq!(rt.anchors.last_search_scope, None);
+        assert_eq!(rt.anchors.last_search_scope(), None);
 
         let events = collect_events(
             &mut rt,
@@ -4082,7 +4002,7 @@ mod tests {
             }),
             "unscoped replay must search the whole project: {events:?}"
         );
-        assert_eq!(rt.anchors.last_search_scope, None);
+        assert_eq!(rt.anchors.last_search_scope(), None);
     }
 
     #[test]
@@ -4110,8 +4030,8 @@ mod tests {
                 text: "Where is needle used in sandbox/".into(),
             },
         );
-        assert_eq!(rt.anchors.last_search_query.as_deref(), Some("needle"));
-        assert_eq!(rt.anchors.last_search_scope.as_deref(), Some("sandbox/"));
+        assert_eq!(rt.anchors.last_search_query(), Some("needle"));
+        assert_eq!(rt.anchors.last_search_scope(), Some("sandbox/"));
 
         let events = collect_events(
             &mut rt,
@@ -4132,7 +4052,7 @@ mod tests {
             }),
             "scoped replay must preserve the effective prompt scope: {events:?}"
         );
-        assert_eq!(rt.anchors.last_search_scope.as_deref(), Some("sandbox/"));
+        assert_eq!(rt.anchors.last_search_scope(), Some("sandbox/"));
     }
 
     #[test]
@@ -4180,28 +4100,52 @@ mod tests {
             matches!(outcome, ToolRoundOutcome::Completed { .. }),
             "search round must complete"
         );
-        assert_eq!(anchors.last_search_query.as_deref(), Some("needle"));
-        assert_eq!(anchors.last_search_scope.as_deref(), Some("sandbox/"));
+        assert_eq!(anchors.last_search_query(), Some("needle"));
+        assert_eq!(anchors.last_search_scope(), Some("sandbox/"));
     }
 
     #[test]
     fn failed_search_code_does_not_update_last_search_anchor() {
         use std::collections::HashSet;
+        use std::fs;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn needle() {}\n").unwrap();
         let registry = default_registry(tmp.path().to_path_buf());
         let mut last_call_key = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
         let mut reads_this_turn = HashSet::new();
-        let mut anchors = AnchorState {
-            last_read_file: None,
-            last_search_query: Some("needle".into()),
-            last_search_scope: Some("sandbox/".into()),
-        };
+        let mut anchors = AnchorState::default();
         let mut requested_read_completed = false;
         let mut events = Vec::new();
+
+        let seed_outcome = run_tool_round(
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "needle".into(),
+                path: Some("sandbox/".into()),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            false,
+            false,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |e| events.push(e),
+        );
+        assert!(
+            matches!(seed_outcome, ToolRoundOutcome::Completed { .. }),
+            "seed search round must complete"
+        );
+        assert_eq!(anchors.last_search_query(), Some("needle"));
+        assert_eq!(anchors.last_search_scope(), Some("sandbox/"));
 
         let outcome = run_tool_round(
             &registry,
@@ -4227,8 +4171,8 @@ mod tests {
             matches!(outcome, ToolRoundOutcome::Completed { .. }),
             "failed non-read tool should return completed with tool error"
         );
-        assert_eq!(anchors.last_search_query.as_deref(), Some("needle"));
-        assert_eq!(anchors.last_search_scope.as_deref(), Some("sandbox/"));
+        assert_eq!(anchors.last_search_query(), Some("needle"));
+        assert_eq!(anchors.last_search_scope(), Some("sandbox/"));
     }
 
     #[test]
@@ -4249,12 +4193,12 @@ mod tests {
                 text: "tool check".into(),
             },
         );
-        assert!(rt.anchors.last_search_query.is_some());
+        assert!(rt.anchors.last_search_query().is_some());
 
         collect_events(&mut rt, RuntimeRequest::Reset);
 
-        assert_eq!(rt.anchors.last_search_query, None);
-        assert_eq!(rt.anchors.last_search_scope, None);
+        assert_eq!(rt.anchors.last_search_query(), None);
+        assert_eq!(rt.anchors.last_search_scope(), None);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod anchors;
 mod conversation;
 mod engine;
 mod prompt;
