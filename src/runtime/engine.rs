@@ -112,6 +112,24 @@ fn create_read_recovery_correction(path: &str) -> String {
     )
 }
 
+fn register_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] This is a registration lookup. The file just read did not show \
+         a registration match, but a matched registration candidate exists. \
+         Read this exact registration file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
+fn load_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] This is a load lookup. The file just read did not show \
+         a load match, but a matched load candidate exists. \
+         Read this exact load file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
 /// Injected when the question contains a code identifier but the model attempts a Direct answer
 /// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
 const SEARCH_BEFORE_ANSWERING: &str =
@@ -206,6 +224,12 @@ enum InvestigationMode {
     /// Prompt signals a narrow creation lookup (where X is created/creation).
     /// Non-create reads are structurally insufficient when create candidates exist.
     CreateLookup,
+    /// Prompt signals a narrow registration lookup.
+    /// Non-register reads are structurally insufficient when register candidates exist.
+    RegisterLookup,
+    /// Prompt signals a narrow load lookup.
+    /// Non-load reads are structurally insufficient when load candidates exist.
+    LoadLookup,
 }
 
 impl InvestigationMode {
@@ -217,6 +241,8 @@ impl InvestigationMode {
             InvestigationMode::ConfigLookup => "ConfigLookup",
             InvestigationMode::InitializationLookup => "InitializationLookup",
             InvestigationMode::CreateLookup => "CreateLookup",
+            InvestigationMode::RegisterLookup => "RegisterLookup",
+            InvestigationMode::LoadLookup => "LoadLookup",
         }
     }
 }
@@ -234,6 +260,10 @@ enum RecoveryKind {
     Initialization,
     /// The file lacked create-term matches when create candidates exist.
     Create,
+    /// The file lacked register-term matches when register candidates exist.
+    Register,
+    /// The file lacked load-term matches when load candidates exist.
+    Load,
 }
 
 impl RecoveryKind {
@@ -244,6 +274,8 @@ impl RecoveryKind {
             RecoveryKind::ConfigFile => "ConfigFile",
             RecoveryKind::Initialization => "Initialization",
             RecoveryKind::Create => "Create",
+            RecoveryKind::Register => "Register",
+            RecoveryKind::Load => "Load",
         }
     }
 }
@@ -315,6 +347,22 @@ struct InvestigationState {
     has_non_create_candidates: bool,
     /// True after the create recovery correction has been issued once this turn.
     create_correction_issued: bool,
+    /// Candidate paths where at least one matched line contains a register term.
+    /// Populated during record_search_results alongside search_candidate_paths.
+    register_candidates: HashSet<String>,
+    /// True if at least one candidate in the current search results has no matched
+    /// register line.
+    has_non_register_candidates: bool,
+    /// True after the register recovery correction has been issued once this turn.
+    register_correction_issued: bool,
+    /// Candidate paths where at least one matched line contains a load term.
+    /// Populated during record_search_results alongside search_candidate_paths.
+    load_candidates: HashSet<String>,
+    /// True if at least one candidate in the current search results has no matched
+    /// load line.
+    has_non_load_candidates: bool,
+    /// True after the load recovery correction has been issued once this turn.
+    load_correction_issued: bool,
 }
 
 impl InvestigationState {
@@ -342,6 +390,12 @@ impl InvestigationState {
             create_candidates: HashSet::new(),
             has_non_create_candidates: false,
             create_correction_issued: false,
+            register_candidates: HashSet::new(),
+            has_non_register_candidates: false,
+            register_correction_issued: false,
+            load_candidates: HashSet::new(),
+            has_non_load_candidates: false,
+            load_correction_issued: false,
         }
     }
 
@@ -373,22 +427,30 @@ impl InvestigationState {
             self.has_non_initialization_candidates = false;
             self.create_candidates.clear();
             self.has_non_create_candidates = false;
+            self.register_candidates.clear();
+            self.has_non_register_candidates = false;
+            self.load_candidates.clear();
+            self.has_non_load_candidates = false;
             self.read_useful_candidate = false;
 
             for result in &results.matches {
                 push_unique_path(&mut self.search_candidate_paths, &result.file);
             }
 
-            // Classify each candidate file along five structural axes.
+            // Classify each candidate file along structural axes.
             // definition-only: every matched line looks like a definition site (line-content).
             // import-only: every matched line looks like an import declaration (line-content).
             // config-file: the file's extension identifies it as a config file (path-based).
             // initialization: at least one matched line contains an exact initialization term.
             // create: at least one matched line contains an exact create term.
+            // register: at least one matched line contains an exact register term.
+            // load: at least one matched line contains an exact load term.
             let mut file_has_non_def: HashSet<String> = HashSet::new();
             let mut file_has_non_import: HashSet<String> = HashSet::new();
             let mut file_has_initialization: HashSet<String> = HashSet::new();
             let mut file_has_create: HashSet<String> = HashSet::new();
+            let mut file_has_register: HashSet<String> = HashSet::new();
+            let mut file_has_load: HashSet<String> = HashSet::new();
             for m in &results.matches {
                 if !tool_codec::looks_like_definition(&m.line) {
                     file_has_non_def.insert(m.file.clone());
@@ -401,6 +463,12 @@ impl InvestigationState {
                 }
                 if contains_create_term(&m.line) {
                     file_has_create.insert(m.file.clone());
+                }
+                if contains_register_term(&m.line) {
+                    file_has_register.insert(m.file.clone());
+                }
+                if contains_load_term(&m.line) {
+                    file_has_load.insert(m.file.clone());
                 }
             }
             for path in &self.search_candidate_paths {
@@ -428,6 +496,16 @@ impl InvestigationState {
                     self.create_candidates.insert(path.clone());
                 } else {
                     self.has_non_create_candidates = true;
+                }
+                if file_has_register.contains(path) {
+                    self.register_candidates.insert(path.clone());
+                } else {
+                    self.has_non_register_candidates = true;
+                }
+                if file_has_load.contains(path) {
+                    self.load_candidates.insert(path.clone());
+                } else {
+                    self.has_non_load_candidates = true;
                 }
             }
         }
@@ -467,6 +545,13 @@ impl InvestigationState {
                 ),
                 ("create_files", self.create_candidates.len().to_string()),
                 ("has_non_create", self.has_non_create_candidates.to_string()),
+                ("register_files", self.register_candidates.len().to_string()),
+                (
+                    "has_non_register",
+                    self.has_non_register_candidates.to_string(),
+                ),
+                ("load_files", self.load_candidates.len().to_string()),
+                ("has_non_load", self.has_non_load_candidates.to_string()),
             ],
         );
         was_empty
@@ -510,6 +595,14 @@ impl InvestigationState {
                 .any(|c| normalize_evidence_path(c) == read_path);
             let is_create_candidate = self
                 .create_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
+            let is_register_candidate = self
+                .register_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
+            let is_load_candidate = self
+                .load_candidates
                 .iter()
                 .any(|c| normalize_evidence_path(c) == read_path);
 
@@ -661,6 +754,76 @@ impl InvestigationState {
                     ],
                 );
                 // Correction already issued: fall through without accepting.
+            }
+            // Gate 5 (RegisterLookup): non-register reads are structurally insufficient when
+            // register candidates exist. Fire once; fallback accepts if no register candidates.
+            else if matches!(mode, InvestigationMode::RegisterLookup)
+                && !is_register_candidate
+                && !self.register_candidates.is_empty()
+            {
+                if !self.register_correction_issued {
+                    self.register_correction_issued = true;
+                    let suggested_path = self.first_register_candidate().map(str::to_string);
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", read_path.clone()),
+                            ("accepted", "false".into()),
+                            ("reason", "register_non_register_candidate".into()),
+                            (
+                                "recovery_path",
+                                suggested_path.clone().unwrap_or_else(|| "none".into()),
+                            ),
+                        ],
+                    );
+                    return suggested_path.map(|p| (p, RecoveryKind::Register));
+                }
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "false".into()),
+                        ("reason", "register_recovery_already_issued".into()),
+                    ],
+                );
+                // Correction already issued: fall through without accepting.
+            }
+            // Gate 6 (LoadLookup): non-load reads are structurally insufficient when
+            // load candidates exist. Fire once; fallback accepts if no load candidates.
+            else if matches!(mode, InvestigationMode::LoadLookup)
+                && !is_load_candidate
+                && !self.load_candidates.is_empty()
+            {
+                if !self.load_correction_issued {
+                    self.load_correction_issued = true;
+                    let suggested_path = self.first_load_candidate().map(str::to_string);
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", read_path.clone()),
+                            ("accepted", "false".into()),
+                            ("reason", "load_non_load_candidate".into()),
+                            (
+                                "recovery_path",
+                                suggested_path.clone().unwrap_or_else(|| "none".into()),
+                            ),
+                        ],
+                    );
+                    return suggested_path.map(|p| (p, RecoveryKind::Load));
+                }
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "false".into()),
+                        ("reason", "load_recovery_already_issued".into()),
+                    ],
+                );
+                // Correction already issued: fall through without accepting.
             } else {
                 // Candidate would normally be accepted. Check import-only before committing.
                 // Import-only candidates are structurally insufficient when substantive
@@ -732,6 +895,12 @@ impl InvestigationState {
             && self.create_candidates.is_empty()
         {
             "create_fallback_no_create_candidates".into()
+        } else if matches!(mode, InvestigationMode::RegisterLookup)
+            && self.register_candidates.is_empty()
+        {
+            "register_fallback_no_register_candidates".into()
+        } else if matches!(mode, InvestigationMode::LoadLookup) && self.load_candidates.is_empty() {
+            "load_fallback_no_load_candidates".into()
         } else if matches!(mode, InvestigationMode::UsageLookup)
             && is_def_only
             && !self.has_non_definition_candidates
@@ -776,6 +945,20 @@ impl InvestigationState {
         self.search_candidate_paths
             .iter()
             .find(|path| self.create_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_register_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| self.register_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_load_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| self.load_candidates.contains(*path))
             .map(String::as_str)
     }
 }
@@ -1048,9 +1231,14 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
         "create",
         "created",
         "creation",
+        "register",
+        "registered",
+        "registration",
+        "load",
+        "loaded",
+        "loading",
         "saved",
         "stored",
-        "loaded",
         "handled",
         "called",
         "used",
@@ -1069,7 +1257,7 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
 
 /// Detects the structural investigation mode from the prompt text.
 /// Evaluated in priority order so each prompt maps to exactly one mode.
-/// Priority: UsageLookup > ConfigLookup > InitializationLookup > CreateLookup > DefinitionLookup > General.
+/// Priority: UsageLookup > ConfigLookup > InitializationLookup > CreateLookup > RegisterLookup > LoadLookup > DefinitionLookup > General.
 fn detect_investigation_mode(text: &str) -> InvestigationMode {
     let lower = text.to_ascii_lowercase();
     if [
@@ -1104,6 +1292,12 @@ fn detect_investigation_mode(text: &str) -> InvestigationMode {
     if contains_create_term(&lower) {
         return InvestigationMode::CreateLookup;
     }
+    if contains_register_term(&lower) {
+        return InvestigationMode::RegisterLookup;
+    }
+    if contains_load_term(&lower) {
+        return InvestigationMode::LoadLookup;
+    }
     if [
         "defined",
         "definition",
@@ -1131,6 +1325,20 @@ const CREATE_TERMS: &[&str] = &["create", "created", "creation"];
 fn contains_create_term(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     CREATE_TERMS.iter().any(|term| lower.contains(term))
+}
+
+const REGISTER_TERMS: &[&str] = &["register", "registered", "registration"];
+
+fn contains_register_term(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    REGISTER_TERMS.iter().any(|term| lower.contains(term))
+}
+
+const LOAD_TERMS: &[&str] = &["load", "loaded", "loading"];
+
+fn contains_load_term(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    LOAD_TERMS.iter().any(|term| lower.contains(term))
 }
 
 fn contains_word(text: &str, needle: &str) -> bool {
@@ -2134,6 +2342,8 @@ fn run_tool_round(
                             initialization_read_recovery_correction(&path)
                         }
                         RecoveryKind::Create => create_read_recovery_correction(&path),
+                        RecoveryKind::Register => register_read_recovery_correction(&path),
+                        RecoveryKind::Load => load_read_recovery_correction(&path),
                     };
                     accumulated.push_str(&correction);
                     accumulated.push_str("\n\n");
@@ -6038,6 +6248,887 @@ mod tests {
         assert!(
             matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
             "create candidate read must admit synthesis: {answer_source:?}"
+        );
+    }
+
+    // Phase 9.2.4 — RegisterLookup
+
+    #[test]
+    fn detect_investigation_mode_returns_register_lookup() {
+        assert!(matches!(
+            detect_investigation_mode("Where is the command registered?"),
+            InvestigationMode::RegisterLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find where handlers register commands"),
+            InvestigationMode::RegisterLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Where does command registration happen?"),
+            InvestigationMode::RegisterLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_create_priority_over_register() {
+        // "created" + "registered" in same prompt — CreateLookup wins (higher priority).
+        assert!(matches!(
+            detect_investigation_mode("Where is the command created and registered?"),
+            InvestigationMode::CreateLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_register_priority_over_definition() {
+        // "registered" + "defined" in same prompt — RegisterLookup wins.
+        assert!(matches!(
+            detect_investigation_mode("Where is the command registered and defined?"),
+            InvestigationMode::RegisterLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_usage_priority_over_register() {
+        assert!(matches!(
+            detect_investigation_mode("Where is the registered command used?"),
+            InvestigationMode::UsageLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_config_priority_over_register() {
+        assert!(matches!(
+            detect_investigation_mode("Where is command registration configured?"),
+            InvestigationMode::ConfigLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_initialization_priority_over_register() {
+        assert!(matches!(
+            detect_investigation_mode("Find where command registration is initialized"),
+            InvestigationMode::InitializationLookup
+        ));
+    }
+
+    #[test]
+    fn contains_register_term_matches_exact_allowed_substrings_only() {
+        // Exact allowed terms.
+        assert!(contains_register_term("registry.register(command)"));
+        assert!(contains_register_term("command was registered here"));
+        assert!(contains_register_term("command registration lives here"));
+        // Case insensitive.
+        assert!(contains_register_term("Registry.Register(command)"));
+        assert!(contains_register_term("REGISTERED_COMMANDS"));
+        // Noisy: substring of longer word — these DO match (substring semantics).
+        assert!(contains_register_term("reregister command handlers"));
+        assert!(contains_register_term("registration_notes = []"));
+        // Not a register term.
+        assert!(!contains_register_term("def handle_command(command):"));
+        assert!(!contains_register_term("return command_id"));
+    }
+
+    #[test]
+    fn register_lookup_non_register_read_triggers_recovery_to_register_file() {
+        // File A: no register-term matches → non-register candidate.
+        // File B: a register-term match → register candidate.
+        // Model reads A first → recovery fires pointing to B.
+        // Model reads B → evidence ready → ToolAssisted.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("cli")).unwrap();
+        fs::write(
+            tmp.path().join("cli").join("handlers.py"),
+            "def handle_command(command):\n    return command.run()\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("cli").join("registry.py"),
+            "def wire_command(command):\n    registry.register(command)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: command]",
+                // Reads the non-register file first — recovery fires.
+                "[read_file: cli/handlers.py]",
+                // Follows recovery, reads the register file.
+                "[read_file: cli/registry.py]",
+                "Commands are registered in cli/registry.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are commands registered?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("registration lookup")
+                    && m.content.contains("cli/registry.py")),
+            "register recovery correction must point to the register candidate"
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "register lookup + recovery + register read must admit synthesis: {answer_source:?}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Commands are registered in cli/registry.py.")
+        );
+    }
+
+    #[test]
+    fn register_lookup_no_register_candidates_degrades_cleanly() {
+        // All candidates have no register-term matches.
+        // Gate does not fire — any read is accepted (fallback behavior).
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("cli")).unwrap();
+        fs::write(
+            tmp.path().join("cli").join("handlers.py"),
+            "def handle_command(command):\n    return command.run()\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: command]",
+                "[read_file: cli/handlers.py]",
+                "Commands are handled in cli/handlers.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are commands registered?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "register lookup with no register candidates must degrade to acceptance: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Commands are handled in cli/handlers.py.")
+        );
+    }
+
+    #[test]
+    fn register_lookup_second_non_register_candidate_after_recovery_is_not_accepted() {
+        // After one recovery the correction flag is set.
+        // A second non-register read falls through the gate without accepting.
+        // With candidate_reads_count == 2 and evidence_ready false, the runtime
+        // terminates with InsufficientEvidence.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("cli")).unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("cli").join("handlers.py"),
+            "def handle_command(command):\n    return command.run()\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("command_runner.py"),
+            "def run_command(command):\n    command.run()\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("cli").join("registry.py"),
+            "def wire_command(command):\n    registry.register(command)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: command]",
+                // First read: non-register → recovery fires pointing to registry.py.
+                "[read_file: cli/handlers.py]",
+                // Second read: another non-register (ignores recovery, reads wrong file).
+                "[read_file: services/command_runner.py]",
+                // Model attempts synthesis — candidate limit hit; runtime terminates.
+                "Commands are registered in cli/handlers.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are commands registered?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "two non-register reads must terminate with InsufficientEvidence: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn register_lookup_noisy_register_term_in_comment_still_classifies_as_register() {
+        // A line like "# TODO: register command handler" contains "register".
+        // The classification is structural/substring — comments match the same as code.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("cli")).unwrap();
+        fs::write(
+            tmp.path().join("cli").join("commands.py"),
+            "# TODO: register command handler\ndef command_handler(command):\n    return command.run()\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: command]",
+                // Comment-containing file is a register candidate (substring match).
+                // Model reads it directly — evidence accepted.
+                "[read_file: cli/commands.py]",
+                "Commands are handled in cli/commands.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are commands registered?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("registration lookup")),
+            "no recovery expected when register candidate is read first"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "register candidate read must admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn register_lookup_path_scope_keeps_candidates_inside_scope() {
+        // Prompt scope must remain the upper bound. The out-of-scope registration
+        // file is stronger-looking but must not appear in search candidates.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/cli")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/cli").join("commands.py"),
+            "def command_handler(command):\n    return command.run()\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/cli").join("registry.py"),
+            "def wire_command(command):\n    registry.register(command)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services").join("registry.py"),
+            "def wire_command(command):\n    registry.register(command)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: command]",
+                "[read_file: sandbox/cli/commands.py]",
+                "[read_file: sandbox/cli/registry.py]",
+                "Commands are registered in sandbox/cli/registry.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where commands are registered in sandbox/cli/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            search_result.contains("sandbox/cli/commands.py"),
+            "scoped search must include in-scope non-register candidate: {search_result}"
+        );
+        assert!(
+            search_result.contains("sandbox/cli/registry.py"),
+            "scoped search must include in-scope register candidate: {search_result}"
+        );
+        assert!(
+            !search_result.contains("sandbox/services/registry.py"),
+            "scoped search must exclude out-of-scope register candidate: {search_result}"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Commands are registered in sandbox/cli/registry.py.")
+        );
+    }
+
+    // Phase 9.2.5 — LoadLookup
+
+    #[test]
+    fn detect_investigation_mode_returns_load_lookup() {
+        assert!(matches!(
+            detect_investigation_mode("Where is the session loaded?"),
+            InvestigationMode::LoadLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find where session loading happens"),
+            InvestigationMode::LoadLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Where do handlers load sessions?"),
+            InvestigationMode::LoadLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_register_priority_over_load() {
+        // "registered" + "loaded" in same prompt — RegisterLookup wins (higher priority).
+        assert!(matches!(
+            detect_investigation_mode("Where is the command registered and loaded?"),
+            InvestigationMode::RegisterLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_load_priority_over_definition() {
+        // "loaded" + "defined" in same prompt — LoadLookup wins.
+        assert!(matches!(
+            detect_investigation_mode("Where is the session loaded and defined?"),
+            InvestigationMode::LoadLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_usage_priority_over_load() {
+        assert!(matches!(
+            detect_investigation_mode("Where is the loaded session used?"),
+            InvestigationMode::UsageLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_config_priority_over_load() {
+        assert!(matches!(
+            detect_investigation_mode("Where is loaded config configured?"),
+            InvestigationMode::ConfigLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_initialization_priority_over_load() {
+        assert!(matches!(
+            detect_investigation_mode("Find where session loading is initialized"),
+            InvestigationMode::InitializationLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_create_priority_over_load() {
+        assert!(matches!(
+            detect_investigation_mode("Find where the loaded session is created"),
+            InvestigationMode::CreateLookup
+        ));
+    }
+
+    #[test]
+    fn contains_load_term_matches_exact_allowed_substrings_only() {
+        // Exact allowed terms.
+        assert!(contains_load_term("session = load_session(session_id)"));
+        assert!(contains_load_term("session was loaded here"));
+        assert!(contains_load_term("session loading happens here"));
+        // Case insensitive.
+        assert!(contains_load_term("Session.Load()"));
+        assert!(contains_load_term("LOADED_SESSION"));
+        // Noisy: substring of longer word — these DO match (substring semantics).
+        assert!(contains_load_term("session loader"));
+        assert!(contains_load_term("reload session"));
+        assert!(contains_load_term("autoload session"));
+        // Not a load term.
+        assert!(!contains_load_term("def handle_session(session):"));
+        assert!(!contains_load_term("return session_id"));
+    }
+
+    #[test]
+    fn load_lookup_non_load_read_triggers_recovery_to_load_file() {
+        // File A: no load-term matches → non-load candidate.
+        // File B: a load-term match → load candidate.
+        // Model reads A first → recovery fires pointing to B.
+        // Model reads B → evidence ready → ToolAssisted.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_handler.py"),
+            "def handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_loader.py"),
+            "def get_session(session_id):\n    return load_session(session_id)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // Reads the non-load file first — recovery fires.
+                "[read_file: services/session_handler.py]",
+                // Follows recovery, reads the load file.
+                "[read_file: services/session_loader.py]",
+                "Sessions are loaded in services/session_loader.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions loaded?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| m.content.contains("load lookup")
+                && m.content.contains("services/session_loader.py")),
+            "load recovery correction must point to the load candidate"
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "load lookup + recovery + load read must admit synthesis: {answer_source:?}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Sessions are loaded in services/session_loader.py.")
+        );
+    }
+
+    #[test]
+    fn load_lookup_no_load_candidates_degrades_cleanly() {
+        // All candidates have no load-term matches.
+        // Gate does not fire — any read is accepted (fallback behavior).
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_handler.py"),
+            "def handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                "[read_file: services/session_handler.py]",
+                "Sessions are handled in services/session_handler.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions loaded?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "load lookup with no load candidates must degrade to acceptance: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Sessions are handled in services/session_handler.py.")
+        );
+    }
+
+    #[test]
+    fn load_lookup_second_non_load_candidate_after_recovery_is_not_accepted() {
+        // After one recovery the correction flag is set.
+        // A second non-load read falls through the gate without accepting.
+        // With candidate_reads_count == 2 and evidence_ready false, the runtime
+        // terminates with InsufficientEvidence.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("controllers")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_handler.py"),
+            "def handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("controllers").join("session_controller.py"),
+            "def show_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_loader.py"),
+            "def get_session(session_id):\n    return load_session(session_id)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // First read: non-load → recovery fires pointing to session_loader.py.
+                "[read_file: services/session_handler.py]",
+                // Second read: another non-load (ignores recovery, reads wrong file).
+                "[read_file: controllers/session_controller.py]",
+                // Model attempts synthesis — candidate limit hit; runtime terminates.
+                "Sessions are loaded in services/session_handler.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions loaded?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "two non-load reads must terminate with InsufficientEvidence: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn load_lookup_noisy_load_term_in_comment_still_classifies_as_load() {
+        // A line like "# TODO: load session data" contains "load".
+        // The classification is structural/substring — comments match the same as code.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_service.py"),
+            "# TODO: load session data\ndef handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // Comment-containing file is a load candidate (substring match).
+                // Model reads it directly — evidence accepted.
+                "[read_file: services/session_service.py]",
+                "Sessions are handled in services/session_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions loaded?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot.iter().any(|m| m.content.contains("load lookup")),
+            "no recovery expected when load candidate is read first"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "load candidate read must admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn load_lookup_path_scope_keeps_candidates_inside_scope() {
+        // Prompt scope must remain the upper bound. The out-of-scope load
+        // file is stronger-looking but must not appear in search candidates.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/controllers")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("sandbox/services")
+                .join("session_handler.py"),
+            "def handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path()
+                .join("sandbox/services")
+                .join("session_loader.py"),
+            "def get_session(session_id):\n    return load_session(session_id)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path()
+                .join("sandbox/controllers")
+                .join("session_loader.py"),
+            "def get_session(session_id):\n    return load_session(session_id)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                "[read_file: sandbox/services/session_handler.py]",
+                "[read_file: sandbox/services/session_loader.py]",
+                "Sessions are loaded in sandbox/services/session_loader.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where sessions are loaded in sandbox/services/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            search_result.contains("sandbox/services/session_handler.py"),
+            "scoped search must include in-scope non-load candidate: {search_result}"
+        );
+        assert!(
+            search_result.contains("sandbox/services/session_loader.py"),
+            "scoped search must include in-scope load candidate: {search_result}"
+        );
+        assert!(
+            !search_result.contains("sandbox/controllers/session_loader.py"),
+            "scoped search must exclude out-of-scope load candidate: {search_result}"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Sessions are loaded in sandbox/services/session_loader.py.")
+        );
+    }
+
+    #[test]
+    fn load_lookup_read_cap_still_applies() {
+        // MaxReadsPerTurn must still apply under LoadLookup.
+        // After 3 reads the runtime blocks further reads regardless of mode.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        for dir in &["a", "b", "c", "d"] {
+            fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        }
+        fs::write(
+            tmp.path().join("a").join("session.py"),
+            "def session_a(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("b").join("session.py"),
+            "def session_b(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("c").join("session.py"),
+            "def session_c(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("d").join("session.py"),
+            "session = load_session(session_id)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // Reads 3 non-load files — hits cap before reaching load file.
+                "[read_file: a/session.py]",
+                "[read_file: b/session.py]",
+                "[read_file: c/session.py]",
+                "[read_file: d/session.py]",
+                "Sessions are loaded in d/session.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions loaded?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "must not fail (cap is a correction): {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: read_file ===")
+                    && m.content.contains("read limit")),
+            "read cap must block the 4th read"
         );
     }
 
