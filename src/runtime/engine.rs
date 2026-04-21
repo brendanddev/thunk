@@ -103,6 +103,15 @@ fn initialization_read_recovery_correction(path: &str) -> String {
     )
 }
 
+fn create_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] This is a creation lookup. The file just read did not show \
+         a creation match, but a matched creation candidate exists. \
+         Read this exact creation file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
 /// Injected when the question contains a code identifier but the model attempts a Direct answer
 /// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
 const SEARCH_BEFORE_ANSWERING: &str =
@@ -194,6 +203,9 @@ enum InvestigationMode {
     /// Prompt signals a narrow initialization lookup.
     /// Non-initialization reads are structurally insufficient when initialization candidates exist.
     InitializationLookup,
+    /// Prompt signals a narrow creation lookup (where X is created/creation).
+    /// Non-create reads are structurally insufficient when create candidates exist.
+    CreateLookup,
 }
 
 impl InvestigationMode {
@@ -204,6 +216,7 @@ impl InvestigationMode {
             InvestigationMode::DefinitionLookup => "DefinitionLookup",
             InvestigationMode::ConfigLookup => "ConfigLookup",
             InvestigationMode::InitializationLookup => "InitializationLookup",
+            InvestigationMode::CreateLookup => "CreateLookup",
         }
     }
 }
@@ -219,6 +232,8 @@ enum RecoveryKind {
     ConfigFile,
     /// The file lacked initialization matches when initialization candidates exist.
     Initialization,
+    /// The file lacked create-term matches when create candidates exist.
+    Create,
 }
 
 impl RecoveryKind {
@@ -228,6 +243,7 @@ impl RecoveryKind {
             RecoveryKind::ImportOnly => "ImportOnly",
             RecoveryKind::ConfigFile => "ConfigFile",
             RecoveryKind::Initialization => "Initialization",
+            RecoveryKind::Create => "Create",
         }
     }
 }
@@ -291,6 +307,14 @@ struct InvestigationState {
     has_non_initialization_candidates: bool,
     /// True after the initialization recovery correction has been issued once this turn.
     initialization_correction_issued: bool,
+    /// Candidate paths where at least one matched line contains a create term.
+    /// Populated during record_search_results alongside search_candidate_paths.
+    create_candidates: HashSet<String>,
+    /// True if at least one candidate in the current search results has no matched
+    /// create line.
+    has_non_create_candidates: bool,
+    /// True after the create recovery correction has been issued once this turn.
+    create_correction_issued: bool,
 }
 
 impl InvestigationState {
@@ -315,6 +339,9 @@ impl InvestigationState {
             initialization_candidates: HashSet::new(),
             has_non_initialization_candidates: false,
             initialization_correction_issued: false,
+            create_candidates: HashSet::new(),
+            has_non_create_candidates: false,
+            create_correction_issued: false,
         }
     }
 
@@ -344,20 +371,24 @@ impl InvestigationState {
             self.has_non_config_candidates = false;
             self.initialization_candidates.clear();
             self.has_non_initialization_candidates = false;
+            self.create_candidates.clear();
+            self.has_non_create_candidates = false;
             self.read_useful_candidate = false;
 
             for result in &results.matches {
                 push_unique_path(&mut self.search_candidate_paths, &result.file);
             }
 
-            // Classify each candidate file along four structural axes.
+            // Classify each candidate file along five structural axes.
             // definition-only: every matched line looks like a definition site (line-content).
             // import-only: every matched line looks like an import declaration (line-content).
             // config-file: the file's extension identifies it as a config file (path-based).
             // initialization: at least one matched line contains an exact initialization term.
+            // create: at least one matched line contains an exact create term.
             let mut file_has_non_def: HashSet<String> = HashSet::new();
             let mut file_has_non_import: HashSet<String> = HashSet::new();
             let mut file_has_initialization: HashSet<String> = HashSet::new();
+            let mut file_has_create: HashSet<String> = HashSet::new();
             for m in &results.matches {
                 if !tool_codec::looks_like_definition(&m.line) {
                     file_has_non_def.insert(m.file.clone());
@@ -367,6 +398,9 @@ impl InvestigationState {
                 }
                 if contains_initialization_term(&m.line) {
                     file_has_initialization.insert(m.file.clone());
+                }
+                if contains_create_term(&m.line) {
+                    file_has_create.insert(m.file.clone());
                 }
             }
             for path in &self.search_candidate_paths {
@@ -389,6 +423,11 @@ impl InvestigationState {
                     self.initialization_candidates.insert(path.clone());
                 } else {
                     self.has_non_initialization_candidates = true;
+                }
+                if file_has_create.contains(path) {
+                    self.create_candidates.insert(path.clone());
+                } else {
+                    self.has_non_create_candidates = true;
                 }
             }
         }
@@ -426,6 +465,8 @@ impl InvestigationState {
                     "has_non_initialization",
                     self.has_non_initialization_candidates.to_string(),
                 ),
+                ("create_files", self.create_candidates.len().to_string()),
+                ("has_non_create", self.has_non_create_candidates.to_string()),
             ],
         );
         was_empty
@@ -465,6 +506,10 @@ impl InvestigationState {
                 .any(|c| normalize_evidence_path(c) == read_path);
             let is_initialization_candidate = self
                 .initialization_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
+            let is_create_candidate = self
+                .create_candidates
                 .iter()
                 .any(|c| normalize_evidence_path(c) == read_path);
 
@@ -581,6 +626,41 @@ impl InvestigationState {
                     ],
                 );
                 // Correction already issued: fall through without accepting.
+            }
+            // Gate 4 (CreateLookup): non-create reads are structurally insufficient when
+            // create candidates exist. Fire once; fallback accepts if no create candidates.
+            else if matches!(mode, InvestigationMode::CreateLookup)
+                && !is_create_candidate
+                && !self.create_candidates.is_empty()
+            {
+                if !self.create_correction_issued {
+                    self.create_correction_issued = true;
+                    let suggested_path = self.first_create_candidate().map(str::to_string);
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", read_path.clone()),
+                            ("accepted", "false".into()),
+                            ("reason", "create_non_create_candidate".into()),
+                            (
+                                "recovery_path",
+                                suggested_path.clone().unwrap_or_else(|| "none".into()),
+                            ),
+                        ],
+                    );
+                    return suggested_path.map(|p| (p, RecoveryKind::Create));
+                }
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "false".into()),
+                        ("reason", "create_recovery_already_issued".into()),
+                    ],
+                );
+                // Correction already issued: fall through without accepting.
             } else {
                 // Candidate would normally be accepted. Check import-only before committing.
                 // Import-only candidates are structurally insufficient when substantive
@@ -648,6 +728,10 @@ impl InvestigationState {
             && self.initialization_candidates.is_empty()
         {
             "initialization_fallback_no_initialization_candidates".into()
+        } else if matches!(mode, InvestigationMode::CreateLookup)
+            && self.create_candidates.is_empty()
+        {
+            "create_fallback_no_create_candidates".into()
         } else if matches!(mode, InvestigationMode::UsageLookup)
             && is_def_only
             && !self.has_non_definition_candidates
@@ -685,6 +769,13 @@ impl InvestigationState {
         self.search_candidate_paths
             .iter()
             .find(|path| self.initialization_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_create_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| self.create_candidates.contains(*path))
             .map(String::as_str)
     }
 }
@@ -954,6 +1045,9 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
         "initialization",
         "initialised",
         "configured",
+        "create",
+        "created",
+        "creation",
         "saved",
         "stored",
         "loaded",
@@ -975,7 +1069,7 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
 
 /// Detects the structural investigation mode from the prompt text.
 /// Evaluated in priority order so each prompt maps to exactly one mode.
-/// Priority: UsageLookup > ConfigLookup > InitializationLookup > DefinitionLookup > General.
+/// Priority: UsageLookup > ConfigLookup > InitializationLookup > CreateLookup > DefinitionLookup > General.
 fn detect_investigation_mode(text: &str) -> InvestigationMode {
     let lower = text.to_ascii_lowercase();
     if [
@@ -1007,6 +1101,9 @@ fn detect_investigation_mode(text: &str) -> InvestigationMode {
     if contains_initialization_term(&lower) {
         return InvestigationMode::InitializationLookup;
     }
+    if contains_create_term(&lower) {
+        return InvestigationMode::CreateLookup;
+    }
     if [
         "defined",
         "definition",
@@ -1027,6 +1124,13 @@ const INITIALIZATION_TERMS: &[&str] = &["initialize", "initialized", "initializa
 fn contains_initialization_term(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     INITIALIZATION_TERMS.iter().any(|term| lower.contains(term))
+}
+
+const CREATE_TERMS: &[&str] = &["create", "created", "creation"];
+
+fn contains_create_term(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    CREATE_TERMS.iter().any(|term| lower.contains(term))
 }
 
 fn contains_word(text: &str, needle: &str) -> bool {
@@ -2029,6 +2133,7 @@ fn run_tool_round(
                         RecoveryKind::Initialization => {
                             initialization_read_recovery_correction(&path)
                         }
+                        RecoveryKind::Create => create_read_recovery_correction(&path),
                     };
                     accumulated.push_str(&correction);
                     accumulated.push_str("\n\n");
@@ -2691,6 +2796,10 @@ mod tests {
         ));
         assert!(prompt_requires_investigation(
             "Where is configuration loaded?"
+        ));
+        assert!(prompt_requires_investigation("Where are tasks created?"));
+        assert!(prompt_requires_investigation(
+            "Find where session creation happens"
         ));
     }
 
@@ -4508,6 +4617,285 @@ mod tests {
         );
     }
 
+    // Scope enforcement: direct unit tests for the enforcement block.
+    //
+    // The codec never produces path: Some(...) for search calls, so the clamping arm
+    // of the enforcement block cannot fire end-to-end. These tests exercise it directly
+    // by constructing ToolInput values and applying the same enforcement logic inline.
+    // path_is_within_scope is the underlying predicate; these tests verify the branch
+    // outcomes of the match block (inject / clamp / preserve) as a whole.
+
+    #[test]
+    fn scope_enforcement_clamps_broader_parent_path() {
+        // Scope: sandbox/services/, model path: sandbox/ (parent — broader).
+        // Enforcement must clamp to sandbox/services/.
+        let scope = "sandbox/services/";
+        let mut path: Option<String> = Some("sandbox/".into());
+        if let Some(ref p) = path.clone() {
+            if !path_is_within_scope(p, scope) {
+                path = Some(scope.to_string());
+            }
+        }
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn scope_enforcement_clamps_unrelated_path() {
+        // Scope: sandbox/services/, model path: src/ (unrelated — orthogonal).
+        // Enforcement must clamp to sandbox/services/.
+        let scope = "sandbox/services/";
+        let mut path: Option<String> = Some("src/".into());
+        if let Some(ref p) = path.clone() {
+            if !path_is_within_scope(p, scope) {
+                path = Some(scope.to_string());
+            }
+        }
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn scope_enforcement_preserves_exact_scope_path() {
+        // Scope: sandbox/services/, model path: sandbox/services/ (exact).
+        // Enforcement must preserve.
+        let scope = "sandbox/services/";
+        let mut path: Option<String> = Some("sandbox/services/".into());
+        if let Some(ref p) = path.clone() {
+            if !path_is_within_scope(p, scope) {
+                path = Some(scope.to_string());
+            }
+        }
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn scope_enforcement_preserves_child_path() {
+        // Scope: sandbox/services/, model path: sandbox/services/tasks/ (child — narrower).
+        // Enforcement must preserve the narrower model path.
+        let scope = "sandbox/services/";
+        let mut path: Option<String> = Some("sandbox/services/tasks/".into());
+        if let Some(ref p) = path.clone() {
+            if !path_is_within_scope(p, scope) {
+                path = Some(scope.to_string());
+            }
+        }
+        assert_eq!(path.as_deref(), Some("sandbox/services/tasks/"));
+    }
+
+    #[test]
+    fn scope_enforcement_injects_when_path_absent() {
+        // Scope present, path None → inject scope.
+        let scope = "sandbox/services/";
+        let mut path: Option<String> = None;
+        if path.is_none() {
+            path = Some(scope.to_string());
+        }
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn no_scope_search_behavior_unchanged() {
+        // Prompt has no path scope (no "in dir/" pattern).
+        // Runtime must not inject or clamp — standard search behavior applies.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_service.py"),
+            "if task.status == TaskStatus.TODO:\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "class TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+
+        // Prompt has no scope — no injection or clamping.
+        // Both files match; model reads the usage file → ToolAssisted.
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: services/task_service.py]",
+                "TaskStatus is used in services/task_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "no-scope turn must not fail: {events:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        // Both in-scope and out-of-scope files must appear as candidates (no clamping).
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            search_result.contains("services/task_service.py"),
+            "unscoped search must include services/task_service.py: {search_result}"
+        );
+        assert!(
+            search_result.contains("models/enums.py"),
+            "unscoped search must include models/enums.py (no clamping without scope): {search_result}"
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "unscoped search + read must admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn scope_upper_bound_forced_broader_path_clamped_end_to_end() {
+        // Forced failure-path validation from the spec:
+        // Prompt: "Find where logging is initialized in sandbox/services/"
+        // The scope extracts to sandbox/services/.
+        // Model issues search without path (codec limitation — path always None),
+        // runtime injects sandbox/services/ → only in-scope files become candidates.
+        // Out-of-scope src/ files are never candidates.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services").join("logger.py"),
+            "def initialize_logging():\n    logging.basicConfig()\n",
+        )
+        .unwrap();
+        // Out-of-scope file that would match if scope was not enforced.
+        fs::write(
+            tmp.path().join("src").join("logger.py"),
+            "def initialize_logging():\n    setup_logger()\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging]",
+                "[read_file: sandbox/services/logger.py]",
+                "Logging is initialized in sandbox/services/logger.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where logging is initialized in sandbox/services/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+
+        // Scope enforcement: only sandbox/services/ candidates must appear.
+        assert!(
+            search_result.contains("sandbox/services/logger.py"),
+            "scoped search must include in-scope candidate: {search_result}"
+        );
+        assert!(
+            !search_result.contains("src/logger.py"),
+            "scoped search must exclude out-of-scope src/ candidate: {search_result}"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Logging is initialized in sandbox/services/logger.py.")
+        );
+    }
+
+    #[test]
+    fn scope_upper_bound_clamped_to_cli_not_sandbox() {
+        // Forced failure-path validation case 2:
+        // Prompt: "Where is TaskStatus used in sandbox/cli/"
+        // Model would search sandbox/ (broader) — clamp must restrict to sandbox/cli/.
+        // Since codec produces path: None, injection fires and restricts to sandbox/cli/.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/cli")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/models")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/cli").join("handler.py"),
+            "if task.status == TaskStatus.PENDING:\n    handle(task)\n",
+        )
+        .unwrap();
+        // Out-of-scope: outside sandbox/cli/.
+        fs::write(
+            tmp.path().join("sandbox/models").join("enums.py"),
+            "class TaskStatus(str, Enum):\n    PENDING = \"pending\"\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: sandbox/cli/handler.py]",
+                "TaskStatus is used in sandbox/cli/handler.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used in sandbox/cli/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+
+        assert!(
+            search_result.contains("sandbox/cli/handler.py"),
+            "scoped search must include in-scope candidate: {search_result}"
+        );
+        assert!(
+            !search_result.contains("sandbox/models/enums.py"),
+            "scoped search must exclude out-of-scope sandbox/models/ candidate: {search_result}"
+        );
+    }
+
     // Phase 9.1.3 — Candidate Selection Quality (import-only weak candidate rejection)
 
     #[test]
@@ -5316,6 +5704,457 @@ mod tests {
         assert_eq!(
             last_assistant,
             Some("Logging is initialized in sandbox/services/logging_setup.py.")
+        );
+    }
+
+    // Phase 9.2.3 — CreateLookup
+
+    #[test]
+    fn detect_investigation_mode_returns_create_lookup() {
+        assert!(matches!(
+            detect_investigation_mode("Where is the session created?"),
+            InvestigationMode::CreateLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find where tasks are created"),
+            InvestigationMode::CreateLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Where does task creation happen?"),
+            InvestigationMode::CreateLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_create_priority_over_definition() {
+        // "created" + "defined" in same prompt — CreateLookup wins (higher priority).
+        assert!(matches!(
+            detect_investigation_mode("Where is the session created and defined?"),
+            InvestigationMode::CreateLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_initialization_priority_over_create() {
+        // "initialized" + "created" in same prompt — InitializationLookup wins.
+        assert!(matches!(
+            detect_investigation_mode("Find where the session is initialized and created"),
+            InvestigationMode::InitializationLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_usage_priority_over_create() {
+        // "used" + "created" in same prompt — UsageLookup wins.
+        assert!(matches!(
+            detect_investigation_mode("Where is the session used and created?"),
+            InvestigationMode::UsageLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_config_priority_over_create() {
+        // "configured" + "created" in same prompt — ConfigLookup wins.
+        assert!(matches!(
+            detect_investigation_mode("Where is the session configured and created?"),
+            InvestigationMode::ConfigLookup
+        ));
+    }
+
+    #[test]
+    fn contains_create_term_matches_exact_allowed_substrings_only() {
+        // Exact allowed terms.
+        assert!(contains_create_term("db.create(session)"));
+        assert!(contains_create_term("session was created here"));
+        assert!(contains_create_term("handles session creation"));
+        // Case insensitive.
+        assert!(contains_create_term("Session.Create()"));
+        assert!(contains_create_term("CREATED_AT timestamp"));
+        // Noisy: substring of longer word — these DO match (substring semantics, same as initialization).
+        assert!(contains_create_term("recreate the session"));
+        assert!(contains_create_term("createTable migration"));
+        // Not a create term.
+        assert!(!contains_create_term("def handle_session(s):"));
+        assert!(!contains_create_term("return session_id"));
+    }
+
+    #[test]
+    fn create_lookup_non_create_read_triggers_recovery_to_create_file() {
+        // File A: no create-term matches → non-create candidate.
+        // File B: a create-term match → create candidate.
+        // Model reads A first → recovery fires pointing to B.
+        // Model reads B → evidence ready → ToolAssisted.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("storage")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_handler.py"),
+            "def handle_task(task):\n    task.run()\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("storage").join("task_store.py"),
+            "def store_task(task):\n    db.create(task)\n    return task.id\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: task]",
+                // Reads the non-create file first — recovery fires.
+                "[read_file: services/task_handler.py]",
+                // Follows recovery, reads the create file.
+                "[read_file: storage/task_store.py]",
+                "Tasks are created in storage/task_store.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are tasks created?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        // Recovery correction must appear.
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("creation lookup")
+                    && m.content.contains("storage/task_store.py")),
+            "create recovery correction must point to the create candidate"
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "create lookup + recovery + create read must admit synthesis: {answer_source:?}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Tasks are created in storage/task_store.py.")
+        );
+    }
+
+    #[test]
+    fn create_lookup_no_create_candidates_degrades_cleanly() {
+        // All candidates have no create-term matches.
+        // Gate does not fire — any read is accepted (fallback behavior).
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_handler.py"),
+            "def handle_task(task):\n    task.run()\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: task]",
+                "[read_file: services/task_handler.py]",
+                "Tasks are handled in services/task_handler.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are tasks created?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "create lookup with no create candidates must degrade to acceptance: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Tasks are handled in services/task_handler.py.")
+        );
+    }
+
+    #[test]
+    fn create_lookup_second_non_create_candidate_after_recovery_is_not_accepted() {
+        // After one recovery the correction flag is set.
+        // A second non-create read falls through the gate without accepting.
+        // With candidate_reads_count == 2 and evidence_ready false, the runtime
+        // terminates with InsufficientEvidence.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("handlers")).unwrap();
+        fs::create_dir_all(tmp.path().join("storage")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("runner.py"),
+            "def run_task(task):\n    task.execute()\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("handlers").join("task_handler.py"),
+            "def handle_task(task):\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("storage").join("task_store.py"),
+            "def store_task(task):\n    db.create(task)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: task]",
+                // First read: non-create → recovery fires pointing to task_store.py.
+                "[read_file: services/runner.py]",
+                // Second read: another non-create (ignores recovery, reads wrong file).
+                "[read_file: handlers/task_handler.py]",
+                // Model attempts synthesis — candidate limit hit; runtime terminates.
+                "Tasks run in services/runner.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are tasks created?".into(),
+            },
+        );
+
+        // Runtime terminates with InsufficientEvidence (not a runtime Failed).
+        assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "two non-create reads must terminate with InsufficientEvidence: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn create_lookup_noisy_create_term_in_comment_still_classifies_as_create() {
+        // A line like "# TODO: create session handling" contains "create" as substring.
+        // The classification is structural/substring — comments match the same as code.
+        // This tests the known noisy behavior described in the spec.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_service.py"),
+            "# TODO: create session handling\ndef get_session(sid):\n    return db.get(sid)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("models").join("session.py"),
+            "class Session:\n    pass\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // Comment-containing file is a create candidate (substring match).
+                // Model reads it directly — evidence accepted.
+                "[read_file: services/session_service.py]",
+                "Sessions are handled in services/session_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions created?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        // No recovery should fire — the comment-line file is a create candidate.
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("creation lookup")),
+            "no recovery expected when create candidate is read first"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "create candidate read must admit synthesis: {answer_source:?}"
+        );
+    }
+
+    // Phase 9.2.3 — regression tests for earlier modes/invariants
+
+    #[test]
+    fn create_lookup_does_not_affect_usage_lookup_regression() {
+        // A usage-lookup prompt with create terms must remain UsageLookup (higher priority).
+        // The create gate must not activate for UsageLookup turns.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_service.py"),
+            "if task.status == TaskStatus.DONE:\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "class TaskStatus(Enum):\n    DONE = 'done'\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: services/task_service.py]",
+                "TaskStatus is used in services/task_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                // "used" triggers UsageLookup; "created" present but must not win.
+                text: "Where is TaskStatus used and created?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "regression: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "UsageLookup must not be disrupted by create terms: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn create_lookup_read_cap_still_applies() {
+        // MaxReadsPerTurn must still apply under CreateLookup.
+        // After 3 reads the runtime blocks further reads regardless of mode.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        for dir in &["a", "b", "c", "d"] {
+            fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        }
+        fs::write(
+            tmp.path().join("a").join("task.py"),
+            "def task_a():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("b").join("task.py"),
+            "def task_b():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("c").join("task.py"),
+            "def task_c():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("d").join("task.py"), "db.create(task)\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: task]",
+                // Reads 3 non-create files — hits cap before reaching create file.
+                "[read_file: a/task.py]",
+                "[read_file: b/task.py]",
+                "[read_file: c/task.py]",
+                "[read_file: d/task.py]",
+                "Tasks are created in d/task.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are tasks created?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "must not fail (cap is a correction): {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        // The 4th read must be blocked by the cap.
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: read_file ===")
+                    && m.content.contains("read limit")),
+            "read cap must block the 4th read"
         );
     }
 }
