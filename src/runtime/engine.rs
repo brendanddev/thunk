@@ -180,6 +180,9 @@ const CANDIDATE_READ_CAP_EXCEEDED: &str =
     "candidate read limit for this investigation reached. No additional matched files will be read.";
 
 const NO_LAST_READ_FILE_AVAILABLE: &str = "No previous file is available to read.";
+const NO_LAST_SEARCH_AVAILABLE: &str = "No previous search is available to repeat.";
+const LAST_SEARCH_REPLAYED: &str = "Repeated the last search.";
+const LAST_SEARCH_REPLAY_FAILED: &str = "Could not repeat the previous search.";
 
 const LIST_DIR_BEFORE_SEARCH_BLOCKED: &str =
     "[runtime: code investigation questions require search_code, not list_dir.\nUse search_code with a keyword from the question — a function name, variable, or concept.]";
@@ -1600,6 +1603,20 @@ fn is_last_read_file_anchor_prompt(text: &str) -> bool {
     )
 }
 
+fn is_last_search_anchor_prompt(text: &str) -> bool {
+    let normalized = normalize_anchor_prompt(text);
+    matches!(
+        normalized.as_str(),
+        "search that again"
+            | "repeat that search"
+            | "repeat the last search"
+            | "run that search again"
+            | "run the last search again"
+            | "search the last query"
+            | "search the last query again"
+    )
+}
+
 fn normalize_anchor_prompt(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -1661,11 +1678,15 @@ fn is_mutating_tool(input: &ToolInput) -> bool {
 #[derive(Debug, Clone, Default)]
 struct AnchorState {
     last_read_file: Option<String>,
+    last_search_query: Option<String>,
+    last_search_scope: Option<String>,
 }
 
 impl AnchorState {
     fn clear(&mut self) {
         self.last_read_file = None;
+        self.last_search_query = None;
+        self.last_search_scope = None;
     }
 
     fn record_successful_read(&mut self, output: &ToolOutput) -> Option<String> {
@@ -1675,6 +1696,26 @@ impl AnchorState {
             return Some(path);
         }
         None
+    }
+
+    fn record_successful_search(
+        &mut self,
+        output: &ToolOutput,
+        query: String,
+        scope: Option<String>,
+    ) -> Option<(String, Option<String>)> {
+        if matches!(output, ToolOutput::SearchResults(_)) {
+            self.last_search_query = Some(query.clone());
+            self.last_search_scope = scope.clone();
+            return Some((query, scope));
+        }
+        None
+    }
+
+    fn last_search(&self) -> Option<(String, Option<String>)> {
+        self.last_search_query
+            .clone()
+            .map(|query| (query, self.last_search_scope.clone()))
     }
 }
 
@@ -1786,6 +1827,11 @@ impl Runtime {
             "anchor_cleared",
             &[("kind", "last_read_file".into())],
         );
+        trace_runtime_decision(
+            on_event,
+            "anchor_cleared",
+            &[("kind", "last_search".into())],
+        );
         self.conversation.reset(self.system_prompt.clone());
         on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
     }
@@ -1809,6 +1855,7 @@ impl Runtime {
         }
 
         let is_last_read_file_anchor = is_last_read_file_anchor_prompt(trimmed);
+        let is_last_search_anchor = is_last_search_anchor_prompt(trimmed);
         self.conversation.push_user(text);
         on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
         if is_last_read_file_anchor {
@@ -1834,6 +1881,40 @@ impl Runtime {
                     NO_LAST_READ_FILE_AVAILABLE,
                     AnswerSource::RuntimeTerminal {
                         reason: RuntimeTerminalReason::ReadFileFailed,
+                        rounds: 0,
+                    },
+                    on_event,
+                );
+            }
+            return;
+        }
+        if is_last_search_anchor {
+            trace_runtime_decision(
+                on_event,
+                "anchor_prompt_matched",
+                &[("kind", "last_search".into())],
+            );
+            if let Some((query, scope)) = self.anchors.last_search() {
+                trace_runtime_decision(
+                    on_event,
+                    "anchor_resolved",
+                    &[
+                        ("kind", "last_search".into()),
+                        ("query", query.clone()),
+                        ("scope", scope.clone().unwrap_or_else(|| "none".into())),
+                    ],
+                );
+                self.run_last_search_anchor(query, scope, on_event);
+            } else {
+                trace_runtime_decision(
+                    on_event,
+                    "anchor_missing",
+                    &[("kind", "last_search".into())],
+                );
+                self.finish_with_runtime_answer(
+                    NO_LAST_SEARCH_AVAILABLE,
+                    AnswerSource::RuntimeTerminal {
+                        reason: RuntimeTerminalReason::InsufficientEvidence,
                         rounds: 0,
                     },
                     on_event,
@@ -1898,6 +1979,90 @@ impl Runtime {
                 self.pending_action = Some(pending.clone());
                 on_event(RuntimeEvent::ApprovalRequired(pending));
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+            }
+        }
+    }
+
+    fn run_last_search_anchor(
+        &mut self,
+        query: String,
+        scope: Option<String>,
+        on_event: &mut dyn FnMut(RuntimeEvent),
+    ) {
+        let input = ToolInput::SearchCode {
+            query: query.clone(),
+            path: scope.clone(),
+        };
+        let name = input.tool_name().to_string();
+
+        on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
+        on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
+
+        match self.registry.dispatch(input) {
+            Ok(ToolRunResult::Immediate(output)) => {
+                debug_assert!(
+                    self.registry
+                        .spec_for(&name)
+                        .map(|s| s.execution_kind == ExecutionKind::Immediate)
+                        .unwrap_or(true),
+                    "tool '{name}' returned Immediate but spec declares RequiresApproval"
+                );
+                if let Some((query, scope)) =
+                    self.anchors
+                        .record_successful_search(&output, query.clone(), scope.clone())
+                {
+                    trace_runtime_decision(
+                        on_event,
+                        "anchor_updated",
+                        &[
+                            ("kind", "last_search".into()),
+                            ("query", query),
+                            ("scope", scope.unwrap_or_else(|| "none".into())),
+                        ],
+                    );
+                }
+                let summary = tool_codec::render_compact_summary(&output);
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: Some(summary),
+                });
+                self.conversation
+                    .push_user(tool_codec::format_tool_result(&name, &output));
+                self.conversation.trim_tool_exchanges_if_needed();
+                self.finish_with_runtime_answer(
+                    LAST_SEARCH_REPLAYED,
+                    AnswerSource::ToolAssisted { rounds: 1 },
+                    on_event,
+                );
+            }
+            Ok(ToolRunResult::Approval(pending)) => {
+                debug_assert!(
+                    self.registry
+                        .spec_for(&name)
+                        .map(|s| s.execution_kind == ExecutionKind::RequiresApproval)
+                        .unwrap_or(false),
+                    "tool '{name}' requested approval but spec declares Immediate"
+                );
+                self.pending_action = Some(pending.clone());
+                on_event(RuntimeEvent::ApprovalRequired(pending));
+                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+            }
+            Err(e) => {
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: None,
+                });
+                self.conversation
+                    .push_user(tool_codec::format_tool_error(&name, &e.to_string()));
+                self.conversation.trim_tool_exchanges_if_needed();
+                self.finish_with_runtime_answer(
+                    LAST_SEARCH_REPLAY_FAILED,
+                    AnswerSource::RuntimeTerminal {
+                        reason: RuntimeTerminalReason::InsufficientEvidence,
+                        rounds: 1,
+                    },
+                    on_event,
+                );
             }
         }
     }
@@ -2433,6 +2598,10 @@ fn run_tool_round(
                 _ => {}
             }
         }
+        let effective_search_input = match &input {
+            ToolInput::SearchCode { query, path } => Some((query.clone(), path.clone())),
+            _ => None,
+        };
         let read_path = match &input {
             ToolInput::ReadFile { path } => Some(path.clone()),
             _ => None,
@@ -2602,6 +2771,21 @@ fn run_tool_round(
                 );
                 // Record search results against the per-turn budget and investigation state.
                 let search_closed_message = if name == "search_code" {
+                    if let Some((query, scope)) = effective_search_input.clone() {
+                        if let Some((query, scope)) =
+                            anchors.record_successful_search(&output, query, scope)
+                        {
+                            trace_runtime_decision(
+                                on_event,
+                                "anchor_updated",
+                                &[
+                                    ("kind", "last_search".into()),
+                                    ("query", query),
+                                    ("scope", scope.unwrap_or_else(|| "none".into())),
+                                ],
+                            );
+                        }
+                    }
                     let was_empty = investigation.record_search_results(&output, on_event);
                     search_budget.record(was_empty);
                     search_budget
@@ -3780,6 +3964,335 @@ mod tests {
                 && all_user.contains("read limit for this turn"),
             "fourth read in the anchor turn must be blocked by the normal read cap"
         );
+    }
+
+    #[test]
+    fn successful_search_code_updates_last_search_anchor() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn needle() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec!["[search_code: needle]", "Search complete."],
+            tmp.path(),
+        );
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "tool check".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "unexpected failure: {events:?}");
+        assert_eq!(rt.anchors.last_search_query.as_deref(), Some("needle"));
+        assert_eq!(rt.anchors.last_search_scope, None);
+    }
+
+    #[test]
+    fn repeat_last_search_dispatches_one_search_code() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn needle() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec!["[search_code: needle]", "Search complete."],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "tool check".into(),
+            },
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "repeat the last search".into(),
+            },
+        );
+
+        let search_starts = events
+            .iter()
+            .filter(
+                |e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "search_code"),
+            )
+            .count();
+        assert_eq!(search_starts, 1, "replay must dispatch exactly one search");
+        assert!(
+            !events.iter().any(
+                |e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "read_file")
+            ),
+            "search replay must not auto-read candidates: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantMessageChunk(chunk) if chunk == LAST_SEARCH_REPLAYED
+            )),
+            "search replay must end with runtime-owned completion: {events:?}"
+        );
+    }
+
+    #[test]
+    fn unscoped_search_replays_with_no_scope() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("one")).unwrap();
+        fs::create_dir_all(tmp.path().join("two")).unwrap();
+        fs::write(tmp.path().join("one/a.rs"), "fn needle_one() {}\n").unwrap();
+        fs::write(tmp.path().join("two/b.rs"), "fn needle_two() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec!["[search_code: needle]", "Search complete."],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "tool check".into(),
+            },
+        );
+        assert_eq!(rt.anchors.last_search_scope, None);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "search the last query again".into(),
+            },
+        );
+
+        assert!(
+            events.iter().any(|e| {
+                matches!(
+                    e,
+                    RuntimeEvent::ToolCallFinished {
+                        name,
+                        summary: Some(summary)
+                    } if name == "search_code"
+                        && summary.contains("found 2 match(es)")
+                        && summary.contains("needle")
+                )
+            }),
+            "unscoped replay must search the whole project: {events:?}"
+        );
+        assert_eq!(rt.anchors.last_search_scope, None);
+    }
+
+    #[test]
+    fn scoped_search_replay_uses_effective_prompt_scope() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("sandbox/in_scope.py"), "needle = True\n").unwrap();
+        fs::write(tmp.path().join("src/outside.py"), "needle = False\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: needle]",
+                "[read_file: sandbox/in_scope.py]",
+                "needle is in sandbox/in_scope.py.",
+            ],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is needle used in sandbox/".into(),
+            },
+        );
+        assert_eq!(rt.anchors.last_search_query.as_deref(), Some("needle"));
+        assert_eq!(rt.anchors.last_search_scope.as_deref(), Some("sandbox/"));
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "run the last search again".into(),
+            },
+        );
+
+        assert!(
+            events.iter().any(|e| {
+                matches!(
+                    e,
+                    RuntimeEvent::ToolCallFinished {
+                        name,
+                        summary: Some(summary)
+                    } if name == "search_code" && summary.contains("found 1 match(es)")
+                )
+            }),
+            "scoped replay must preserve the effective prompt scope: {events:?}"
+        );
+        assert_eq!(rt.anchors.last_search_scope.as_deref(), Some("sandbox/"));
+    }
+
+    #[test]
+    fn search_anchor_stores_effective_clamped_scope() {
+        use std::collections::HashSet;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("sandbox/in_scope.py"), "needle = True\n").unwrap();
+        fs::write(tmp.path().join("src/outside.py"), "needle = False\n").unwrap();
+
+        let registry = default_registry(tmp.path().to_path_buf());
+        let mut last_call_key = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn = HashSet::new();
+        let mut anchors = AnchorState::default();
+        let mut requested_read_completed = false;
+        let mut events = Vec::new();
+
+        let outcome = run_tool_round(
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "needle".into(),
+                path: Some("src/".into()),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            false,
+            true,
+            InvestigationMode::UsageLookup,
+            None,
+            &mut requested_read_completed,
+            Some("sandbox/"),
+            &mut |e| events.push(e),
+        );
+
+        assert!(
+            matches!(outcome, ToolRoundOutcome::Completed { .. }),
+            "search round must complete"
+        );
+        assert_eq!(anchors.last_search_query.as_deref(), Some("needle"));
+        assert_eq!(anchors.last_search_scope.as_deref(), Some("sandbox/"));
+    }
+
+    #[test]
+    fn failed_search_code_does_not_update_last_search_anchor() {
+        use std::collections::HashSet;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let registry = default_registry(tmp.path().to_path_buf());
+        let mut last_call_key = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn = HashSet::new();
+        let mut anchors = AnchorState {
+            last_read_file: None,
+            last_search_query: Some("needle".into()),
+            last_search_scope: Some("sandbox/".into()),
+        };
+        let mut requested_read_completed = false;
+        let mut events = Vec::new();
+
+        let outcome = run_tool_round(
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "".into(),
+                path: None,
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            false,
+            false,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |e| events.push(e),
+        );
+
+        assert!(
+            matches!(outcome, ToolRoundOutcome::Completed { .. }),
+            "failed non-read tool should return completed with tool error"
+        );
+        assert_eq!(anchors.last_search_query.as_deref(), Some("needle"));
+        assert_eq!(anchors.last_search_scope.as_deref(), Some("sandbox/"));
+    }
+
+    #[test]
+    fn reset_clears_last_search_anchor() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn needle() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec!["[search_code: needle]", "Search complete."],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "tool check".into(),
+            },
+        );
+        assert!(rt.anchors.last_search_query.is_some());
+
+        collect_events(&mut rt, RuntimeRequest::Reset);
+
+        assert_eq!(rt.anchors.last_search_query, None);
+        assert_eq!(rt.anchors.last_search_scope, None);
+    }
+
+    #[test]
+    fn no_search_anchor_replay_returns_deterministic_failure() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(Vec::<String>::new(), tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "search that again".into(),
+            },
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantMessageChunk(chunk)
+                    if chunk == NO_LAST_SEARCH_AVAILABLE
+            )),
+            "no-search-anchor prompt must produce deterministic runtime answer: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { .. })),
+            "no-search-anchor prompt must not dispatch tools: {events:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_search_anchor_phrases_do_not_resolve() {
+        assert!(!is_last_search_anchor_prompt("search it again"));
+        assert!(!is_last_search_anchor_prompt("search for that thing again"));
+        assert!(!is_last_search_anchor_prompt("search again"));
+        assert!(is_last_search_anchor_prompt("search that again"));
+        assert!(is_last_search_anchor_prompt("repeat the last search"));
     }
 
     #[test]
