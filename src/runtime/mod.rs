@@ -1,6 +1,7 @@
 mod anchors;
 mod conversation;
 mod engine;
+mod investigation;
 mod prompt;
 #[cfg(test)]
 mod scenarios;
