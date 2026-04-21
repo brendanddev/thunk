@@ -140,6 +140,10 @@ Some tool outcomes end with a runtime-owned assistant answer instead of another 
 - search closes after a non-empty result or after the one empty retry
 - later search attempts are removed from the model context and replaced with a runtime correction that tells the model to answer from the available evidence
 
+Structured investigation modes are complete. The current priority order is:
+
+`UsageLookup` > `ConfigLookup` > `InitializationLookup` > `CreateLookup` > `RegisterLookup` > `LoadLookup` > `SaveLookup` > `DefinitionLookup` > `General`
+
 ### Initialization Lookup
 
 For prompts that ask where something is initialized, the runtime gives extra care to the file it accepts as evidence.
@@ -147,6 +151,14 @@ For prompts that ask where something is initialized, the runtime gives extra car
 If search results include files that look like initialization matches, reading a different kind of match is not enough. The runtime can ask the model once to read a matched initialization file instead.
 
 If no initialization match exists in the search results, the runtime falls back to the normal search-result read behavior.
+
+### Save Lookup
+
+For prompts that ask where something is saved, the runtime detects exact substring matches for `save`, `saved`, and `saving`.
+
+Save candidates are classified only from matched search-result lines. If save candidates exist, reading a non-save match is not enough. The runtime can ask the model once to read a matched save candidate instead.
+
+If no save match exists in the search results, the runtime falls back to the normal search-result read behavior.
 
 ### 5. End or Pause
 

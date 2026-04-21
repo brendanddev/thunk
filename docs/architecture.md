@@ -178,7 +178,7 @@ The system prompt tells the model that when a tool is needed, the reply should c
 
 Prompt-only behavioral rules are not treated as sufficient for loop safety. For `search_code`, the runtime also enforces a per-turn budget: one search is always allowed, one retry is allowed only if the first search returned no matches, and later search attempts are blocked with a runtime correction.
 
-For investigation-required turns, runtime-owned evidence rules also apply. `list_dir` is blocked before `search_code`, because directory listings are not sufficient evidence for code-location questions. Non-empty search results require a `read_file` from the current search candidate set before synthesis. Some lookup types add mode-specific evidence gates: usage lookups prefer usage-bearing evidence when it exists, configuration lookups prefer config-file evidence when it exists, and initialization lookups prefer initialization evidence when it exists. Definition lookups still accept reading the definition file as sufficient evidence.
+For investigation-required turns, runtime-owned evidence rules also apply. `list_dir` is blocked before `search_code`, because directory listings are not sufficient evidence for code-location questions. Non-empty search results require a `read_file` from the current search candidate set before synthesis. Some lookup types add mode-specific evidence gates: usage lookups prefer usage-bearing evidence when it exists, configuration lookups prefer config-file evidence when it exists, and initialization/create/register/load/save lookups prefer matched-line evidence for that mode when it exists. Definition lookups still accept reading the definition file as sufficient evidence.
 
 ---
 
@@ -232,6 +232,7 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 - Mutating tools do not write during `run()`; writes happen only in `execute_approved()`.
 - `search_code` executes literal substring searches, and repeated search behavior is bounded per user turn by runtime state.
 - investigation-required turns block `list_dir` before search, require a matched read before synthesis, and use runtime-owned mode-specific evidence gating.
+- investigation candidate reads remain capped at 2, recovery is single-shot, and action lookup modes use matched-line structural classification only, without semantic reasoning or tool / `tool_codec` changes.
 - rejected mutations are answered by the runtime without model synthesis, so the assistant cannot claim a rejected write/edit happened
 - failed `read_file` calls can terminate with a runtime-owned answer, so missing-file reads do not loop
 - Malformed `edit_file` repair attempts after edit errors are surfaced back to the model through runtime correction rather than silently ending the turn.

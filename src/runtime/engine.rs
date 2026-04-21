@@ -130,6 +130,15 @@ fn load_read_recovery_correction(path: &str) -> String {
     )
 }
 
+fn save_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] This is a save lookup. The file just read did not show \
+         a save match, but a matched save candidate exists. \
+         Read this exact save file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
 /// Injected when the question contains a code identifier but the model attempts a Direct answer
 /// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
 const SEARCH_BEFORE_ANSWERING: &str =
@@ -166,6 +175,9 @@ const MAX_CANDIDATE_READS_PER_INVESTIGATION: usize = 2;
 /// Injected when the model exceeds MAX_READS_PER_TURN in one turn.
 const READ_CAP_EXCEEDED: &str =
     "read limit for this turn reached. Answer from the file evidence already in context.";
+
+const CANDIDATE_READ_CAP_EXCEEDED: &str =
+    "candidate read limit for this investigation reached. No additional matched files will be read.";
 
 const LIST_DIR_BEFORE_SEARCH_BLOCKED: &str =
     "[runtime: code investigation questions require search_code, not list_dir.\nUse search_code with a keyword from the question — a function name, variable, or concept.]";
@@ -230,6 +242,9 @@ enum InvestigationMode {
     /// Prompt signals a narrow load lookup.
     /// Non-load reads are structurally insufficient when load candidates exist.
     LoadLookup,
+    /// Prompt signals a narrow save lookup.
+    /// Non-save reads are structurally insufficient when save candidates exist.
+    SaveLookup,
 }
 
 impl InvestigationMode {
@@ -243,6 +258,7 @@ impl InvestigationMode {
             InvestigationMode::CreateLookup => "CreateLookup",
             InvestigationMode::RegisterLookup => "RegisterLookup",
             InvestigationMode::LoadLookup => "LoadLookup",
+            InvestigationMode::SaveLookup => "SaveLookup",
         }
     }
 }
@@ -264,6 +280,8 @@ enum RecoveryKind {
     Register,
     /// The file lacked load-term matches when load candidates exist.
     Load,
+    /// The file lacked save-term matches when save candidates exist.
+    Save,
 }
 
 impl RecoveryKind {
@@ -276,6 +294,7 @@ impl RecoveryKind {
             RecoveryKind::Create => "Create",
             RecoveryKind::Register => "Register",
             RecoveryKind::Load => "Load",
+            RecoveryKind::Save => "Save",
         }
     }
 }
@@ -363,6 +382,11 @@ struct InvestigationState {
     has_non_load_candidates: bool,
     /// True after the load recovery correction has been issued once this turn.
     load_correction_issued: bool,
+    /// Candidate paths where at least one matched line contains a save term.
+    /// Populated during record_search_results alongside search_candidate_paths.
+    save_candidates: HashSet<String>,
+    /// True after the save recovery correction has been issued once this turn.
+    save_correction_issued: bool,
 }
 
 impl InvestigationState {
@@ -396,11 +420,25 @@ impl InvestigationState {
             load_candidates: HashSet::new(),
             has_non_load_candidates: false,
             load_correction_issued: false,
+            save_candidates: HashSet::new(),
+            save_correction_issued: false,
         }
     }
 
     fn evidence_ready(&self) -> bool {
         self.search_produced_results && self.read_useful_candidate
+    }
+
+    fn is_search_candidate_path(&self, path: &str) -> bool {
+        let read_path = normalize_evidence_path(path);
+        let relative_suffix = read_path.contains('/').then(|| format!("/{read_path}"));
+        self.search_candidate_paths.iter().any(|candidate| {
+            let candidate = normalize_evidence_path(candidate);
+            candidate == read_path
+                || relative_suffix
+                    .as_ref()
+                    .is_some_and(|suffix| candidate.ends_with(suffix))
+        })
     }
 
     fn record_search_results(
@@ -431,6 +469,7 @@ impl InvestigationState {
             self.has_non_register_candidates = false;
             self.load_candidates.clear();
             self.has_non_load_candidates = false;
+            self.save_candidates.clear();
             self.read_useful_candidate = false;
 
             for result in &results.matches {
@@ -445,12 +484,14 @@ impl InvestigationState {
             // create: at least one matched line contains an exact create term.
             // register: at least one matched line contains an exact register term.
             // load: at least one matched line contains an exact load term.
+            // save: at least one matched line contains an exact save term.
             let mut file_has_non_def: HashSet<String> = HashSet::new();
             let mut file_has_non_import: HashSet<String> = HashSet::new();
             let mut file_has_initialization: HashSet<String> = HashSet::new();
             let mut file_has_create: HashSet<String> = HashSet::new();
             let mut file_has_register: HashSet<String> = HashSet::new();
             let mut file_has_load: HashSet<String> = HashSet::new();
+            let mut file_has_save: HashSet<String> = HashSet::new();
             for m in &results.matches {
                 if !tool_codec::looks_like_definition(&m.line) {
                     file_has_non_def.insert(m.file.clone());
@@ -469,6 +510,9 @@ impl InvestigationState {
                 }
                 if contains_load_term(&m.line) {
                     file_has_load.insert(m.file.clone());
+                }
+                if contains_save_term(&m.line) {
+                    file_has_save.insert(m.file.clone());
                 }
             }
             for path in &self.search_candidate_paths {
@@ -506,6 +550,9 @@ impl InvestigationState {
                     self.load_candidates.insert(path.clone());
                 } else {
                     self.has_non_load_candidates = true;
+                }
+                if file_has_save.contains(path) {
+                    self.save_candidates.insert(path.clone());
                 }
             }
         }
@@ -552,6 +599,7 @@ impl InvestigationState {
                 ),
                 ("load_files", self.load_candidates.len().to_string()),
                 ("has_non_load", self.has_non_load_candidates.to_string()),
+                ("save_files", self.save_candidates.len().to_string()),
             ],
         );
         was_empty
@@ -603,6 +651,10 @@ impl InvestigationState {
                 .any(|c| normalize_evidence_path(c) == read_path);
             let is_load_candidate = self
                 .load_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
+            let is_save_candidate = self
+                .save_candidates
                 .iter()
                 .any(|c| normalize_evidence_path(c) == read_path);
 
@@ -824,6 +876,41 @@ impl InvestigationState {
                     ],
                 );
                 // Correction already issued: fall through without accepting.
+            }
+            // Gate 7 (SaveLookup): non-save reads are structurally insufficient when
+            // save candidates exist. Fire once; fallback accepts if no save candidates.
+            else if matches!(mode, InvestigationMode::SaveLookup)
+                && !is_save_candidate
+                && !self.save_candidates.is_empty()
+            {
+                if !self.save_correction_issued {
+                    self.save_correction_issued = true;
+                    let suggested_path = self.first_save_candidate().map(str::to_string);
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", read_path.clone()),
+                            ("accepted", "false".into()),
+                            ("reason", "save_non_save_candidate".into()),
+                            (
+                                "recovery_path",
+                                suggested_path.clone().unwrap_or_else(|| "none".into()),
+                            ),
+                        ],
+                    );
+                    return suggested_path.map(|p| (p, RecoveryKind::Save));
+                }
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "false".into()),
+                        ("reason", "save_recovery_already_issued".into()),
+                    ],
+                );
+                // Correction already issued: fall through without accepting.
             } else {
                 // Candidate would normally be accepted. Check import-only before committing.
                 // Import-only candidates are structurally insufficient when substantive
@@ -901,6 +988,8 @@ impl InvestigationState {
             "register_fallback_no_register_candidates".into()
         } else if matches!(mode, InvestigationMode::LoadLookup) && self.load_candidates.is_empty() {
             "load_fallback_no_load_candidates".into()
+        } else if matches!(mode, InvestigationMode::SaveLookup) && self.save_candidates.is_empty() {
+            "save_fallback_no_save_candidates".into()
         } else if matches!(mode, InvestigationMode::UsageLookup)
             && is_def_only
             && !self.has_non_definition_candidates
@@ -959,6 +1048,13 @@ impl InvestigationState {
         self.search_candidate_paths
             .iter()
             .find(|path| self.load_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_save_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| self.save_candidates.contains(*path))
             .map(String::as_str)
     }
 }
@@ -1237,7 +1333,9 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
         "load",
         "loaded",
         "loading",
+        "save",
         "saved",
+        "saving",
         "stored",
         "handled",
         "called",
@@ -1257,7 +1355,7 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
 
 /// Detects the structural investigation mode from the prompt text.
 /// Evaluated in priority order so each prompt maps to exactly one mode.
-/// Priority: UsageLookup > ConfigLookup > InitializationLookup > CreateLookup > RegisterLookup > LoadLookup > DefinitionLookup > General.
+/// Priority: UsageLookup > ConfigLookup > InitializationLookup > CreateLookup > RegisterLookup > LoadLookup > SaveLookup > DefinitionLookup > General.
 fn detect_investigation_mode(text: &str) -> InvestigationMode {
     let lower = text.to_ascii_lowercase();
     if [
@@ -1297,6 +1395,9 @@ fn detect_investigation_mode(text: &str) -> InvestigationMode {
     }
     if contains_load_term(&lower) {
         return InvestigationMode::LoadLookup;
+    }
+    if contains_save_term(&lower) {
+        return InvestigationMode::SaveLookup;
     }
     if [
         "defined",
@@ -1339,6 +1440,13 @@ const LOAD_TERMS: &[&str] = &["load", "loaded", "loading"];
 fn contains_load_term(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     LOAD_TERMS.iter().any(|term| lower.contains(term))
+}
+
+const SAVE_TERMS: &[&str] = &["save", "saved", "saving"];
+
+fn contains_save_term(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    SAVE_TERMS.iter().any(|term| lower.contains(term))
 }
 
 fn contains_word(text: &str, needle: &str) -> bool {
@@ -2259,6 +2367,55 @@ fn run_tool_round(
             }
         }
 
+        // Candidate-read cap: once two matched candidates have been read without
+        // useful evidence, do not allow the model to keep reading current candidates.
+        if investigation_required
+            && !investigation.evidence_ready()
+            && investigation.candidate_reads_count >= MAX_CANDIDATE_READS_PER_INVESTIGATION
+        {
+            if let Some(rp) = read_path.as_deref() {
+                if investigation.is_search_candidate_path(rp) {
+                    trace_runtime_decision(
+                        on_event,
+                        "read_evidence",
+                        &[
+                            ("path", normalize_evidence_path(rp)),
+                            ("accepted", "false".into()),
+                            ("reason", "candidate_read_limit_exhausted".into()),
+                            (
+                                "candidate_reads",
+                                investigation.candidate_reads_count.to_string(),
+                            ),
+                        ],
+                    );
+                    trace_runtime_decision(
+                        on_event,
+                        "terminal_insufficient_evidence",
+                        &[
+                            ("reason", "candidate_read_limit_exhausted".into()),
+                            (
+                                "candidate_reads",
+                                investigation.candidate_reads_count.to_string(),
+                            ),
+                        ],
+                    );
+                    on_event(RuntimeEvent::ToolCallFinished {
+                        name: name.clone(),
+                        summary: None,
+                    });
+                    accumulated.push_str(&tool_codec::format_tool_error(
+                        &name,
+                        CANDIDATE_READ_CAP_EXCEEDED,
+                    ));
+                    return ToolRoundOutcome::TerminalAnswer {
+                        results: accumulated,
+                        answer: ungrounded_investigation_final_answer().to_string(),
+                        reason: RuntimeTerminalReason::InsufficientEvidence,
+                    };
+                }
+            }
+        }
+
         // Per-turn read cap: block new reads once MAX_READS_PER_TURN unique files have been read.
         // reads_this_turn.len() counts only successful reads, so the cap is exact.
         if read_path.is_some() && reads_this_turn.len() >= MAX_READS_PER_TURN {
@@ -2344,6 +2501,7 @@ fn run_tool_round(
                         RecoveryKind::Create => create_read_recovery_correction(&path),
                         RecoveryKind::Register => register_read_recovery_correction(&path),
                         RecoveryKind::Load => load_read_recovery_correction(&path),
+                        RecoveryKind::Save => save_read_recovery_correction(&path),
                     };
                     accumulated.push_str(&correction);
                     accumulated.push_str("\n\n");
@@ -4432,6 +4590,98 @@ mod tests {
             last_assistant,
             Some(ungrounded_investigation_final_answer()),
             "last assistant must be the runtime terminal, not model synthesis"
+        );
+    }
+
+    #[test]
+    fn third_candidate_read_after_two_insufficient_reads_is_blocked_pre_dispatch() {
+        // Usage lookup: two definition-only reads exhaust the candidate-read budget
+        // without useful evidence. If the model then tries a third distinct matched
+        // candidate read instead of synthesizing, runtime must stop before dispatch.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("models").join("enums.py"),
+            "class TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("models").join("alt_enums.py"),
+            "class TaskStatus:\n    DONE = \"done\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("task_service.py"),
+            "from models.enums import TaskStatus\nif task.status == TaskStatus.TODO:\n    pass\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                // First insufficient candidate read: recovery points to task_service.py.
+                "[read_file: models/enums.py]",
+                // Second insufficient candidate read: budget is now exhausted.
+                "[read_file: models/alt_enums.py]",
+                // Third distinct search candidate: must be blocked before dispatch.
+                "[read_file: services/task_service.py]",
+                "TaskStatus is used in services/task_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must terminate cleanly: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "third candidate read must terminate with InsufficientEvidence: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: read_file ===").count(),
+            2,
+            "third candidate read must not dispatch"
+        );
+        assert!(
+            all_user.contains("candidate read limit for this investigation reached"),
+            "blocked third read must be recorded as a runtime tool error"
+        );
+        assert!(
+            !all_user.contains("=== tool_result: read_file ===\npath: services/task_service.py"),
+            "usage candidate must not be read after the two-candidate cap"
         );
     }
 
@@ -7115,6 +7365,491 @@ mod tests {
             &mut rt,
             RuntimeRequest::Submit {
                 text: "Where are sessions loaded?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "must not fail (cap is a correction): {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: read_file ===")
+                    && m.content.contains("read limit")),
+            "read cap must block the 4th read"
+        );
+    }
+
+    // Phase 9.2.6 — SaveLookup
+
+    #[test]
+    fn detect_investigation_mode_returns_save_lookup() {
+        assert!(matches!(
+            detect_investigation_mode("Where is the session saved?"),
+            InvestigationMode::SaveLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Find where session saving happens"),
+            InvestigationMode::SaveLookup
+        ));
+        assert!(matches!(
+            detect_investigation_mode("Where do handlers save sessions?"),
+            InvestigationMode::SaveLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_load_priority_over_save() {
+        // "loaded" + "saved" in same prompt — LoadLookup wins (higher priority).
+        assert!(matches!(
+            detect_investigation_mode("Where is the session loaded and saved?"),
+            InvestigationMode::LoadLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_save_priority_over_definition() {
+        // "saved" + "defined" in same prompt — SaveLookup wins.
+        assert!(matches!(
+            detect_investigation_mode("Where is the session saved and defined?"),
+            InvestigationMode::SaveLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_usage_priority_over_save() {
+        assert!(matches!(
+            detect_investigation_mode("Where is the saved session used?"),
+            InvestigationMode::UsageLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_config_priority_over_save() {
+        assert!(matches!(
+            detect_investigation_mode("Where is saved config configured?"),
+            InvestigationMode::ConfigLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_initialization_priority_over_save() {
+        assert!(matches!(
+            detect_investigation_mode("Find where session saving is initialized"),
+            InvestigationMode::InitializationLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_create_priority_over_save() {
+        assert!(matches!(
+            detect_investigation_mode("Find where the saved session is created"),
+            InvestigationMode::CreateLookup
+        ));
+    }
+
+    #[test]
+    fn detect_investigation_mode_register_priority_over_save() {
+        assert!(matches!(
+            detect_investigation_mode("Find where the saved command is registered"),
+            InvestigationMode::RegisterLookup
+        ));
+    }
+
+    #[test]
+    fn contains_save_term_matches_exact_allowed_substrings_only() {
+        // Exact allowed terms.
+        assert!(contains_save_term("save_session(session)"));
+        assert!(contains_save_term("session was saved here"));
+        assert!(contains_save_term("session saving happens here"));
+        // Case insensitive.
+        assert!(contains_save_term("Session.Save()"));
+        assert!(contains_save_term("SAVED_SESSION"));
+        // Noisy: substring of longer word — these DO match (substring semantics).
+        assert!(contains_save_term("autosave session"));
+        assert!(contains_save_term("savepoint created"));
+        assert!(contains_save_term("saved_at timestamp"));
+        // Not a save term.
+        assert!(!contains_save_term("def handle_session(session):"));
+        assert!(!contains_save_term("return session_id"));
+    }
+
+    #[test]
+    fn save_lookup_non_save_read_triggers_recovery_to_save_file() {
+        // File A: no save-term matches → non-save candidate.
+        // File B: a save-term match → save candidate.
+        // Model reads A first → recovery fires pointing to B.
+        // Model reads B → evidence ready → ToolAssisted.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_handler.py"),
+            "def handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_store.py"),
+            "def store_session(session):\n    save_session(session)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // Reads the non-save file first — recovery fires.
+                "[read_file: services/session_handler.py]",
+                // Follows recovery, reads the save file.
+                "[read_file: services/session_store.py]",
+                "Sessions are saved in services/session_store.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions saved?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| m.content.contains("save lookup")
+                && m.content.contains("services/session_store.py")),
+            "save recovery correction must point to the save candidate"
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "save lookup + recovery + save read must admit synthesis: {answer_source:?}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Sessions are saved in services/session_store.py.")
+        );
+    }
+
+    #[test]
+    fn save_lookup_no_save_candidates_degrades_cleanly() {
+        // All candidates have no save-term matches.
+        // Gate does not fire — any read is accepted (fallback behavior).
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_handler.py"),
+            "def handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                "[read_file: services/session_handler.py]",
+                "Sessions are handled in services/session_handler.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions saved?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "save lookup with no save candidates must degrade to acceptance: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Sessions are handled in services/session_handler.py.")
+        );
+    }
+
+    #[test]
+    fn save_lookup_second_non_save_candidate_after_recovery_is_not_accepted() {
+        // After one recovery the correction flag is set.
+        // A second non-save read falls through the gate without accepting.
+        // With candidate_reads_count == 2 and evidence_ready false, the runtime
+        // terminates with InsufficientEvidence.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::create_dir_all(tmp.path().join("controllers")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_handler.py"),
+            "def handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("controllers").join("session_controller.py"),
+            "def show_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_store.py"),
+            "def store_session(session):\n    save_session(session)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // First read: non-save → recovery fires pointing to session_store.py.
+                "[read_file: services/session_handler.py]",
+                // Second read: another non-save (ignores recovery, reads wrong file).
+                "[read_file: controllers/session_controller.py]",
+                // Model attempts synthesis — candidate limit hit; runtime terminates.
+                "Sessions are saved in services/session_handler.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions saved?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "two non-save reads must terminate with InsufficientEvidence: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn save_lookup_noisy_save_term_in_comment_still_classifies_as_save() {
+        // A line like "# TODO: save session data" contains "save".
+        // The classification is structural/substring — comments match the same as code.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("services")).unwrap();
+        fs::write(
+            tmp.path().join("services").join("session_service.py"),
+            "# TODO: save session data\ndef handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // Comment-containing file is a save candidate (substring match).
+                // Model reads it directly — evidence accepted.
+                "[read_file: services/session_service.py]",
+                "Sessions are handled in services/session_service.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions saved?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            !snapshot.iter().any(|m| m.content.contains("save lookup")),
+            "no recovery expected when save candidate is read first"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "save candidate read must admit synthesis: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn save_lookup_path_scope_keeps_candidates_inside_scope() {
+        // Prompt scope must remain the upper bound. The out-of-scope save
+        // file is stronger-looking but must not appear in search candidates.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/controllers")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("sandbox/services")
+                .join("session_handler.py"),
+            "def handle_session(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services").join("session_store.py"),
+            "def store_session(session):\n    save_session(session)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path()
+                .join("sandbox/controllers")
+                .join("session_store.py"),
+            "def store_session(session):\n    save_session(session)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                "[read_file: sandbox/services/session_handler.py]",
+                "[read_file: sandbox/services/session_store.py]",
+                "Sessions are saved in sandbox/services/session_store.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where sessions are saved in sandbox/services/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            search_result.contains("sandbox/services/session_handler.py"),
+            "scoped search must include in-scope non-save candidate: {search_result}"
+        );
+        assert!(
+            search_result.contains("sandbox/services/session_store.py"),
+            "scoped search must include in-scope save candidate: {search_result}"
+        );
+        assert!(
+            !search_result.contains("sandbox/controllers/session_store.py"),
+            "scoped search must exclude out-of-scope save candidate: {search_result}"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("Sessions are saved in sandbox/services/session_store.py.")
+        );
+    }
+
+    #[test]
+    fn save_lookup_read_cap_still_applies() {
+        // MaxReadsPerTurn must still apply under SaveLookup.
+        // After 3 reads the runtime blocks further reads regardless of mode.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        for dir in &["a", "b", "c", "d"] {
+            fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        }
+        fs::write(
+            tmp.path().join("a").join("session.py"),
+            "def session_a(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("b").join("session.py"),
+            "def session_b(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("c").join("session.py"),
+            "def session_c(session):\n    return session.id\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("d").join("session.py"),
+            "save_session(session)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: session]",
+                // Reads 3 non-save files — hits cap before reaching save file.
+                "[read_file: a/session.py]",
+                "[read_file: b/session.py]",
+                "[read_file: c/session.py]",
+                "[read_file: d/session.py]",
+                "Sessions are saved in d/session.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where are sessions saved?".into(),
             },
         );
 
