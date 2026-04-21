@@ -179,6 +179,8 @@ const READ_CAP_EXCEEDED: &str =
 const CANDIDATE_READ_CAP_EXCEEDED: &str =
     "candidate read limit for this investigation reached. No additional matched files will be read.";
 
+const NO_LAST_READ_FILE_AVAILABLE: &str = "No previous file is available to read.";
+
 const LIST_DIR_BEFORE_SEARCH_BLOCKED: &str =
     "[runtime: code investigation questions require search_code, not list_dir.\nUse search_code with a keyword from the question — a function name, variable, or concept.]";
 
@@ -1585,6 +1587,27 @@ fn requested_read_path(text: &str) -> Option<String> {
     }
 }
 
+fn is_last_read_file_anchor_prompt(text: &str) -> bool {
+    let normalized = normalize_anchor_prompt(text);
+    matches!(
+        normalized.as_str(),
+        "read that file"
+            | "read that file again"
+            | "read the last file"
+            | "open that file"
+            | "open that file again"
+            | "open the last file"
+    )
+}
+
+fn normalize_anchor_prompt(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|c: char| matches!(c, '.' | '?' | '!' | ',' | ';' | ':'))
+        .to_ascii_lowercase()
+}
+
 /// Returns true if the path's file extension identifies it as a config file.
 /// Classification is purely extension-based — no content analysis or filename heuristics.
 /// Handles the exact `.env` dotfile explicitly since `Path::extension()` returns None for it.
@@ -1635,6 +1658,26 @@ fn is_mutating_tool(input: &ToolInput) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Default)]
+struct AnchorState {
+    last_read_file: Option<String>,
+}
+
+impl AnchorState {
+    fn clear(&mut self) {
+        self.last_read_file = None;
+    }
+
+    fn record_successful_read(&mut self, output: &ToolOutput) -> Option<String> {
+        if let ToolOutput::FileContents(file) = output {
+            let path = file.path.clone();
+            self.last_read_file = Some(path.clone());
+            return Some(path);
+        }
+        None
+    }
+}
+
 /// snake_case: contains underscore, ≥2 segments, each segment ≥2 alphanumeric chars.
 fn is_snake_case_identifier(token: &str) -> bool {
     if !token.contains('_') {
@@ -1667,6 +1710,7 @@ pub struct Runtime {
     backend: Box<dyn ModelBackend>,
     registry: ToolRegistry,
     system_prompt: String,
+    anchors: AnchorState,
     /// Holds a mutating tool action that is waiting for user approval.
     /// Set when a tool round suspends; cleared by Approve or Reject.
     /// At most one pending action exists at any time.
@@ -1706,6 +1750,7 @@ impl Runtime {
             backend,
             registry,
             system_prompt,
+            anchors: AnchorState::default(),
             pending_action: None,
         }
     }
@@ -1735,6 +1780,12 @@ impl Runtime {
 
     fn handle_reset(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
         self.pending_action = None;
+        self.anchors.clear();
+        trace_runtime_decision(
+            on_event,
+            "anchor_cleared",
+            &[("kind", "last_read_file".into())],
+        );
         self.conversation.reset(self.system_prompt.clone());
         on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
     }
@@ -1757,9 +1808,98 @@ impl Runtime {
             return;
         }
 
+        let is_last_read_file_anchor = is_last_read_file_anchor_prompt(trimmed);
         self.conversation.push_user(text);
         on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+        if is_last_read_file_anchor {
+            trace_runtime_decision(
+                on_event,
+                "anchor_prompt_matched",
+                &[("kind", "last_read_file".into())],
+            );
+            if let Some(path) = self.anchors.last_read_file.clone() {
+                trace_runtime_decision(
+                    on_event,
+                    "anchor_resolved",
+                    &[("kind", "last_read_file".into()), ("path", path.clone())],
+                );
+                self.run_last_read_file_anchor(path, on_event);
+            } else {
+                trace_runtime_decision(
+                    on_event,
+                    "anchor_missing",
+                    &[("kind", "last_read_file".into())],
+                );
+                self.finish_with_runtime_answer(
+                    NO_LAST_READ_FILE_AVAILABLE,
+                    AnswerSource::RuntimeTerminal {
+                        reason: RuntimeTerminalReason::ReadFileFailed,
+                        rounds: 0,
+                    },
+                    on_event,
+                );
+            }
+            return;
+        }
         self.run_turns(0, on_event);
+    }
+
+    fn run_last_read_file_anchor(&mut self, path: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        let mut last_call_key: Option<String> = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn: HashSet<String> = HashSet::new();
+        let mut requested_read_completed = false;
+
+        on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
+        match run_tool_round(
+            &self.registry,
+            vec![ToolInput::ReadFile { path }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut self.anchors,
+            false,
+            false,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            on_event,
+        ) {
+            ToolRoundOutcome::Completed { results } => {
+                self.conversation.push_user(results);
+                self.conversation.trim_tool_exchanges_if_needed();
+                on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
+                self.run_turns_with_initial_reads(1, reads_this_turn, on_event);
+            }
+            ToolRoundOutcome::TerminalAnswer {
+                results,
+                answer,
+                reason,
+            } => {
+                self.conversation.push_user(results);
+                self.conversation.trim_tool_exchanges_if_needed();
+                self.finish_with_runtime_answer(
+                    &answer,
+                    AnswerSource::RuntimeTerminal { reason, rounds: 1 },
+                    on_event,
+                );
+            }
+            ToolRoundOutcome::ApprovalRequired {
+                accumulated,
+                pending,
+            } => {
+                if !accumulated.is_empty() {
+                    self.conversation.push_user(accumulated);
+                    self.conversation.trim_tool_exchanges_if_needed();
+                }
+                self.pending_action = Some(pending.clone());
+                on_event(RuntimeEvent::ApprovalRequired(pending));
+                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+            }
+        }
     }
 
     fn handle_approve(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
@@ -1840,12 +1980,20 @@ impl Runtime {
     /// Runs the generate -> tool-round loop until the model produces a final answer,
     /// the tool round limit is reached, or a tool action requires approval.
     /// `tool_rounds` is the count already consumed before this call (0 for a fresh turn).
-    fn run_turns(&mut self, mut tool_rounds: usize, on_event: &mut dyn FnMut(RuntimeEvent)) {
+    fn run_turns(&mut self, tool_rounds: usize, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        self.run_turns_with_initial_reads(tool_rounds, HashSet::new(), on_event);
+    }
+
+    fn run_turns_with_initial_reads(
+        &mut self,
+        mut tool_rounds: usize,
+        mut reads_this_turn: HashSet<String>,
+        on_event: &mut dyn FnMut(RuntimeEvent),
+    ) {
         let mut corrections = 0usize;
         let mut last_call_key: Option<String> = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
-        let mut reads_this_turn: HashSet<String> = HashSet::new();
         let mut requested_read_completed = false;
         let mut read_request_correction_issued = false;
         // Computed once from the original user message. Excludes tool result/error injections
@@ -2145,6 +2293,7 @@ impl Runtime {
                 &mut search_budget,
                 &mut investigation,
                 &mut reads_this_turn,
+                &mut self.anchors,
                 mutation_allowed,
                 investigation_required,
                 investigation_mode,
@@ -2234,6 +2383,7 @@ fn run_tool_round(
     search_budget: &mut SearchBudget,
     investigation: &mut InvestigationState,
     reads_this_turn: &mut HashSet<String>,
+    anchors: &mut AnchorState,
     mutation_allowed: bool,
     investigation_required: bool,
     investigation_mode: InvestigationMode,
@@ -2462,6 +2612,13 @@ fn run_tool_round(
                 };
                 // Track successful file reads for evidence grounding and dedup.
                 let read_recovery = if name == "read_file" {
+                    if let Some(path) = anchors.record_successful_read(&output) {
+                        trace_runtime_decision(
+                            on_event,
+                            "anchor_updated",
+                            &[("kind", "last_read_file".into()), ("path", path)],
+                        );
+                    }
                     let recovery =
                         investigation.record_read_result(&output, investigation_mode, on_event);
                     if let Some(requested) = requested_read_path {
@@ -3243,6 +3400,386 @@ mod tests {
             Some("src/runtime/engine.rs")
         );
         assert_eq!(requested_read_path("Read about logging"), None);
+    }
+
+    #[test]
+    fn successful_read_file_updates_last_read_file_anchor() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src/runtime")).unwrap();
+        fs::write(
+            tmp.path().join("src/runtime/engine.rs"),
+            "fn run_turns() {}\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec!["[read_file: src/runtime/engine.rs]", "Read engine.rs."],
+            tmp.path(),
+        );
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read src/runtime/engine.rs".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "unexpected failure: {events:?}");
+        let expected_path = tmp
+            .path()
+            .join("src/runtime/engine.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            rt.anchors.last_read_file.as_deref(),
+            Some(expected_path.as_str())
+        );
+    }
+
+    #[test]
+    fn read_that_file_again_dispatches_one_read_to_anchor() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/anchor.rs"), "fn anchor() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: src/anchor.rs]",
+                "First read complete.",
+                "Anchored read complete.",
+            ],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read src/anchor.rs".into(),
+            },
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read that file again".into(),
+            },
+        );
+
+        let read_starts = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "read_file"))
+            .count();
+        assert_eq!(read_starts, 1, "anchor prompt must dispatch one read");
+        let expected_path = tmp
+            .path()
+            .join("src/anchor.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            events.iter().any(|e| {
+                matches!(
+                    e,
+                    RuntimeEvent::ToolCallFinished {
+                        name,
+                        summary: Some(summary)
+                    } if name == "read_file" && summary.contains(&expected_path)
+                )
+            }),
+            "anchored read must target the last successful path: {events:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some("Anchored read complete."));
+    }
+
+    #[test]
+    fn open_the_last_file_resolves_to_last_read_file_anchor() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/last.rs"), "fn last() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: src/last.rs]",
+                "First read complete.",
+                "Opened last file.",
+            ],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read src/last.rs".into(),
+            },
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "open the last file".into(),
+            },
+        );
+
+        let expected_path = tmp
+            .path()
+            .join("src/last.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            events.iter().any(|e| {
+                matches!(
+                    e,
+                    RuntimeEvent::ToolCallFinished {
+                        name,
+                        summary: Some(summary)
+                    } if name == "read_file" && summary.contains(&expected_path)
+                )
+            }),
+            "open the last file must read the anchored path: {events:?}"
+        );
+    }
+
+    #[test]
+    fn reset_clears_last_read_file_anchor() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/reset.rs"), "fn reset_anchor() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec!["[read_file: src/reset.rs]", "First read complete."],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read src/reset.rs".into(),
+            },
+        );
+        assert!(rt.anchors.last_read_file.is_some());
+
+        collect_events(&mut rt, RuntimeRequest::Reset);
+        assert_eq!(rt.anchors.last_read_file, None);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read that file".into(),
+            },
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantMessageChunk(chunk)
+                    if chunk == NO_LAST_READ_FILE_AVAILABLE
+            )),
+            "reset anchor prompt must produce deterministic no-anchor answer: {events:?}"
+        );
+    }
+
+    #[test]
+    fn failed_read_file_does_not_update_last_read_file_anchor() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/good.rs"), "fn good() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: src/good.rs]",
+                "First read complete.",
+                "[read_file: src/missing.rs]",
+            ],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read src/good.rs".into(),
+            },
+        );
+        let anchored_path = rt.anchors.last_read_file.clone();
+        assert!(anchored_path.is_some());
+
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read src/missing.rs".into(),
+            },
+        );
+        assert_eq!(
+            rt.anchors.last_read_file, anchored_path,
+            "failed reads must not replace the last successful read anchor"
+        );
+    }
+
+    #[test]
+    fn no_anchor_followup_returns_deterministic_failure() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(Vec::<String>::new(), tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read that file".into(),
+            },
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantMessageChunk(chunk)
+                    if chunk == NO_LAST_READ_FILE_AVAILABLE
+            )),
+            "no-anchor prompt must produce deterministic runtime answer: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { .. })),
+            "no-anchor prompt must not guess or dispatch tools: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::ReadFileFailed,
+                    ..
+                })
+            ),
+            "no-anchor prompt must terminate as runtime-owned read failure: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_anchor_phrases_do_not_resolve_last_read_file() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/anchor.rs"), "fn anchor() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: src/anchor.rs]",
+                "First read complete.",
+                "Not an anchor.",
+                "Still not an anchor.",
+                "Also not an anchor.",
+            ],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read src/anchor.rs".into(),
+            },
+        );
+        assert!(rt.anchors.last_read_file.is_some());
+
+        for phrase in ["open it", "read that", "open the second result"] {
+            let events = collect_events(
+                &mut rt,
+                RuntimeRequest::Submit {
+                    text: phrase.into(),
+                },
+            );
+            assert!(
+                !events.iter().any(
+                    |e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "read_file")
+                ),
+                "unsupported phrase `{phrase}` must not resolve the last-read anchor: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_read_counts_against_same_turn_read_cap() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        for file in ["anchor.rs", "b.rs", "c.rs", "d.rs"] {
+            fs::write(
+                tmp.path().join("src").join(file),
+                format!("fn {}() {{}}\n", file.replace(".rs", "")),
+            )
+            .unwrap();
+        }
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: src/anchor.rs]",
+                "First read complete.",
+                "[read_file: src/b.rs]",
+                "[read_file: src/c.rs]",
+                "[read_file: src/d.rs]",
+                "I have enough file evidence.",
+            ],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read src/anchor.rs".into(),
+            },
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read that file again".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must complete without failure: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            all_user.matches("=== tool_result: read_file ===").count(),
+            4,
+            "first turn read plus three second-turn reads must succeed"
+        );
+        assert!(
+            all_user.contains("=== tool_error: read_file ===")
+                && all_user.contains("read limit for this turn"),
+            "fourth read in the anchor turn must be blocked by the normal read cap"
+        );
     }
 
     #[test]
