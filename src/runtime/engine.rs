@@ -6,14 +6,19 @@ use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
 use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
 
-use super::anchors::{is_last_read_file_anchor_prompt, is_last_search_anchor_prompt, AnchorState};
+use super::anchors::{
+    has_same_scope_reference, is_last_read_file_anchor_prompt, is_last_search_anchor_prompt,
+    AnchorState,
+};
 use super::conversation::Conversation;
+#[cfg(test)]
 use super::investigation::{
     contains_create_term, contains_initialization_term, contains_load_term, contains_register_term,
-    contains_save_term, InvestigationMode, InvestigationState, RecoveryKind,
+    contains_save_term, is_config_file, looks_like_import,
 };
-#[cfg(test)]
-use super::investigation::{is_config_file, looks_like_import};
+use super::investigation::{
+    detect_investigation_mode, InvestigationMode, InvestigationState, RecoveryKind,
+};
 use super::prompt;
 use super::tool_codec;
 use super::types::{Activity, AnswerSource, RuntimeEvent, RuntimeRequest, RuntimeTerminalReason};
@@ -186,6 +191,7 @@ const CANDIDATE_READ_CAP_EXCEEDED: &str =
 
 const NO_LAST_READ_FILE_AVAILABLE: &str = "No previous file is available to read.";
 const NO_LAST_SEARCH_AVAILABLE: &str = "No previous search is available to repeat.";
+const NO_LAST_SCOPED_SEARCH_AVAILABLE: &str = "No previous scoped search is available to reuse.";
 const LAST_SEARCH_REPLAYED: &str = "Repeated the last search.";
 const LAST_SEARCH_REPLAY_FAILED: &str = "Could not repeat the previous search.";
 
@@ -510,67 +516,6 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
     ]
     .iter()
     .any(|term| contains_word(&lower, term))
-}
-
-/// Detects the structural investigation mode from the prompt text.
-/// Evaluated in priority order so each prompt maps to exactly one mode.
-/// Priority: UsageLookup > ConfigLookup > InitializationLookup > CreateLookup > RegisterLookup > LoadLookup > SaveLookup > DefinitionLookup > General.
-fn detect_investigation_mode(text: &str) -> InvestigationMode {
-    let lower = text.to_ascii_lowercase();
-    if [
-        "use",
-        "used",
-        "uses",
-        "usage",
-        "reference",
-        "referenced",
-        "references",
-        "occur",
-        "occurs",
-        "occurrence",
-        "occurrences",
-        "appear",
-        "appears",
-    ]
-    .iter()
-    .any(|term| contains_word(&lower, term))
-    {
-        return InvestigationMode::UsageLookup;
-    }
-    if ["config", "configured", "configuration", "configure"]
-        .iter()
-        .any(|term| contains_word(&lower, term))
-    {
-        return InvestigationMode::ConfigLookup;
-    }
-    if contains_initialization_term(&lower) {
-        return InvestigationMode::InitializationLookup;
-    }
-    if contains_create_term(&lower) {
-        return InvestigationMode::CreateLookup;
-    }
-    if contains_register_term(&lower) {
-        return InvestigationMode::RegisterLookup;
-    }
-    if contains_load_term(&lower) {
-        return InvestigationMode::LoadLookup;
-    }
-    if contains_save_term(&lower) {
-        return InvestigationMode::SaveLookup;
-    }
-    if [
-        "defined",
-        "definition",
-        "declared",
-        "declares",
-        "declaration",
-    ]
-    .iter()
-    .any(|term| contains_word(&lower, term))
-    {
-        return InvestigationMode::DefinitionLookup;
-    }
-    InvestigationMode::General
 }
 
 fn contains_word(text: &str, needle: &str) -> bool {
@@ -1187,11 +1132,52 @@ impl Runtime {
         let investigation_mode = original_user_prompt
             .map(detect_investigation_mode)
             .unwrap_or(InvestigationMode::General);
-        let investigation_path_scope: Option<String> = if investigation_required {
+        let explicit_investigation_path_scope: Option<String> = if investigation_required {
             original_user_prompt.and_then(extract_investigation_path_scope)
         } else {
             None
         };
+        let same_scope_reference = investigation_required
+            && explicit_investigation_path_scope.is_none()
+            && original_user_prompt.is_some_and(has_same_scope_reference);
+        let investigation_path_scope: Option<String> =
+            if let Some(scope) = explicit_investigation_path_scope {
+                Some(scope)
+            } else if same_scope_reference {
+                trace_runtime_decision(
+                    on_event,
+                    "anchor_prompt_matched",
+                    &[("kind", "same_scope".into())],
+                );
+                match self.anchors.last_scoped_search_scope().map(str::to_string) {
+                    Some(scope) => {
+                        trace_runtime_decision(
+                            on_event,
+                            "anchor_resolved",
+                            &[("kind", "same_scope".into()), ("scope", scope.clone())],
+                        );
+                        Some(scope)
+                    }
+                    None => {
+                        trace_runtime_decision(
+                            on_event,
+                            "anchor_missing",
+                            &[("kind", "same_scope".into())],
+                        );
+                        self.finish_with_runtime_answer(
+                            NO_LAST_SCOPED_SEARCH_AVAILABLE,
+                            AnswerSource::RuntimeTerminal {
+                                reason: RuntimeTerminalReason::InsufficientEvidence,
+                                rounds: tool_rounds,
+                            },
+                            on_event,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
         trace_runtime_decision(
             on_event,
             "investigation_mode_detected",
@@ -3318,6 +3304,355 @@ mod tests {
         assert!(!is_last_search_anchor_prompt("search again"));
         assert!(is_last_search_anchor_prompt("search that again"));
         assert!(is_last_search_anchor_prompt("repeat the last search"));
+    }
+
+    #[test]
+    fn same_scope_followup_reuses_last_successful_scoped_search_scope() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/logging.py"),
+            "def initialize_logging():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/database.yaml"),
+            "database: sqlite:///service.db\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("src/database.yaml"),
+            "database: sqlite:///wrong.db\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging]",
+                "[read_file: sandbox/services/logging.py]",
+                "logging is initialized in sandbox/services/logging.py.",
+                "[search_code: database]",
+                "[read_file: sandbox/services/database.yaml]",
+                "database is configured in sandbox/services/database.yaml.",
+            ],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where logging is initialized in sandbox/services/".into(),
+            },
+        );
+        assert_eq!(rt.anchors.last_search_scope(), Some("sandbox/services/"));
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where database is configured in the same folder".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        let search_result = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            search_result.contains("sandbox/services/database.yaml"),
+            "same-scope search must include in-scope config: {search_result}"
+        );
+        assert!(
+            !search_result.contains("src/database.yaml"),
+            "same-scope search must exclude out-of-scope config: {search_result}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("database is configured in sandbox/services/database.yaml.")
+        );
+    }
+
+    #[test]
+    fn same_scope_followup_without_prior_search_fails_deterministically() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(Vec::<String>::new(), tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where database is configured in the same folder".into(),
+            },
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantMessageChunk(chunk)
+                    if chunk == NO_LAST_SCOPED_SEARCH_AVAILABLE
+            )),
+            "missing same-scope anchor must produce deterministic answer: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { .. })),
+            "missing same-scope anchor must not dispatch tools: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "missing same-scope anchor must terminate as insufficient evidence: {answer_source:?}"
+        );
+    }
+
+    #[test]
+    fn same_scope_followup_after_unscoped_search_fails_deterministically() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn needle() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec!["[search_code: needle]", "Search complete."],
+            tmp.path(),
+        );
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "tool check".into(),
+            },
+        );
+        assert_eq!(rt.anchors.last_search_query(), Some("needle"));
+        assert_eq!(rt.anchors.last_search_scope(), None);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where database is configured within the same scope".into(),
+            },
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantMessageChunk(chunk)
+                    if chunk == NO_LAST_SCOPED_SEARCH_AVAILABLE
+            )),
+            "unscoped last search must not provide same-scope continuity: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { .. })),
+            "unscoped last search must not fall back to global search: {events:?}"
+        );
+    }
+
+    #[test]
+    fn same_scope_followup_explicit_concrete_path_takes_precedence() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/config")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/config/database.yaml"),
+            "database: sqlite:///config.db\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/database.yaml"),
+            "database: sqlite:///service.db\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: database]",
+                "[read_file: sandbox/config/database.yaml]",
+                "database is configured in sandbox/config/database.yaml.",
+            ],
+            tmp.path(),
+        );
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where database is configured in sandbox/config/ and in the same folder"
+                    .into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        let search_result = snapshot
+            .iter()
+            .find(|m| m.content.contains("=== tool_result: search_code ==="))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            search_result.contains("sandbox/config/database.yaml"),
+            "explicit scope must be used even with same-scope phrase: {search_result}"
+        );
+        assert!(
+            !search_result.contains("sandbox/services/database.yaml"),
+            "same-scope phrase must not override explicit concrete scope: {search_result}"
+        );
+    }
+
+    #[test]
+    fn unsupported_same_scope_phrases_do_not_match() {
+        assert!(!has_same_scope_reference("Find database in the same place"));
+        assert!(!has_same_scope_reference("Find it there"));
+        assert!(!has_same_scope_reference("Search the same place"));
+        assert!(!has_same_scope_reference("Find database in this folder"));
+        assert!(!has_same_scope_reference(
+            "Find database in the same folderish"
+        ));
+        assert!(!has_same_scope_reference(
+            "Find database within the same scopekeeper"
+        ));
+        assert!(has_same_scope_reference("Find database in the same folder"));
+        assert!(has_same_scope_reference(
+            "Find database within the same directory"
+        ));
+        assert!(has_same_scope_reference(
+            "Find database within the same scope"
+        ));
+    }
+
+    #[test]
+    fn same_scope_forced_broader_path_clamps_to_prior_scoped_search() {
+        use std::collections::HashSet;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/logging.py"),
+            "def initialize_logging():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/database.yaml"),
+            "database: sqlite:///service.db\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("src/database.yaml"),
+            "database: sqlite:///wrong.db\n",
+        )
+        .unwrap();
+
+        let registry = default_registry(tmp.path().to_path_buf());
+        let mut anchors = AnchorState::default();
+        let mut events = Vec::new();
+
+        let mut seed_last_call_key = None;
+        let mut seed_search_budget = SearchBudget::new();
+        let mut seed_investigation = InvestigationState::new();
+        let mut seed_reads_this_turn = HashSet::new();
+        let mut seed_requested_read_completed = false;
+        let seed_outcome = run_tool_round(
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "logging".into(),
+                path: Some("sandbox/services/".into()),
+            }],
+            &mut seed_last_call_key,
+            &mut seed_search_budget,
+            &mut seed_investigation,
+            &mut seed_reads_this_turn,
+            &mut anchors,
+            false,
+            true,
+            InvestigationMode::InitializationLookup,
+            None,
+            &mut seed_requested_read_completed,
+            None,
+            &mut |e| events.push(e),
+        );
+        assert!(
+            matches!(seed_outcome, ToolRoundOutcome::Completed { .. }),
+            "seed scoped search must complete"
+        );
+        assert_eq!(
+            anchors.last_scoped_search_scope(),
+            Some("sandbox/services/")
+        );
+
+        let same_scope = anchors
+            .last_scoped_search_scope()
+            .map(str::to_string)
+            .expect("seeded scoped search");
+        let mut last_call_key = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn = HashSet::new();
+        let mut requested_read_completed = false;
+        let outcome = run_tool_round(
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "database".into(),
+                path: Some("src/".into()),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            false,
+            true,
+            InvestigationMode::ConfigLookup,
+            None,
+            &mut requested_read_completed,
+            Some(&same_scope),
+            &mut |e| events.push(e),
+        );
+
+        let results = match outcome {
+            ToolRoundOutcome::Completed { results } => results,
+            _ => panic!("forced same-scope clamp should complete"),
+        };
+        assert!(
+            results.contains("sandbox/services/database.yaml"),
+            "clamped same-scope search must include prior scoped path: {results}"
+        );
+        assert!(
+            !results.contains("src/database.yaml"),
+            "broader model path must be clamped away from src/: {results}"
+        );
+        assert_eq!(
+            anchors.last_scoped_search_scope(),
+            Some("sandbox/services/")
+        );
     }
 
     #[test]

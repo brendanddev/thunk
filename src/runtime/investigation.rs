@@ -3,7 +3,6 @@ use std::path::Path;
 
 use crate::tools::ToolOutput;
 
-use super::tool_codec;
 use super::types::RuntimeEvent;
 
 const RUNTIME_TRACE_ENV: &str = "PARAMS_TRACE_RUNTIME";
@@ -79,6 +78,11 @@ pub(super) fn contains_save_term(text: &str) -> bool {
     SAVE_TERMS.iter().any(|term| lower.contains(term))
 }
 
+fn contains_word(text: &str, needle: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|token| token == needle)
+}
+
 /// Returns true if the path's file extension identifies it as a config file.
 /// Classification is purely extension-based — no content analysis or filename heuristics.
 /// Handles the exact `.env` dotfile explicitly since `Path::extension()` returns None for it.
@@ -112,6 +116,38 @@ pub(super) fn looks_like_import(line: &str) -> bool {
     t.starts_with("import ")
         // `from X import Y` — Python
         || (t.starts_with("from ") && t.contains(" import "))
+}
+
+/// Returns true if the line (after stripping leading whitespace) looks like a symbol definition.
+/// Coverage: Rust, Python, Go, TypeScript, JavaScript.
+/// C/C++ patterns are excluded — too many false positives without a type parser.
+/// No regex, no scoring — prefix matching only.
+fn looks_like_definition(line: &str) -> bool {
+    let t = line.trim_start();
+    // Rust
+    t.starts_with("pub enum ")
+        || t.starts_with("pub struct ")
+        || t.starts_with("pub fn ")
+        || t.starts_with("pub type ")
+        || t.starts_with("pub trait ")
+        || t.starts_with("pub const ")
+        || t.starts_with("pub static ")
+        || t.starts_with("enum ")
+        || t.starts_with("struct ")
+        || t.starts_with("fn ")
+        || t.starts_with("type ")
+        || t.starts_with("const ")
+        || t.starts_with("trait ")
+        || t.starts_with("impl ")
+        // Python / TypeScript / JavaScript (shared keywords)
+        || t.starts_with("class ")
+        // Python
+        || t.starts_with("def ")
+        // Go
+        || t.starts_with("func ")
+        // TypeScript / JavaScript
+        || t.starts_with("function ")
+        || t.starts_with("interface ")
 }
 
 /// Structural mode for the current investigation turn.
@@ -161,6 +197,67 @@ impl InvestigationMode {
             InvestigationMode::SaveLookup => "SaveLookup",
         }
     }
+}
+
+/// Detects the structural investigation mode from the prompt text.
+/// Evaluated in priority order so each prompt maps to exactly one mode.
+/// Priority: UsageLookup > ConfigLookup > InitializationLookup > CreateLookup > RegisterLookup > LoadLookup > SaveLookup > DefinitionLookup > General.
+pub(super) fn detect_investigation_mode(text: &str) -> InvestigationMode {
+    let lower = text.to_ascii_lowercase();
+    if [
+        "use",
+        "used",
+        "uses",
+        "usage",
+        "reference",
+        "referenced",
+        "references",
+        "occur",
+        "occurs",
+        "occurrence",
+        "occurrences",
+        "appear",
+        "appears",
+    ]
+    .iter()
+    .any(|term| contains_word(&lower, term))
+    {
+        return InvestigationMode::UsageLookup;
+    }
+    if ["config", "configured", "configuration", "configure"]
+        .iter()
+        .any(|term| contains_word(&lower, term))
+    {
+        return InvestigationMode::ConfigLookup;
+    }
+    if contains_initialization_term(&lower) {
+        return InvestigationMode::InitializationLookup;
+    }
+    if contains_create_term(&lower) {
+        return InvestigationMode::CreateLookup;
+    }
+    if contains_register_term(&lower) {
+        return InvestigationMode::RegisterLookup;
+    }
+    if contains_load_term(&lower) {
+        return InvestigationMode::LoadLookup;
+    }
+    if contains_save_term(&lower) {
+        return InvestigationMode::SaveLookup;
+    }
+    if [
+        "defined",
+        "definition",
+        "declared",
+        "declares",
+        "declaration",
+    ]
+    .iter()
+    .any(|term| contains_word(&lower, term))
+    {
+        return InvestigationMode::DefinitionLookup;
+    }
+    InvestigationMode::General
 }
 
 /// Distinguishes which structural insufficiency caused a candidate read to be rejected.
@@ -425,7 +522,7 @@ impl InvestigationState {
             let mut file_has_load: HashSet<String> = HashSet::new();
             let mut file_has_save: HashSet<String> = HashSet::new();
             for m in &results.matches {
-                if !tool_codec::looks_like_definition(&m.line) {
+                if !looks_like_definition(&m.line) {
                     file_has_non_def.insert(m.file.clone());
                 }
                 if !looks_like_import(&m.line) {

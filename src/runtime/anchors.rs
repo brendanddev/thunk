@@ -8,6 +8,7 @@ use crate::tools::ToolOutput;
 /// Supported anchors:
 /// - last_read_file: updated from successful `read_file`
 /// - last_search: updated from successful `search_code`
+/// - last_search_scope: reused only for explicit same-scope follow-up prompts
 ///
 /// Anchors are intentionally:
 /// - exact-match only (no semantic / pronoun / ordinal resolution)
@@ -73,6 +74,11 @@ impl AnchorState {
             .map(|query| (query, self.last_search_scope.clone()))
     }
 
+    /// Returns the scope from the last successful scoped search, if any.
+    pub(super) fn last_scoped_search_scope(&self) -> Option<&str> {
+        self.last_search_scope.as_deref()
+    }
+
     #[cfg(test)]
     pub(super) fn last_search_query(&self) -> Option<&str> {
         self.last_search_query.as_deref()
@@ -118,6 +124,51 @@ pub(super) fn is_last_search_anchor_prompt(text: &str) -> bool {
             | "search the last query"
             | "search the last query again"
     )
+}
+
+/// Returns true if the input contains a supported explicit same-scope reference.
+///
+/// Matching is structural only. These phrases reuse the last successful scoped
+/// search's effective scope; they do not resolve pronouns or infer paths.
+pub(super) fn has_same_scope_reference(text: &str) -> bool {
+    let normalized = normalize_anchor_prompt(text);
+    [
+        "in the same folder",
+        "within the same folder",
+        "in the same directory",
+        "within the same directory",
+        "in the same scope",
+        "within the same scope",
+    ]
+    .iter()
+    .any(|phrase| contains_normalized_phrase(&normalized, phrase))
+}
+
+fn contains_normalized_phrase(text: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(offset) = text[start..].find(phrase) {
+        let idx = start + offset;
+        let before_ok = idx == 0
+            || text[..idx]
+                .chars()
+                .next_back()
+                .is_none_or(is_phrase_boundary);
+        let after_idx = idx + phrase.len();
+        let after_ok = after_idx >= text.len()
+            || text[after_idx..]
+                .chars()
+                .next()
+                .is_none_or(is_phrase_boundary);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + phrase.len();
+    }
+    false
+}
+
+fn is_phrase_boundary(c: char) -> bool {
+    !c.is_ascii_alphanumeric() && c != '_'
 }
 
 /// Normalizes anchor prompts by:
