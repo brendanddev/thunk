@@ -64,7 +64,7 @@ struct BoundedCapture {
 
 fn run_bounded_git_diff(root: &std::path::Path) -> Result<BoundedGitOutput, ToolError> {
     let mut child = Command::new("git")
-        .args(["diff", "--no-ext-diff", "--no-color", "--"])
+        .args(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--"])
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -277,6 +277,47 @@ mod tests {
         assert!(diff.patch.contains("-old"));
         assert!(diff.patch.contains("+new"));
         assert_eq!(diff.bytes_shown, diff.patch.as_bytes().len());
+        assert!(!diff.truncated);
+    }
+
+    #[test]
+    fn configured_textconv_filter_is_not_invoked() {
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        fs::write(
+            tmp.path().join(".gitattributes"),
+            "*.txt diff=params_textconv\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("converted.txt"), "old\n").unwrap();
+        git(tmp.path(), &["add", ".gitattributes", "converted.txt"]);
+        git(
+            tmp.path(),
+            &[
+                "-c",
+                "user.name=params",
+                "-c",
+                "user.email=params@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        git(
+            tmp.path(),
+            &["config", "diff.params_textconv.textconv", "false"],
+        );
+        fs::write(tmp.path().join("converted.txt"), "new\n").unwrap();
+
+        let out = run_diff(tmp.path()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::GitDiff(diff)) = out else {
+            panic!("expected Immediate(GitDiff)");
+        };
+        assert!(diff
+            .patch
+            .contains("diff --git a/converted.txt b/converted.txt"));
+        assert!(diff.patch.contains("-old"));
+        assert!(diff.patch.contains("+new"));
         assert!(!diff.truncated);
     }
 
