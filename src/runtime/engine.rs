@@ -149,6 +149,14 @@ fn save_read_recovery_correction(path: &str) -> String {
     )
 }
 
+fn lockfile_read_recovery_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] The file just read is a lockfile, but a matched source candidate exists. \
+         Read this exact matched source file next with no other text: \
+         [read_file: {path}]"
+    )
+}
+
 /// Injected when the question contains a code identifier but the model attempts a Direct answer
 /// without any investigation. Fires at most once per turn (see direct_answer_correction_issued).
 const SEARCH_BEFORE_ANSWERING: &str =
@@ -411,6 +419,112 @@ fn call_fingerprint(input: &ToolInput) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSurface {
+    RetrievalFirst,
+    GitReadOnly,
+}
+
+impl ToolSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            ToolSurface::RetrievalFirst => "RetrievalFirst",
+            ToolSurface::GitReadOnly => "GitReadOnly",
+        }
+    }
+}
+
+fn select_tool_surface(prompt: &str) -> ToolSurface {
+    if is_explicit_git_tooling_prompt(prompt) {
+        ToolSurface::GitReadOnly
+    } else {
+        ToolSurface::RetrievalFirst
+    }
+}
+
+fn is_explicit_git_tooling_prompt(prompt: &str) -> bool {
+    let tokens = normalized_prompt_tokens(prompt);
+    starts_with_token_phrase(&tokens, &["show", "git", "status"])
+        || starts_with_token_phrase(&tokens, &["show", "git", "diff"])
+        || starts_with_token_phrase(&tokens, &["show", "git", "log"])
+        || starts_with_token_phrase(&tokens, &["git", "status"])
+        || starts_with_token_phrase(&tokens, &["git", "diff"])
+        || starts_with_token_phrase(&tokens, &["git", "log"])
+        || starts_with_token_phrase(&tokens, &["show", "working", "tree"])
+        || starts_with_token_phrase(&tokens, &["show", "recent", "commits"])
+        || starts_with_token_phrase(&tokens, &["show", "latest", "commits"])
+}
+
+fn starts_with_token_phrase(tokens: &[String], phrase: &[&str]) -> bool {
+    tokens.len() >= phrase.len()
+        && tokens
+            .iter()
+            .take(phrase.len())
+            .map(String::as_str)
+            .eq(phrase.iter().copied())
+}
+
+fn tool_allowed_for_surface(input: &ToolInput, surface: ToolSurface) -> bool {
+    match input {
+        ToolInput::GitStatus | ToolInput::GitDiff | ToolInput::GitLog => {
+            surface == ToolSurface::GitReadOnly
+        }
+        ToolInput::ReadFile { .. } | ToolInput::ListDir { .. } | ToolInput::SearchCode { .. } => {
+            surface == ToolSurface::RetrievalFirst
+        }
+        // Mutation permission remains separate from tool-surface policy.
+        ToolInput::EditFile { .. } | ToolInput::WriteFile { .. } => true,
+    }
+}
+
+fn surface_policy_correction(surface: ToolSurface) -> &'static str {
+    match surface {
+        ToolSurface::RetrievalFirst => {
+            "[runtime:correction] This turn allows retrieval tools only: search_code, read_file, list_dir. Git tools are not available."
+        }
+        ToolSurface::GitReadOnly => {
+            "[runtime:correction] This turn allows Git read-only tools only: git_status, git_diff, git_log. Retrieval tools are not available."
+        }
+    }
+}
+
+fn repeated_disallowed_tool_error(surface: ToolSurface) -> &'static str {
+    match surface {
+        ToolSurface::RetrievalFirst => {
+            "repeated unavailable tool use for this retrieval-first turn."
+        }
+        ToolSurface::GitReadOnly => "repeated unavailable tool use for this Git read-only turn.",
+    }
+}
+
+fn repeated_disallowed_tool_final_answer() -> &'static str {
+    "I could not continue because the model repeatedly tried to use tools that are unavailable for this request."
+}
+
+fn weak_search_query_correction(reason: &str) -> String {
+    format!(
+        "[runtime:correction] This search query is too broad for an investigation turn ({reason}). Use a specific literal identifier or project term."
+    )
+}
+
+fn repeated_weak_search_query_final_answer() -> &'static str {
+    "I could not continue because the model repeatedly used search queries that are too broad for this investigation."
+}
+
+fn weak_search_query_reason(query: &str) -> Option<&'static str> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Some("empty");
+    }
+    if trimmed.chars().count() < 3 {
+        return Some("too_short");
+    }
+    if trimmed.eq_ignore_ascii_case("git") {
+        return Some("git");
+    }
+    None
+}
+
 fn rejection_final_answer(tool_name: &str) -> &'static str {
     match tool_name {
         "write_file" => "Canceled. No file was created or changed.",
@@ -525,6 +639,7 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
         "appear",
         "appears",
         "filtered",
+        "rendered",
     ]
     .iter()
     .any(|term| contains_word(&lower, term))
@@ -533,6 +648,14 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
 fn contains_word(text: &str, needle: &str) -> bool {
     text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|token| token == needle)
+}
+
+fn normalized_prompt_tokens(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn user_requested_mutation(text: &str) -> bool {
@@ -893,6 +1016,8 @@ impl Runtime {
         let mut investigation = InvestigationState::new();
         let mut reads_this_turn: HashSet<String> = HashSet::new();
         let mut requested_read_completed = false;
+        let mut disallowed_tool_attempts = 0usize;
+        let mut weak_search_query_attempts = 0usize;
 
         on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
         match run_tool_round(
@@ -903,6 +1028,9 @@ impl Runtime {
             &mut investigation,
             &mut reads_this_turn,
             &mut self.anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed_tool_attempts,
+            &mut weak_search_query_attempts,
             false,
             false,
             InvestigationMode::General,
@@ -1123,6 +1251,8 @@ impl Runtime {
         let mut investigation = InvestigationState::new();
         let mut requested_read_completed = false;
         let mut read_request_correction_issued = false;
+        let mut disallowed_tool_attempts = 0usize;
+        let mut weak_search_query_attempts = 0usize;
         // Computed once from the original user message. Excludes tool result/error injections
         // and correction messages so the approve-failure path (run_turns(0,...)) is safe.
         let original_user_prompt = self.conversation.last_user_content().filter(|c| {
@@ -1141,6 +1271,9 @@ impl Runtime {
         let mutation_allowed = original_user_prompt
             .map(user_requested_mutation)
             .unwrap_or(false);
+        let tool_surface = original_user_prompt
+            .map(select_tool_surface)
+            .unwrap_or(ToolSurface::RetrievalFirst);
         let investigation_mode = original_user_prompt
             .map(detect_investigation_mode)
             .unwrap_or(InvestigationMode::General);
@@ -1208,6 +1341,11 @@ impl Runtime {
                     .unwrap_or("none")
                     .to_string(),
             )],
+        );
+        trace_runtime_decision(
+            on_event,
+            "tool_surface_selected",
+            &[("surface", tool_surface.as_str().into())],
         );
         loop {
             let response =
@@ -1460,6 +1598,9 @@ impl Runtime {
                 &mut investigation,
                 &mut reads_this_turn,
                 &mut self.anchors,
+                tool_surface,
+                &mut disallowed_tool_attempts,
+                &mut weak_search_query_attempts,
                 mutation_allowed,
                 investigation_required,
                 investigation_mode,
@@ -1550,6 +1691,9 @@ fn run_tool_round(
     investigation: &mut InvestigationState,
     reads_this_turn: &mut HashSet<String>,
     anchors: &mut AnchorState,
+    tool_surface: ToolSurface,
+    disallowed_tool_attempts: &mut usize,
+    weak_search_query_attempts: &mut usize,
     mutation_allowed: bool,
     investigation_required: bool,
     investigation_mode: InvestigationMode,
@@ -1610,6 +1754,74 @@ fn run_tool_round(
         let name = input.tool_name().to_string();
         let key = call_fingerprint(&input);
         on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
+
+        if !tool_allowed_for_surface(&input, tool_surface) {
+            *disallowed_tool_attempts += 1;
+            trace_runtime_decision(
+                on_event,
+                "tool_disallowed",
+                &[
+                    ("tool", name.clone()),
+                    ("surface", tool_surface.as_str().into()),
+                    ("attempts", disallowed_tool_attempts.to_string()),
+                ],
+            );
+            on_event(RuntimeEvent::ToolCallFinished {
+                name: name.clone(),
+                summary: None,
+            });
+            if *disallowed_tool_attempts == 1 {
+                accumulated.push_str(&tool_codec::format_tool_error(
+                    &name,
+                    surface_policy_correction(tool_surface),
+                ));
+                continue;
+            }
+            accumulated.push_str(&tool_codec::format_tool_error(
+                &name,
+                repeated_disallowed_tool_error(tool_surface),
+            ));
+            return ToolRoundOutcome::TerminalAnswer {
+                results: accumulated,
+                answer: repeated_disallowed_tool_final_answer().to_string(),
+                reason: RuntimeTerminalReason::RepeatedDisallowedTool,
+            };
+        }
+
+        if tool_surface == ToolSurface::RetrievalFirst && investigation_required {
+            if let ToolInput::SearchCode { query, .. } = &input {
+                if let Some(reason) = weak_search_query_reason(query) {
+                    *weak_search_query_attempts += 1;
+                    trace_runtime_decision(
+                        on_event,
+                        "weak_search_query_rejected",
+                        &[
+                            ("query", query.clone()),
+                            ("reason", reason.into()),
+                            ("attempts", weak_search_query_attempts.to_string()),
+                        ],
+                    );
+                    on_event(RuntimeEvent::ToolCallFinished {
+                        name: name.clone(),
+                        summary: None,
+                    });
+                    if *weak_search_query_attempts == 1 {
+                        let correction = weak_search_query_correction(reason);
+                        accumulated.push_str(&tool_codec::format_tool_error(&name, &correction));
+                        continue;
+                    }
+                    accumulated.push_str(&tool_codec::format_tool_error(
+                        &name,
+                        "repeated weak search query for this investigation turn.",
+                    ));
+                    return ToolRoundOutcome::TerminalAnswer {
+                        results: accumulated,
+                        answer: repeated_weak_search_query_final_answer().to_string(),
+                        reason: RuntimeTerminalReason::RepeatedWeakSearchQuery,
+                    };
+                }
+            }
+        }
 
         if is_mutating_tool(&input) && !mutation_allowed {
             on_event(RuntimeEvent::ToolCallFinished {
@@ -1844,6 +2056,7 @@ fn run_tool_round(
                         RecoveryKind::Register => register_read_recovery_correction(&path),
                         RecoveryKind::Load => load_read_recovery_correction(&path),
                         RecoveryKind::Save => save_read_recovery_correction(&path),
+                        RecoveryKind::Lockfile => lockfile_read_recovery_correction(&path),
                     };
                     accumulated.push_str(&correction);
                     accumulated.push_str("\n\n");
@@ -2525,6 +2738,16 @@ mod tests {
     }
 
     #[test]
+    fn prompt_requires_investigation_detects_rendered_lookup() {
+        assert!(prompt_requires_investigation(
+            "where is git status rendered"
+        ));
+        assert!(prompt_requires_investigation(
+            "Find where status is rendered"
+        ));
+    }
+
+    #[test]
     fn prompt_requires_investigation_detects_search_verb() {
         // "search" is a self-sufficient trigger — no secondary condition needed.
         assert!(prompt_requires_investigation(
@@ -3164,6 +3387,8 @@ mod tests {
         let mut reads_this_turn = HashSet::new();
         let mut anchors = AnchorState::default();
         let mut requested_read_completed = false;
+        let mut disallowed_tool_attempts = 0usize;
+        let mut weak_search_query_attempts = 0usize;
         let mut events = Vec::new();
 
         let outcome = run_tool_round(
@@ -3177,6 +3402,9 @@ mod tests {
             &mut investigation,
             &mut reads_this_turn,
             &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed_tool_attempts,
+            &mut weak_search_query_attempts,
             false,
             true,
             InvestigationMode::UsageLookup,
@@ -3209,6 +3437,8 @@ mod tests {
         let mut reads_this_turn = HashSet::new();
         let mut anchors = AnchorState::default();
         let mut requested_read_completed = false;
+        let mut disallowed_tool_attempts = 0usize;
+        let mut weak_search_query_attempts = 0usize;
         let mut events = Vec::new();
 
         let seed_outcome = run_tool_round(
@@ -3222,6 +3452,9 @@ mod tests {
             &mut investigation,
             &mut reads_this_turn,
             &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed_tool_attempts,
+            &mut weak_search_query_attempts,
             false,
             false,
             InvestigationMode::General,
@@ -3248,6 +3481,9 @@ mod tests {
             &mut investigation,
             &mut reads_this_turn,
             &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed_tool_attempts,
+            &mut weak_search_query_attempts,
             false,
             false,
             InvestigationMode::General,
@@ -3330,6 +3566,59 @@ mod tests {
     }
 
     #[test]
+    fn tool_surface_defaults_to_retrieval_first_for_code_investigation_prompts() {
+        assert_eq!(
+            select_tool_surface("Where is TaskStatus used in sandbox/?"),
+            ToolSurface::RetrievalFirst
+        );
+        assert_eq!(
+            select_tool_surface("Find where database is configured in sandbox/"),
+            ToolSurface::RetrievalFirst
+        );
+    }
+
+    #[test]
+    fn tool_surface_selects_git_read_only_for_explicit_git_prompts() {
+        for prompt in [
+            "show git status",
+            "show git diff",
+            "show git log",
+            "show working tree status",
+            "show working-tree status",
+            "show recent commits",
+            "show latest commits",
+            "git status",
+            "git diff",
+            "git log",
+        ] {
+            assert_eq!(
+                select_tool_surface(prompt),
+                ToolSurface::GitReadOnly,
+                "prompt should select GitReadOnly: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_surface_does_not_use_bare_overlapping_tokens() {
+        for prompt in [
+            "find where status is computed",
+            "where is diff rendered",
+            "find log initialization in sandbox/",
+            "where is commit saved",
+            "where is git integration implemented",
+            "find git helper in src/",
+            "where is git status rendered",
+        ] {
+            assert_eq!(
+                select_tool_surface(prompt),
+                ToolSurface::RetrievalFirst,
+                "prompt should remain RetrievalFirst: {prompt}"
+            );
+        }
+    }
+
+    #[test]
     fn git_status_does_not_update_anchors() {
         use tempfile::TempDir;
 
@@ -3374,7 +3663,6 @@ mod tests {
         let mut rt = make_runtime_in(
             vec![
                 "[git_status]",
-                "TaskStatus appears in git status.",
                 "[search_code: TaskStatus]",
                 "[read_file: a.rs]",
                 "TaskStatus is used in a.rs.",
@@ -3397,14 +3685,16 @@ mod tests {
         assert!(
             snapshot
                 .iter()
-                .any(|m| m.content.contains("=== tool_result: git_status ===")),
-            "git_status should run as a normal tool result"
+                .any(|m| m.content.contains("=== tool_error: git_status ===")
+                    && m.content
+                        .contains(surface_policy_correction(ToolSurface::RetrievalFirst))),
+            "git_status should be rejected before dispatch on RetrievalFirst turns"
         );
         assert!(
             snapshot
                 .iter()
-                .any(|m| m.content.contains("Use search_code")),
-            "git_status must not satisfy investigation evidence"
+                .all(|m| !m.content.contains("=== tool_result: git_status ===")),
+            "disallowed git_status must not execute"
         );
         assert!(
             snapshot
@@ -3465,7 +3755,6 @@ mod tests {
         let mut rt = make_runtime_in(
             vec![
                 "[git_diff]",
-                "TaskStatus appears in git diff.",
                 "[search_code: TaskStatus]",
                 "[read_file: a.rs]",
                 "TaskStatus is used in a.rs.",
@@ -3488,14 +3777,16 @@ mod tests {
         assert!(
             snapshot
                 .iter()
-                .any(|m| m.content.contains("=== tool_result: git_diff ===")),
-            "git_diff should run as a normal tool result"
+                .any(|m| m.content.contains("=== tool_error: git_diff ===")
+                    && m.content
+                        .contains(surface_policy_correction(ToolSurface::RetrievalFirst))),
+            "git_diff should be rejected before dispatch on RetrievalFirst turns"
         );
         assert!(
             snapshot
                 .iter()
-                .any(|m| m.content.contains("Use search_code")),
-            "git_diff must not satisfy investigation evidence"
+                .all(|m| !m.content.contains("=== tool_result: git_diff ===")),
+            "disallowed git_diff must not execute"
         );
         assert!(
             snapshot
@@ -3556,7 +3847,6 @@ mod tests {
         let mut rt = make_runtime_in(
             vec![
                 "[git_log]",
-                "TaskStatus appears in git log.",
                 "[search_code: TaskStatus]",
                 "[read_file: a.rs]",
                 "TaskStatus is used in a.rs.",
@@ -3579,14 +3869,16 @@ mod tests {
         assert!(
             snapshot
                 .iter()
-                .any(|m| m.content.contains("=== tool_result: git_log ===")),
-            "git_log should run as a normal tool result"
+                .any(|m| m.content.contains("=== tool_error: git_log ===")
+                    && m.content
+                        .contains(surface_policy_correction(ToolSurface::RetrievalFirst))),
+            "git_log should be rejected before dispatch on RetrievalFirst turns"
         );
         assert!(
             snapshot
                 .iter()
-                .any(|m| m.content.contains("Use search_code")),
-            "git_log must not satisfy investigation evidence"
+                .all(|m| !m.content.contains("=== tool_result: git_log ===")),
+            "disallowed git_log must not execute"
         );
         assert!(
             snapshot
@@ -3599,6 +3891,676 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("=== tool_result: read_file ===")),
             "model must still read matched code evidence"
+        );
+    }
+
+    #[test]
+    fn disallowed_git_tool_does_not_update_anchors() {
+        let mut rt = make_runtime(vec!["[git_status]", "No git tool was needed."]);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "hello".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "disallowed git tool should be surfaced as tool error without failing: {events:?}"
+        );
+        assert_eq!(rt.anchors.last_read_file(), None);
+        assert_eq!(rt.anchors.last_search(), None);
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: git_status ===")
+                    && m.content
+                        .contains(surface_policy_correction(ToolSurface::RetrievalFirst))),
+            "git_status must be rejected before dispatch"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("=== tool_result: git_status ===")),
+            "rejected git_status must not execute"
+        );
+    }
+
+    #[test]
+    fn first_disallowed_git_tool_on_retrieval_first_turn_gets_surface_correction() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn render_git_status() {}\n").unwrap();
+        let mut rt = make_runtime_in(
+            vec![
+                "[git_status]",
+                "[search_code: git_status]",
+                "[read_file: a.rs]",
+                "git status is rendered in a.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "where is git status rendered".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn should recover after first policy correction: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: git_status ===")
+                    && m.content
+                        .contains(surface_policy_correction(ToolSurface::RetrievalFirst))),
+            "first disallowed git tool must get retrieval surface correction"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("=== tool_result: git_status ===")),
+            "disallowed git_status must not execute"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: search_code ===")),
+            "model should recover to retrieval tools"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "model should still read grounded file evidence"
+        );
+    }
+
+    #[test]
+    fn second_disallowed_git_tool_on_retrieval_first_turn_terminates_policy_violation() {
+        let mut rt = make_runtime(vec!["[git_status]", "[git_diff]"]);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "where is git status rendered".into(),
+            },
+        );
+
+        let answer_source = events.iter().find_map(|event| {
+            if let RuntimeEvent::AnswerReady(source) = event {
+                Some(source)
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::RepeatedDisallowedTool,
+                    ..
+                })
+            ),
+            "second disallowed git tool must terminate as policy violation: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| m
+                .content
+                .contains(repeated_disallowed_tool_error(ToolSurface::RetrievalFirst))),
+            "terminal policy error must be surfaced"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("=== tool_result: git_")),
+            "disallowed git tools must not execute"
+        );
+    }
+
+    #[test]
+    fn git_read_only_surface_rejects_search_code_but_allows_git_tool() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[git_status]",
+                "Working tree checked.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "show git status".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "GitReadOnly turn should recover to allowed git tool: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: search_code ===")
+                    && m.content
+                        .contains(surface_policy_correction(ToolSurface::GitReadOnly))),
+            "search_code must be rejected on GitReadOnly turns"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("=== tool_result: search_code ===")),
+            "rejected search_code must not execute"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: git_status ===")),
+            "git_status should still dispatch on GitReadOnly turns"
+        );
+    }
+
+    #[test]
+    fn first_disallowed_search_on_git_read_only_turn_gets_surface_correction() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: status]",
+                "[git_status]",
+                "Working tree checked.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "show git status".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn should recover after first GitReadOnly policy correction: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: search_code ===")
+                    && m.content
+                        .contains(surface_policy_correction(ToolSurface::GitReadOnly))),
+            "first disallowed retrieval tool must get Git surface correction"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("=== tool_result: search_code ===")),
+            "disallowed search_code must not execute"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: git_status ===")),
+            "model should recover to allowed git tool"
+        );
+    }
+
+    #[test]
+    fn second_disallowed_retrieval_tool_on_git_read_only_turn_terminates_policy_violation() {
+        let mut rt = make_runtime(vec!["[search_code: status]", "[read_file: src/main.rs]"]);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "show git status".into(),
+            },
+        );
+
+        let answer_source = events.iter().find_map(|event| {
+            if let RuntimeEvent::AnswerReady(source) = event {
+                Some(source)
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::RepeatedDisallowedTool,
+                    ..
+                })
+            ),
+            "second disallowed retrieval tool must terminate as policy violation: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| m
+                .content
+                .contains(repeated_disallowed_tool_error(ToolSurface::GitReadOnly))),
+            "terminal policy error must be surfaced"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("=== tool_result: search_code ===")
+                    && !m.content.contains("=== tool_result: read_file ===")),
+            "disallowed retrieval tools must not execute"
+        );
+    }
+
+    #[test]
+    fn allowed_tool_execution_failure_does_not_count_as_disallowed_tool_attempt() {
+        let mut rt = make_runtime(vec!["[read_file: missing.rs]"]);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read missing.rs".into(),
+            },
+        );
+
+        let answer_source = events.iter().find_map(|event| {
+            if let RuntimeEvent::AnswerReady(source) = event {
+                Some(source)
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::ReadFileFailed,
+                    ..
+                })
+            ),
+            "allowed read failure must remain a read failure, not policy violation: {events:?}"
+        );
+        assert!(
+            !matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::RepeatedDisallowedTool,
+                    ..
+                })
+            ),
+            "tool execution failures must not trigger surface-policy terminal reason"
+        );
+    }
+
+    #[test]
+    fn weak_search_query_reason_rejects_only_approved_structural_cases() {
+        assert_eq!(weak_search_query_reason(""), Some("empty"));
+        assert_eq!(weak_search_query_reason("   "), Some("empty"));
+        assert_eq!(weak_search_query_reason("g"), Some("too_short"));
+        assert_eq!(weak_search_query_reason("gt"), Some("too_short"));
+        assert_eq!(weak_search_query_reason("git"), Some("git"));
+        assert_eq!(weak_search_query_reason("GIT"), Some("git"));
+
+        for allowed in [
+            "status",
+            "diff",
+            "log",
+            "file",
+            "code",
+            "src",
+            "main",
+            "test",
+            "tests",
+            "git_status",
+            "src/runtime",
+        ] {
+            assert_eq!(
+                weak_search_query_reason(allowed),
+                None,
+                "query should not be rejected by the first-pass weak-query guard: {allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn weak_search_query_rejects_first_attempt_then_allows_specific_recovery() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/git_status.rs"),
+            "fn render_git_status() {}\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: git]",
+                "[search_code: git_status]",
+                "[read_file: src/git_status.rs]",
+                "git_status is implemented in src/git_status.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "where is git_status implemented".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must recover after one weak-query correction: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: search_code ===")
+                    && m.content.contains(&weak_search_query_correction("git"))),
+            "first weak search must be rejected with a runtime correction"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: search_code ===")),
+            "specific recovery search should execute"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "recovery should still read grounded evidence"
+        );
+    }
+
+    #[test]
+    fn repeated_weak_search_query_terminates_distinct_policy_reason() {
+        let mut rt = make_runtime(vec!["[search_code: git]", "[search_code: g]"]);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "where is git_status implemented".into(),
+            },
+        );
+
+        let answer_source = events.iter().find_map(|event| {
+            if let RuntimeEvent::AnswerReady(source) = event {
+                Some(source)
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::RepeatedWeakSearchQuery,
+                    ..
+                })
+            ),
+            "repeated weak search queries must terminate on a distinct runtime reason: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("=== tool_result: search_code ===")),
+            "rejected weak searches must not dispatch"
+        );
+    }
+
+    #[test]
+    fn rendered_lookup_enables_weak_query_guard_after_surface_rejection() {
+        let mut rt = make_runtime(vec![
+            "[git_status]",
+            "[search_code: git]",
+            "[search_code: git]",
+        ]);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "where is git status rendered".into(),
+            },
+        );
+
+        assert_eq!(
+            select_tool_surface("where is git status rendered"),
+            ToolSurface::RetrievalFirst
+        );
+        let answer_source = events.iter().find_map(|event| {
+            if let RuntimeEvent::AnswerReady(source) = event {
+                Some(source)
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::RepeatedWeakSearchQuery,
+                    ..
+                })
+            ),
+            "rendered lookup should become investigation-required and hit weak-query guard: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: git_status ===")
+                    && m.content
+                        .contains(surface_policy_correction(ToolSurface::RetrievalFirst))),
+            "wrong-surface git_status should still be rejected first"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: search_code ===")
+                    && m.content.contains(&weak_search_query_correction("git"))),
+            "first weak git search should receive the weak-query correction"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("=== tool_result: git_status ===")
+                    && !m.content.contains("=== tool_result: search_code ===")
+                    && !m.content.contains("=== tool_result: read_file ===")),
+            "wrong-surface and weak-query attempts must not dispatch or read evidence"
+        );
+    }
+
+    #[test]
+    fn lockfile_read_rejected_when_matched_source_candidate_exists() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("Cargo.lock"), "git_status = \"1.0.0\"\n").unwrap();
+        fs::write(
+            tmp.path().join("src/git_status.rs"),
+            "fn render_git_status() {}\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: git_status]",
+                "[read_file: Cargo.lock]",
+                "[read_file: src/git_status.rs]",
+                "git_status is implemented in src/git_status.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "where is git_status implemented".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must recover from lockfile read: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .filter(|m| m.content.contains("=== tool_result: read_file ==="))
+                .count()
+                >= 2,
+            "lockfile read should execute, then recovery should read source evidence"
+        );
+        assert!(
+            snapshot.iter().any(|m| m
+                .content
+                .contains("[runtime:correction] The file just read is a lockfile")
+                && m.content.contains("[read_file: ")
+                && m.content.contains("src/git_status.rs")),
+            "runtime should issue one lockfile-specific recovery to the source candidate"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("git_status is implemented in src/git_status.rs.")
+        );
+    }
+
+    #[test]
+    fn lockfile_read_accepted_when_no_matched_source_candidate_exists() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.lock"), "git_status = \"1.0.0\"\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: git_status]",
+                "[read_file: Cargo.lock]",
+                "git_status only appears in Cargo.lock.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "where is git_status implemented".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "lockfile-only result should fall back to normal grounded behavior: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().all(|m| !m
+                .content
+                .contains("[runtime:correction] The file just read is a lockfile")),
+            "lockfile guard must not fire when no stronger source candidate exists"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some("git_status only appears in Cargo.lock.")
+        );
+    }
+
+    #[test]
+    fn lockfile_guard_preserves_config_lookup_recovery_priority() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/Cargo.lock"),
+            "database = \"postgres\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/database.py"),
+            "database = \"runtime default\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/database.yaml"),
+            "database: postgres\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: database]",
+                "[read_file: sandbox/Cargo.lock]",
+                "[read_file: sandbox/database.yaml]",
+                "database is configured in sandbox/database.yaml.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where database is configured in sandbox/".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "config lookup should recover to config candidate before lockfile guard: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| m
+                .content
+                .contains("[runtime:correction] This is a config lookup")
+                && m.content.contains("sandbox/database.yaml")),
+            "config recovery should remain the active mode-specific gate"
+        );
+        assert!(
+            snapshot.iter().all(|m| !m
+                .content
+                .contains("[runtime:correction] The file just read is a lockfile")),
+            "lockfile guard must not override ConfigLookup recovery"
         );
     }
 
@@ -3919,6 +4881,8 @@ mod tests {
         let mut seed_investigation = InvestigationState::new();
         let mut seed_reads_this_turn = HashSet::new();
         let mut seed_requested_read_completed = false;
+        let mut seed_disallowed_tool_attempts = 0usize;
+        let mut seed_weak_search_query_attempts = 0usize;
         let seed_outcome = run_tool_round(
             &registry,
             vec![ToolInput::SearchCode {
@@ -3930,6 +4894,9 @@ mod tests {
             &mut seed_investigation,
             &mut seed_reads_this_turn,
             &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut seed_disallowed_tool_attempts,
+            &mut seed_weak_search_query_attempts,
             false,
             true,
             InvestigationMode::InitializationLookup,
@@ -3956,6 +4923,8 @@ mod tests {
         let mut investigation = InvestigationState::new();
         let mut reads_this_turn = HashSet::new();
         let mut requested_read_completed = false;
+        let mut disallowed_tool_attempts = 0usize;
+        let mut weak_search_query_attempts = 0usize;
         let outcome = run_tool_round(
             &registry,
             vec![ToolInput::SearchCode {
@@ -3967,6 +4936,9 @@ mod tests {
             &mut investigation,
             &mut reads_this_turn,
             &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed_tool_attempts,
+            &mut weak_search_query_attempts,
             false,
             true,
             InvestigationMode::ConfigLookup,

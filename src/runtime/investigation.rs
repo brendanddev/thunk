@@ -12,6 +12,17 @@ const CREATE_TERMS: &[&str] = &["create", "created", "creation"];
 const REGISTER_TERMS: &[&str] = &["register", "registered", "registration"];
 const LOAD_TERMS: &[&str] = &["load", "loaded", "loading"];
 const SAVE_TERMS: &[&str] = &["save", "saved", "saving"];
+const LOCKFILE_NAMES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+];
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h", "hpp",
+];
 
 fn trace_runtime_decision(
     on_event: &mut dyn FnMut(RuntimeEvent),
@@ -103,6 +114,21 @@ pub(super) fn is_config_file(path: &str) -> bool {
         }
     }
     false
+}
+
+fn is_lockfile_path(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|filename| LOCKFILE_NAMES.contains(&filename))
+}
+
+fn is_source_candidate_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| SOURCE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
 }
 
 /// Returns true if the line (after stripping leading whitespace) is an import declaration.
@@ -279,6 +305,8 @@ pub(super) enum RecoveryKind {
     Load,
     /// The file lacked save-term matches when save candidates exist.
     Save,
+    /// The file was a lockfile when a matched source candidate exists.
+    Lockfile,
 }
 
 impl RecoveryKind {
@@ -292,6 +320,7 @@ impl RecoveryKind {
             RecoveryKind::Register => "Register",
             RecoveryKind::Load => "Load",
             RecoveryKind::Save => "Save",
+            RecoveryKind::Lockfile => "Lockfile",
         }
     }
 }
@@ -384,6 +413,10 @@ pub(super) struct InvestigationState {
     save_candidates: HashSet<String>,
     /// True after the save recovery correction has been issued once this turn.
     save_correction_issued: bool,
+    /// Candidate paths whose basename is an exact known lockfile name.
+    lockfile_candidates: HashSet<String>,
+    /// True after the lockfile recovery correction has been issued once this turn.
+    lockfile_correction_issued: bool,
 }
 
 impl InvestigationState {
@@ -419,6 +452,8 @@ impl InvestigationState {
             load_correction_issued: false,
             save_candidates: HashSet::new(),
             save_correction_issued: false,
+            lockfile_candidates: HashSet::new(),
+            lockfile_correction_issued: false,
         }
     }
 
@@ -499,6 +534,7 @@ impl InvestigationState {
             self.load_candidates.clear();
             self.has_non_load_candidates = false;
             self.save_candidates.clear();
+            self.lockfile_candidates.clear();
             self.read_useful_candidate = false;
 
             for result in &results.matches {
@@ -514,6 +550,7 @@ impl InvestigationState {
             // register: at least one matched line contains an exact register term.
             // load: at least one matched line contains an exact load term.
             // save: at least one matched line contains an exact save term.
+            // lockfile: exact filename match against known lockfile basenames.
             let mut file_has_non_def: HashSet<String> = HashSet::new();
             let mut file_has_non_import: HashSet<String> = HashSet::new();
             let mut file_has_initialization: HashSet<String> = HashSet::new();
@@ -583,6 +620,9 @@ impl InvestigationState {
                 if file_has_save.contains(path) {
                     self.save_candidates.insert(path.clone());
                 }
+                if is_lockfile_path(path) {
+                    self.lockfile_candidates.insert(path.clone());
+                }
             }
         }
         trace_runtime_decision(
@@ -629,6 +669,7 @@ impl InvestigationState {
                 ("load_files", self.load_candidates.len().to_string()),
                 ("has_non_load", self.has_non_load_candidates.to_string()),
                 ("save_files", self.save_candidates.len().to_string()),
+                ("lockfiles", self.lockfile_candidates.len().to_string()),
             ],
         );
         was_empty
@@ -684,6 +725,10 @@ impl InvestigationState {
                 .any(|c| normalize_evidence_path(c) == read_path);
             let is_save_candidate = self
                 .save_candidates
+                .iter()
+                .any(|c| normalize_evidence_path(c) == read_path);
+            let is_lockfile_candidate = self
+                .lockfile_candidates
                 .iter()
                 .any(|c| normalize_evidence_path(c) == read_path);
 
@@ -941,6 +986,38 @@ impl InvestigationState {
                 );
                 // Correction already issued: fall through without accepting.
             } else {
+                if is_lockfile_candidate {
+                    let suggested_path = self.first_source_candidate().map(str::to_string);
+                    if suggested_path.is_some() {
+                        if !self.lockfile_correction_issued {
+                            self.lockfile_correction_issued = true;
+                            trace_runtime_decision(
+                                on_event,
+                                "read_evidence",
+                                &[
+                                    ("path", read_path.clone()),
+                                    ("accepted", "false".into()),
+                                    ("reason", "lockfile_candidate".into()),
+                                    (
+                                        "recovery_path",
+                                        suggested_path.clone().unwrap_or_else(|| "none".into()),
+                                    ),
+                                ],
+                            );
+                            return suggested_path.map(|p| (p, RecoveryKind::Lockfile));
+                        }
+                        trace_runtime_decision(
+                            on_event,
+                            "read_evidence",
+                            &[
+                                ("path", read_path.clone()),
+                                ("accepted", "false".into()),
+                                ("reason", "lockfile_recovery_already_issued".into()),
+                            ],
+                        );
+                        return None;
+                    }
+                }
                 // Candidate would normally be accepted. Check import-only before committing.
                 // Import-only candidates are structurally insufficient when substantive
                 // (non-import) candidates exist in the current result set.
@@ -1084,6 +1161,15 @@ impl InvestigationState {
         self.search_candidate_paths
             .iter()
             .find(|path| self.save_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_source_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| {
+                !self.lockfile_candidates.contains(*path) && is_source_candidate_path(path)
+            })
             .map(String::as_str)
     }
 }

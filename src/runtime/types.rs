@@ -43,6 +43,8 @@ pub enum AnswerSource {
 pub enum RuntimeTerminalReason {
     RejectedMutation,
     ReadFileFailed,
+    RepeatedDisallowedTool,
+    RepeatedWeakSearchQuery,
     /// Search was attempted but all results were empty and no file was read.
     /// The runtime emits the answer directly rather than letting the model speculate.
     InsufficientEvidence,
