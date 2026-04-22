@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::app::config::Config;
 use crate::app::Result;
-use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
+use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, Message, ModelBackend};
 use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
 
 use super::anchors::{
@@ -429,12 +429,88 @@ enum ToolSurface {
     GitReadOnly,
 }
 
-impl ToolSurface {
-    fn as_str(self) -> &'static str {
-        match self {
-            ToolSurface::RetrievalFirst => "RetrievalFirst",
-            ToolSurface::GitReadOnly => "GitReadOnly",
+struct ToolSurfaceDefinition {
+    surface: ToolSurface,
+    name: &'static str,
+    tools: &'static [SurfaceTool],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceTool {
+    SearchCode,
+    ReadFile,
+    ListDir,
+    GitStatus,
+    GitDiff,
+    GitLog,
+}
+
+const RETRIEVAL_FIRST_TOOLS: &[SurfaceTool] = &[
+    SurfaceTool::SearchCode,
+    SurfaceTool::ReadFile,
+    SurfaceTool::ListDir,
+];
+const GIT_READ_ONLY_TOOLS: &[SurfaceTool] = &[
+    SurfaceTool::GitStatus,
+    SurfaceTool::GitDiff,
+    SurfaceTool::GitLog,
+];
+const TOOL_SURFACE_DEFINITIONS: &[ToolSurfaceDefinition] = &[
+    ToolSurfaceDefinition {
+        surface: ToolSurface::RetrievalFirst,
+        name: "RetrievalFirst",
+        tools: RETRIEVAL_FIRST_TOOLS,
+    },
+    ToolSurfaceDefinition {
+        surface: ToolSurface::GitReadOnly,
+        name: "GitReadOnly",
+        tools: GIT_READ_ONLY_TOOLS,
+    },
+];
+
+impl SurfaceTool {
+    fn from_input(input: &ToolInput) -> Option<Self> {
+        match input {
+            ToolInput::SearchCode { .. } => Some(Self::SearchCode),
+            ToolInput::ReadFile { .. } => Some(Self::ReadFile),
+            ToolInput::ListDir { .. } => Some(Self::ListDir),
+            ToolInput::GitStatus => Some(Self::GitStatus),
+            ToolInput::GitDiff => Some(Self::GitDiff),
+            ToolInput::GitLog => Some(Self::GitLog),
+            ToolInput::EditFile { .. } | ToolInput::WriteFile { .. } => None,
         }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::SearchCode => "search_code",
+            Self::ReadFile => "read_file",
+            Self::ListDir => "list_dir",
+            Self::GitStatus => "git_status",
+            Self::GitDiff => "git_diff",
+            Self::GitLog => "git_log",
+        }
+    }
+}
+
+impl ToolSurface {
+    fn definition(self) -> &'static ToolSurfaceDefinition {
+        TOOL_SURFACE_DEFINITIONS
+            .iter()
+            .find(|definition| definition.surface == self)
+            .expect("tool surface definition must exist")
+    }
+
+    fn as_str(self) -> &'static str {
+        self.definition().name
+    }
+
+    fn tools(self) -> &'static [SurfaceTool] {
+        self.definition().tools
+    }
+
+    fn allowed_tool_names(self) -> impl Iterator<Item = &'static str> {
+        self.tools().iter().copied().map(SurfaceTool::name)
     }
 }
 
@@ -469,16 +545,19 @@ fn starts_with_token_phrase(tokens: &[String], phrase: &[&str]) -> bool {
 }
 
 fn tool_allowed_for_surface(input: &ToolInput, surface: ToolSurface) -> bool {
-    match input {
-        ToolInput::GitStatus | ToolInput::GitDiff | ToolInput::GitLog => {
-            surface == ToolSurface::GitReadOnly
-        }
-        ToolInput::ReadFile { .. } | ToolInput::ListDir { .. } | ToolInput::SearchCode { .. } => {
-            surface == ToolSurface::RetrievalFirst
-        }
+    if let Some(tool) = SurfaceTool::from_input(input) {
+        tool_surface_for_tool(tool) == Some(surface)
+    } else {
         // Mutation permission remains separate from tool-surface policy.
-        ToolInput::EditFile { .. } | ToolInput::WriteFile { .. } => true,
+        true
     }
+}
+
+fn tool_surface_for_tool(tool: SurfaceTool) -> Option<ToolSurface> {
+    TOOL_SURFACE_DEFINITIONS
+        .iter()
+        .find(|definition| definition.tools.contains(&tool))
+        .map(|definition| definition.surface)
 }
 
 fn surface_policy_correction(surface: ToolSurface) -> &'static str {
@@ -1352,24 +1431,28 @@ impl Runtime {
             &[("surface", tool_surface.as_str().into())],
         );
         loop {
-            let response =
-                match run_generate_turn(self.backend.as_mut(), &mut self.conversation, on_event) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => {
-                        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                        on_event(RuntimeEvent::Failed {
-                            message: format!("{} returned no output.", self.backend.name()),
-                        });
-                        return;
-                    }
-                    Err(e) => {
-                        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                        on_event(RuntimeEvent::Failed {
-                            message: e.to_string(),
-                        });
-                        return;
-                    }
-                };
+            let response = match run_generate_turn(
+                self.backend.as_mut(),
+                &mut self.conversation,
+                tool_surface,
+                on_event,
+            ) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    on_event(RuntimeEvent::Failed {
+                        message: format!("{} returned no output.", self.backend.name()),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    on_event(RuntimeEvent::Failed {
+                        message: e.to_string(),
+                    });
+                    return;
+                }
+            };
 
             let calls = tool_codec::parse_all_tool_inputs(&response);
 
@@ -2197,9 +2280,15 @@ fn last_injected_was_edit_error(conversation: &Conversation) -> bool {
 fn run_generate_turn(
     backend: &mut dyn ModelBackend,
     conversation: &mut Conversation,
+    tool_surface: ToolSurface,
     on_event: &mut dyn FnMut(RuntimeEvent),
 ) -> Result<Option<String>> {
-    let request = GenerateRequest::new(conversation.snapshot());
+    let mut messages = conversation.snapshot();
+    messages.push(Message::system(prompt::render_tool_surface_hint(
+        tool_surface.as_str(),
+        tool_surface.allowed_tool_names(),
+    )));
+    let request = GenerateRequest::new(messages);
     let mut response = String::new();
 
     let result = backend.generate(request, &mut |event| match event {
@@ -2243,9 +2332,11 @@ fn map_backend_status(status: BackendStatus) -> Activity {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::app::config::Config;
+    use crate::llm::backend::Role;
     use crate::tools::{default_registry, RiskLevel};
 
     struct TestBackend {
@@ -2286,6 +2377,50 @@ mod tests {
         }
     }
 
+    struct RecordingBackend {
+        responses: Vec<String>,
+        call_count: usize,
+        requests: Arc<Mutex<Vec<GenerateRequest>>>,
+    }
+
+    impl RecordingBackend {
+        fn new(
+            responses: Vec<impl Into<String>>,
+            requests: Arc<Mutex<Vec<GenerateRequest>>>,
+        ) -> Self {
+            Self {
+                responses: responses.into_iter().map(Into::into).collect(),
+                call_count: 0,
+                requests,
+            }
+        }
+    }
+
+    impl ModelBackend for RecordingBackend {
+        fn name(&self) -> &str {
+            "recording-test"
+        }
+
+        fn generate(
+            &mut self,
+            request: GenerateRequest,
+            on_event: &mut dyn FnMut(BackendEvent),
+        ) -> crate::app::Result<()> {
+            self.requests.lock().unwrap().push(request);
+            let reply = self
+                .responses
+                .get(self.call_count)
+                .cloned()
+                .unwrap_or_default();
+            self.call_count += 1;
+            if !reply.is_empty() {
+                on_event(BackendEvent::TextDelta(reply));
+            }
+            on_event(BackendEvent::Finished);
+            Ok(())
+        }
+    }
+
     fn make_runtime(responses: Vec<impl Into<String>>) -> Runtime {
         Runtime::new(
             &Config::default(),
@@ -2302,6 +2437,19 @@ mod tests {
             Box::new(TestBackend::new(responses)),
             default_registry(root.to_path_buf()),
         )
+    }
+
+    fn make_runtime_with_recorded_requests(
+        responses: Vec<impl Into<String>>,
+    ) -> (Runtime, Arc<Mutex<Vec<GenerateRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Runtime::new(
+            &Config::default(),
+            &PathBuf::from("."),
+            Box::new(RecordingBackend::new(responses, Arc::clone(&requests))),
+            default_registry(PathBuf::from(".")),
+        );
+        (runtime, requests)
     }
 
     fn collect_events(runtime: &mut Runtime, request: RuntimeRequest) -> Vec<RuntimeEvent> {
@@ -3690,6 +3838,175 @@ mod tests {
                 "prompt should remain RetrievalFirst: {prompt}"
             );
         }
+    }
+
+    #[test]
+    fn tool_surface_hint_renders_from_canonical_surface_membership() {
+        assert_eq!(
+            prompt::render_tool_surface_hint(
+                ToolSurface::RetrievalFirst.as_str(),
+                ToolSurface::RetrievalFirst.allowed_tool_names()
+            ),
+            "Active tool surface: RetrievalFirst. Available this turn: search_code, read_file, list_dir."
+        );
+        assert_eq!(
+            prompt::render_tool_surface_hint(
+                ToolSurface::GitReadOnly.as_str(),
+                ToolSurface::GitReadOnly.allowed_tool_names()
+            ),
+            "Active tool surface: GitReadOnly. Available this turn: git_status, git_diff, git_log."
+        );
+    }
+
+    #[test]
+    fn tool_surface_enforcement_uses_canonical_surface_membership() {
+        let inputs = [
+            ToolInput::SearchCode {
+                query: "needle".into(),
+                path: None,
+            },
+            ToolInput::ReadFile {
+                path: "src/lib.rs".into(),
+            },
+            ToolInput::ListDir { path: ".".into() },
+            ToolInput::GitStatus,
+            ToolInput::GitDiff,
+            ToolInput::GitLog,
+        ];
+
+        for surface in [ToolSurface::RetrievalFirst, ToolSurface::GitReadOnly] {
+            for input in &inputs {
+                let tool =
+                    SurfaceTool::from_input(input).expect("test inputs are surface-controlled");
+                assert_eq!(
+                    tool_allowed_for_surface(input, surface),
+                    surface.tools().contains(&tool),
+                    "surface enforcement must match canonical membership for {} on {}",
+                    input.tool_name(),
+                    surface.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retrieval_first_surface_hint_is_sent_to_model() {
+        let (mut rt, requests) = make_runtime_with_recorded_requests(vec!["Done."]);
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "hello".into(),
+            },
+        );
+
+        let requests = requests.lock().unwrap();
+        let first = requests.first().expect("backend request must be recorded");
+        assert!(
+            first.messages.iter().any(|m| {
+                m.role == Role::System
+                    && m.content
+                        == "Active tool surface: RetrievalFirst. Available this turn: search_code, read_file, list_dir."
+            }),
+            "RetrievalFirst surface hint must be injected into backend request: {:?}",
+            first.messages
+        );
+    }
+
+    #[test]
+    fn git_read_only_surface_hint_is_sent_to_model() {
+        let (mut rt, requests) = make_runtime_with_recorded_requests(vec!["Done."]);
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "show git status".into(),
+            },
+        );
+
+        let requests = requests.lock().unwrap();
+        let first = requests.first().expect("backend request must be recorded");
+        assert!(
+            first.messages.iter().any(|m| {
+                m.role == Role::System
+                    && m.content
+                        == "Active tool surface: GitReadOnly. Available this turn: git_status, git_diff, git_log."
+            }),
+            "GitReadOnly surface hint must be injected into backend request: {:?}",
+            first.messages
+        );
+    }
+
+    #[test]
+    fn tool_surface_hint_is_ephemeral_not_persisted() {
+        let (mut rt, _requests) = make_runtime_with_recorded_requests(vec!["Done."]);
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "hello".into(),
+            },
+        );
+
+        assert!(
+            !rt.messages_snapshot().iter().any(|m| {
+                m.content
+                    .starts_with("Active tool surface: RetrievalFirst. Available this turn:")
+                    || m.content
+                        .starts_with("Active tool surface: GitReadOnly. Available this turn:")
+            }),
+            "surface hint must not be persisted in conversation history"
+        );
+    }
+
+    #[test]
+    fn tool_surface_hint_does_not_replace_original_user_prompt() {
+        let (mut rt, requests) = make_runtime_with_recorded_requests(vec!["Done."]);
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "where is serde used".into(),
+            },
+        );
+
+        let requests = requests.lock().unwrap();
+        let first = requests.first().expect("backend request must be recorded");
+        assert!(
+            first
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content == "where is serde used"),
+            "original user prompt must remain in backend request: {:?}",
+            first.messages
+        );
+        assert!(
+            first.messages.iter().any(|m| {
+                m.role == Role::System
+                    && m.content
+                        .starts_with("Active tool surface: RetrievalFirst. Available this turn:")
+            }),
+            "surface hint must be additional system context"
+        );
+    }
+
+    #[test]
+    fn mutation_turn_still_receives_surface_hint() {
+        let (mut rt, requests) = make_runtime_with_recorded_requests(vec!["Done."]);
+        collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "create a new file src/new.rs".into(),
+            },
+        );
+
+        let requests = requests.lock().unwrap();
+        let first = requests.first().expect("backend request must be recorded");
+        assert!(
+            first.messages.iter().any(|m| {
+                m.role == Role::System
+                    && m.content
+                        == "Active tool surface: RetrievalFirst. Available this turn: search_code, read_file, list_dir."
+            }),
+            "mutation-intent turns still expose active surface hint: {:?}",
+            first.messages
+        );
     }
 
     #[test]

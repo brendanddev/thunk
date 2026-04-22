@@ -4,6 +4,20 @@ use crate::tools::ToolSpec;
 
 use super::tool_codec;
 
+pub(crate) fn render_tool_surface_hint<I>(surface_name: &str, allowed_tools: I) -> String
+where
+    I: IntoIterator<Item = &'static str>,
+{
+    let mut tools = String::new();
+    for tool in allowed_tools {
+        if !tools.is_empty() {
+            tools.push_str(", ");
+        }
+        tools.push_str(tool);
+    }
+    format!("Active tool surface: {surface_name}. Available this turn: {tools}.")
+}
+
 pub fn build_system_prompt(app_name: &str, project_root: &Path, specs: &[ToolSpec]) -> String {
     let mut prompt = format!(
         "You are {app_name}, a local AI coding assistant.\n\
