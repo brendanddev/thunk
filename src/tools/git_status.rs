@@ -1,5 +1,6 @@
-use std::io;
-use std::process::Command;
+use std::io::{self, Read};
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
 
 use super::context::ToolContext;
 use super::types::{
@@ -10,6 +11,8 @@ use super::Tool;
 
 const MAX_STATUS_ENTRIES: usize = 100;
 const MAX_STATUS_PATH_CHARS: usize = 240;
+const MAX_GIT_STATUS_STDOUT_BYTES: usize = 64 * 1024;
+const MAX_GIT_STATUS_STDERR_BYTES: usize = 8 * 1024;
 
 pub struct GitStatusTool {
     context: ToolContext,
@@ -39,21 +42,99 @@ impl Tool for GitStatusTool {
             ));
         };
 
-        let output = Command::new("git")
-            .args(["status", "--short", "--branch"])
-            .current_dir(&self.context.root)
-            .output()
-            .map_err(git_command_error)?;
+        let output = run_bounded_git_status(&self.context.root)?;
 
         if !output.status.success() {
-            return Err(git_status_error(&output.stderr));
+            return Err(git_status_error(&output.stderr.bytes));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout.bytes);
         Ok(ToolRunResult::Immediate(ToolOutput::GitStatus(
-            parse_git_status_output(&stdout),
+            parse_git_status_output(&stdout, output.stdout.truncated),
         )))
     }
+}
+
+struct BoundedGitOutput {
+    status: ExitStatus,
+    stdout: BoundedCapture,
+    stderr: BoundedCapture,
+}
+
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn run_bounded_git_status(root: &std::path::Path) -> Result<BoundedGitOutput, ToolError> {
+    let mut child = Command::new("git")
+        .args(["status", "--short", "--branch"])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(git_command_error)?;
+
+    let stdout = child.stdout.take().ok_or_else(output_capture_error)?;
+    let stderr = child.stderr.take().ok_or_else(output_capture_error)?;
+
+    let stdout_reader =
+        thread::spawn(move || read_bounded_stream(stdout, MAX_GIT_STATUS_STDOUT_BYTES));
+    let stderr_reader =
+        thread::spawn(move || read_bounded_stream(stderr, MAX_GIT_STATUS_STDERR_BYTES));
+
+    let status = child.wait()?;
+    let stdout = join_capture(stdout_reader)?;
+    let stderr = join_capture(stderr_reader)?;
+
+    Ok(BoundedGitOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded_stream<R: Read>(mut reader: R, limit: usize) -> io::Result<BoundedCapture> {
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        let remaining = limit.saturating_sub(bytes.len());
+        if remaining > 0 {
+            let keep = remaining.min(n);
+            bytes.extend_from_slice(&buf[..keep]);
+        }
+
+        if n > remaining {
+            truncated = true;
+            break;
+        }
+    }
+
+    if truncated {
+        io::copy(&mut reader, &mut io::sink())?;
+    }
+
+    Ok(BoundedCapture { bytes, truncated })
+}
+
+fn join_capture(
+    handle: thread::JoinHandle<io::Result<BoundedCapture>>,
+) -> Result<BoundedCapture, ToolError> {
+    handle
+        .join()
+        .map_err(|_| output_capture_error())?
+        .map_err(ToolError::Io)
+}
+
+fn output_capture_error() -> ToolError {
+    ToolError::InvalidInput("git_status failed: output capture failed".into())
 }
 
 fn git_command_error(error: io::Error) -> ToolError {
@@ -73,7 +154,7 @@ fn git_status_error(stderr: &[u8]) -> ToolError {
     }
 }
 
-fn parse_git_status_output(stdout: &str) -> GitStatusOutput {
+fn parse_git_status_output(stdout: &str, capture_truncated: bool) -> GitStatusOutput {
     let mut lines = stdout.lines();
     let (branch, upstream, ahead, behind) = lines
         .next()
@@ -92,6 +173,12 @@ fn parse_git_status_output(stdout: &str) -> GitStatusOutput {
         }
     }
 
+    let total_entries = if capture_truncated && total_entries <= entries.len() {
+        total_entries.saturating_add(1)
+    } else {
+        total_entries
+    };
+
     GitStatusOutput {
         branch,
         upstream,
@@ -99,7 +186,7 @@ fn parse_git_status_output(stdout: &str) -> GitStatusOutput {
         behind,
         entries,
         total_entries,
-        truncated: total_entries > MAX_STATUS_ENTRIES,
+        truncated: capture_truncated || total_entries > MAX_STATUS_ENTRIES,
     }
 }
 
@@ -168,6 +255,7 @@ fn truncate_path(path: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
 
@@ -254,6 +342,24 @@ mod tests {
         };
         assert_eq!(status.total_entries, 105);
         assert_eq!(status.entries.len(), MAX_STATUS_ENTRIES);
+        assert!(status.truncated);
+    }
+
+    #[test]
+    fn bounded_capture_marks_truncated_without_retaining_extra_bytes() {
+        let input = vec![b'x'; MAX_GIT_STATUS_STDERR_BYTES + 10];
+        let capture = read_bounded_stream(Cursor::new(input), MAX_GIT_STATUS_STDERR_BYTES).unwrap();
+
+        assert_eq!(capture.bytes.len(), MAX_GIT_STATUS_STDERR_BYTES);
+        assert!(capture.truncated);
+    }
+
+    #[test]
+    fn parse_git_status_marks_truncated_when_capture_was_capped() {
+        let status = parse_git_status_output("## main\n?? changed.txt\n", true);
+
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.total_entries, 2);
         assert!(status.truncated);
     }
 

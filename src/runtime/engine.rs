@@ -396,6 +396,7 @@ fn call_fingerprint(input: &ToolInput) -> String {
             )
         }
         ToolInput::GitStatus => "git_status".to_string(),
+        ToolInput::GitDiff => "git_diff".to_string(),
         ToolInput::EditFile {
             path,
             search,
@@ -3409,6 +3410,97 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("=== tool_result: search_code ===")),
             "model must still search after git_status"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "model must still read matched code evidence"
+        );
+    }
+
+    #[test]
+    fn git_diff_does_not_update_anchors() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let mut rt = make_runtime_in(vec!["[git_diff]", "Working tree diff checked."], tmp.path());
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Show git diff".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "git_diff turn must not fail: {events:?}"
+        );
+        assert_eq!(rt.anchors.last_read_file(), None);
+        assert_eq!(rt.anchors.last_search(), None);
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: git_diff ===")),
+            "git_diff result must be injected as a normal tool result"
+        );
+    }
+
+    #[test]
+    fn git_diff_does_not_satisfy_investigation_evidence() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        fs::write(
+            tmp.path().join("a.rs"),
+            "fn use_task_status() { TaskStatus; }\n",
+        )
+        .unwrap();
+        let mut rt = make_runtime_in(
+            vec![
+                "[git_diff]",
+                "TaskStatus appears in git diff.",
+                "[search_code: TaskStatus]",
+                "[read_file: a.rs]",
+                "TaskStatus is used in a.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must recover through search/read: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: git_diff ===")),
+            "git_diff should run as a normal tool result"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("Use search_code")),
+            "git_diff must not satisfy investigation evidence"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: search_code ===")),
+            "model must still search after git_diff"
         );
         assert!(
             snapshot

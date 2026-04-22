@@ -123,14 +123,21 @@ fn scan_bracket_calls(text: &str) -> Vec<(usize, ToolInput)> {
 
 fn scan_static_bracket_calls(text: &str) -> Vec<(usize, ToolInput)> {
     let mut results = Vec::new();
-    let mut search_start = 0;
-    while search_start < text.len() {
-        let Some(rel) = text[search_start..].find("[git_status]") else {
-            break;
-        };
-        let open_abs = search_start + rel;
-        results.push((open_abs, ToolInput::GitStatus));
-        search_start = open_abs + "[git_status]".len();
+    let static_tools: &[(&str, ToolInput)] = &[
+        ("[git_status]", ToolInput::GitStatus),
+        ("[git_diff]", ToolInput::GitDiff),
+    ];
+
+    for (tag, input) in static_tools {
+        let mut search_start = 0;
+        while search_start < text.len() {
+            let Some(rel) = text[search_start..].find(tag) else {
+                break;
+            };
+            let open_abs = search_start + rel;
+            results.push((open_abs, input.clone()));
+            search_start = open_abs + tag.len();
+        }
     }
     results
 }
@@ -525,6 +532,15 @@ pub fn render_compact_summary(output: &ToolOutput) -> String {
                 format!("git status on {branch}: {} entries", g.total_entries)
             }
         }
+        ToolOutput::GitDiff(d) => {
+            if d.bytes_shown == 0 {
+                "git diff empty".to_string()
+            } else if d.truncated {
+                format!("git diff ({} bytes, truncated)", d.bytes_shown)
+            } else {
+                format!("git diff ({} bytes)", d.bytes_shown)
+            }
+        }
         ToolOutput::EditFile(e) => {
             format!("replaced {} line(s) in {}", e.lines_replaced, e.path)
         }
@@ -729,6 +745,21 @@ fn render_git_status(g: &crate::tools::types::GitStatusOutput) -> String {
     lines.join("\n")
 }
 
+fn render_git_diff(d: &crate::tools::types::GitDiffOutput) -> String {
+    if d.patch.is_empty() {
+        return "No unstaged changes.".to_string();
+    }
+
+    if d.truncated {
+        format!(
+            "[showing first {} bytes of git diff]\n{}\n[truncated]",
+            d.bytes_shown, d.patch
+        )
+    } else {
+        d.patch.clone()
+    }
+}
+
 fn render_output(output: &ToolOutput) -> String {
     match output {
         ToolOutput::FileContents(f) => {
@@ -770,6 +801,7 @@ fn render_output(output: &ToolOutput) -> String {
             }
         }
         ToolOutput::GitStatus(g) => render_git_status(g),
+        ToolOutput::GitDiff(d) => render_git_diff(d),
         ToolOutput::EditFile(e) => {
             format!("replaced {} line(s) in {}", e.lines_replaced, e.path)
         }
@@ -843,6 +875,9 @@ Only if results are completely empty, try one different single keyword, then sto
 
 Show git working tree status:
 [git_status]
+
+Show unstaged git working tree diff:
+[git_diff]
 
 Edit a file:
 [edit_file]
@@ -970,8 +1005,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_git_diff_call() {
+        let text = "[git_diff]";
+        let calls = parse_all_tool_inputs(text);
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(&calls[0], ToolInput::GitDiff));
+    }
+
+    #[test]
     fn git_status_call_inside_code_fence_is_not_executed() {
         let text = "Example:\n```\n[git_status]\n```";
+        let calls = parse_all_tool_inputs(text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn git_diff_call_inside_code_fence_is_not_executed() {
+        let text = "Example:\n```\n[git_diff]\n```";
         let calls = parse_all_tool_inputs(text);
         assert!(calls.is_empty());
     }
@@ -1420,6 +1470,27 @@ mod tests {
     }
 
     #[test]
+    fn render_git_diff_output() {
+        use crate::tools::types::GitDiffOutput;
+        use crate::tools::ToolOutput;
+
+        let output = ToolOutput::GitDiff(GitDiffOutput {
+            patch: "diff --git a/a.rs b/a.rs\n+new\n".into(),
+            bytes_shown: 31,
+            truncated: true,
+        });
+
+        assert_eq!(
+            render_compact_summary(&output),
+            "git diff (31 bytes, truncated)"
+        );
+        let rendered = format_tool_result("git_diff", &output);
+        assert!(rendered.contains("[showing first 31 bytes of git diff]"));
+        assert!(rendered.contains("diff --git a/a.rs b/a.rs"));
+        assert!(rendered.contains("[truncated]"));
+    }
+
+    #[test]
     fn render_output_includes_metadata_line_for_untruncated_file() {
         use crate::tools::types::FileContentsOutput;
         use crate::tools::ToolOutput;
@@ -1839,6 +1910,7 @@ mod tests {
         assert!(instructions.contains("[list_dir:"));
         assert!(instructions.contains("[search_code:"));
         assert!(instructions.contains("[git_status]"));
+        assert!(instructions.contains("[git_diff]"));
         assert!(instructions.contains("[edit_file]"));
         assert!(instructions.contains("[/edit_file]"));
         assert!(instructions.contains("[write_file:"));
