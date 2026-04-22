@@ -395,6 +395,7 @@ fn call_fingerprint(input: &ToolInput) -> String {
                 path.as_deref().unwrap_or("")
             )
         }
+        ToolInput::GitStatus => "git_status".to_string(),
         ToolInput::EditFile {
             path,
             search,
@@ -2020,6 +2021,17 @@ mod tests {
         events
     }
 
+    fn init_git_repo(root: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init must succeed");
+    }
+
     fn has_failed(events: &[RuntimeEvent]) -> bool {
         events
             .iter()
@@ -3313,6 +3325,97 @@ mod tests {
         assert!(!is_last_search_anchor_prompt("search again"));
         assert!(is_last_search_anchor_prompt("search that again"));
         assert!(is_last_search_anchor_prompt("repeat the last search"));
+    }
+
+    #[test]
+    fn git_status_does_not_update_anchors() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let mut rt = make_runtime_in(vec!["[git_status]", "Working tree checked."], tmp.path());
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Show git status".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "git_status turn must not fail: {events:?}"
+        );
+        assert_eq!(rt.anchors.last_read_file(), None);
+        assert_eq!(rt.anchors.last_search(), None);
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: git_status ===")),
+            "git_status result must be injected as a normal tool result"
+        );
+    }
+
+    #[test]
+    fn git_status_does_not_satisfy_investigation_evidence() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        fs::write(
+            tmp.path().join("a.rs"),
+            "fn use_task_status() { TaskStatus; }\n",
+        )
+        .unwrap();
+        let mut rt = make_runtime_in(
+            vec![
+                "[git_status]",
+                "TaskStatus appears in git status.",
+                "[search_code: TaskStatus]",
+                "[read_file: a.rs]",
+                "TaskStatus is used in a.rs.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus used?".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must recover through search/read: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: git_status ===")),
+            "git_status should run as a normal tool result"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("Use search_code")),
+            "git_status must not satisfy investigation evidence"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: search_code ===")),
+            "model must still search after git_status"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "model must still read matched code evidence"
+        );
     }
 
     #[test]

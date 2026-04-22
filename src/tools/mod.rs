@@ -1,5 +1,6 @@
 pub mod context;
 mod edit_file;
+mod git_status;
 mod list_dir;
 mod pending;
 mod read_file;
@@ -11,6 +12,7 @@ mod write_file;
 use std::path::PathBuf;
 
 use edit_file::EditFileTool;
+use git_status::GitStatusTool;
 use list_dir::ListDirTool;
 use read_file::ReadFileTool;
 use search_code::SearchCodeTool;
@@ -54,6 +56,7 @@ pub fn default_registry(root: PathBuf) -> ToolRegistry {
     registry.register(ReadFileTool::new(ToolContext::new(root.clone())));
     registry.register(ListDirTool::new(ToolContext::new(root.clone())));
     registry.register(SearchCodeTool::new(ToolContext::new(root.clone())));
+    registry.register(GitStatusTool::new(ToolContext::new(root.clone())));
     registry.register(EditFileTool::new(ToolContext::new(root.clone())));
     registry.register(WriteFileTool::new(ToolContext::new(root)));
     registry

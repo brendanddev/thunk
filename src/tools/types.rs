@@ -23,6 +23,7 @@ pub enum ToolInput {
         /// Optional sub-path to restrict the search. Searches entire tree if None.
         path: Option<String>,
     },
+    GitStatus,
     EditFile {
         /// Path relative to the project root, or absolute.
         path: String,
@@ -47,6 +48,7 @@ impl ToolInput {
             ToolInput::ReadFile { .. } => "read_file",
             ToolInput::ListDir { .. } => "list_dir",
             ToolInput::SearchCode { .. } => "search_code",
+            ToolInput::GitStatus => "git_status",
             ToolInput::EditFile { .. } => "edit_file",
             ToolInput::WriteFile { .. } => "write_file",
         }
@@ -62,6 +64,7 @@ pub enum ToolOutput {
     FileContents(FileContentsOutput),
     DirectoryListing(DirectoryListingOutput),
     SearchResults(SearchResultsOutput),
+    GitStatus(GitStatusOutput),
     EditFile(EditFileOutput),
     WriteFile(WriteFileOutput),
 }
@@ -113,6 +116,24 @@ pub struct SearchMatch {
     pub file: String,
     pub line_number: usize,
     pub line: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitStatusOutput {
+    pub branch: Option<String>,
+    pub upstream: Option<String>,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+    pub entries: Vec<GitStatusEntry>,
+    pub total_entries: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitStatusEntry {
+    pub xy: String,
+    pub path: String,
+    pub path_truncated: bool,
 }
 
 #[derive(Debug, Clone)]

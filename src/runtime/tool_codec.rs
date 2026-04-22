@@ -38,6 +38,7 @@ pub fn parse_all_tool_inputs(text: &str) -> Vec<ToolInput> {
     let fences = code_fence_ranges(text);
     let mut all: Vec<(usize, ToolInput)> = Vec::new();
     all.extend(scan_bracket_calls(text));
+    all.extend(scan_static_bracket_calls(text));
     all.extend(scan_edit_blocks(text));
     all.extend(scan_write_blocks(text));
     all.extend(scan_search_code_blocks(text));
@@ -117,6 +118,20 @@ fn scan_bracket_calls(text: &str) -> Vec<(usize, ToolInput)> {
         }
     }
 
+    results
+}
+
+fn scan_static_bracket_calls(text: &str) -> Vec<(usize, ToolInput)> {
+    let mut results = Vec::new();
+    let mut search_start = 0;
+    while search_start < text.len() {
+        let Some(rel) = text[search_start..].find("[git_status]") else {
+            break;
+        };
+        let open_abs = search_start + rel;
+        results.push((open_abs, ToolInput::GitStatus));
+        search_start = open_abs + "[git_status]".len();
+    }
     results
 }
 
@@ -494,6 +509,22 @@ pub fn render_compact_summary(output: &ToolOutput) -> String {
                 format!("found {} match(es) for '{}'", s.total_matches, s.query)
             }
         }
+        ToolOutput::GitStatus(g) => {
+            let branch = g.branch.as_deref().unwrap_or("unknown branch");
+            if g.total_entries == 0 {
+                format!("git status clean on {branch}")
+            } else if g.truncated {
+                format!(
+                    "git status on {branch}: showing {} of {} entries",
+                    g.entries.len(),
+                    g.total_entries
+                )
+            } else if g.total_entries == 1 {
+                format!("git status on {branch}: 1 entry")
+            } else {
+                format!("git status on {branch}: {} entries", g.total_entries)
+            }
+        }
         ToolOutput::EditFile(e) => {
             format!("replaced {} line(s) in {}", e.lines_replaced, e.path)
         }
@@ -659,6 +690,45 @@ fn render_search_results_grouped(s: &crate::tools::types::SearchResultsOutput) -
     lines.join("\n")
 }
 
+fn render_git_status(g: &crate::tools::types::GitStatusOutput) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "branch: {}",
+        g.branch.as_deref().unwrap_or("(unknown)")
+    ));
+    if let Some(upstream) = &g.upstream {
+        lines.push(format!("upstream: {upstream}"));
+    }
+    if let Some(ahead) = g.ahead {
+        lines.push(format!("ahead: {ahead}"));
+    }
+    if let Some(behind) = g.behind {
+        lines.push(format!("behind: {behind}"));
+    }
+
+    if g.entries.is_empty() {
+        lines.push("working tree clean".to_string());
+    } else {
+        if g.truncated {
+            lines.push(format!(
+                "[showing first {} of {} status entries]",
+                g.entries.len(),
+                g.total_entries
+            ));
+        }
+        for entry in &g.entries {
+            let suffix = if entry.path_truncated {
+                " [path truncated]"
+            } else {
+                ""
+            };
+            lines.push(format!("{} {}{}", entry.xy, entry.path, suffix));
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn render_output(output: &ToolOutput) -> String {
     match output {
         ToolOutput::FileContents(f) => {
@@ -699,6 +769,7 @@ fn render_output(output: &ToolOutput) -> String {
                 render_search_results_grouped(s)
             }
         }
+        ToolOutput::GitStatus(g) => render_git_status(g),
         ToolOutput::EditFile(e) => {
             format!("replaced {} line(s) in {}", e.lines_replaced, e.path)
         }
@@ -769,6 +840,9 @@ Use exactly one plain literal keyword or identifier, such as logging, write_file
 Do not use phrases, dots, parentheses, backslashes, regex syntax, or method-call syntax.
 Emit only one search call at a time. If the results point to a specific file but do not show enough detail, read that file once with read_file, then respond. Never emit a second search_code.
 Only if results are completely empty, try one different single keyword, then stop searching and respond.
+
+Show git working tree status:
+[git_status]
 
 Edit a file:
 [edit_file]
@@ -885,6 +959,21 @@ mod tests {
             matches!(&calls[0], ToolInput::SearchCode { query, path: None }
             if query == "fn main")
         );
+    }
+
+    #[test]
+    fn parses_git_status_call() {
+        let text = "[git_status]";
+        let calls = parse_all_tool_inputs(text);
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(&calls[0], ToolInput::GitStatus));
+    }
+
+    #[test]
+    fn git_status_call_inside_code_fence_is_not_executed() {
+        let text = "Example:\n```\n[git_status]\n```";
+        let calls = parse_all_tool_inputs(text);
+        assert!(calls.is_empty());
     }
 
     #[test]
@@ -1298,6 +1387,36 @@ mod tests {
         assert!(result.contains("[1 lines]"));
         assert!(result.contains("fn main() {}"));
         assert!(result.contains("=== /tool_result ==="));
+    }
+
+    #[test]
+    fn render_git_status_output() {
+        use crate::tools::types::{GitStatusEntry, GitStatusOutput};
+        use crate::tools::ToolOutput;
+
+        let output = ToolOutput::GitStatus(GitStatusOutput {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ahead: Some(1),
+            behind: None,
+            entries: vec![GitStatusEntry {
+                xy: " M".into(),
+                path: "src/main.rs".into(),
+                path_truncated: false,
+            }],
+            total_entries: 1,
+            truncated: false,
+        });
+
+        assert_eq!(
+            render_compact_summary(&output),
+            "git status on main: 1 entry"
+        );
+        let rendered = format_tool_result("git_status", &output);
+        assert!(rendered.contains("branch: main"));
+        assert!(rendered.contains("upstream: origin/main"));
+        assert!(rendered.contains("ahead: 1"));
+        assert!(rendered.contains(" M src/main.rs"));
     }
 
     #[test]
@@ -1719,6 +1838,7 @@ mod tests {
         assert!(instructions.contains("[read_file:"));
         assert!(instructions.contains("[list_dir:"));
         assert!(instructions.contains("[search_code:"));
+        assert!(instructions.contains("[git_status]"));
         assert!(instructions.contains("[edit_file]"));
         assert!(instructions.contains("[/edit_file]"));
         assert!(instructions.contains("[write_file:"));
