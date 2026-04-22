@@ -297,6 +297,10 @@ impl SearchBudget {
         self.calls >= 2 || (self.calls == 1 && !self.last_was_empty)
     }
 
+    fn empty_retry_exhausted(&self) -> bool {
+        self.calls >= 2 && self.last_was_empty
+    }
+
     fn closed_message(&self) -> &'static str {
         if self.calls >= 2 && self.last_was_empty {
             SEARCH_CLOSED_AFTER_EMPTY_RETRY
@@ -1374,6 +1378,28 @@ impl Runtime {
                     .iter()
                     .any(|c| matches!(c, ToolInput::SearchCode { .. }))
             {
+                if search_budget.empty_retry_exhausted()
+                    && !investigation.search_produced_results()
+                    && investigation.files_read_count() == 0
+                {
+                    trace_insufficient_evidence_terminal(
+                        "empty_search_retry_exhausted",
+                        tool_rounds,
+                        &search_budget,
+                        &investigation,
+                        on_event,
+                    );
+                    self.conversation.discard_last_if_assistant();
+                    self.finish_with_runtime_answer(
+                        insufficient_evidence_final_answer(),
+                        AnswerSource::RuntimeTerminal {
+                            reason: RuntimeTerminalReason::InsufficientEvidence,
+                            rounds: tool_rounds,
+                        },
+                        on_event,
+                    );
+                    return;
+                }
                 if corrections < MAX_CORRECTIONS {
                     corrections += 1;
                     self.conversation.discard_last_if_assistant();
@@ -1871,6 +1897,29 @@ fn run_tool_round(
         // Per-turn search budget: 1 search always allowed; a second only when the first
         // returned no results; further searches are always blocked.
         if matches!(input, ToolInput::SearchCode { .. }) && !search_budget.is_allowed() {
+            if search_budget.empty_retry_exhausted()
+                && !investigation.search_produced_results()
+                && investigation.files_read_count() == 0
+            {
+                trace_runtime_decision(
+                    on_event,
+                    "terminal_insufficient_evidence",
+                    &[
+                        ("reason", "empty_search_retry_exhausted".into()),
+                        ("search_calls", search_budget.calls.to_string()),
+                        ("files_read", investigation.files_read_count().to_string()),
+                    ],
+                );
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: None,
+                });
+                return ToolRoundOutcome::TerminalAnswer {
+                    results: accumulated,
+                    answer: insufficient_evidence_final_answer().to_string(),
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                };
+            }
             on_event(RuntimeEvent::ToolCallFinished {
                 name: name.clone(),
                 summary: None,
@@ -1960,6 +2009,31 @@ fn run_tool_round(
         }
 
         if last_call_key.as_deref() == Some(key.as_str()) {
+            if matches!(input, ToolInput::SearchCode { .. })
+                && search_budget.calls > 0
+                && search_budget.last_was_empty
+                && !investigation.search_produced_results()
+                && investigation.files_read_count() == 0
+            {
+                trace_runtime_decision(
+                    on_event,
+                    "terminal_insufficient_evidence",
+                    &[
+                        ("reason", "empty_search_duplicate_retry".into()),
+                        ("search_calls", search_budget.calls.to_string()),
+                        ("files_read", investigation.files_read_count().to_string()),
+                    ],
+                );
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: None,
+                });
+                return ToolRoundOutcome::TerminalAnswer {
+                    results: accumulated,
+                    answer: insufficient_evidence_final_answer().to_string(),
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                };
+            }
             let msg = format!("{name} called with identical arguments twice in a row");
             on_event(RuntimeEvent::ToolCallFinished {
                 name: name.clone(),
@@ -5855,14 +5929,15 @@ mod tests {
     }
 
     #[test]
-    fn search_budget_blocks_third_search_regardless() {
-        // Controlled temp dir: first two searches return empty, third must still be blocked.
+    fn empty_search_retry_exhausted_third_search_terminates_pre_dispatch() {
+        // Controlled temp dir: first two searches return empty; a third search attempt
+        // terminates without another correction loop or search tool_error.
         use std::fs;
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("file.rs"), "fn find_me() {}").unwrap();
 
-        // first=empty, second=empty (allowed by budget), third=blocked regardless
+        // first=empty, second=empty (allowed by budget), third=terminal.
         let mut rt = make_runtime_in(
             vec![
                 "[search_code: no_match_a][search_code: no_match_b][search_code: find_me]",
@@ -5870,19 +5945,139 @@ mod tests {
             ],
             tmp.path(),
         );
-        collect_events(
+        let events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
                 text: "triple search".into(),
             },
         );
+        assert!(
+            !has_failed(&events),
+            "empty search exhaustion must terminate cleanly: {events:?}"
+        );
 
         let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            2,
+            "only the first empty search and the allowed empty retry should execute"
+        );
         assert!(
-            snapshot
+            !all_user.contains("search budget exceeded"),
+            "empty retry exhaustion should terminal without another search-budget tool_error"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "empty retry exhaustion must use InsufficientEvidence terminal: {answer_source:?}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(insufficient_evidence_final_answer()),
+            "last assistant message must be runtime terminal answer"
+        );
+    }
+
+    #[test]
+    fn duplicate_search_after_empty_result_terminates_without_cycle_loop() {
+        // Manual regression: after an empty search, repeating the same search should
+        // terminate as insufficient evidence instead of looping through cycle tool_errors.
+        use std::fs;
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("file.rs"), "fn unrelated() {}").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: clap]",
+                "[search_code: clap]",
+                "This response should not be consumed.",
+            ],
+            tmp.path(),
+        );
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is clap used".into(),
+            },
+        );
+        assert!(
+            !has_failed(&events),
+            "duplicate empty-search retry must terminate cleanly: {events:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            1,
+            "only the first empty search should execute"
+        );
+        assert!(
+            !all_user.contains("identical arguments twice in a row"),
+            "duplicate empty-search retry should terminal without cycle tool_error"
+        );
+        assert!(
+            !snapshot
                 .iter()
-                .any(|m| m.content.contains("search budget exceeded")),
-            "third search must always be blocked regardless of prior results"
+                .any(|m| m.content.contains("This response should not be consumed")),
+            "runtime terminal must stop before another model synthesis"
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "duplicate empty-search retry must use InsufficientEvidence terminal: {answer_source:?}"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(insufficient_evidence_final_answer()),
+            "last assistant message must be runtime terminal answer"
         );
     }
 
