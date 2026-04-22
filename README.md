@@ -4,6 +4,8 @@ Local-first, personal AI coding assistant CLI focused on local-first workflows, 
 
 > Version 0.8.16
 
+---
+
 ## Overview
 
 `params-cli` is a Rust-based personal AI coding assistant built around a small, explicit runtime:
@@ -15,6 +17,18 @@ Local-first, personal AI coding assistant CLI focused on local-first workflows, 
 - swappable model backends
 
 The project is structured to keep model generation, tool execution, persistence, and UI separate instead of folding everything into one text-driven loop.
+
+---
+
+## Whats Different
+
+- Runtime owned correctness
+- Structural, not semantic
+- Grounded code investigation
+- Controlled multi-turn continuity
+- Built for local and low resource environments
+
+---
 
 ## What It Does Today
 
@@ -46,6 +60,8 @@ Current control commands:
 - `/approve`
 - `/reject`
 
+---
+
 ## Runtime Behavior
 
 At a high level:
@@ -61,6 +77,8 @@ At a high level:
 Some outcomes are deliberately terminal and runtime-owned: rejecting a pending mutation produces a cancellation answer without asking the model to summarize, and a failed `read_file` can end cleanly without retrying in a loop.
 
 `search_code` is a literal substring search. The runtime now simplifies model-generated search phrases into a single literal keyword and enforces a per-turn budget: one search is allowed, a second search is allowed only when the first returned no matches, and later search attempts are blocked with a correction so the model must answer cleanly.
+
+---
 
 ## Architecture
 
@@ -81,6 +99,8 @@ Key architectural rules reflected in the code:
 - the runtime does not depend on the TUI or SQLite directly
 - the TUI renders events but does not execute tools
 
+---
+
 ## Current Limitations
 
 - No shell, git, web, or external integration tools yet.
@@ -89,6 +109,8 @@ Key architectural rules reflected in the code:
 - Pending approvals are not persisted across restarts.
 - Restored session history is loaded into the runtime, but not replayed into the visible TUI transcript.
 - Tool UI is compact and text-based; there is no diff view or expandable preview UI yet.
+
+---
 
 ## Running
 
@@ -115,6 +137,8 @@ Configuration lives in `config.toml`.
 - `llm.provider = "mock"` uses the built-in mock backend.
 - `llm.provider = "llama_cpp"` uses the local llama.cpp backend.
 - `llama_cpp.model_path` points to the local `.gguf` file to load.
+
+---
 
 ## Documentation
 

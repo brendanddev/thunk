@@ -234,6 +234,10 @@ fn normalize_evidence_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
+fn path_has_parent_component(path: &str) -> bool {
+    path.split('/').any(|component| component == "..")
+}
+
 /// Returns true when `model_path` is within (equal to or narrower than) `scope`.
 ///
 /// Both paths are normalized before comparison. Trailing slashes are stripped so
@@ -243,9 +247,14 @@ fn normalize_evidence_path(path: &str) -> String {
 ///
 /// Absolute paths (e.g. emitted by the model as "/abs/path/") are never within
 /// a relative scope and will always return false, causing the caller to clamp.
+/// Parent-directory components (`..`) are also rejected structurally before
+/// accepting equal-or-child scope relationships.
 fn path_is_within_scope(model_path: &str, scope: &str) -> bool {
     let p = normalize_evidence_path(model_path);
     let s = normalize_evidence_path(scope);
+    if path_has_parent_component(&p) || path_has_parent_component(&s) {
+        return false;
+    }
     let p = p.trim_end_matches('/');
     let s = s.trim_end_matches('/');
     p.starts_with(s) && (p.len() == s.len() || p.as_bytes().get(s.len()) == Some(&b'/'))
@@ -3474,6 +3483,49 @@ mod tests {
     }
 
     #[test]
+    fn same_scope_followup_after_empty_scope_search_fails_deterministically() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(Vec::<String>::new(), tmp.path());
+        let output =
+            crate::tools::ToolOutput::SearchResults(crate::tools::types::SearchResultsOutput {
+                query: "needle".into(),
+                matches: Vec::new(),
+                total_matches: 0,
+                truncated: false,
+            });
+
+        rt.anchors
+            .record_successful_search(&output, "needle".into(), Some("   ".into()));
+        assert_eq!(rt.anchors.last_search_query(), Some("needle"));
+        assert_eq!(rt.anchors.last_search_scope(), None);
+        assert_eq!(rt.anchors.last_scoped_search_scope(), None);
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where database is configured in the same folder".into(),
+            },
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantMessageChunk(chunk)
+                    if chunk == NO_LAST_SCOPED_SEARCH_AVAILABLE
+            )),
+            "empty stored scope must not provide same-scope continuity: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { .. })),
+            "empty stored scope must not dispatch tools: {events:?}"
+        );
+    }
+
+    #[test]
     fn same_scope_followup_explicit_concrete_path_takes_precedence() {
         use std::fs;
         use tempfile::TempDir;
@@ -5410,6 +5462,22 @@ mod tests {
     }
 
     #[test]
+    fn path_is_within_scope_parent_components_rejected() {
+        assert!(!path_is_within_scope(
+            "sandbox/services/../",
+            "sandbox/services/"
+        ));
+        assert!(!path_is_within_scope(
+            "sandbox/services/../../src/",
+            "sandbox/services/"
+        ));
+        assert!(!path_is_within_scope(
+            "sandbox/services/tasks/",
+            "sandbox/services/../"
+        ));
+    }
+
+    #[test]
     fn path_is_within_scope_dotslash_normalization() {
         // ./sandbox/services/ normalizes to sandbox/services/ — should match.
         assert!(path_is_within_scope(
@@ -5501,6 +5569,20 @@ mod tests {
         // Enforcement must clamp to sandbox/services/.
         let scope = "sandbox/services/";
         let mut path: Option<String> = Some("sandbox/".into());
+        if let Some(ref p) = path.clone() {
+            if !path_is_within_scope(p, scope) {
+                path = Some(scope.to_string());
+            }
+        }
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn scope_enforcement_clamps_parent_component_path() {
+        // Scope: sandbox/services/, model path: sandbox/services/../ (parent escape).
+        // Enforcement must clamp to sandbox/services/.
+        let scope = "sandbox/services/";
+        let mut path: Option<String> = Some("sandbox/services/../".into());
         if let Some(ref p) = path.clone() {
             if !path_is_within_scope(p, scope) {
                 path = Some(scope.to_string());

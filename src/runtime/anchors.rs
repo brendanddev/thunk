@@ -55,6 +55,13 @@ impl AnchorState {
         scope: Option<String>,
     ) -> Option<(String, Option<String>)> {
         if matches!(output, ToolOutput::SearchResults(_)) {
+            let scope = scope.and_then(|scope| {
+                if scope.trim().is_empty() {
+                    None
+                } else {
+                    Some(scope)
+                }
+            });
             self.last_search_query = Some(query.clone());
             self.last_search_scope = scope.clone();
             return Some((query, scope));
@@ -76,7 +83,9 @@ impl AnchorState {
 
     /// Returns the scope from the last successful scoped search, if any.
     pub(super) fn last_scoped_search_scope(&self) -> Option<&str> {
-        self.last_search_scope.as_deref()
+        self.last_search_scope
+            .as_deref()
+            .filter(|scope| !scope.trim().is_empty())
     }
 
     #[cfg(test)]
