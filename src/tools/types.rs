@@ -25,6 +25,7 @@ pub enum ToolInput {
     },
     GitStatus,
     GitDiff,
+    GitLog,
     EditFile {
         /// Path relative to the project root, or absolute.
         path: String,
@@ -51,6 +52,7 @@ impl ToolInput {
             ToolInput::SearchCode { .. } => "search_code",
             ToolInput::GitStatus => "git_status",
             ToolInput::GitDiff => "git_diff",
+            ToolInput::GitLog => "git_log",
             ToolInput::EditFile { .. } => "edit_file",
             ToolInput::WriteFile { .. } => "write_file",
         }
@@ -68,6 +70,7 @@ pub enum ToolOutput {
     SearchResults(SearchResultsOutput),
     GitStatus(GitStatusOutput),
     GitDiff(GitDiffOutput),
+    GitLog(GitLogOutput),
     EditFile(EditFileOutput),
     WriteFile(WriteFileOutput),
 }
@@ -144,6 +147,21 @@ pub struct GitDiffOutput {
     pub patch: String,
     pub bytes_shown: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitLogOutput {
+    pub entries: Vec<GitLogEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitLogEntry {
+    pub hash: String,
+    pub short_hash: String,
+    pub date: String,
+    pub author: String,
+    pub subject: String,
 }
 
 #[derive(Debug, Clone)]

@@ -126,6 +126,7 @@ fn scan_static_bracket_calls(text: &str) -> Vec<(usize, ToolInput)> {
     let static_tools: &[(&str, ToolInput)] = &[
         ("[git_status]", ToolInput::GitStatus),
         ("[git_diff]", ToolInput::GitDiff),
+        ("[git_log]", ToolInput::GitLog),
     ];
 
     for (tag, input) in static_tools {
@@ -541,6 +542,19 @@ pub fn render_compact_summary(output: &ToolOutput) -> String {
                 format!("git diff ({} bytes)", d.bytes_shown)
             }
         }
+        ToolOutput::GitLog(g) => {
+            if g.entries.is_empty() {
+                "git log empty".to_string()
+            } else if g.truncated && g.entries.len() == 1 {
+                "git log (1 commit, truncated)".to_string()
+            } else if g.truncated {
+                format!("git log ({} commits, truncated)", g.entries.len())
+            } else if g.entries.len() == 1 {
+                "git log (1 commit)".to_string()
+            } else {
+                format!("git log ({} commits)", g.entries.len())
+            }
+        }
         ToolOutput::EditFile(e) => {
             format!("replaced {} line(s) in {}", e.lines_replaced, e.path)
         }
@@ -760,6 +774,28 @@ fn render_git_diff(d: &crate::tools::types::GitDiffOutput) -> String {
     }
 }
 
+fn render_git_log(g: &crate::tools::types::GitLogOutput) -> String {
+    if g.entries.is_empty() {
+        return "No commits found.".to_string();
+    }
+
+    let mut lines = Vec::new();
+    if g.truncated {
+        lines.push(format!(
+            "[showing {} recent commits; output truncated]",
+            g.entries.len()
+        ));
+    }
+    for entry in &g.entries {
+        lines.push(format!(
+            "{} {} {} - {}",
+            entry.short_hash, entry.date, entry.author, entry.subject
+        ));
+    }
+
+    lines.join("\n")
+}
+
 fn render_output(output: &ToolOutput) -> String {
     match output {
         ToolOutput::FileContents(f) => {
@@ -802,6 +838,7 @@ fn render_output(output: &ToolOutput) -> String {
         }
         ToolOutput::GitStatus(g) => render_git_status(g),
         ToolOutput::GitDiff(d) => render_git_diff(d),
+        ToolOutput::GitLog(g) => render_git_log(g),
         ToolOutput::EditFile(e) => {
             format!("replaced {} line(s) in {}", e.lines_replaced, e.path)
         }
@@ -878,6 +915,9 @@ Show git working tree status:
 
 Show unstaged git working tree diff:
 [git_diff]
+
+Show recent git commit history:
+[git_log]
 
 Edit a file:
 [edit_file]
@@ -1013,6 +1053,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_git_log_call() {
+        let text = "[git_log]";
+        let calls = parse_all_tool_inputs(text);
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(&calls[0], ToolInput::GitLog));
+    }
+
+    #[test]
     fn git_status_call_inside_code_fence_is_not_executed() {
         let text = "Example:\n```\n[git_status]\n```";
         let calls = parse_all_tool_inputs(text);
@@ -1022,6 +1070,13 @@ mod tests {
     #[test]
     fn git_diff_call_inside_code_fence_is_not_executed() {
         let text = "Example:\n```\n[git_diff]\n```";
+        let calls = parse_all_tool_inputs(text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn git_log_call_inside_code_fence_is_not_executed() {
+        let text = "Example:\n```\n[git_log]\n```";
         let calls = parse_all_tool_inputs(text);
         assert!(calls.is_empty());
     }
@@ -1491,6 +1546,31 @@ mod tests {
     }
 
     #[test]
+    fn render_git_log_output() {
+        use crate::tools::types::{GitLogEntry, GitLogOutput};
+        use crate::tools::ToolOutput;
+
+        let output = ToolOutput::GitLog(GitLogOutput {
+            entries: vec![GitLogEntry {
+                hash: "0123456789012345678901234567890123456789".into(),
+                short_hash: "0123456".into(),
+                date: "2026-04-22".into(),
+                author: "params".into(),
+                subject: "add git log".into(),
+            }],
+            truncated: true,
+        });
+
+        assert_eq!(
+            render_compact_summary(&output),
+            "git log (1 commit, truncated)"
+        );
+        let rendered = format_tool_result("git_log", &output);
+        assert!(rendered.contains("[showing 1 recent commits; output truncated]"));
+        assert!(rendered.contains("0123456 2026-04-22 params - add git log"));
+    }
+
+    #[test]
     fn render_output_includes_metadata_line_for_untruncated_file() {
         use crate::tools::types::FileContentsOutput;
         use crate::tools::ToolOutput;
@@ -1911,6 +1991,7 @@ mod tests {
         assert!(instructions.contains("[search_code:"));
         assert!(instructions.contains("[git_status]"));
         assert!(instructions.contains("[git_diff]"));
+        assert!(instructions.contains("[git_log]"));
         assert!(instructions.contains("[edit_file]"));
         assert!(instructions.contains("[/edit_file]"));
         assert!(instructions.contains("[write_file:"));
