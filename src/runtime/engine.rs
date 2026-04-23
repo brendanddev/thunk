@@ -537,6 +537,12 @@ fn is_explicit_git_tooling_prompt(prompt: &str) -> bool {
         || starts_with_token_phrase(&tokens, &["show", "working", "tree"])
         || starts_with_token_phrase(&tokens, &["show", "recent", "commits"])
         || starts_with_token_phrase(&tokens, &["show", "latest", "commits"])
+        || starts_with_token_phrase(&tokens, &["show", "recent", "git", "status"])
+        || starts_with_token_phrase(&tokens, &["show", "recent", "git", "diff"])
+        || starts_with_token_phrase(&tokens, &["show", "recent", "git", "log"])
+        || starts_with_token_phrase(&tokens, &["show", "latest", "git", "status"])
+        || starts_with_token_phrase(&tokens, &["show", "latest", "git", "diff"])
+        || starts_with_token_phrase(&tokens, &["show", "latest", "git", "log"])
 }
 
 fn starts_with_token_phrase(tokens: &[String], phrase: &[&str]) -> bool {
@@ -3905,6 +3911,12 @@ mod tests {
             "git status",
             "git diff",
             "git log",
+            "show recent git status",
+            "show recent git diff",
+            "show recent git log",
+            "show latest git status",
+            "show latest git diff",
+            "show latest git log",
         ] {
             assert_eq!(
                 select_tool_surface(prompt),
