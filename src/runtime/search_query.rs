@@ -1,5 +1,9 @@
 use crate::tools::ToolInput;
 
+/// Extracts a single strong token from a natural-language query.
+///
+/// Drops common stopwords and returns the first meaningful identifier-like
+/// token. Falls back to the original query when no better token is found.
 pub(super) fn simplify_search_query(query: &str) -> String {
     const STOPWORDS: &[&str] = &[
         "a",
@@ -45,6 +49,9 @@ pub(super) fn simplify_search_query(query: &str) -> String {
     trimmed.to_string()
 }
 
+/// Applies query simplification in-place for SearchCode inputs.
+///
+/// Ensures the runtime always sends a minimally useful query to the tool.
 pub(super) fn simplify_search_input(input: &mut ToolInput) {
     if let ToolInput::SearchCode { query, .. } = input {
         let simplified = simplify_search_query(query);
@@ -54,6 +61,10 @@ pub(super) fn simplify_search_input(input: &mut ToolInput) {
     }
 }
 
+/// Classifies weak search queries for runtime guardrails.
+///
+/// Returns a reason when the query is too weak to be useful, allowing
+/// deterministic correction/termination behavior.
 pub(super) fn weak_search_query_reason(query: &str) -> Option<&'static str> {
     let trimmed = query.trim();
     if trimmed.is_empty() {

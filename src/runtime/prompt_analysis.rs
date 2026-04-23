@@ -1,5 +1,10 @@
 use super::paths::normalize_evidence_path;
 
+/// Determines whether a prompt should enter investigation mode.
+///
+/// Uses structural signals first (identifier-like tokens), then falls back to
+/// constrained natural-language lookup detection. This must remain conservative
+/// to avoid over-triggering investigation on general questions.
 pub(super) fn prompt_requires_investigation(text: &str) -> bool {
     for raw in text.split(|c: char| {
         c.is_whitespace()
@@ -33,6 +38,11 @@ pub(super) fn prompt_requires_investigation(text: &str) -> bool {
     natural_language_code_lookup_requires_investigation(text)
 }
 
+/// Detects investigation intent from natural-language lookup phrasing.
+///
+/// Requires both a lookup verb (find/where/locate/search) and a secondary
+/// condition indicating code-related intent, except for "search" which is
+/// treated as an explicit tool request.
 fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let has_lookup_verb = contains_word(&lower, "find")
@@ -88,11 +98,18 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
     .any(|term| contains_word(&lower, term))
 }
 
+/// Checks for exact token matches within a normalized text stream.
+///
+/// Avoids substring matching to prevent false positives (e.g., "find" in "finder").
 fn contains_word(text: &str, needle: &str) -> bool {
     text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|token| token == needle)
 }
 
+/// Produces a normalized token stream for prompt analysis.
+///
+/// Lowercases and splits on non-identifier characters. Shared by multiple
+/// classification helpers to ensure consistent tokenization.
 pub(super) fn normalized_prompt_tokens(text: &str) -> Vec<String> {
     text.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -101,6 +118,10 @@ pub(super) fn normalized_prompt_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Detects whether the user is requesting a mutation operation.
+///
+/// Uses a strict keyword list to avoid accidental triggering from
+/// conversational language.
 pub(super) fn user_requested_mutation(text: &str) -> bool {
     text.split(|c: char| {
         c.is_whitespace()
@@ -207,6 +228,10 @@ pub(super) fn extract_investigation_path_scope(text: &str) -> Option<String> {
     found
 }
 
+/// Extracts a direct-read file path from a prompt starting with "read".
+///
+/// Accepts "read <path>" and "read file <path>" forms. Returns None if the
+/// structure does not match or the candidate does not resemble a file path.
 pub(super) fn requested_read_path(text: &str) -> Option<String> {
     let mut tokens = text.split_whitespace();
     let first = tokens.next()?;
@@ -232,6 +257,10 @@ pub(super) fn requested_read_path(text: &str) -> Option<String> {
     }
 }
 
+/// Heuristic check for whether a token resembles a file path.
+///
+/// Allows common patterns (directories, extensions, README) without resolving
+/// or validating against the filesystem.
 pub(super) fn looks_like_file_path(path: &str) -> bool {
     !path.is_empty()
         && (path.contains('/')

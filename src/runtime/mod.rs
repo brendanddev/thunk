@@ -5,10 +5,12 @@ mod investigation;
 mod paths;
 mod prompt;
 mod prompt_analysis;
+mod response_text;
 #[cfg(test)]
 mod scenarios;
 mod search_query;
 mod tool_codec;
+mod tool_surface;
 mod trace;
 mod types;
 
