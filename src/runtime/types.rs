@@ -46,6 +46,8 @@ pub enum RuntimeTerminalReason {
     RepeatedDisallowedTool,
     RepeatedToolAfterEvidenceReady,
     RepeatedWeakSearchQuery,
+    /// Model attempted further tool use after the turn's artifact was already acquired.
+    RepeatedToolAfterAnswerPhase,
     /// Search was attempted but all results were empty and no file was read.
     /// The runtime emits the answer directly rather than letting the model speculate.
     InsufficientEvidence,

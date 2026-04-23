@@ -82,6 +82,10 @@ const EVIDENCE_READY_ANSWER_ONLY: &str =
     "[runtime:correction] Evidence is already ready from the file(s) read this turn. \
      Do not call more tools. Answer using the existing file evidence.";
 
+const TURN_COMPLETE_ANSWER_ONLY: &str =
+    "[runtime:correction] The file was already read this turn. \
+     Do not call more tools. Provide your final answer now based on what was read.";
+
 fn usage_read_recovery_correction(path: &str) -> String {
     format!(
         "[runtime:correction] This is a usage lookup. The file just read only showed definition matches, \
@@ -618,6 +622,14 @@ fn repeated_disallowed_tool_final_answer() -> &'static str {
 
 fn repeated_tool_after_evidence_ready_final_answer() -> &'static str {
     "I could not continue because the model kept calling tools after sufficient file evidence was already read."
+}
+
+fn repeated_tool_after_answer_phase_final_answer() -> &'static str {
+    "I could not continue because the model kept calling tools after the file was already read this turn."
+}
+
+fn mutation_complete_final_answer(tool_name: &str, summary: &str) -> String {
+    format!("{tool_name} result: {summary}")
 }
 
 fn weak_search_query_correction(reason: &str) -> String {
@@ -1296,6 +1308,7 @@ impl Runtime {
         match self.registry.execute_approved(&pending) {
             Ok(output) => {
                 let summary = tool_codec::render_compact_summary(&output);
+                let final_answer = mutation_complete_final_answer(&tool_name, &summary);
                 on_event(RuntimeEvent::ToolCallFinished {
                     name: tool_name.clone(),
                     summary: Some(summary),
@@ -1303,10 +1316,11 @@ impl Runtime {
                 let result_text = tool_codec::format_tool_result(&tool_name, &output);
                 self.conversation.push_user(result_text);
                 self.conversation.trim_tool_exchanges_if_needed();
-                // Re-enter the generation loop so the model synthesizes a response
-                // confirming what was done — mirrors the Immediate tool path in run_turns.
-                on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
-                self.run_turns(1, on_event);
+                self.finish_with_runtime_answer(
+                    &final_answer,
+                    AnswerSource::ToolAssisted { rounds: 1 },
+                    on_event,
+                );
             }
             Err(e) => {
                 on_event(RuntimeEvent::ToolCallFinished {
@@ -1376,6 +1390,8 @@ impl Runtime {
         let mut disallowed_tool_attempts = 0usize;
         let mut weak_search_query_attempts = 0usize;
         let mut post_evidence_tool_attempts = 0usize;
+        let mut answer_phase = false;
+        let mut post_answer_phase_tool_attempts = 0usize;
         // Computed once from the original user message. Excludes tool result/error injections
         // and correction messages so the approve-failure path (run_turns(0,...)) is safe.
         let original_user_prompt = self.conversation.last_user_content().filter(|c| {
@@ -1516,6 +1532,25 @@ impl Runtime {
                     repeated_tool_after_evidence_ready_final_answer(),
                     AnswerSource::RuntimeTerminal {
                         reason: RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
+                        rounds: tool_rounds,
+                    },
+                    on_event,
+                );
+                return;
+            }
+
+            if answer_phase && !calls.is_empty() {
+                post_answer_phase_tool_attempts += 1;
+                self.conversation.discard_last_if_assistant();
+                if post_answer_phase_tool_attempts == 1 {
+                    self.conversation
+                        .push_user(TURN_COMPLETE_ANSWER_ONLY.to_string());
+                    continue;
+                }
+                self.finish_with_runtime_answer(
+                    repeated_tool_after_answer_phase_final_answer(),
+                    AnswerSource::RuntimeTerminal {
+                        reason: RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
                         rounds: tool_rounds,
                     },
                     on_event,
@@ -1807,6 +1842,9 @@ impl Runtime {
                             );
                             return;
                         }
+                    }
+                    if !answer_phase && !investigation_required && !reads_this_turn.is_empty() {
+                        answer_phase = true;
                     }
                     // Signal re-entry before the next generate so the status bar
                     // transitions cleanly from "executing tools" → "processing" → …
@@ -3457,13 +3495,16 @@ mod tests {
     }
 
     #[test]
-    fn anchored_read_counts_against_same_turn_read_cap() {
+    fn anchored_read_seeds_reads_this_turn_and_answer_phase_fires_after_model_initiated_read() {
+        // The anchor re-read seeds reads_this_turn before run_turns_with_initial_reads.
+        // After one model-initiated read (b.rs), answer_phase fires and blocks further tools.
+        // This verifies that reads_this_turn is correctly threaded through the anchor path.
         use std::fs;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
-        for file in ["anchor.rs", "b.rs", "c.rs", "d.rs"] {
+        for file in ["anchor.rs", "b.rs"] {
             fs::write(
                 tmp.path().join("src").join(file),
                 format!("fn {}() {{}}\n", file.replace(".rs", "")),
@@ -3471,14 +3512,14 @@ mod tests {
             .unwrap();
         }
 
+        let final_answer = "Read both files.";
         let mut rt = make_runtime_in(
             vec![
                 "[read_file: src/anchor.rs]",
                 "First read complete.",
                 "[read_file: src/b.rs]",
-                "[read_file: src/c.rs]",
-                "[read_file: src/d.rs]",
-                "I have enough file evidence.",
+                "[search_code: anchor]",
+                final_answer,
             ],
             tmp.path(),
         );
@@ -3508,16 +3549,29 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Turn 1: anchor.rs. Turn 2: anchor.rs re-read + b.rs = 3 total.
         assert_eq!(
             all_user.matches("=== tool_result: read_file ===").count(),
-            4,
-            "first turn read plus three second-turn reads must succeed"
+            3,
+            "turn 1 anchor + anchor re-read + one model-initiated read must succeed"
         );
+        // After b.rs is read, answer_phase fires and blocks the search_code attempt.
         assert!(
-            all_user.contains("=== tool_error: read_file ===")
-                && all_user.contains("read limit for this turn"),
-            "fourth read in the anchor turn must be blocked by the normal read cap"
+            all_user.contains(TURN_COMPLETE_ANSWER_ONLY),
+            "answer_phase correction must fire after model-initiated read in anchor turn"
         );
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            0,
+            "post-read search_code must be blocked by answer_phase gate"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(final_answer));
     }
 
     #[test]
@@ -6978,27 +7032,223 @@ mod tests {
         );
     }
 
+    // Phase 11.2.1 — Runtime Turn Finalization (Stage 1)
+
+    #[test]
+    fn direct_read_blocks_post_read_tool_call_with_answer_phase_correction() {
+        // Non-investigation direct read: after read_file succeeds, answer_phase = true.
+        // A subsequent tool call must be blocked with TURN_COMPLETE_ANSWER_ONLY correction.
+        // The model then produces the final answer.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("foo.rs"), "fn foo() {}\n").unwrap();
+
+        let final_answer = "foo.rs defines a single function.";
+        let mut rt = make_runtime_in(
+            vec!["[read_file: foo.rs]", "[search_code: foo]", final_answer],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read foo.rs".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            all_user.matches("=== tool_result: read_file ===").count(),
+            1,
+            "read_file must have executed exactly once"
+        );
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            0,
+            "search_code after read must be blocked by answer_phase gate"
+        );
+        assert!(
+            all_user.contains(TURN_COMPLETE_ANSWER_ONLY),
+            "answer_phase correction must be injected after blocked search"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(final_answer));
+    }
+
+    #[test]
+    fn general_retrieval_blocks_post_read_search_with_answer_phase_correction() {
+        // Non-investigation search + read: after read succeeds, answer_phase = true.
+        // A further search attempt must be blocked. The model then answers.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/main.rs"),
+            "fn main() { println!(\"hello\"); }\n",
+        )
+        .unwrap();
+
+        let final_answer = "The project entry point is src/main.rs.";
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: main]",
+                "[read_file: src/main.rs]",
+                "[search_code: main]",
+                final_answer,
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "describe what this project does".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "must not fail: {events:?}");
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            1,
+            "only the first search_code (before any read) must dispatch"
+        );
+        assert_eq!(
+            all_user.matches("=== tool_result: read_file ===").count(),
+            1,
+            "read_file must have executed once"
+        );
+        assert!(
+            all_user.contains(TURN_COMPLETE_ANSWER_ONLY),
+            "answer_phase correction must be injected after post-read search attempt"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(final_answer));
+    }
+
+    #[test]
+    fn repeated_tool_after_answer_phase_terminates_before_search_budget_failure() {
+        // Non-investigation: after read, answer_phase = true.
+        // First post-read tool call → TURN_COMPLETE_ANSWER_ONLY correction.
+        // Second post-read tool call → RepeatedToolAfterAnswerPhase terminal.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("bar.rs"), "fn bar() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: bar.rs]",
+                "[search_code: bar]",
+                "[search_code: bar]",
+                "This response must not be consumed.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "read bar.rs".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
+                    ..
+                })
+            ),
+            "second post-read tool attempt must use RepeatedToolAfterAnswerPhase: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            0,
+            "post-read search_code attempts must not dispatch"
+        );
+        assert!(
+            all_user.contains(TURN_COMPLETE_ANSWER_ONLY),
+            "first post-read tool attempt must receive answer_phase correction"
+        );
+
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(repeated_tool_after_answer_phase_final_answer())
+        );
+    }
+
     #[test]
     fn read_cap_blocks_reads_beyond_limit() {
+        // On non-investigation turns, answer_phase fires after the first read.
+        // The second read attempt is blocked by the answer_phase gate, not the cap.
+        // This verifies that post-read tool drift is prevented for non-investigation turns.
         use std::fs;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
         fs::write(tmp.path().join("b.rs"), "fn b() {}\n").unwrap();
-        fs::write(tmp.path().join("c.rs"), "fn c() {}\n").unwrap();
-        fs::write(tmp.path().join("d.rs"), "fn d() {}\n").unwrap();
 
-        // Reads a, b, c all succeed (within MAX_READS_PER_TURN = 3).
-        // Read d is the first beyond the cap and must be blocked.
+        let final_answer = "I have read the file.";
         let mut rt = make_runtime_in(
-            vec![
-                "[read_file: a.rs]",
-                "[read_file: b.rs]",
-                "[read_file: c.rs]",
-                "[read_file: d.rs]",
-                "I have read enough files.",
-            ],
+            vec!["[read_file: a.rs]", "[read_file: b.rs]", final_answer],
             tmp.path(),
         );
 
@@ -7030,27 +7280,26 @@ mod tests {
 
         assert_eq!(
             all_user.matches("=== tool_result: read_file ===").count(),
-            3,
-            "exactly three reads must succeed (a, b, c)"
+            1,
+            "answer_phase fires after first read; second read must not dispatch"
         );
         assert!(
-            all_user.contains("=== tool_error: read_file ===")
-                && all_user.contains("read limit for this turn"),
-            "fourth read must be blocked with the cap tool error"
+            all_user.contains(TURN_COMPLETE_ANSWER_ONLY),
+            "second read attempt must be blocked by answer_phase correction"
         );
     }
 
     #[test]
     fn duplicate_read_is_blocked_within_same_turn() {
+        // On non-investigation turns, answer_phase fires after the first read.
+        // The duplicate read attempt is blocked by the answer_phase gate (not the dedup
+        // guard) — both mechanisms prevent the read, but answer_phase fires first.
         use std::fs;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
 
-        // Round 1: first read succeeds.
-        // Round 2: model tries to read the same path again — must be blocked.
-        // Round 3: model synthesizes from the evidence already in context.
         let mut rt = make_runtime_in(
             vec![
                 "[read_file: engine.rs]",
@@ -7080,21 +7329,26 @@ mod tests {
 
         let snapshot = rt.messages_snapshot();
 
-        // First read must produce a tool result.
-        assert!(
-            snapshot
-                .iter()
-                .any(|m| m.content.contains("=== tool_result: read_file ===")),
-            "first read must succeed and inject a tool result"
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // First read must succeed.
+        assert_eq!(
+            all_user.matches("=== tool_result: read_file ===").count(),
+            1,
+            "first read must succeed; duplicate must not dispatch"
         );
 
-        // Second read must be blocked with a tool error containing the dedup message.
+        // On non-investigation turns, answer_phase fires after the first read.
+        // The duplicate read attempt is intercepted by the answer_phase gate (pre-dispatch),
+        // which injects TURN_COMPLETE_ANSWER_ONLY rather than the dedup tool error.
         assert!(
-            snapshot.iter().any(|m| {
-                m.content.contains("=== tool_error: read_file ===")
-                    && m.content.contains("already read this turn")
-            }),
-            "duplicate read must be blocked with the dedup tool error"
+            all_user.contains(TURN_COMPLETE_ANSWER_ONLY),
+            "duplicate read attempt must be blocked by answer_phase correction"
         );
     }
 
@@ -7186,22 +7440,19 @@ mod tests {
     }
 
     #[test]
-    fn approve_synthesizes_after_successful_mutation() {
-        // After approving a write_file call, the model must be re-invoked for synthesis.
-        // The synthesis response closes the loop and becomes the final assistant message.
+    fn approve_produces_runtime_owned_answer_after_successful_mutation() {
+        // After approving a mutation, the runtime must finalize directly without
+        // re-entering model generation. The answer is built from the tool output summary.
         use std::io::Write;
         use tempfile::NamedTempFile;
 
-        // Write an existing file so edit_file has something to edit.
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "hello").unwrap();
         let path = f.path().to_string_lossy().into_owned();
-
-        // edit_file payload: path\x00search\x00replace (null-byte separated)
         let payload = format!("{}\x00hello\x00world", path);
 
-        // The synthesis response — model confirms what was done.
-        let mut rt = make_runtime(vec!["Done, the edit has been applied."]);
+        // No model responses needed — the runtime owns the answer.
+        let mut rt = make_runtime(Vec::<&str>::new());
         let before_count = rt.messages_snapshot().len();
 
         rt.set_pending_for_test(PendingAction {
@@ -7214,37 +7465,49 @@ mod tests {
         let events = collect_events(&mut rt, RuntimeRequest::Approve);
         assert!(!has_failed(&events), "approve must not fail: {events:?}");
 
-        // Synthesis must have fired — AssistantMessageChunk is emitted during synthesis.
+        // finish_with_runtime_answer emits AssistantMessageChunk for the runtime-owned answer.
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, RuntimeEvent::AssistantMessageChunk(_))),
-            "approve must trigger synthesis: no AssistantMessageChunk in events"
+            "runtime-owned answer must emit AssistantMessageChunk"
+        );
+
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::ToolAssisted { rounds: 1 })
+            ),
+            "mutation finalization must use ToolAssisted {{ rounds: 1 }}: {answer_source:?}"
         );
 
         let snapshot = rt.messages_snapshot();
-        // Snapshot must have grown: at minimum tool result + synthesis assistant message.
         assert!(
             snapshot.len() > before_count,
-            "snapshot must grow after approve + synthesis"
+            "snapshot must grow after approve + runtime finalization"
         );
-        // Tool result must be present.
         assert!(
             snapshot
                 .iter()
                 .any(|m| m.content.contains("=== tool_result: edit_file ===")),
             "tool result must be in conversation after approve"
         );
-        // The final assistant message must be the synthesis response, not a tool call.
         let last_assistant = snapshot
             .iter()
             .rev()
             .find(|m| m.role == crate::llm::backend::Role::Assistant);
         assert!(
             last_assistant
-                .map(|m| m.content.contains("Done"))
+                .map(|m| m.content.starts_with("edit_file result:"))
                 .unwrap_or(false),
-            "last assistant message must be the synthesis response"
+            "last assistant message must be the runtime-owned mutation answer: {last_assistant:?}"
         );
     }
 

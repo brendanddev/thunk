@@ -745,10 +745,12 @@ mod tests {
                 .any(|m| m.content.contains("=== tool_result: edit_file ===")),
             "approved repaired edit must inject a tool result"
         );
-        assert_eq!(
-            last_assistant_content(&snapshot),
-            Some("Edit applied."),
-            "approval should still synthesize after executing the repaired edit"
+        // Phase 11.2.1: runtime-owned answer after mutation — no model synthesis.
+        assert!(
+            last_assistant_content(&snapshot)
+                .map(|s| s.starts_with("edit_file result:"))
+                .unwrap_or(false),
+            "approval should produce runtime-owned answer after executing the repaired edit"
         );
     }
 
@@ -1532,12 +1534,11 @@ mod tests {
 
     // Scenario 7: approve -> synthesis
     //
-    // Failure class: approved mutations did not trigger synthesis — the TUI froze
-    // with no response after /approve. Now handle_approve calls run_turns(1, …)
-    // so the model confirms what was done.
+    // Phase 11.2.1: approved mutations now produce a runtime-owned answer directly.
+    // The runtime calls finish_with_runtime_answer rather than re-entering generation.
 
     #[test]
-    fn approve_triggers_synthesis_after_mutation() {
+    fn approve_produces_runtime_owned_answer_after_mutation() {
         use std::io::Write;
 
         use crate::tools::RiskLevel;
@@ -1551,7 +1552,8 @@ mod tests {
 
         let payload = format!("{}\x00hello\x00world", path);
 
-        let mut rt = make_runtime(&dir, vec!["Edit applied successfully."]);
+        // No model responses needed — the runtime owns the answer.
+        let mut rt = make_runtime(&dir, Vec::<&str>::new());
         rt.set_pending_for_test(crate::tools::PendingAction {
             tool_name: "edit_file".into(),
             summary: format!("edit {path}"),
@@ -1561,7 +1563,11 @@ mod tests {
 
         let events = collect_events(&mut rt, RuntimeRequest::Approve);
         assert!(!has_failed(&events), "approve must not fail: {events:?}");
-        assert!(has_chunk(&events), "approve must drive synthesis");
+        // finish_with_runtime_answer emits AssistantMessageChunk for the runtime-owned answer.
+        assert!(
+            has_chunk(&events),
+            "approve must emit runtime-owned answer chunk"
+        );
 
         let snapshot = rt.messages_snapshot();
         assert!(
@@ -1576,9 +1582,9 @@ mod tests {
             .find(|m| m.role == crate::llm::backend::Role::Assistant);
         assert!(
             last_assistant
-                .map(|m| m.content.contains("Edit applied"))
+                .map(|m| m.content.starts_with("edit_file result:"))
                 .unwrap_or(false),
-            "last assistant message must be synthesis"
+            "last assistant message must be runtime-owned answer: {last_assistant:?}"
         );
     }
 }
