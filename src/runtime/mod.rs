@@ -1,6 +1,7 @@
 mod anchors;
 mod conversation;
 mod engine;
+mod generation;
 mod investigation;
 mod paths;
 mod prompt;

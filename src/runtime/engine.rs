@@ -2,8 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::app::config::Config;
-use crate::app::Result;
-use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, Message, ModelBackend};
+use crate::llm::backend::ModelBackend;
 use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
 
 use super::anchors::{
@@ -11,6 +10,7 @@ use super::anchors::{
     AnchorState,
 };
 use super::conversation::Conversation;
+use super::generation::{emit_visible_assistant_message, run_generate_turn};
 #[cfg(test)]
 use super::investigation::{
     contains_create_term, contains_initialization_term, contains_load_term, contains_register_term,
@@ -1621,62 +1621,6 @@ fn last_injected_was_edit_error(conversation: &Conversation) -> bool {
         .unwrap_or(false)
 }
 
-/// Runs a single generation turn: sends the current conversation to the backend,
-/// buffers the assistant response into conversation history, then returns the
-/// complete response text, or None if the backend produced no output. Assistant
-/// message events are emitted only after runtime admission.
-fn run_generate_turn(
-    backend: &mut dyn ModelBackend,
-    conversation: &mut Conversation,
-    tool_surface: ToolSurface,
-    on_event: &mut dyn FnMut(RuntimeEvent),
-) -> Result<Option<String>> {
-    let mut messages = conversation.snapshot();
-    messages.push(Message::system(prompt::render_tool_surface_hint(
-        tool_surface.as_str(),
-        tool_surface.allowed_tool_names(),
-    )));
-    let request = GenerateRequest::new(messages);
-    let mut response = String::new();
-
-    let result = backend.generate(request, &mut |event| match event {
-        BackendEvent::StatusChanged(status) => {
-            on_event(RuntimeEvent::ActivityChanged(map_backend_status(status)));
-        }
-        BackendEvent::TextDelta(chunk) => {
-            response.push_str(&chunk);
-        }
-        BackendEvent::Timing { stage, elapsed_ms } => {
-            on_event(RuntimeEvent::BackendTiming { stage, elapsed_ms });
-        }
-        BackendEvent::Finished => {}
-    });
-
-    result?;
-
-    if response.is_empty() {
-        Ok(None)
-    } else {
-        conversation.begin_assistant_reply();
-        conversation.push_assistant_chunk(&response);
-        Ok(Some(response))
-    }
-}
-
-fn emit_visible_assistant_message(text: &str, on_event: &mut dyn FnMut(RuntimeEvent)) {
-    on_event(RuntimeEvent::ActivityChanged(Activity::Responding));
-    on_event(RuntimeEvent::AssistantMessageStarted);
-    on_event(RuntimeEvent::AssistantMessageChunk(text.to_string()));
-    on_event(RuntimeEvent::AssistantMessageFinished);
-}
-
-fn map_backend_status(status: BackendStatus) -> Activity {
-    match status {
-        BackendStatus::LoadingModel => Activity::LoadingModel,
-        BackendStatus::Generating => Activity::Generating,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1684,7 +1628,7 @@ mod tests {
 
     use super::*;
     use crate::app::config::Config;
-    use crate::llm::backend::Role;
+    use crate::llm::backend::{BackendEvent, GenerateRequest, Role};
     use crate::tools::{default_registry, RiskLevel};
 
     struct TestBackend {
