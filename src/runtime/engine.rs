@@ -216,7 +216,7 @@ const LIST_DIR_BEFORE_SEARCH_BLOCKED: &str =
 
 use super::trace::trace_runtime_decision;
 
-use super::paths::{normalize_evidence_path, path_is_within_scope};
+use super::paths::{normalize_evidence_path, path_is_within_scope, path_matches_requested};
 
 /// Tracks search_code usage within a single turn.
 /// Rules: 1 search always permitted; a second search is permitted only when the first
@@ -1703,7 +1703,7 @@ fn run_tool_round(
         }
 
         if let (Some(requested), ToolInput::ReadFile { path }) = (requested_read_path, &input) {
-            if normalize_evidence_path(path) != normalize_evidence_path(requested) {
+            if !path_matches_requested(path, requested) {
                 let error = format!(
                     "read_file path `{path}` does not match the requested path `{requested}`"
                 );
