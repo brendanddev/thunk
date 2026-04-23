@@ -78,6 +78,10 @@ const READ_BEFORE_ANSWERING: &str =
     "[runtime:correction] Search returned matches but no matched file has been read this turn. \
      Read one of the matched files with [read_file: path] before answering.";
 
+const EVIDENCE_READY_ANSWER_ONLY: &str =
+    "[runtime:correction] Evidence is already ready from the file(s) read this turn. \
+     Do not call more tools. Answer using the existing file evidence.";
+
 fn usage_read_recovery_correction(path: &str) -> String {
     format!(
         "[runtime:correction] This is a usage lookup. The file just read only showed definition matches, \
@@ -553,6 +557,28 @@ fn tool_allowed_for_surface(input: &ToolInput, surface: ToolSurface) -> bool {
     }
 }
 
+fn is_git_read_only_tool_input(input: &ToolInput) -> bool {
+    matches!(
+        SurfaceTool::from_input(input).and_then(tool_surface_for_tool),
+        Some(ToolSurface::GitReadOnly)
+    )
+}
+
+fn git_acquisition_answer_section(name: &str, body: &str) -> String {
+    format!("{name}:\n{}", body.trim_end())
+}
+
+fn render_git_acquisition_answer(sections: Vec<String>) -> Option<String> {
+    if sections.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Git read-only result:\n\n{}",
+            sections.join("\n\n")
+        ))
+    }
+}
+
 fn tool_surface_for_tool(tool: SurfaceTool) -> Option<ToolSurface> {
     TOOL_SURFACE_DEFINITIONS
         .iter()
@@ -582,6 +608,10 @@ fn repeated_disallowed_tool_error(surface: ToolSurface) -> &'static str {
 
 fn repeated_disallowed_tool_final_answer() -> &'static str {
     "I could not continue because the model repeatedly tried to use tools that are unavailable for this request."
+}
+
+fn repeated_tool_after_evidence_ready_final_answer() -> &'static str {
+    "I could not continue because the model kept calling tools after sufficient file evidence was already read."
 }
 
 fn weak_search_query_correction(reason: &str) -> String {
@@ -929,7 +959,10 @@ pub struct Runtime {
 /// Outcome of dispatching one round of tool calls.
 enum ToolRoundOutcome {
     /// All tools in this round completed immediately; results are ready to push.
-    Completed { results: String },
+    Completed {
+        results: String,
+        git_acquisition_answer: Option<String>,
+    },
     /// The runtime has enough information to end the turn without asking the model
     /// for another synthesis pass.
     TerminalAnswer {
@@ -1122,7 +1155,7 @@ impl Runtime {
             None,
             on_event,
         ) {
-            ToolRoundOutcome::Completed { results } => {
+            ToolRoundOutcome::Completed { results, .. } => {
                 self.conversation.push_user(results);
                 self.conversation.trim_tool_exchanges_if_needed();
                 on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
@@ -1336,6 +1369,7 @@ impl Runtime {
         let mut read_request_correction_issued = false;
         let mut disallowed_tool_attempts = 0usize;
         let mut weak_search_query_attempts = 0usize;
+        let mut post_evidence_tool_attempts = 0usize;
         // Computed once from the original user message. Excludes tool result/error injections
         // and correction messages so the approve-failure path (run_turns(0,...)) is safe.
         let original_user_prompt = self.conversation.last_user_content().filter(|c| {
@@ -1455,6 +1489,33 @@ impl Runtime {
             };
 
             let calls = tool_codec::parse_all_tool_inputs(&response);
+
+            if investigation_required && investigation.evidence_ready() && !calls.is_empty() {
+                post_evidence_tool_attempts += 1;
+                trace_runtime_decision(
+                    on_event,
+                    "post_evidence_tool_call_rejected",
+                    &[
+                        ("attempts", post_evidence_tool_attempts.to_string()),
+                        ("tool_count", calls.len().to_string()),
+                    ],
+                );
+                self.conversation.discard_last_if_assistant();
+                if post_evidence_tool_attempts == 1 {
+                    self.conversation
+                        .push_user(EVIDENCE_READY_ANSWER_ONLY.to_string());
+                    continue;
+                }
+                self.finish_with_runtime_answer(
+                    repeated_tool_after_evidence_ready_final_answer(),
+                    AnswerSource::RuntimeTerminal {
+                        reason: RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
+                        rounds: tool_rounds,
+                    },
+                    on_event,
+                );
+                return;
+            }
 
             if search_budget.is_closed()
                 && calls
@@ -1718,9 +1779,29 @@ impl Runtime {
                 investigation_path_scope.as_deref(),
                 on_event,
             ) {
-                ToolRoundOutcome::Completed { results } => {
+                ToolRoundOutcome::Completed {
+                    results,
+                    git_acquisition_answer,
+                } => {
                     self.conversation.push_user(results);
                     self.conversation.trim_tool_exchanges_if_needed();
+                    if tool_surface == ToolSurface::GitReadOnly {
+                        if let Some(answer) = git_acquisition_answer {
+                            trace_runtime_decision(
+                                on_event,
+                                "git_acquisition_completed",
+                                &[("rounds", tool_rounds.to_string())],
+                            );
+                            self.finish_with_runtime_answer(
+                                &answer,
+                                AnswerSource::ToolAssisted {
+                                    rounds: tool_rounds,
+                                },
+                                on_event,
+                            );
+                            return;
+                        }
+                    }
                     // Signal re-entry before the next generate so the status bar
                     // transitions cleanly from "executing tools" → "processing" → …
                     on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
@@ -1812,6 +1893,7 @@ fn run_tool_round(
     on_event: &mut dyn FnMut(RuntimeEvent),
 ) -> ToolRoundOutcome {
     let mut accumulated = String::new();
+    let mut git_answer_sections = Vec::new();
 
     for mut input in calls {
         simplify_search_input(&mut input);
@@ -1862,6 +1944,7 @@ fn run_tool_round(
         };
         let name = input.tool_name().to_string();
         let key = call_fingerprint(&input);
+        let is_git_read_only_tool = is_git_read_only_tool_input(&input);
         on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
 
         if !tool_allowed_for_surface(&input, tool_surface) {
@@ -2195,6 +2278,12 @@ fn run_tool_round(
                     name: name.clone(),
                     summary: Some(summary),
                 });
+                if is_git_read_only_tool {
+                    git_answer_sections.push(git_acquisition_answer_section(
+                        &name,
+                        &tool_codec::render_output(&output),
+                    ));
+                }
                 accumulated.push_str(&tool_codec::format_tool_result(&name, &output));
                 if let Some((path, kind)) = read_recovery {
                     trace_runtime_decision(
@@ -2244,6 +2333,9 @@ fn run_tool_round(
                     name: name.clone(),
                     summary: None,
                 });
+                if is_git_read_only_tool {
+                    git_answer_sections.push(git_acquisition_answer_section(&name, &error));
+                }
                 accumulated.push_str(&tool_codec::format_tool_error(&name, &error));
                 if let Some(path) = read_path {
                     return ToolRoundOutcome::TerminalAnswer {
@@ -2260,6 +2352,7 @@ fn run_tool_round(
 
     ToolRoundOutcome::Completed {
         results: accumulated,
+        git_acquisition_answer: render_git_acquisition_answer(git_answer_sections),
     }
 }
 
@@ -4518,6 +4611,224 @@ mod tests {
     }
 
     #[test]
+    fn git_read_only_first_generation_multi_tool_acquisition_is_allowed() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let mut rt = make_runtime_in(
+            vec![
+                "[git_status]\n[git_diff]",
+                "This response should not be consumed.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "show git status".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "same-generation Git acquisition must not fail: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|event| {
+            if let RuntimeEvent::AnswerReady(source) = event {
+                Some(source)
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::ToolAssisted { rounds: 1 })
+            ),
+            "same-generation Git tools should consume one acquisition round: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let all_user = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_user.contains("=== tool_result: git_status ==="),
+            "git_status should execute in the acquisition round"
+        );
+        assert!(
+            all_user.contains("=== tool_result: git_diff ==="),
+            "git_diff should execute in the same acquisition round"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        assert!(
+            last_assistant.contains("Git read-only result:"),
+            "runtime should produce the final Git answer"
+        );
+        assert!(
+            last_assistant.contains("git_status:"),
+            "runtime answer should include git_status output"
+        );
+        assert!(
+            last_assistant.contains("git_diff:"),
+            "runtime answer should include git_diff output"
+        );
+        assert!(
+            last_assistant.contains("working tree clean"),
+            "runtime answer should reuse rendered git_status output"
+        );
+        assert!(
+            last_assistant.contains("No unstaged changes."),
+            "runtime answer should reuse rendered git_diff output"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("This response should not be consumed.")),
+            "runtime must not request model synthesis after Git acquisition"
+        );
+    }
+
+    #[test]
+    fn git_read_only_runtime_answer_prevents_second_generation_git_tool() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let mut rt = make_runtime_in(vec!["[git_status]", "[git_diff]"], tmp.path());
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "show git status".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "GitReadOnly turn should finish immediately after acquisition: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|event| {
+            if let RuntimeEvent::AnswerReady(source) = event {
+                Some(source)
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::ToolAssisted { rounds: 1 })
+            ),
+            "runtime-produced Git answer should remain a successful tool-assisted answer: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let all_user = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: git_status ===").count(),
+            1,
+            "first Git acquisition tool should dispatch exactly once"
+        );
+        assert_eq!(
+            all_user.matches("=== tool_result: git_diff ===").count(),
+            0,
+            "second backend response must not be consumed after acquisition completes"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert!(
+            last_assistant.is_some_and(
+                |answer| answer.contains("git_status:") && !answer.contains("git_diff:")
+            ),
+            "runtime answer should include only the completed acquisition output"
+        );
+    }
+
+    #[test]
+    fn failed_git_acquisition_finishes_without_retrieval_drift() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(vec!["[git_diff]", "[search_code: git_diff]"], tmp.path());
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "show git diff".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "failed Git acquisition should finish through runtime synthesis: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|event| {
+            if let RuntimeEvent::AnswerReady(source) = event {
+                Some(source)
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::ToolAssisted { rounds: 1 })
+            ),
+            "failed Git acquisition still completes as a bounded tool-assisted answer: {answer_source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let all_user = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_user.contains("=== tool_error: git_diff ==="),
+            "Git tool failure should be injected as the acquisition result"
+        );
+        assert!(
+            !all_user.contains("=== tool_error: search_code ==="),
+            "second backend response must not be consumed after failed Git acquisition"
+        );
+        assert!(
+            !all_user.contains("=== tool_result: search_code ==="),
+            "retrieval drift must not dispatch search_code"
+        );
+        assert!(
+            !all_user.contains(surface_policy_correction(ToolSurface::GitReadOnly)),
+            "no post-acquisition surface correction should be needed"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert!(
+            last_assistant.is_some_and(|answer| answer.contains("git_diff:")
+                && answer.contains("git_diff failed: not a Git repository")),
+            "runtime answer should include the Git tool error"
+        );
+    }
+
+    #[test]
     fn second_disallowed_retrieval_tool_on_git_read_only_turn_terminates_policy_violation() {
         let mut rt = make_runtime(vec!["[search_code: status]", "[read_file: src/main.rs]"]);
 
@@ -5340,7 +5651,7 @@ mod tests {
         );
 
         let results = match outcome {
-            ToolRoundOutcome::Completed { results } => results,
+            ToolRoundOutcome::Completed { results, .. } => results,
             _ => panic!("forced same-scope clamp should complete"),
         };
         assert!(
@@ -6395,6 +6706,263 @@ mod tests {
             last_assistant,
             Some(insufficient_evidence_final_answer()),
             "last assistant message must be runtime terminal answer"
+        );
+    }
+
+    #[test]
+    fn definition_lookup_extra_tool_after_evidence_ready_enters_answer_only_mode() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/models")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/cli")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/models/enums.py"),
+            "class TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/cli/commands.py"),
+            "def show_commands():\n    return []\n",
+        )
+        .unwrap();
+
+        let final_answer = "TaskStatus is defined in sandbox/models/enums.py.";
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: sandbox/models/enums.py]",
+                "[read_file: sandbox/cli/commands.py]",
+                final_answer,
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus defined in sandbox/".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "extra post-evidence tool call must not fail the turn: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "model should synthesize after answer-only correction: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: read_file ===").count(),
+            1,
+            "extra read_file after sufficient evidence must not dispatch"
+        );
+        assert!(
+            all_user.contains(EVIDENCE_READY_ANSWER_ONLY),
+            "runtime must inject answer-only correction after evidence is ready"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::Failed { message }
+                    if message == "Model kept searching after the search budget was closed."
+            )),
+            "post-evidence tool use must not reach the closed-search-budget failure path"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(final_answer));
+    }
+
+    #[test]
+    fn initialization_recovery_extra_tool_after_evidence_ready_enters_answer_only_mode() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/logging_usage.py"),
+            "def emit_log(logger):\n    logger.info(\"logging event\")\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/logging_init.py"),
+            "def initialize_logging():\n    logging.basicConfig(level=\"INFO\")\n",
+        )
+        .unwrap();
+
+        let final_answer = "Logging is initialized in sandbox/services/logging_init.py.";
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging]",
+                "[read_file: sandbox/services/logging_usage.py]",
+                "[read_file: sandbox/services/logging_init.py]",
+                "[read_file: sandbox/services/logging_usage.py]",
+                final_answer,
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where logging is initialized in sandbox/".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "post-recovery evidence-ready tool call must not fail the turn: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: read_file ===").count(),
+            2,
+            "only the wrong first read and accepted recovery read should dispatch"
+        );
+        assert!(
+            all_user.contains("This is an initialization lookup"),
+            "initialization recovery must still be issued before evidence is ready"
+        );
+        assert!(
+            all_user.contains(EVIDENCE_READY_ANSWER_ONLY),
+            "runtime must switch to answer-only mode after accepted recovery evidence"
+        );
+        assert!(
+            !all_user.contains(
+                "=== tool_result: read_file ===\npath: sandbox/services/logging_usage.py\n"
+            ) || all_user
+                .matches(
+                    "=== tool_result: read_file ===\npath: sandbox/services/logging_usage.py\n"
+                )
+                .count()
+                == 1,
+            "extra post-evidence read of the usage file must not dispatch"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(final_answer));
+    }
+
+    #[test]
+    fn repeated_post_evidence_tool_use_terminates_before_search_budget_failure() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/models")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/models/enums.py"),
+            "class TaskStatus(str, Enum):\n    TODO = \"todo\"\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: TaskStatus]",
+                "[read_file: sandbox/models/enums.py]",
+                "[search_code: TaskStatus]",
+                "[search_code: TaskStatus]",
+                "This response should not be consumed.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is TaskStatus defined in sandbox/".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "repeated post-evidence tools must terminate cleanly: {events:?}"
+        );
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
+                    ..
+                })
+            ),
+            "second post-evidence tool attempt must use dedicated terminal reason: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let all_user: String = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::User)
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all_user.matches("=== tool_result: search_code ===").count(),
+            1,
+            "post-evidence search_code attempts must not dispatch"
+        );
+        assert!(
+            all_user.contains(EVIDENCE_READY_ANSWER_ONLY),
+            "first post-evidence tool attempt must receive answer-only correction"
+        );
+        assert!(
+            all_user.matches(SEARCH_CLOSED_AFTER_RESULTS).count() == 1,
+            "post-evidence tool attempts must not add another search-budget-closed correction"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::Failed { message }
+                    if message == "Model kept searching after the search budget was closed."
+            )),
+            "post-evidence tool attempts must not fall into closed-search-budget failure"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(repeated_tool_after_evidence_ready_final_answer())
         );
     }
 

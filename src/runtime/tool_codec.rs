@@ -796,7 +796,7 @@ fn render_git_log(g: &crate::tools::types::GitLogOutput) -> String {
     lines.join("\n")
 }
 
-fn render_output(output: &ToolOutput) -> String {
+pub(crate) fn render_output(output: &ToolOutput) -> String {
     match output {
         ToolOutput::FileContents(f) => {
             if f.truncated {

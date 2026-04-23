@@ -28,7 +28,7 @@ impl Activity {
 pub enum AnswerSource {
     /// Model produced a final answer without using any tools.
     Direct,
-    /// Model produced a final answer after one or more tool rounds.
+    /// A final answer was produced after one or more tool rounds.
     ToolAssisted { rounds: usize },
     /// Runtime produced a deterministic terminal answer without model synthesis.
     RuntimeTerminal {
@@ -44,6 +44,7 @@ pub enum RuntimeTerminalReason {
     RejectedMutation,
     ReadFileFailed,
     RepeatedDisallowedTool,
+    RepeatedToolAfterEvidenceReady,
     RepeatedWeakSearchQuery,
     /// Search was attempted but all results were empty and no file was read.
     /// The runtime emits the answer directly rather than letting the model speculate.
