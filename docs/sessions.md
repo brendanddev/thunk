@@ -154,9 +154,10 @@ The old session remains in SQLite; reset does not delete prior sessions.
 
 ## IDs And Ordering
 
-Session IDs are generated as short lowercase hex strings.
+Session IDs are generated as 16-character lowercase hex strings.
 
 Sessions are restored by `updated_at` descending, so the app always resumes the most recently updated saved session.
+The docs intentionally treat those timestamp fields as opaque stored ordering values rather than promising a specific unit.
 
 Messages within a session are stored and loaded in ascending `seq` order.
 

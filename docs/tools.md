@@ -8,15 +8,18 @@ Describes the current tool layer: the common tool contract, how tools are regist
 
 The tool layer gives the runtime a typed interface for project-local actions.
 
-Today that tool surface is intentionally small:
+Today that built-in tool set is intentionally small:
 
 - `read_file`
 - `list_dir`
 - `search_code`
+- `git_status`
+- `git_diff`
+- `git_log`
 - `edit_file`
 - `write_file`
 
-The layer is built around explicit types rather than text parsing. Raw assistant text is parsed in `runtime/tool_codec.rs` before any tool is called.
+The layer is built around explicit types rather than text parsing. Raw assistant text is parsed in `runtime/tool_codec.rs` before any tool is called, and the runtime may expose only a subset of registered tools on a given turn. Current tool-surface policy applies only to the read-only retrieval/Git families; `edit_file` and `write_file` are gated separately by mutation intent and approval.
 
 ---
 
@@ -41,6 +44,9 @@ The runtime never passes raw strings into tools. It passes one typed `ToolInput`
 - `ReadFile`
 - `ListDir`
 - `SearchCode`
+- `GitStatus`
+- `GitDiff`
+- `GitLog`
 - `EditFile`
 - `WriteFile`
 
@@ -51,6 +57,7 @@ Completed tools return typed outputs:
 - file contents
 - directory listings
 - search results
+- git status / diff / log results
 - edit confirmations
 - write confirmations
 
@@ -187,6 +194,43 @@ Runtime behavior adds guardrails around the tool because prompt-only guidance wa
 - after a definition-only read on a usage lookup, runtime can inject a bounded correction naming a concrete matched usage file
 - definition lookups still accept a definition-file read as sufficient evidence
 
+### `git_status`
+
+Runs a fixed read-only status command and returns structured repository status information immediately.
+
+Current behavior:
+
+- runs a bounded `git status --short --branch`
+- captures stdout/stderr with deterministic size limits
+- truncates long status entry paths in rendered output
+- returns a deterministic tool error when Git is unavailable or the project root is not a Git repository
+
+This is not an arbitrary Git command runner. The tool takes no free-form arguments.
+
+### `git_diff`
+
+Runs a fixed read-only diff command and returns the current working-tree diff immediately.
+
+Current behavior:
+
+- runs a bounded `git diff --no-ext-diff --no-textconv --no-color --`
+- captures stdout/stderr with deterministic size limits
+- returns structured diff text plus truncation metadata
+- returns a deterministic tool error when Git is unavailable or the project root is not a Git repository
+
+Like the other Git tools, this is intentionally narrow and argument-free.
+
+### `git_log`
+
+Runs a fixed read-only recent-history command and returns recent commits immediately.
+
+Current behavior:
+
+- runs a bounded recent-history log with `--max-count=20`
+- disables pager/signature noise and uses short dates
+- returns parsed commit entries with truncation metadata
+- treats empty history and non-repo failures deterministically
+
 ### `edit_file`
 
 Proposes an exact text replacement in an existing file.
@@ -227,6 +271,7 @@ This is a full-file write tool, not an append or patch tool.
 Tools must not:
 
 - parse raw assistant output
+- decide which tools are available for the current turn
 - manage approval state after returning `PendingAction`
 - write UI messages
 - persist sessions
@@ -238,9 +283,10 @@ Those responsibilities belong to the runtime, app/storage, and TUI layers.
 
 ## Current Limitations
 
-- There are only five built-in tools.
-- There is no shell, git, web, or external integration tool yet.
+- There are only eight built-in tools.
+- There is no shell, web, or external integration tool.
 - `search_code` uses a simple literal line substring search, not regex or semantic search.
+- The current model-facing `search_code` wire format exposes only the plain query form, even though the typed input supports an optional scoped path.
 - `edit_file` only replaces the first exact match.
 - `write_file` does not create parent directories.
 - Tool result rendering is optimized for the runtime and TUI, not for rich previews or diffs.

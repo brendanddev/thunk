@@ -6,7 +6,7 @@ Defines the high-level architecture and design decisions of the app, including t
 
 ## System Overview
 
-`params-cli` is a local-first Rust TUI coding assistant. It runs a conversation loop against a selected model backend, lets the model request a small set of file-system tools through a constrained text protocol, and requires explicit user approval before mutating files.
+`params-cli` is a local-first Rust TUI coding assistant. It runs a conversation loop against a selected model backend, lets the model request a small set of typed project-local tools through a constrained text protocol, and requires explicit user approval before mutating files.
 
 At startup, `src/main.rs` calls `app::run()`. The app layer discovers the project root from `config.toml`, loads config, builds the model backend and tool registry, opens optional session logging, restores the most recent session from SQLite, and launches the TUI. After that, the TUI talks only to `AppContext`; `AppContext` forwards requests into the runtime and persists the runtime transcript.
 
@@ -24,15 +24,15 @@ The core problem the project solves is running an AI coding assistant locally wi
 
 ### `runtime/`
 
-- Responsibilities: system prompt construction, conversation state, backend generation loop, tool-call parsing through `tool_codec`, tool dispatch, approval pause/resume, and runtime events.
-- Owns: `Conversation`, `pending_action`, `RuntimeRequest`, `RuntimeEvent`, and the decision to inject tool results back into the conversation.
+- Responsibilities: system prompt construction, conversation state, backend generation loop, tool-call parsing through `tool_codec`, tool dispatch, tool-surface policy, bounded investigation flow, anchor handling, approval pause/resume, runtime corrections, and runtime events.
+- Owns: `Conversation`, per-turn policy/enforcement state, `pending_action`, `RuntimeRequest`, `RuntimeEvent`, and the decision to inject tool results back into the conversation.
 - Must not: talk to SQLite directly, manipulate terminal state, or let tools parse raw model text.
 
 ### `tools/`
 
-- Responsibilities: typed tool contracts, tool registry, project-root-aware path resolution, and concrete tool behavior for reading, listing, searching, editing, and writing files.
+- Responsibilities: typed tool contracts, tool registry, project-root-aware path resolution, and concrete tool behavior for reading, listing, searching, Git inspection, editing, and writing files.
 - Owns: `ToolInput`, `ToolOutput`, `ToolRunResult`, `PendingAction` payload encoding, and path-safety checks for mutating tools.
-- Must not: parse assistant text, manage approval state after returning a `PendingAction`, render UI, or persist sessions.
+- Must not: parse assistant text, decide per-turn tool availability, manage approval state after returning a `PendingAction`, render UI, or persist sessions.
 
 ### `storage/`
 
@@ -49,7 +49,7 @@ The core problem the project solves is running an AI coding assistant locally wi
 ### `tui/`
 
 - Responsibilities: terminal lifecycle, raw input editing, slash-command parsing, transcript rendering, and mapping `RuntimeEvent`s into visible UI messages.
-- Owns: `AppState`, `/help`, `/clear`, `/quit`, `/approve`, `/reject`, and alternate-screen / raw-mode handling.
+- Owns: `AppState`, `/help`, `/clear`, `/quit`, `/exit`, `/approve`, `/reject`, and alternate-screen / raw-mode handling.
 - Must not: execute tools, save sessions, parse tool calls, or contain runtime business logic.
 
 ### Supporting Utility: `logging/`
@@ -65,17 +65,17 @@ The core problem the project solves is running an AI coding assistant locally wi
 1. The user types into the TUI.
 2. Slash commands are handled in `tui/commands`; normal prompts become `RuntimeRequest::Submit`.
 3. `AppContext` forwards the request into `Runtime` and logs request/event timing if a session log is open.
-4. The runtime appends the user message to `Conversation`, snapshots the full message list, and sends it to the active `ModelBackend`.
+4. The runtime appends the user message to `Conversation`, derives per-turn policy state such as tool surface / mutation intent / investigation mode / anchor handling, snapshots the full message list, and sends it to the active `ModelBackend`. The active tool-surface hint is injected into the backend request as additional system context and is not persisted in conversation history.
 5. The backend streams `BackendEvent`s. The runtime converts status updates into `Activity` changes and text deltas into an assistant message in the conversation.
 6. When generation finishes, `tool_codec::parse_all_tool_inputs()` scans the full assistant response and returns typed `ToolInput` values in document order.
 7. `ToolRegistry` dispatches each `ToolInput` to its tool implementation.
 8. Immediate tool results are rendered two ways by the runtime: a compact one-line summary for the TUI, and a `=== tool_result: name ===` block appended back into the conversation as a user message.
 9. If a tool returns `Approval(PendingAction)`, the runtime stores that single pending action, emits `ApprovalRequired`, and stops the turn until the user chooses `/approve` or `/reject`.
-10. If no approval is pending, the runtime normally re-enters generation with the injected tool results so the assistant can produce a same-turn answer grounded in actual tool output.
-11. If the runtime already knows the terminal outcome, such as a rejected mutation or failed `read_file`, it can emit a runtime-owned assistant answer instead of asking the model to synthesize.
+10. If no approval is pending, the runtime either re-enters generation with the injected tool results or finishes immediately with a runtime-produced answer, depending on the turn lifecycle. Retrieval turns usually re-enter generation; completed Git read-only turns do not.
+11. If the runtime already knows the terminal outcome, such as a rejected mutation, failed `read_file`, exhausted investigation, or completed Git read-only acquisition, it can emit a runtime-owned assistant answer instead of asking the model to synthesize.
 12. The TUI renders events only. It never sees typed tool payloads and never calls tool implementations directly.
 
-One important current behavior: successful tool rounds do not end the turn immediately. The runtime normally calls the model again with the tool results so the final answer can synthesize what was actually found or changed. Terminal runtime-owned answers are reserved for cases where model synthesis would be less reliable than the runtime state, such as rejection or missing-file read failures.
+One important current behavior: successful tool rounds do not all end the same way. Retrieval and approved-mutation turns usually call the model again with tool results in context so the final answer can synthesize what was actually found or changed. Git read-only turns are different: after one completed Git acquisition round, the runtime produces the visible answer directly and ends the turn without a post-tool synthesis round.
 
 ---
 
@@ -107,7 +107,7 @@ The runtime owns the pending action lifecycle, but it does not interpret `payloa
 4. `/approve` calls `ToolRegistry::execute_approved()`.
 5. `/reject` appends a `=== tool_error: name ===` block and emits a runtime-owned cancellation answer.
 
-On approval success, the runtime appends a `=== tool_result: name ===` block and resumes generation for synthesis. On approval failure, it appends a `=== tool_error: name ===` block and resumes generation so the model can recover. On rejection, the runtime does not re-enter model generation because it already knows no mutation occurred.
+On approval success, the runtime appends a `=== tool_result: name ===` block and re-enters generation for a follow-up response. On approval failure, it appends a `=== tool_error: name ===` block and resumes generation so the model can recover. On rejection, the runtime does not re-enter model generation because it already knows no mutation occurred.
 
 ### Two-Phase Execution
 
@@ -145,6 +145,9 @@ Supported model-facing call formats:
 [read_file: path/to/file.rs]
 [list_dir: src/]
 [search_code: keyword]
+[git_status]
+[git_diff]
+[git_log]
 
 [edit_file]
 path: path/to/file.rs
@@ -177,6 +180,7 @@ Protocol rules in the current implementation:
 The system prompt tells the model that when a tool is needed, the reply should contain tool call tags only. Direct plain-text answers are still allowed when no tool is needed. Tool results are never model-authored: the runtime injects `=== tool_result: name ===` and `=== tool_error: name ===` blocks after execution, and those result formats are intentionally not described back to the model.
 
 Prompt-only behavioral rules are not treated as sufficient for loop safety. For `search_code`, the runtime also enforces a per-turn budget: one search is always allowed, one retry is allowed only if the first search returned no matches, and later search attempts are blocked with a runtime correction.
+More broadly, the runtime owns structural enforcement around tool availability, search/read ordering, explicit file-read requests, and Git turn completion. `tool_codec` formats and parses those interactions, but it does not decide policy.
 
 For investigation-required turns, runtime-owned evidence rules also apply. `list_dir` is blocked before `search_code`, because directory listings are not sufficient evidence for code-location questions. Non-empty search results require a `read_file` from the current search candidate set before synthesis. Some lookup types add mode-specific evidence gates: usage lookups prefer usage-bearing evidence when it exists, configuration lookups prefer config-file evidence when it exists, and initialization/create/register/load/save lookups prefer matched-line evidence for that mode when it exists. Definition lookups still accept reading the definition file as sufficient evidence.
 
@@ -227,12 +231,19 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 - At most one `pending_action` exists at a time.
 - New user submissions are rejected while an approval is pending.
 - The runtime owns conversation mutation, tool result injection, and approval state.
+- Each turn uses exactly one runtime-selected tool surface for the surface-owned read-only families. Current surfaces are `RetrievalFirst` (`search_code`, `read_file`, `list_dir`) and `GitReadOnly` (`git_status`, `git_diff`, `git_log`).
+- Mutation permission is separate from tool-surface policy. `edit_file` and `write_file` are gated by a conservative mutation-intent check plus the approval flow, not by the `RetrievalFirst` / `GitReadOnly` surface definitions.
+- Tool-surface enforcement is pre-dispatch and runtime-owned. The same canonical surface definitions are also used to render the ephemeral backend hint for the active turn.
 - Raw assistant tool syntax is parsed only in `tool_codec`.
 - Tools return typed data; tools do not append conversation text themselves.
 - Mutating tools do not write during `run()`; writes happen only in `execute_approved()`.
 - `search_code` executes literal substring searches, and repeated search behavior is bounded per user turn by runtime state.
 - investigation-required turns block `list_dir` before search, require a matched read before synthesis, and use runtime-owned mode-specific evidence gating.
+- Once investigation evidence is ready, further tool calls in that turn are structurally invalid. The runtime corrects once, then terminals if the model repeats the violation.
 - investigation candidate reads remain capped at 2, recovery is single-shot, and action lookup modes use matched-line structural classification only, without semantic reasoning or tool / `tool_codec` changes.
+- A completed Git read-only acquisition round can contain multiple Git tools in the same assistant response, but after that round the runtime ends the turn with a visible answer and does not ask the model to synthesize.
+- Explicit follow-up anchors are runtime-owned and structural only: last-read file, last-search replay, and same-scope reuse. They are updated from successful tool outputs, kept in memory only, and cleared on reset.
+- Explicit file-read prompts such as `read src/runtime/engine.rs` are tracked by the runtime. If the model reads a different file or never produces the requested read, the turn ends with a runtime-owned failure answer.
 - rejected mutations are answered by the runtime without model synthesis, so the assistant cannot claim a rejected write/edit happened
 - failed `read_file` calls can terminate with a runtime-owned answer, so missing-file reads do not loop
 - Malformed `edit_file` repair attempts after edit errors are surfaced back to the model through runtime correction rather than silently ending the turn.
@@ -247,9 +258,11 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 
 - Live context management is incomplete. Restore trimming exists, but there is no proactive token-based budgeting or live conversation trimming before generation.
 - Tool-loop safety still includes a hard limit of `10` tool rounds per turn; search has narrower per-turn runtime enforcement, but broader planning quality is still model-dependent.
+- Approved mutation turns still rely on a post-approval model response. There is not yet a runtime-owned completion invariant after a successful `edit_file` or `write_file`.
 - `edit_file` can still be noisy before a valid exact edit block appears; this is a model-output quality issue, not a correctness issue once a valid tool call is parsed.
 - Advanced memory is not implemented. There is no embeddings layer, structured memory, or long-term recall.
 - LSP integration is not implemented.
-- The tool surface is still small: `read_file`, `list_dir`, `search_code`, `edit_file`, and `write_file` only.
+- The built-in tool set is still intentionally small: `read_file`, `list_dir`, `search_code`, `git_status`, `git_diff`, `git_log`, `edit_file`, and `write_file` only.
+- There is still no shell, web, or external service integration tool.
 - Tool UX is still compact-first. There is no file preview mode, diff visualization, or expandable tool-output UI.
 - Restore UX is incomplete because restored context is not replayed into the visible TUI transcript.
