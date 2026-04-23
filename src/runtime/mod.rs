@@ -4,8 +4,10 @@ mod engine;
 mod investigation;
 mod paths;
 mod prompt;
+mod prompt_analysis;
 #[cfg(test)]
 mod scenarios;
+mod search_query;
 mod tool_codec;
 mod trace;
 mod types;
