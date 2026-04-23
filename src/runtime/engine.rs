@@ -214,67 +214,9 @@ const LAST_SEARCH_REPLAY_FAILED: &str = "Could not repeat the previous search.";
 const LIST_DIR_BEFORE_SEARCH_BLOCKED: &str =
     "[runtime: code investigation questions require search_code, not list_dir.\nUse search_code with a keyword from the question — a function name, variable, or concept.]";
 
-const RUNTIME_TRACE_ENV: &str = "PARAMS_TRACE_RUNTIME";
+use super::trace::trace_runtime_decision;
 
-fn trace_runtime_decision(
-    on_event: &mut dyn FnMut(RuntimeEvent),
-    event: &str,
-    fields: &[(&str, String)],
-) {
-    if std::env::var_os(RUNTIME_TRACE_ENV).is_none() {
-        return;
-    }
-
-    let mut line = format!("[runtime:trace] event={event}");
-    for (key, value) in fields {
-        line.push(' ');
-        line.push_str(key);
-        line.push('=');
-        line.push_str(&trace_field_value(value));
-    }
-    on_event(RuntimeEvent::RuntimeTrace(line));
-}
-
-fn trace_field_value(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | ':' | '='))
-    {
-        value.to_string()
-    } else {
-        format!("{value:?}")
-    }
-}
-
-fn normalize_evidence_path(path: &str) -> String {
-    path.replace('\\', "/").trim_start_matches("./").to_string()
-}
-
-fn path_has_parent_component(path: &str) -> bool {
-    path.split('/').any(|component| component == "..")
-}
-
-/// Returns true when `model_path` is within (equal to or narrower than) `scope`.
-///
-/// Both paths are normalized before comparison. Trailing slashes are stripped so
-/// "sandbox/services/" and "sandbox/services" compare identically. The boundary
-/// guard (`get(s.len()) == Some(&b'/')`) prevents "sandbox/service_extra" from
-/// falsely matching scope "sandbox/service".
-///
-/// Absolute paths (e.g. emitted by the model as "/abs/path/") are never within
-/// a relative scope and will always return false, causing the caller to clamp.
-/// Parent-directory components (`..`) are also rejected structurally before
-/// accepting equal-or-child scope relationships.
-fn path_is_within_scope(model_path: &str, scope: &str) -> bool {
-    let p = normalize_evidence_path(model_path);
-    let s = normalize_evidence_path(scope);
-    if path_has_parent_component(&p) || path_has_parent_component(&s) {
-        return false;
-    }
-    let p = p.trim_end_matches('/');
-    let s = s.trim_end_matches('/');
-    p.starts_with(s) && (p.len() == s.len() || p.as_bytes().get(s.len()) == Some(&b'/'))
-}
+use super::paths::{normalize_evidence_path, path_is_within_scope};
 
 /// Tracks search_code usage within a single turn.
 /// Rules: 1 search always permitted; a second search is permitted only when the first

@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::tools::ToolOutput;
 
+use super::paths::normalize_evidence_path;
 use super::types::RuntimeEvent;
 
 const RUNTIME_TRACE_ENV: &str = "PARAMS_TRACE_RUNTIME";
@@ -58,10 +59,6 @@ fn push_unique_path(paths: &mut Vec<String>, path: &str) {
     if !paths.iter().any(|existing| existing == path) {
         paths.push(path.to_string());
     }
-}
-
-fn normalize_evidence_path(path: &str) -> String {
-    path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
 pub(super) fn contains_initialization_term(text: &str) -> bool {
