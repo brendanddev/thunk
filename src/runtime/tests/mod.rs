@@ -7,10 +7,12 @@ use crate::tools::default_registry;
 
 pub use super::{AnswerSource, PendingAction, RiskLevel, Runtime, RuntimeEvent, RuntimeRequest};
 
+mod anchors;
 mod approval;
 mod finalization;
 mod read_bounds;
 mod search_budget;
+mod search_guardrails;
 mod tool_round;
 mod tool_surface;
 
