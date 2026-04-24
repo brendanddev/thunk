@@ -29,7 +29,7 @@ const MAX_TOOL_ROUNDS: usize = 10;
 const MAX_CORRECTIONS: usize = 1;
 
 use super::response_text::*;
-use super::trace::trace_runtime_decision;
+use super::trace::{trace_runtime_decision, RUNTIME_TRACE_ENV};
 
 fn trace_insufficient_evidence_terminal(
     reason: &str,
@@ -57,6 +57,107 @@ fn trace_insufficient_evidence_terminal(
             ("evidence_ready", investigation.evidence_ready().to_string()),
         ],
     );
+}
+
+#[derive(Clone, Copy)]
+enum GenerationRoundLabel {
+    Initial,
+    PostTool,
+    PostEvidenceRetry,
+    CorrectionRetry,
+}
+
+impl GenerationRoundLabel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::PostTool => "post-tool",
+            Self::PostEvidenceRetry => "post-evidence-retry",
+            Self::CorrectionRetry => "correction-retry",
+        }
+    }
+}
+
+struct TurnPerformance {
+    enabled: bool,
+    rounds: usize,
+    round_labels: Vec<GenerationRoundLabel>,
+    ctx_ms: u64,
+    tokenize_ms: u64,
+    prefill_ms: u64,
+    generation_ms: u64,
+}
+
+impl TurnPerformance {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os(RUNTIME_TRACE_ENV).is_some(),
+            rounds: 0,
+            round_labels: Vec::new(),
+            ctx_ms: 0,
+            tokenize_ms: 0,
+            prefill_ms: 0,
+            generation_ms: 0,
+        }
+    }
+
+    fn start_round(
+        &mut self,
+        label: GenerationRoundLabel,
+        on_event: &mut dyn FnMut(RuntimeEvent),
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        self.rounds += 1;
+        self.round_labels.push(label);
+        on_event(RuntimeEvent::RuntimeTrace(format!(
+            "[runtime:perf] round={} label={}",
+            self.rounds,
+            label.as_str()
+        )));
+    }
+
+    fn record_backend_timing(&mut self, stage: &str, elapsed_ms: u64) {
+        if !self.enabled {
+            return;
+        }
+
+        match stage {
+            "ctx_create" => self.ctx_ms += elapsed_ms,
+            "tokenize" => self.tokenize_ms += elapsed_ms,
+            "prefill_done" => self.prefill_ms += elapsed_ms,
+            "generation_done" => self.generation_ms += elapsed_ms,
+            _ => {}
+        }
+    }
+
+    fn emit_summary(&self, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        if !self.enabled {
+            return;
+        }
+
+        let round_labels = if self.round_labels.is_empty() {
+            "none".to_string()
+        } else {
+            self.round_labels
+                .iter()
+                .map(|label| label.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        on_event(RuntimeEvent::RuntimeTrace(format!(
+            "[runtime:perf] rounds={} round_labels={} prefill_ms={} generation_ms={} ctx_ms={} tokenize_ms={}",
+            self.rounds,
+            round_labels,
+            self.prefill_ms,
+            self.generation_ms,
+            self.ctx_ms,
+            self.tokenize_ms
+        )));
+    }
 }
 
 use super::tool_surface::{select_tool_surface, ToolSurface};
@@ -475,12 +576,21 @@ impl Runtime {
         let mut last_call_key: Option<String> = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
+        let mut turn_perf = TurnPerformance::new();
+        let mut next_round_label = GenerationRoundLabel::Initial;
         let mut requested_read_completed = false;
         let mut read_request_correction_issued = false;
         let mut disallowed_tool_attempts = 0usize;
         let mut weak_search_query_attempts = 0usize;
         let mut answer_phase: Option<AnswerPhaseKind> = None;
         let mut post_answer_phase_tool_attempts = 0usize;
+
+        macro_rules! finish_turn {
+            () => {{
+                turn_perf.emit_summary(on_event);
+                return;
+            }};
+        }
         // Computed once from the original user message. Excludes tool result/error injections
         // and correction messages so the approve-failure path (run_turns(0,...)) is safe.
         let original_user_prompt = self.conversation.last_user_content().filter(|c| {
@@ -545,7 +655,7 @@ impl Runtime {
                             },
                             on_event,
                         );
-                        return;
+                        finish_turn!();
                     }
                 }
             } else {
@@ -576,26 +686,37 @@ impl Runtime {
             &[("surface", tool_surface.as_str().into())],
         );
         loop {
-            let response = match run_generate_turn(
-                self.backend.as_mut(),
-                &mut self.conversation,
-                tool_surface,
-                on_event,
-            ) {
-                Ok(Some(r)) => r,
-                Ok(None) => {
-                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                    on_event(RuntimeEvent::Failed {
-                        message: format!("{} returned no output.", self.backend.name()),
-                    });
-                    return;
-                }
-                Err(e) => {
-                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                    on_event(RuntimeEvent::Failed {
-                        message: e.to_string(),
-                    });
-                    return;
+            turn_perf.start_round(next_round_label, on_event);
+            let response = {
+                let turn_perf = &mut turn_perf;
+                let mut perf_on_event = |event| {
+                    if let RuntimeEvent::BackendTiming { stage, elapsed_ms } = &event {
+                        turn_perf.record_backend_timing(stage, *elapsed_ms);
+                    }
+                    on_event(event);
+                };
+
+                match run_generate_turn(
+                    self.backend.as_mut(),
+                    &mut self.conversation,
+                    tool_surface,
+                    &mut perf_on_event,
+                ) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                        on_event(RuntimeEvent::Failed {
+                            message: format!("{} returned no output.", self.backend.name()),
+                        });
+                        finish_turn!();
+                    }
+                    Err(e) => {
+                        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                        on_event(RuntimeEvent::Failed {
+                            message: e.to_string(),
+                        });
+                        finish_turn!();
+                    }
                 }
             };
 
@@ -616,6 +737,12 @@ impl Runtime {
                     }
                     self.conversation.discard_last_if_assistant();
                     if post_answer_phase_tool_attempts == 1 {
+                        next_round_label = match phase {
+                            AnswerPhaseKind::PostRead => GenerationRoundLabel::CorrectionRetry,
+                            AnswerPhaseKind::InvestigationEvidenceReady => {
+                                GenerationRoundLabel::PostEvidenceRetry
+                            }
+                        };
                         self.conversation.push_user(
                             match phase {
                                 AnswerPhaseKind::PostRead => TURN_COMPLETE_ANSWER_ONLY,
@@ -645,7 +772,7 @@ impl Runtime {
                         },
                         on_event,
                     );
-                    return;
+                    finish_turn!();
                 }
             }
 
@@ -674,20 +801,21 @@ impl Runtime {
                         },
                         on_event,
                     );
-                    return;
+                    finish_turn!();
                 }
                 if corrections < MAX_CORRECTIONS {
                     corrections += 1;
                     self.conversation.discard_last_if_assistant();
                     self.conversation
                         .push_user(search_budget.closed_message().to_string());
+                    next_round_label = GenerationRoundLabel::CorrectionRetry;
                     continue;
                 }
                 on_event(RuntimeEvent::Failed {
                     message: "Model kept searching after the search budget was closed.".to_string(),
                 });
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                return;
+                finish_turn!();
             }
 
             if calls.is_empty() {
@@ -702,6 +830,7 @@ impl Runtime {
                     self.conversation.discard_last_if_assistant();
                     self.conversation
                         .push_user(EDIT_REPAIR_CORRECTION.to_string());
+                    next_round_label = GenerationRoundLabel::CorrectionRetry;
                     continue;
                 }
 
@@ -713,13 +842,14 @@ impl Runtime {
                         self.conversation.discard_last_if_assistant();
                         self.conversation
                             .push_user(FABRICATION_CORRECTION.to_string());
+                        next_round_label = GenerationRoundLabel::CorrectionRetry;
                         continue;
                     }
                     on_event(RuntimeEvent::Failed {
                         message: "Model repeatedly produced fabricated tool results. Try rephrasing your request.".to_string(),
                     });
                     on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                    return;
+                    finish_turn!();
                 }
                 // Malformed block: a known closing tag ([/write_file], [/edit_file], etc.)
                 // is present without the matching opening tag. The model used a wrong tag name.
@@ -730,6 +860,7 @@ impl Runtime {
                         self.conversation.discard_last_if_assistant();
                         self.conversation
                             .push_user(MALFORMED_BLOCK_CORRECTION.to_string());
+                        next_round_label = GenerationRoundLabel::CorrectionRetry;
                         continue;
                     }
                     on_event(RuntimeEvent::Failed {
@@ -738,7 +869,7 @@ impl Runtime {
                                 .to_string(),
                     });
                     on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                    return;
+                    finish_turn!();
                 }
 
                 if let Some(path) = requested_read_path.as_deref() {
@@ -749,6 +880,7 @@ impl Runtime {
                             self.conversation.push_user(format!(
                                 "{READ_REQUEST_TOOL_REQUIRED} Requested path: `{path}`"
                             ));
+                            next_round_label = GenerationRoundLabel::CorrectionRetry;
                             continue;
                         }
 
@@ -760,7 +892,7 @@ impl Runtime {
                             },
                             on_event,
                         );
-                        return;
+                        finish_turn!();
                     }
                 }
 
@@ -787,7 +919,7 @@ impl Runtime {
                         },
                         on_event,
                     );
-                    return;
+                    finish_turn!();
                 }
 
                 if investigation_required && !investigation.evidence_ready() {
@@ -795,6 +927,7 @@ impl Runtime {
                         if investigation.issue_direct_answer_correction() {
                             self.conversation
                                 .push_user(SEARCH_BEFORE_ANSWERING.to_string());
+                            next_round_label = GenerationRoundLabel::CorrectionRetry;
                             continue;
                         }
 
@@ -813,7 +946,7 @@ impl Runtime {
                             },
                             on_event,
                         );
-                        return;
+                        finish_turn!();
                     }
 
                     if investigation.search_produced_results() {
@@ -837,7 +970,7 @@ impl Runtime {
                                 },
                                 on_event,
                             );
-                            return;
+                            finish_turn!();
                         }
 
                         if corrections < MAX_CORRECTIONS
@@ -847,6 +980,7 @@ impl Runtime {
                             self.conversation.discard_last_if_assistant();
                             self.conversation
                                 .push_user(READ_BEFORE_ANSWERING.to_string());
+                            next_round_label = GenerationRoundLabel::CorrectionRetry;
                             continue;
                         }
 
@@ -865,7 +999,7 @@ impl Runtime {
                             },
                             on_event,
                         );
-                        return;
+                        finish_turn!();
                     }
                 }
 
@@ -879,7 +1013,7 @@ impl Runtime {
                 emit_visible_assistant_message(&response, on_event);
                 on_event(RuntimeEvent::AnswerReady(source));
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                return;
+                finish_turn!();
             }
 
             tool_rounds += 1;
@@ -887,7 +1021,7 @@ impl Runtime {
             if tool_rounds >= MAX_TOOL_ROUNDS {
                 on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolLimitReached));
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                return;
+                finish_turn!();
             }
 
             on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
@@ -931,7 +1065,7 @@ impl Runtime {
                                 },
                                 on_event,
                             );
-                            return;
+                            finish_turn!();
                         }
                     }
                     if answer_phase.is_none() {
@@ -941,6 +1075,7 @@ impl Runtime {
                             answer_phase = Some(AnswerPhaseKind::PostRead);
                         }
                     }
+                    next_round_label = GenerationRoundLabel::PostTool;
                     // Signal re-entry before the next generate so the status bar
                     // transitions cleanly from "executing tools" → "processing" → …
                     on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
@@ -962,7 +1097,7 @@ impl Runtime {
                         },
                         on_event,
                     );
-                    return;
+                    finish_turn!();
                 }
                 ToolRoundOutcome::ApprovalRequired {
                     accumulated,
@@ -975,7 +1110,7 @@ impl Runtime {
                     self.pending_action = Some(pending.clone());
                     on_event(RuntimeEvent::ApprovalRequired(pending));
                     on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                    return;
+                    finish_turn!();
                 }
             }
         }
