@@ -11,9 +11,6 @@ data/
 ## Logs
 logs/
 
-## Private documentation
-docs/private/
-
 ## Sandbox project
 sandbox/
 

@@ -22,11 +22,13 @@ The project is structured to keep model generation, tool execution, persistence,
 
 ## Whats Different
 
-- Runtime owned correctness
-- Structural, not semantic
-- Grounded code investigation
-- Controlled multi-turn continuity
-- Built for local and low resource environments
+- Runtime-owned correctness, not prompt-driven behavior
+- Structural execution instead of relying on model reasoning alone
+- Grounded code investigation via enforced search → read → answer flow
+- Explicit tool surface constraints per turn
+- Deterministic correction and terminal outcomes
+- Designed to remain correct even with small or imperfect local models
+- Built for local-first, low-resource environments
 
 ---
 
@@ -80,6 +82,22 @@ Some outcomes are deliberately terminal and runtime-owned: rejecting a pending m
 
 ---
 
+## Execution Model
+
+The runtime enforces a structured investigation loop rather than relying on the model to behave correctly on its own.
+
+At a high level:
+
+- search → read → answer gating is enforced per turn
+- evidence must be established before synthesis is allowed
+- tool usage is restricted by per-turn tool surfaces
+- after evidence is accepted, further tool calls are blocked
+- repeated violations result in runtime-owned terminal outcomes
+
+This allows the system to remain correct and predictable even when the model makes mistakes or attempts invalid actions.
+
+---
+
 ## Architecture
 
 The codebase is split into six main layers:
@@ -109,6 +127,9 @@ Key architectural rules reflected in the code:
 - Pending approvals are not persisted across restarts.
 - Restored session history is loaded into the runtime, but not replayed into the visible TUI transcript.
 - Tool UI is compact and text-based; there is no diff view or expandable preview UI yet.
+- Performance is currently dominated by repeated model rounds and prompt prefill.
+- No bounded answer synthesis yet after evidence is ready (planned).
+- No prompt caching or context compression yet.
 
 ---
 
