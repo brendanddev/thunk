@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::types::RuntimeTerminalReason;
 
-// ── Git tool / anchor isolation ──────────────────────────────────────────────
+// Git tool / anchor isolation
 
 #[test]
 fn git_status_does_not_update_anchors() {
@@ -125,7 +125,7 @@ fn git_log_does_not_update_anchors() {
     );
 }
 
-// ── Investigation evidence ───────────────────────────────────────────────────
+// Investigation evidence
 
 #[test]
 fn git_status_does_not_satisfy_investigation_evidence() {
@@ -310,7 +310,7 @@ fn git_log_does_not_satisfy_investigation_evidence() {
     );
 }
 
-// ── RetrievalFirst surface policy ────────────────────────────────────────────
+// RetrievalFirst surface policy
 
 #[test]
 fn disallowed_git_tool_does_not_update_anchors() {
@@ -456,7 +456,7 @@ fn second_disallowed_git_tool_on_retrieval_first_turn_terminates_policy_violatio
     );
 }
 
-// ── GitReadOnly surface policy ───────────────────────────────────────────────
+// GitReadOnly surface policy
 
 #[test]
 fn git_read_only_surface_rejects_search_code_but_allows_git_tool() {

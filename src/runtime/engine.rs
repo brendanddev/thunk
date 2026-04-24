@@ -11,11 +11,6 @@ use super::anchors::{
 };
 use super::conversation::Conversation;
 use super::generation::{emit_visible_assistant_message, run_generate_turn};
-#[cfg(test)]
-use super::investigation::{
-    contains_create_term, contains_initialization_term, contains_load_term, contains_register_term,
-    contains_save_term, is_config_file, looks_like_import,
-};
 use super::investigation::{detect_investigation_mode, InvestigationMode, InvestigationState};
 use super::prompt;
 use super::tool_codec;
@@ -470,6 +465,12 @@ impl Runtime {
         mut reads_this_turn: HashSet<String>,
         on_event: &mut dyn FnMut(RuntimeEvent),
     ) {
+        #[derive(Clone, Copy)]
+        enum AnswerPhaseKind {
+            PostRead,
+            InvestigationEvidenceReady,
+        }
+
         let mut corrections = 0usize;
         let mut last_call_key: Option<String> = None;
         let mut search_budget = SearchBudget::new();
@@ -478,8 +479,7 @@ impl Runtime {
         let mut read_request_correction_issued = false;
         let mut disallowed_tool_attempts = 0usize;
         let mut weak_search_query_attempts = 0usize;
-        let mut post_evidence_tool_attempts = 0usize;
-        let mut answer_phase = false;
+        let mut answer_phase: Option<AnswerPhaseKind> = None;
         let mut post_answer_phase_tool_attempts = 0usize;
         // Computed once from the original user message. Excludes tool result/error injections
         // and correction messages so the approve-failure path (run_turns(0,...)) is safe.
@@ -601,50 +601,52 @@ impl Runtime {
 
             let calls = tool_codec::parse_all_tool_inputs(&response);
 
-            if investigation_required && investigation.evidence_ready() && !calls.is_empty() {
-                post_evidence_tool_attempts += 1;
-                trace_runtime_decision(
-                    on_event,
-                    "post_evidence_tool_call_rejected",
-                    &[
-                        ("attempts", post_evidence_tool_attempts.to_string()),
-                        ("tool_count", calls.len().to_string()),
-                    ],
-                );
-                self.conversation.discard_last_if_assistant();
-                if post_evidence_tool_attempts == 1 {
-                    self.conversation
-                        .push_user(EVIDENCE_READY_ANSWER_ONLY.to_string());
-                    continue;
+            if let Some(phase) = answer_phase {
+                if !calls.is_empty() {
+                    post_answer_phase_tool_attempts += 1;
+                    if matches!(phase, AnswerPhaseKind::InvestigationEvidenceReady) {
+                        trace_runtime_decision(
+                            on_event,
+                            "post_evidence_tool_call_rejected",
+                            &[
+                                ("attempts", post_answer_phase_tool_attempts.to_string()),
+                                ("tool_count", calls.len().to_string()),
+                            ],
+                        );
+                    }
+                    self.conversation.discard_last_if_assistant();
+                    if post_answer_phase_tool_attempts == 1 {
+                        self.conversation.push_user(
+                            match phase {
+                                AnswerPhaseKind::PostRead => TURN_COMPLETE_ANSWER_ONLY,
+                                AnswerPhaseKind::InvestigationEvidenceReady => {
+                                    EVIDENCE_READY_ANSWER_ONLY
+                                }
+                            }
+                            .to_string(),
+                        );
+                        continue;
+                    }
+                    let (answer, reason) = match phase {
+                        AnswerPhaseKind::PostRead => (
+                            repeated_tool_after_answer_phase_final_answer(),
+                            RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
+                        ),
+                        AnswerPhaseKind::InvestigationEvidenceReady => (
+                            repeated_tool_after_evidence_ready_final_answer(),
+                            RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
+                        ),
+                    };
+                    self.finish_with_runtime_answer(
+                        answer,
+                        AnswerSource::RuntimeTerminal {
+                            reason,
+                            rounds: tool_rounds,
+                        },
+                        on_event,
+                    );
+                    return;
                 }
-                self.finish_with_runtime_answer(
-                    repeated_tool_after_evidence_ready_final_answer(),
-                    AnswerSource::RuntimeTerminal {
-                        reason: RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
-                        rounds: tool_rounds,
-                    },
-                    on_event,
-                );
-                return;
-            }
-
-            if answer_phase && !calls.is_empty() {
-                post_answer_phase_tool_attempts += 1;
-                self.conversation.discard_last_if_assistant();
-                if post_answer_phase_tool_attempts == 1 {
-                    self.conversation
-                        .push_user(TURN_COMPLETE_ANSWER_ONLY.to_string());
-                    continue;
-                }
-                self.finish_with_runtime_answer(
-                    repeated_tool_after_answer_phase_final_answer(),
-                    AnswerSource::RuntimeTerminal {
-                        reason: RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
-                        rounds: tool_rounds,
-                    },
-                    on_event,
-                );
-                return;
             }
 
             if search_budget.is_closed()
@@ -932,8 +934,12 @@ impl Runtime {
                             return;
                         }
                     }
-                    if !answer_phase && !investigation_required && !reads_this_turn.is_empty() {
-                        answer_phase = true;
+                    if answer_phase.is_none() {
+                        if investigation_required && investigation.evidence_ready() {
+                            answer_phase = Some(AnswerPhaseKind::InvestigationEvidenceReady);
+                        } else if !investigation_required && !reads_this_turn.is_empty() {
+                            answer_phase = Some(AnswerPhaseKind::PostRead);
+                        }
                     }
                     // Signal re-entry before the next generate so the status bar
                     // transitions cleanly from "executing tools" → "processing" → …
@@ -1494,202 +1500,6 @@ mod tests {
     // Phase 9.1.3 — Candidate Selection Quality (import-only weak candidate rejection)
 
     #[test]
-    fn looks_like_import_accepts_simple_import() {
-        assert!(looks_like_import("import logging"));
-        assert!(looks_like_import("import os, sys"));
-        assert!(looks_like_import("  import logging"));
-    }
-
-    #[test]
-    fn looks_like_import_accepts_from_import() {
-        assert!(looks_like_import("from models.enums import TaskStatus"));
-        assert!(looks_like_import("from . import utils"));
-        assert!(looks_like_import("  from models.enums import TaskStatus"));
-    }
-
-    #[test]
-    fn looks_like_import_rejects_usage_lines() {
-        assert!(!looks_like_import(
-            "if task.status == TaskStatus.TODO: pass"
-        ));
-        assert!(!looks_like_import("result = TaskStatus.COMPLETED"));
-        assert!(!looks_like_import("logger = logging.getLogger(__name__)"));
-    }
-
-    #[test]
-    fn looks_like_import_rejects_definition_lines() {
-        assert!(!looks_like_import("class TaskStatus(str, Enum):"));
-        assert!(!looks_like_import("def get_status(task):"));
-    }
-
-    // Phase 9.2.1 — InvestigationMode enum + Config lookup mode
-
-    #[test]
-    fn detect_investigation_mode_returns_usage_lookup() {
-        assert!(matches!(
-            detect_investigation_mode("Where is TaskStatus used?"),
-            InvestigationMode::UsageLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find all references to build_report"),
-            InvestigationMode::UsageLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Where does TaskStatus appear?"),
-            InvestigationMode::UsageLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_returns_config_lookup() {
-        assert!(matches!(
-            detect_investigation_mode("Where is the database configured?"),
-            InvestigationMode::ConfigLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find where logging configuration lives"),
-            InvestigationMode::ConfigLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("How is the connection configured?"),
-            InvestigationMode::ConfigLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_returns_initialization_lookup() {
-        assert!(matches!(
-            detect_investigation_mode("Find where logging is initialized"),
-            InvestigationMode::InitializationLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find logging initialization"),
-            InvestigationMode::InitializationLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find code that can initialize logging"),
-            InvestigationMode::InitializationLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find where logging is initialised"),
-            InvestigationMode::General
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_returns_definition_lookup() {
-        assert!(matches!(
-            detect_investigation_mode("Where is TaskStatus defined?"),
-            InvestigationMode::DefinitionLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Where is the TaskRunner declared?"),
-            InvestigationMode::DefinitionLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_returns_general() {
-        assert!(matches!(
-            detect_investigation_mode("What does run_turns do?"),
-            InvestigationMode::General
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Explain the TaskRunner"),
-            InvestigationMode::General
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_usage_priority_over_config() {
-        // "configured" + "used" in same prompt — UsageLookup wins (higher priority).
-        assert!(matches!(
-            detect_investigation_mode("Where is the configured value used?"),
-            InvestigationMode::UsageLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Where is configuration used?"),
-            InvestigationMode::UsageLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_usage_priority_over_initialization() {
-        assert!(matches!(
-            detect_investigation_mode("Where is logging initialization used?"),
-            InvestigationMode::UsageLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_config_priority_over_definition() {
-        assert!(matches!(
-            detect_investigation_mode("Where is config defined?"),
-            InvestigationMode::ConfigLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find config for logging"),
-            InvestigationMode::ConfigLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_config_priority_over_initialization() {
-        assert!(matches!(
-            detect_investigation_mode("Find where logging configuration is initialized"),
-            InvestigationMode::ConfigLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_initialization_priority_over_definition() {
-        assert!(matches!(
-            detect_investigation_mode("Where is initialization defined?"),
-            InvestigationMode::InitializationLookup
-        ));
-    }
-
-    #[test]
-    fn contains_initialization_term_matches_exact_allowed_substrings_only() {
-        assert!(contains_initialization_term("def initialize_logging():"));
-        assert!(contains_initialization_term(
-            "# logging is initialized here"
-        ));
-        assert!(contains_initialization_term("logging initialization entry"));
-        assert!(!contains_initialization_term("setup_logging()"));
-        assert!(!contains_initialization_term("bootstrap logging"));
-        assert!(!contains_initialization_term("logging is initialised here"));
-    }
-
-    #[test]
-    fn is_config_file_accepts_standard_extensions() {
-        assert!(is_config_file("config/database.yaml"));
-        assert!(is_config_file("config/app.yml"));
-        assert!(is_config_file("Cargo.toml"));
-        assert!(is_config_file("config/settings.json"));
-        assert!(is_config_file("config/app.ini"));
-        assert!(is_config_file("deploy/app.cfg"));
-        assert!(is_config_file("config/logging.conf"));
-        assert!(is_config_file("config/db.properties"));
-    }
-
-    #[test]
-    fn is_config_file_accepts_env_dotfiles() {
-        assert!(is_config_file(".env"));
-        assert!(is_config_file("config/.env"));
-        assert!(!is_config_file(".env.local"));
-        assert!(!is_config_file(".env.production"));
-    }
-
-    #[test]
-    fn is_config_file_rejects_source_files() {
-        assert!(!is_config_file("services/task_service.py"));
-        assert!(!is_config_file("src/runtime/engine.rs"));
-        assert!(!is_config_file("models/enums.py"));
-        assert!(!is_config_file("main.go"));
-    }
-
-    #[test]
     fn config_lookup_second_non_config_candidate_after_recovery_is_not_accepted() {
         // Config lookup: config candidate exists, but the model ignores the config recovery
         // and reads a second non-config candidate. The second read must remain insufficient;
@@ -1926,151 +1736,7 @@ mod tests {
 
     // Phase 9.2.3 — CreateLookup
 
-    #[test]
-    fn detect_investigation_mode_returns_create_lookup() {
-        assert!(matches!(
-            detect_investigation_mode("Where is the session created?"),
-            InvestigationMode::CreateLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find where tasks are created"),
-            InvestigationMode::CreateLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Where does task creation happen?"),
-            InvestigationMode::CreateLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_create_priority_over_definition() {
-        // "created" + "defined" in same prompt — CreateLookup wins (higher priority).
-        assert!(matches!(
-            detect_investigation_mode("Where is the session created and defined?"),
-            InvestigationMode::CreateLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_initialization_priority_over_create() {
-        // "initialized" + "created" in same prompt — InitializationLookup wins.
-        assert!(matches!(
-            detect_investigation_mode("Find where the session is initialized and created"),
-            InvestigationMode::InitializationLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_usage_priority_over_create() {
-        // "used" + "created" in same prompt — UsageLookup wins.
-        assert!(matches!(
-            detect_investigation_mode("Where is the session used and created?"),
-            InvestigationMode::UsageLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_config_priority_over_create() {
-        // "configured" + "created" in same prompt — ConfigLookup wins.
-        assert!(matches!(
-            detect_investigation_mode("Where is the session configured and created?"),
-            InvestigationMode::ConfigLookup
-        ));
-    }
-
-    #[test]
-    fn contains_create_term_matches_exact_allowed_substrings_only() {
-        // Exact allowed terms.
-        assert!(contains_create_term("db.create(session)"));
-        assert!(contains_create_term("session was created here"));
-        assert!(contains_create_term("handles session creation"));
-        // Case insensitive.
-        assert!(contains_create_term("Session.Create()"));
-        assert!(contains_create_term("CREATED_AT timestamp"));
-        // Noisy: substring of longer word — these DO match (substring semantics, same as initialization).
-        assert!(contains_create_term("recreate the session"));
-        assert!(contains_create_term("createTable migration"));
-        // Not a create term.
-        assert!(!contains_create_term("def handle_session(s):"));
-        assert!(!contains_create_term("return session_id"));
-    }
-
     // Phase 9.2.4 — RegisterLookup
-
-    #[test]
-    fn detect_investigation_mode_returns_register_lookup() {
-        assert!(matches!(
-            detect_investigation_mode("Where is the command registered?"),
-            InvestigationMode::RegisterLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find where handlers register commands"),
-            InvestigationMode::RegisterLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Where does command registration happen?"),
-            InvestigationMode::RegisterLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_create_priority_over_register() {
-        // "created" + "registered" in same prompt — CreateLookup wins (higher priority).
-        assert!(matches!(
-            detect_investigation_mode("Where is the command created and registered?"),
-            InvestigationMode::CreateLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_register_priority_over_definition() {
-        // "registered" + "defined" in same prompt — RegisterLookup wins.
-        assert!(matches!(
-            detect_investigation_mode("Where is the command registered and defined?"),
-            InvestigationMode::RegisterLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_usage_priority_over_register() {
-        assert!(matches!(
-            detect_investigation_mode("Where is the registered command used?"),
-            InvestigationMode::UsageLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_config_priority_over_register() {
-        assert!(matches!(
-            detect_investigation_mode("Where is command registration configured?"),
-            InvestigationMode::ConfigLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_initialization_priority_over_register() {
-        assert!(matches!(
-            detect_investigation_mode("Find where command registration is initialized"),
-            InvestigationMode::InitializationLookup
-        ));
-    }
-
-    #[test]
-    fn contains_register_term_matches_exact_allowed_substrings_only() {
-        // Exact allowed terms.
-        assert!(contains_register_term("registry.register(command)"));
-        assert!(contains_register_term("command was registered here"));
-        assert!(contains_register_term("command registration lives here"));
-        // Case insensitive.
-        assert!(contains_register_term("Registry.Register(command)"));
-        assert!(contains_register_term("REGISTERED_COMMANDS"));
-        // Noisy: substring of longer word — these DO match (substring semantics).
-        assert!(contains_register_term("reregister command handlers"));
-        assert!(contains_register_term("registration_notes = []"));
-        // Not a register term.
-        assert!(!contains_register_term("def handle_command(command):"));
-        assert!(!contains_register_term("return command_id"));
-    }
 
     #[test]
     fn register_lookup_path_scope_keeps_candidates_inside_scope() {
@@ -2147,90 +1813,6 @@ mod tests {
     }
 
     // Phase 9.2.5 — LoadLookup
-
-    #[test]
-    fn detect_investigation_mode_returns_load_lookup() {
-        assert!(matches!(
-            detect_investigation_mode("Where is the session loaded?"),
-            InvestigationMode::LoadLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find where session loading happens"),
-            InvestigationMode::LoadLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Where do handlers load sessions?"),
-            InvestigationMode::LoadLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_register_priority_over_load() {
-        // "registered" + "loaded" in same prompt — RegisterLookup wins (higher priority).
-        assert!(matches!(
-            detect_investigation_mode("Where is the command registered and loaded?"),
-            InvestigationMode::RegisterLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_load_priority_over_definition() {
-        // "loaded" + "defined" in same prompt — LoadLookup wins.
-        assert!(matches!(
-            detect_investigation_mode("Where is the session loaded and defined?"),
-            InvestigationMode::LoadLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_usage_priority_over_load() {
-        assert!(matches!(
-            detect_investigation_mode("Where is the loaded session used?"),
-            InvestigationMode::UsageLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_config_priority_over_load() {
-        assert!(matches!(
-            detect_investigation_mode("Where is loaded config configured?"),
-            InvestigationMode::ConfigLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_initialization_priority_over_load() {
-        assert!(matches!(
-            detect_investigation_mode("Find where session loading is initialized"),
-            InvestigationMode::InitializationLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_create_priority_over_load() {
-        assert!(matches!(
-            detect_investigation_mode("Find where the loaded session is created"),
-            InvestigationMode::CreateLookup
-        ));
-    }
-
-    #[test]
-    fn contains_load_term_matches_exact_allowed_substrings_only() {
-        // Exact allowed terms.
-        assert!(contains_load_term("session = load_session(session_id)"));
-        assert!(contains_load_term("session was loaded here"));
-        assert!(contains_load_term("session loading happens here"));
-        // Case insensitive.
-        assert!(contains_load_term("Session.Load()"));
-        assert!(contains_load_term("LOADED_SESSION"));
-        // Noisy: substring of longer word — these DO match (substring semantics).
-        assert!(contains_load_term("session loader"));
-        assert!(contains_load_term("reload session"));
-        assert!(contains_load_term("autoload session"));
-        // Not a load term.
-        assert!(!contains_load_term("def handle_session(session):"));
-        assert!(!contains_load_term("return session_id"));
-    }
 
     #[test]
     fn load_lookup_path_scope_keeps_candidates_inside_scope() {
@@ -2379,98 +1961,6 @@ mod tests {
     }
 
     // Phase 9.2.6 — SaveLookup
-
-    #[test]
-    fn detect_investigation_mode_returns_save_lookup() {
-        assert!(matches!(
-            detect_investigation_mode("Where is the session saved?"),
-            InvestigationMode::SaveLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Find where session saving happens"),
-            InvestigationMode::SaveLookup
-        ));
-        assert!(matches!(
-            detect_investigation_mode("Where do handlers save sessions?"),
-            InvestigationMode::SaveLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_load_priority_over_save() {
-        // "loaded" + "saved" in same prompt — LoadLookup wins (higher priority).
-        assert!(matches!(
-            detect_investigation_mode("Where is the session loaded and saved?"),
-            InvestigationMode::LoadLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_save_priority_over_definition() {
-        // "saved" + "defined" in same prompt — SaveLookup wins.
-        assert!(matches!(
-            detect_investigation_mode("Where is the session saved and defined?"),
-            InvestigationMode::SaveLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_usage_priority_over_save() {
-        assert!(matches!(
-            detect_investigation_mode("Where is the saved session used?"),
-            InvestigationMode::UsageLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_config_priority_over_save() {
-        assert!(matches!(
-            detect_investigation_mode("Where is saved config configured?"),
-            InvestigationMode::ConfigLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_initialization_priority_over_save() {
-        assert!(matches!(
-            detect_investigation_mode("Find where session saving is initialized"),
-            InvestigationMode::InitializationLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_create_priority_over_save() {
-        assert!(matches!(
-            detect_investigation_mode("Find where the saved session is created"),
-            InvestigationMode::CreateLookup
-        ));
-    }
-
-    #[test]
-    fn detect_investigation_mode_register_priority_over_save() {
-        assert!(matches!(
-            detect_investigation_mode("Find where the saved command is registered"),
-            InvestigationMode::RegisterLookup
-        ));
-    }
-
-    #[test]
-    fn contains_save_term_matches_exact_allowed_substrings_only() {
-        // Exact allowed terms.
-        assert!(contains_save_term("save_session(session)"));
-        assert!(contains_save_term("session was saved here"));
-        assert!(contains_save_term("session saving happens here"));
-        // Case insensitive.
-        assert!(contains_save_term("Session.Save()"));
-        assert!(contains_save_term("SAVED_SESSION"));
-        // Noisy: substring of longer word — these DO match (substring semantics).
-        assert!(contains_save_term("autosave session"));
-        assert!(contains_save_term("savepoint created"));
-        assert!(contains_save_term("saved_at timestamp"));
-        // Not a save term.
-        assert!(!contains_save_term("def handle_session(session):"));
-        assert!(!contains_save_term("return session_id"));
-    }
 
     #[test]
     fn save_lookup_path_scope_keeps_candidates_inside_scope() {
