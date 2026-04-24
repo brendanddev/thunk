@@ -17,7 +17,11 @@ where
         }
         tools.push_str(tool);
     }
-    format!("Active tool surface: {surface_name}. Available this turn: {tools}.")
+    if tools.is_empty() {
+        format!("Active tool surface: {surface_name}. No tools are available. Provide your final answer now.")
+    } else {
+        format!("Active tool surface: {surface_name}. Available this turn: {tools}.")
+    }
 }
 
 pub fn build_system_prompt(app_name: &str, project_root: &Path, specs: &[ToolSpec]) -> String {

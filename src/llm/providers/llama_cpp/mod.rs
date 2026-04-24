@@ -75,10 +75,18 @@ impl ModelBackend for LlamaCppBackend {
     ) -> Result<()> {
         let config = self.config.clone();
         let prompt = format_messages(&request.messages);
-        if self.loaded.is_none() {
+        let is_cold = self.loaded.is_none();
+        if is_cold {
             on_event(BackendEvent::StatusChanged(BackendStatus::LoadingModel));
         }
+        let t_load_start = is_cold.then(std::time::Instant::now);
         let loaded = self.ensure_loaded()?;
+        if let Some(t) = t_load_start {
+            on_event(BackendEvent::Timing {
+                stage: "model_load",
+                elapsed_ms: t.elapsed().as_millis() as u64,
+            });
+        }
         on_event(BackendEvent::StatusChanged(BackendStatus::Generating));
         run_generation(loaded, &config, &prompt, on_event)
     }

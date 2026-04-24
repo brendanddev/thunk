@@ -117,6 +117,7 @@ impl GenerationRoundCause {
 
 struct TurnPerformance {
     enabled: bool,
+    turn_start: Option<std::time::Instant>,
     rounds: usize,
     round_labels: Vec<GenerationRoundLabel>,
     round_causes: Vec<GenerationRoundCause>,
@@ -125,12 +126,16 @@ struct TurnPerformance {
     tokenize_ms: u64,
     prefill_ms: u64,
     generation_ms: u64,
+    model_load_ms: u64,
+    tool_ms: u64,
 }
 
 impl TurnPerformance {
     fn new() -> Self {
+        let enabled = std::env::var_os(RUNTIME_TRACE_ENV).is_some();
         Self {
-            enabled: std::env::var_os(RUNTIME_TRACE_ENV).is_some(),
+            enabled,
+            turn_start: enabled.then(std::time::Instant::now),
             rounds: 0,
             round_labels: Vec::new(),
             round_causes: Vec::new(),
@@ -139,6 +144,8 @@ impl TurnPerformance {
             tokenize_ms: 0,
             prefill_ms: 0,
             generation_ms: 0,
+            model_load_ms: 0,
+            tool_ms: 0,
         }
     }
 
@@ -176,8 +183,16 @@ impl TurnPerformance {
             "tokenize" => self.tokenize_ms += elapsed_ms,
             "prefill_done" => self.prefill_ms += elapsed_ms,
             "generation_done" => self.generation_ms += elapsed_ms,
+            "model_load" => self.model_load_ms += elapsed_ms,
             _ => {}
         }
+    }
+
+    fn record_tool_elapsed(&mut self, elapsed_ms: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.tool_ms += elapsed_ms;
     }
 
     fn emit_summary(&self, on_event: &mut dyn FnMut(RuntimeEvent)) {
@@ -213,8 +228,14 @@ impl TurnPerformance {
                 .join(",")
         };
 
+        let model_ms = self.ctx_ms + self.tokenize_ms + self.prefill_ms + self.generation_ms;
+        let total_turn_ms = self
+            .turn_start
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+
         on_event(RuntimeEvent::RuntimeTrace(format!(
-            "[runtime:perf] rounds={} round_labels={} causes={} prompt_sizes={} prefill_ms={} generation_ms={} ctx_ms={} tokenize_ms={}",
+            "[runtime:perf] rounds={} round_labels={} causes={} prompt_sizes={} prefill_ms={} generation_ms={} ctx_ms={} tokenize_ms={} model_load_ms={} tool_ms={} model_ms={} total_turn_ms={}",
             self.rounds,
             round_labels,
             causes,
@@ -222,7 +243,11 @@ impl TurnPerformance {
             self.prefill_ms,
             self.generation_ms,
             self.ctx_ms,
-            self.tokenize_ms
+            self.tokenize_ms,
+            self.model_load_ms,
+            self.tool_ms,
+            model_ms,
+            total_turn_ms
         )));
     }
 }
@@ -787,8 +812,24 @@ impl Runtime {
             &[("surface", tool_surface.as_str().into())],
         );
         loop {
+            // Bind answer-phase synthesis to a no-tool surface so the model is never offered
+            // tool access after evidence is accepted. This eliminates the extra generation
+            // round that would otherwise occur when the model attempts a tool call and the
+            // runtime has to issue a post_evidence_tool_call_rejected correction.
+            let effective_surface = if answer_phase.is_some() {
+                ToolSurface::AnswerOnly
+            } else {
+                tool_surface
+            };
+            if matches!(effective_surface, ToolSurface::AnswerOnly) {
+                trace_runtime_decision(
+                    on_event,
+                    "answer_phase_synthesis_bounded",
+                    &[("surface", "AnswerOnly".into())],
+                );
+            }
             let prompt_chars = if turn_perf.enabled {
-                estimate_generation_prompt_chars(&self.conversation, tool_surface)
+                estimate_generation_prompt_chars(&self.conversation, effective_surface)
             } else {
                 0
             };
@@ -805,7 +846,7 @@ impl Runtime {
                 match run_generate_turn(
                     self.backend.as_mut(),
                     &mut self.conversation,
-                    tool_surface,
+                    effective_surface,
                     &mut perf_on_event,
                 ) {
                     Ok(Some(r)) => r,
@@ -1146,6 +1187,11 @@ impl Runtime {
             }
 
             on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
+            let t_tool_start = if turn_perf.enabled {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             match run_tool_round(
                 &self.registry,
@@ -1170,6 +1216,9 @@ impl Runtime {
                     results,
                     git_acquisition_answer,
                 } => {
+                    if let Some(t) = t_tool_start {
+                        turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
+                    }
                     let post_tool_cause = infer_post_tool_round_cause(&results);
                     self.conversation.push_user(results);
                     self.conversation.trim_tool_exchanges_if_needed();
@@ -1210,6 +1259,9 @@ impl Runtime {
                     answer,
                     reason,
                 } => {
+                    if let Some(t) = t_tool_start {
+                        turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
+                    }
                     self.conversation.push_user(results);
                     self.conversation.trim_tool_exchanges_if_needed();
                     self.finish_with_runtime_answer(
@@ -1226,6 +1278,9 @@ impl Runtime {
                     accumulated,
                     pending,
                 } => {
+                    if let Some(t) = t_tool_start {
+                        turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
+                    }
                     if !accumulated.is_empty() {
                         self.conversation.push_user(accumulated);
                         self.conversation.trim_tool_exchanges_if_needed();
@@ -1335,6 +1390,53 @@ mod tests {
         events
             .iter()
             .any(|e| matches!(e, RuntimeEvent::Failed { .. }))
+    }
+
+    #[test]
+    fn perf_summary_includes_cold_start_and_tool_fields() {
+        // Phase 11.3.4 + 11.3.5: verify model_load_ms, tool_ms, model_ms, total_turn_ms
+        // appear in the [runtime:perf] summary when tracing is enabled.
+        //
+        // Uses env-var isolation: set before constructing TurnPerformance (which captures
+        // enabled at construction), removed immediately after so parallel tests are unaffected.
+        std::env::set_var(RUNTIME_TRACE_ENV, "1");
+        let mut perf = TurnPerformance::new();
+        std::env::remove_var(RUNTIME_TRACE_ENV);
+
+        perf.record_backend_timing("model_load", 4200);
+        perf.record_backend_timing("ctx_create", 50);
+        perf.record_backend_timing("tokenize", 20);
+        perf.record_backend_timing("prefill_done", 1000);
+        perf.record_backend_timing("generation_done", 800);
+        perf.record_tool_elapsed(300);
+        perf.record_tool_elapsed(150);
+
+        let mut lines = Vec::new();
+        perf.emit_summary(&mut |e| {
+            if let RuntimeEvent::RuntimeTrace(line) = e {
+                lines.push(line);
+            }
+        });
+
+        assert_eq!(lines.len(), 1, "expect exactly one summary line");
+        let summary = &lines[0];
+        assert!(
+            summary.contains("model_load_ms=4200"),
+            "cold-start field missing: {summary}"
+        );
+        assert!(
+            summary.contains("tool_ms=450"),
+            "tool aggregation field missing: {summary}"
+        );
+        // model_ms = ctx_ms(50) + tokenize_ms(20) + prefill_ms(1000) + generation_ms(800) = 1870
+        assert!(
+            summary.contains("model_ms=1870"),
+            "model-side aggregate missing: {summary}"
+        );
+        assert!(
+            summary.contains("total_turn_ms="),
+            "wall-clock turn time missing: {summary}"
+        );
     }
 
     #[test]

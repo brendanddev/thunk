@@ -5,6 +5,7 @@ use super::super::prompt;
 use super::super::tool_surface::{
     select_tool_surface, tool_allowed_for_surface, SurfaceTool, ToolSurface,
 };
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn tool_surface_defaults_to_retrieval_first_for_code_investigation_prompts() {
@@ -231,5 +232,96 @@ fn mutation_turn_still_receives_surface_hint() {
         }),
         "mutation-intent turns still expose active surface hint: {:?}",
         first.messages
+    );
+}
+
+#[test]
+fn answer_only_surface_hint_declares_no_tools() {
+    // Phase 12.0.1: AnswerOnly surface hint must list zero tools and
+    // explicitly tell the model to provide its final answer.
+    let hint = prompt::render_tool_surface_hint(
+        ToolSurface::AnswerOnly.as_str(),
+        ToolSurface::AnswerOnly.allowed_tool_names(),
+    );
+    assert!(
+        hint.contains("AnswerOnly"),
+        "hint must name the AnswerOnly surface: {hint}"
+    );
+    assert!(
+        !hint.contains("search_code"),
+        "AnswerOnly surface must not offer search_code: {hint}"
+    );
+    assert!(
+        !hint.contains("read_file"),
+        "AnswerOnly surface must not offer read_file: {hint}"
+    );
+    assert!(
+        !hint.contains("Available this turn:"),
+        "AnswerOnly surface must not use the tool-list format: {hint}"
+    );
+}
+
+#[test]
+fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
+    // Phase 12.0.1: after a successful read the runtime sets answer_phase = PostRead.
+    // The synthesis generation must receive the AnswerOnly surface hint so the model
+    // is not offered any tools — eliminating the post_evidence_tool_call_rejected round.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(tmp.path().join("sandbox/main.py"), "def main(): pass\n").unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(RecordingBackend::new(
+            vec![
+                "[read_file: sandbox/main.py]", // round 1: model reads the requested file
+                "Here is what I found.",         // round 2: synthesis — must get AnswerOnly hint
+            ],
+            Arc::clone(&requests),
+        )),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Read sandbox/main.py".into(),
+        },
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected exactly 2 backend calls (read + synthesis): {requests:?}"
+    );
+
+    let synthesis = &requests[1];
+    // Find the ephemeral per-turn surface hint (starts with "Active tool surface:").
+    // This is distinct from the main system prompt, which always describes all tools.
+    let surface_hint = synthesis
+        .messages
+        .iter()
+        .find(|m| m.role == Role::System && m.content.starts_with("Active tool surface:"))
+        .expect("synthesis request must carry a surface hint");
+    assert!(
+        surface_hint.content.contains("AnswerOnly"),
+        "synthesis surface hint must name AnswerOnly: {}",
+        surface_hint.content
+    );
+    assert!(
+        !surface_hint.content.contains("search_code"),
+        "AnswerOnly surface hint must not offer search_code: {}",
+        surface_hint.content
+    );
+    assert!(
+        !surface_hint.content.contains("read_file"),
+        "AnswerOnly surface hint must not offer read_file: {}",
+        surface_hint.content
     );
 }

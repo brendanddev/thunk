@@ -194,6 +194,9 @@ pub(super) fn surface_policy_correction(surface: ToolSurface) -> &'static str {
         ToolSurface::GitReadOnly => {
             "[runtime:correction] This turn allows Git read-only tools only: git_status, git_diff, git_log. Retrieval tools are not available."
         }
+        ToolSurface::AnswerOnly => {
+            "[runtime:correction] No tools are available. Provide your final answer now."
+        }
     }
 }
 
@@ -203,6 +206,7 @@ pub(super) fn repeated_disallowed_tool_error(surface: ToolSurface) -> &'static s
             "repeated unavailable tool use for this retrieval-first turn."
         }
         ToolSurface::GitReadOnly => "repeated unavailable tool use for this Git read-only turn.",
+        ToolSurface::AnswerOnly => "no tools are available during answer synthesis.",
     }
 }
 

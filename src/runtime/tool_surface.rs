@@ -11,6 +11,10 @@ use super::prompt_analysis::normalized_prompt_tokens;
 pub(super) enum ToolSurface {
     RetrievalFirst,
     GitReadOnly,
+    /// Synthesis-only surface: no tools offered.
+    /// Used for answer-phase generations after evidence is accepted or a read completes,
+    /// to prevent the model from attempting tool calls and triggering a correction round.
+    AnswerOnly,
 }
 
 /// Canonical registry entry for a tool surface.
@@ -47,6 +51,7 @@ const GIT_READ_ONLY_TOOLS: &[SurfaceTool] = &[
     SurfaceTool::GitDiff,
     SurfaceTool::GitLog,
 ];
+const ANSWER_ONLY_TOOLS: &[SurfaceTool] = &[];
 const TOOL_SURFACE_DEFINITIONS: &[ToolSurfaceDefinition] = &[
     ToolSurfaceDefinition {
         surface: ToolSurface::RetrievalFirst,
@@ -57,6 +62,11 @@ const TOOL_SURFACE_DEFINITIONS: &[ToolSurfaceDefinition] = &[
         surface: ToolSurface::GitReadOnly,
         name: "GitReadOnly",
         tools: GIT_READ_ONLY_TOOLS,
+    },
+    ToolSurfaceDefinition {
+        surface: ToolSurface::AnswerOnly,
+        name: "AnswerOnly",
+        tools: ANSWER_ONLY_TOOLS,
     },
 ];
 
