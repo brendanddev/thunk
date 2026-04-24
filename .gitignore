@@ -11,6 +11,9 @@ data/
 ## Logs
 logs/
 
+## Configuration
+config.toml
+
 ## Sandbox project
 sandbox/
 

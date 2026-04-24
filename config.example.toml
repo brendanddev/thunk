@@ -1,0 +1,22 @@
+[app]
+name = "params"
+
+[ui]
+show_activity = true
+
+[llm]
+provider = "llama_cpp"
+
+[llama_cpp]
+# Path to your local GGUF model file
+model_path = "data/models/your-model.gguf"
+
+# Performance tuning (adjust based on your hardware)
+gpu_layers = 20
+context_tokens = 8192
+batch_tokens = 2048
+max_tokens = 512
+temperature = 0.3
+
+# Enable for debugging llama.cpp internals
+show_native_logs = false
