@@ -4,6 +4,8 @@ use crate::tools::ToolSpec;
 
 use super::tool_codec;
 
+/// Builds the ephemeral per-turn tool-surface hint injected before generation.
+/// This is not persisted in conversation history.
 pub(crate) fn render_tool_surface_hint<I>(surface_name: &str, allowed_tools: I) -> String
 where
     I: IntoIterator<Item = &'static str>,

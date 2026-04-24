@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::types::RuntimeTerminalReason;
 
-// ── Read-file anchor tests ───────────────────────────────────────────────────
+// Read-file anchor tests
 
 #[test]
 fn successful_read_file_updates_last_read_file_anchor() {
@@ -425,7 +425,7 @@ fn anchored_read_seeds_reads_this_turn_and_answer_phase_fires_after_model_initia
     assert_eq!(last_assistant, Some(final_answer));
 }
 
-// ── Search anchor tests ──────────────────────────────────────────────────────
+// Search anchor tests
 
 #[test]
 fn successful_search_code_updates_last_search_anchor() {
@@ -670,7 +670,7 @@ fn no_search_anchor_replay_returns_deterministic_failure() {
     );
 }
 
-// ── Same-scope continuity tests ──────────────────────────────────────────────
+// Same-scope continuity tests
 
 #[test]
 fn same_scope_followup_reuses_last_successful_scoped_search_scope() {

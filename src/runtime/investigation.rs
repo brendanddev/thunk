@@ -8,11 +8,15 @@ use super::types::RuntimeEvent;
 
 const RUNTIME_TRACE_ENV: &str = "PARAMS_TRACE_RUNTIME";
 
+// Exact substring triggers used for structured investigation modes.
+// Keep these narrow: broad matching increases false positives for small local models.
 const INITIALIZATION_TERMS: &[&str] = &["initialize", "initialized", "initialization"];
 const CREATE_TERMS: &[&str] = &["create", "created", "creation"];
 const REGISTER_TERMS: &[&str] = &["register", "registered", "registration"];
 const LOAD_TERMS: &[&str] = &["load", "loaded", "loading"];
 const SAVE_TERMS: &[&str] = &["save", "saved", "saving"];
+
+// Lockfiles are useful project metadata, but usually poor evidence for code-location answers.
 const LOCKFILE_NAMES: &[&str] = &[
     "Cargo.lock",
     "package-lock.json",
@@ -21,10 +25,13 @@ const LOCKFILE_NAMES: &[&str] = &[
     "poetry.lock",
     "Pipfile.lock",
 ];
+
+// Source extensions used to prefer implementation files over generated or metadata matches.
 const SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h", "hpp",
 ];
 
+// Advisory runtime tracing only. Trace events must not influence control flow.
 fn trace_runtime_decision(
     on_event: &mut dyn FnMut(RuntimeEvent),
     event: &str,

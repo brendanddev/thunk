@@ -39,6 +39,7 @@ pub enum AnswerSource {
     ToolLimitReached,
 }
 
+/// Runtime-owned terminal outcomes. These are policy decisions, not model output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeTerminalReason {
     RejectedMutation,
@@ -53,6 +54,7 @@ pub enum RuntimeTerminalReason {
     InsufficientEvidence,
 }
 
+/// External inputs the runtime accepts from the app/TUI layer.
 #[derive(Debug, Clone)]
 pub enum RuntimeRequest {
     Submit {
@@ -66,6 +68,7 @@ pub enum RuntimeRequest {
     Reject,
 }
 
+/// Events emitted by the runtime for UI rendering, logging, and lifecycle handling.
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     ActivityChanged(Activity),
