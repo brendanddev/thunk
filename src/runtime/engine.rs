@@ -78,10 +78,49 @@ impl GenerationRoundLabel {
     }
 }
 
+#[derive(Clone, Copy)]
+enum GenerationRoundCause {
+    Initial,
+    ToolResults,
+    Recovery,
+    SearchRetry,
+    PostEvidenceToolCallRejected,
+    AnswerPhaseToolCallRejected,
+    SearchBudgetClosedCorrection,
+    EditRepairCorrection,
+    FabricationCorrection,
+    MalformedBlockCorrection,
+    ReadRequestToolRequired,
+    SearchBeforeAnsweringCorrection,
+    ReadBeforeAnsweringCorrection,
+}
+
+impl GenerationRoundCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::ToolResults => "tool-results",
+            Self::Recovery => "recovery",
+            Self::SearchRetry => "search-retry",
+            Self::PostEvidenceToolCallRejected => "post_evidence_tool_call_rejected",
+            Self::AnswerPhaseToolCallRejected => "answer_phase_tool_call_rejected",
+            Self::SearchBudgetClosedCorrection => "search_budget_closed_correction",
+            Self::EditRepairCorrection => "edit_repair_correction",
+            Self::FabricationCorrection => "fabrication_correction",
+            Self::MalformedBlockCorrection => "malformed_block_correction",
+            Self::ReadRequestToolRequired => "read_request_tool_required",
+            Self::SearchBeforeAnsweringCorrection => "search_before_answering",
+            Self::ReadBeforeAnsweringCorrection => "read_before_answering",
+        }
+    }
+}
+
 struct TurnPerformance {
     enabled: bool,
     rounds: usize,
     round_labels: Vec<GenerationRoundLabel>,
+    round_causes: Vec<GenerationRoundCause>,
+    prompt_sizes: Vec<usize>,
     ctx_ms: u64,
     tokenize_ms: u64,
     prefill_ms: u64,
@@ -94,6 +133,8 @@ impl TurnPerformance {
             enabled: std::env::var_os(RUNTIME_TRACE_ENV).is_some(),
             rounds: 0,
             round_labels: Vec::new(),
+            round_causes: Vec::new(),
+            prompt_sizes: Vec::new(),
             ctx_ms: 0,
             tokenize_ms: 0,
             prefill_ms: 0,
@@ -104,6 +145,8 @@ impl TurnPerformance {
     fn start_round(
         &mut self,
         label: GenerationRoundLabel,
+        cause: GenerationRoundCause,
+        prompt_chars: usize,
         on_event: &mut dyn FnMut(RuntimeEvent),
     ) {
         if !self.enabled {
@@ -112,10 +155,14 @@ impl TurnPerformance {
 
         self.rounds += 1;
         self.round_labels.push(label);
+        self.round_causes.push(cause);
+        self.prompt_sizes.push(prompt_chars);
         on_event(RuntimeEvent::RuntimeTrace(format!(
-            "[runtime:perf] round={} label={}",
+            "[runtime:perf] round={} label={} cause={} prompt_chars={}",
             self.rounds,
-            label.as_str()
+            label.as_str(),
+            cause.as_str(),
+            prompt_chars
         )));
     }
 
@@ -147,16 +194,69 @@ impl TurnPerformance {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let causes = if self.round_causes.is_empty() {
+            "none".to_string()
+        } else {
+            self.round_causes
+                .iter()
+                .map(|cause| cause.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let prompt_sizes = if self.prompt_sizes.is_empty() {
+            "none".to_string()
+        } else {
+            self.prompt_sizes
+                .iter()
+                .map(|size| size.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
 
         on_event(RuntimeEvent::RuntimeTrace(format!(
-            "[runtime:perf] rounds={} round_labels={} prefill_ms={} generation_ms={} ctx_ms={} tokenize_ms={}",
+            "[runtime:perf] rounds={} round_labels={} causes={} prompt_sizes={} prefill_ms={} generation_ms={} ctx_ms={} tokenize_ms={}",
             self.rounds,
             round_labels,
+            causes,
+            prompt_sizes,
             self.prefill_ms,
             self.generation_ms,
             self.ctx_ms,
             self.tokenize_ms
         )));
+    }
+}
+
+fn estimate_generation_prompt_chars(conversation: &Conversation, tool_surface: ToolSurface) -> usize {
+    let hint = prompt::render_tool_surface_hint(
+        tool_surface.as_str(),
+        tool_surface.allowed_tool_names(),
+    );
+    conversation
+        .snapshot()
+        .into_iter()
+        .map(|message| message.content.len())
+        .sum::<usize>()
+        + hint.len()
+}
+
+fn infer_post_tool_round_cause(results: &str) -> GenerationRoundCause {
+    if results.contains("=== tool_result: search_code ===") && results.contains("No matches found.")
+    {
+        GenerationRoundCause::SearchRetry
+    } else if results.contains("This is a usage lookup")
+        || results.contains("This is a config lookup")
+        || results.contains("This is an initialization lookup")
+        || results.contains("This is a creation lookup")
+        || results.contains("This is a registration lookup")
+        || results.contains("This is a load lookup")
+        || results.contains("This is a save lookup")
+        || results.contains("The file just read contained only import matches")
+        || results.contains("The file just read is a lockfile")
+    {
+        GenerationRoundCause::Recovery
+    } else {
+        GenerationRoundCause::ToolResults
     }
 }
 
@@ -578,6 +678,7 @@ impl Runtime {
         let mut investigation = InvestigationState::new();
         let mut turn_perf = TurnPerformance::new();
         let mut next_round_label = GenerationRoundLabel::Initial;
+        let mut next_round_cause = GenerationRoundCause::Initial;
         let mut requested_read_completed = false;
         let mut read_request_correction_issued = false;
         let mut disallowed_tool_attempts = 0usize;
@@ -686,7 +787,12 @@ impl Runtime {
             &[("surface", tool_surface.as_str().into())],
         );
         loop {
-            turn_perf.start_round(next_round_label, on_event);
+            let prompt_chars = if turn_perf.enabled {
+                estimate_generation_prompt_chars(&self.conversation, tool_surface)
+            } else {
+                0
+            };
+            turn_perf.start_round(next_round_label, next_round_cause, prompt_chars, on_event);
             let response = {
                 let turn_perf = &mut turn_perf;
                 let mut perf_on_event = |event| {
@@ -737,12 +843,18 @@ impl Runtime {
                     }
                     self.conversation.discard_last_if_assistant();
                     if post_answer_phase_tool_attempts == 1 {
-                        next_round_label = match phase {
-                            AnswerPhaseKind::PostRead => GenerationRoundLabel::CorrectionRetry,
-                            AnswerPhaseKind::InvestigationEvidenceReady => {
-                                GenerationRoundLabel::PostEvidenceRetry
-                            }
+                        let (label, cause) = match phase {
+                            AnswerPhaseKind::PostRead => (
+                                GenerationRoundLabel::CorrectionRetry,
+                                GenerationRoundCause::AnswerPhaseToolCallRejected,
+                            ),
+                            AnswerPhaseKind::InvestigationEvidenceReady => (
+                                GenerationRoundLabel::PostEvidenceRetry,
+                                GenerationRoundCause::PostEvidenceToolCallRejected,
+                            ),
                         };
+                        next_round_label = label;
+                        next_round_cause = cause;
                         self.conversation.push_user(
                             match phase {
                                 AnswerPhaseKind::PostRead => TURN_COMPLETE_ANSWER_ONLY,
@@ -809,6 +921,7 @@ impl Runtime {
                     self.conversation
                         .push_user(search_budget.closed_message().to_string());
                     next_round_label = GenerationRoundLabel::CorrectionRetry;
+                    next_round_cause = GenerationRoundCause::SearchBudgetClosedCorrection;
                     continue;
                 }
                 on_event(RuntimeEvent::Failed {
@@ -831,6 +944,7 @@ impl Runtime {
                     self.conversation
                         .push_user(EDIT_REPAIR_CORRECTION.to_string());
                     next_round_label = GenerationRoundLabel::CorrectionRetry;
+                    next_round_cause = GenerationRoundCause::EditRepairCorrection;
                     continue;
                 }
 
@@ -843,6 +957,7 @@ impl Runtime {
                         self.conversation
                             .push_user(FABRICATION_CORRECTION.to_string());
                         next_round_label = GenerationRoundLabel::CorrectionRetry;
+                        next_round_cause = GenerationRoundCause::FabricationCorrection;
                         continue;
                     }
                     on_event(RuntimeEvent::Failed {
@@ -861,6 +976,7 @@ impl Runtime {
                         self.conversation
                             .push_user(MALFORMED_BLOCK_CORRECTION.to_string());
                         next_round_label = GenerationRoundLabel::CorrectionRetry;
+                        next_round_cause = GenerationRoundCause::MalformedBlockCorrection;
                         continue;
                     }
                     on_event(RuntimeEvent::Failed {
@@ -881,6 +997,7 @@ impl Runtime {
                                 "{READ_REQUEST_TOOL_REQUIRED} Requested path: `{path}`"
                             ));
                             next_round_label = GenerationRoundLabel::CorrectionRetry;
+                            next_round_cause = GenerationRoundCause::ReadRequestToolRequired;
                             continue;
                         }
 
@@ -928,6 +1045,8 @@ impl Runtime {
                             self.conversation
                                 .push_user(SEARCH_BEFORE_ANSWERING.to_string());
                             next_round_label = GenerationRoundLabel::CorrectionRetry;
+                            next_round_cause =
+                                GenerationRoundCause::SearchBeforeAnsweringCorrection;
                             continue;
                         }
 
@@ -981,6 +1100,8 @@ impl Runtime {
                             self.conversation
                                 .push_user(READ_BEFORE_ANSWERING.to_string());
                             next_round_label = GenerationRoundLabel::CorrectionRetry;
+                            next_round_cause =
+                                GenerationRoundCause::ReadBeforeAnsweringCorrection;
                             continue;
                         }
 
@@ -1049,6 +1170,7 @@ impl Runtime {
                     results,
                     git_acquisition_answer,
                 } => {
+                    let post_tool_cause = infer_post_tool_round_cause(&results);
                     self.conversation.push_user(results);
                     self.conversation.trim_tool_exchanges_if_needed();
                     if tool_surface == ToolSurface::GitReadOnly {
@@ -1076,6 +1198,7 @@ impl Runtime {
                         }
                     }
                     next_round_label = GenerationRoundLabel::PostTool;
+                    next_round_cause = post_tool_cause;
                     // Signal re-entry before the next generate so the status bar
                     // transitions cleanly from "executing tools" → "processing" → …
                     on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
