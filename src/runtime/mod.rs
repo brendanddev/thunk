@@ -10,6 +10,8 @@ mod response_text;
 #[cfg(test)]
 mod scenarios;
 mod search_query;
+#[cfg(test)]
+mod tests;
 mod tool_codec;
 mod tool_round;
 mod tool_surface;
