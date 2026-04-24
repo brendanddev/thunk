@@ -44,6 +44,17 @@ pub(super) fn path_is_within_scope(model_path: &str, scope: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn enforce_scope(scope: &str, mut path: Option<String>) -> Option<String> {
+        if let Some(ref p) = path.clone() {
+            if !path_is_within_scope(p, scope) {
+                path = Some(scope.to_string());
+            }
+        } else {
+            path = Some(scope.to_string());
+        }
+        path
+    }
+
     #[test]
     fn path_matches_requested_exact_relative() {
         assert!(path_matches_requested("sandbox/main.py", "sandbox/main.py"));
@@ -71,5 +82,143 @@ mod tests {
             "sandbox/other.py",
             "sandbox/main.py"
         ));
+    }
+
+    #[test]
+    fn path_is_within_scope_exact_match() {
+        assert!(path_is_within_scope(
+            "sandbox/services/",
+            "sandbox/services/"
+        ));
+        assert!(path_is_within_scope("sandbox/services", "sandbox/services"));
+        assert!(path_is_within_scope(
+            "sandbox/services/",
+            "sandbox/services"
+        ));
+        assert!(path_is_within_scope(
+            "sandbox/services",
+            "sandbox/services/"
+        ));
+    }
+
+    #[test]
+    fn path_is_within_scope_narrower_path_accepted() {
+        assert!(path_is_within_scope(
+            "sandbox/services/tasks/",
+            "sandbox/services/"
+        ));
+        assert!(path_is_within_scope(
+            "sandbox/cli/handlers/",
+            "sandbox/cli/"
+        ));
+        assert!(path_is_within_scope("sandbox/", "sandbox/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_broader_path_rejected() {
+        assert!(!path_is_within_scope("sandbox/", "sandbox/services/"));
+        assert!(!path_is_within_scope("src/", "sandbox/services/"));
+        assert!(!path_is_within_scope(".", "sandbox/services/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_orthogonal_path_rejected() {
+        assert!(!path_is_within_scope("src/runtime/", "sandbox/services/"));
+        assert!(!path_is_within_scope("models/", "services/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_boundary_guard_prevents_prefix_collision() {
+        assert!(!path_is_within_scope(
+            "sandbox/service_extra/",
+            "sandbox/service/"
+        ));
+        assert!(!path_is_within_scope(
+            "sandbox/services_extended/",
+            "sandbox/services/"
+        ));
+        assert!(path_is_within_scope(
+            "sandbox/services/sub/",
+            "sandbox/services/"
+        ));
+    }
+
+    #[test]
+    fn path_is_within_scope_absolute_path_rejected() {
+        assert!(!path_is_within_scope(
+            "/Users/project/sandbox/services/",
+            "sandbox/services/"
+        ));
+        assert!(!path_is_within_scope("/abs/path/", "sandbox/"));
+    }
+
+    #[test]
+    fn path_is_within_scope_parent_components_rejected() {
+        assert!(!path_is_within_scope(
+            "sandbox/services/../",
+            "sandbox/services/"
+        ));
+        assert!(!path_is_within_scope(
+            "sandbox/services/../../src/",
+            "sandbox/services/"
+        ));
+        assert!(!path_is_within_scope(
+            "sandbox/services/tasks/",
+            "sandbox/services/../"
+        ));
+    }
+
+    #[test]
+    fn path_is_within_scope_dotslash_normalization() {
+        assert!(path_is_within_scope(
+            "./sandbox/services/",
+            "sandbox/services/"
+        ));
+        assert!(path_is_within_scope(
+            "sandbox/services/",
+            "./sandbox/services/"
+        ));
+    }
+
+    #[test]
+    fn scope_enforcement_clamps_broader_parent_path() {
+        let scope = "sandbox/services/";
+        let path = enforce_scope(scope, Some("sandbox/".into()));
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn scope_enforcement_clamps_parent_component_path() {
+        let scope = "sandbox/services/";
+        let path = enforce_scope(scope, Some("sandbox/services/../".into()));
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn scope_enforcement_clamps_unrelated_path() {
+        let scope = "sandbox/services/";
+        let path = enforce_scope(scope, Some("src/".into()));
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn scope_enforcement_preserves_exact_scope_path() {
+        let scope = "sandbox/services/";
+        let path = enforce_scope(scope, Some("sandbox/services/".into()));
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
+    }
+
+    #[test]
+    fn scope_enforcement_preserves_child_path() {
+        let scope = "sandbox/services/";
+        let path = enforce_scope(scope, Some("sandbox/services/tasks/".into()));
+        assert_eq!(path.as_deref(), Some("sandbox/services/tasks/"));
+    }
+
+    #[test]
+    fn scope_enforcement_injects_when_path_absent() {
+        let scope = "sandbox/services/";
+        let path = enforce_scope(scope, None);
+        assert_eq!(path.as_deref(), Some("sandbox/services/"));
     }
 }

@@ -11,6 +11,7 @@ mod anchors;
 mod approval;
 mod finalization;
 mod git_acquisition;
+mod integration_misc;
 mod investigation;
 mod investigation_modes;
 mod path_scope;

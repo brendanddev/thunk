@@ -78,3 +78,48 @@ pub(super) fn weak_search_query_reason(query: &str) -> Option<&'static str> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weak_search_query_reason_rejects_only_approved_structural_cases() {
+        assert_eq!(weak_search_query_reason(""), Some("empty"));
+        assert_eq!(weak_search_query_reason("   "), Some("empty"));
+        assert_eq!(weak_search_query_reason("g"), Some("too_short"));
+        assert_eq!(weak_search_query_reason("gt"), Some("too_short"));
+        assert_eq!(weak_search_query_reason("git"), Some("git"));
+        assert_eq!(weak_search_query_reason("GIT"), Some("git"));
+
+        for allowed in [
+            "status",
+            "diff",
+            "log",
+            "file",
+            "code",
+            "src",
+            "main",
+            "test",
+            "tests",
+            "git_status",
+            "src/runtime",
+        ] {
+            assert_eq!(
+                weak_search_query_reason(allowed),
+                None,
+                "query should not be rejected by the first-pass weak-query guard: {allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_query_simplification_prefers_single_literal_keyword() {
+        assert_eq!(simplify_search_query("logging initialization"), "logging");
+        assert_eq!(simplify_search_query("logger initialization"), "logger");
+        assert_eq!(simplify_search_query("write_file()"), "write_file");
+        assert_eq!(simplify_search_query("sessions saved"), "sessions");
+        assert_eq!(simplify_search_query("fn main"), "main");
+        assert_eq!(simplify_search_query(r"logging\.init\(\)"), "logging");
+    }
+}
