@@ -10,6 +10,7 @@ pub use super::{AnswerSource, PendingAction, RiskLevel, Runtime, RuntimeEvent, R
 mod anchors;
 mod approval;
 mod finalization;
+mod git_acquisition;
 mod read_bounds;
 mod search_budget;
 mod search_guardrails;
