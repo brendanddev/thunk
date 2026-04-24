@@ -8,8 +8,11 @@ use crate::tools::default_registry;
 pub use super::{AnswerSource, PendingAction, RiskLevel, Runtime, RuntimeEvent, RuntimeRequest};
 
 mod approval;
+mod finalization;
 mod read_bounds;
+mod search_budget;
 mod tool_round;
+mod tool_surface;
 
 pub struct TestBackend {
     responses: Vec<String>,
