@@ -1112,10 +1112,87 @@ impl InvestigationState {
         }
     }
 
+    /// Selects the best candidate path for the first runtime-dispatched read after a
+    /// non-empty search result. The runtime calls this to determine which file to read
+    /// directly, bypassing model selection entirely.
+    ///
+    /// For structured investigation modes the selection uses the same classification
+    /// signals already computed during `record_search_results`. For General mode (no
+    /// structural preference) the first non-lockfile source candidate is returned, or
+    /// the first candidate overall if no source files are present.
+    ///
+    /// Returns `None` only when there are no candidates.
+    pub(super) fn select_first_read_candidate(&self, mode: InvestigationMode) -> Option<String> {
+        if self.search_candidate_paths.is_empty() {
+            return None;
+        }
+        let path = match mode {
+            InvestigationMode::UsageLookup if self.has_non_definition_candidates => {
+                self.best_non_definition_candidate()?
+            }
+            InvestigationMode::DefinitionLookup
+                if !self.definition_only_candidates.is_empty() =>
+            {
+                self.first_definition_candidate()?
+            }
+            InvestigationMode::ConfigLookup if !self.config_file_candidates.is_empty() => {
+                self.first_config_candidate()?
+            }
+            InvestigationMode::InitializationLookup
+                if !self.initialization_candidates.is_empty() =>
+            {
+                self.first_initialization_candidate()?
+            }
+            InvestigationMode::CreateLookup if !self.create_candidates.is_empty() => {
+                self.first_create_candidate()?
+            }
+            InvestigationMode::RegisterLookup if !self.register_candidates.is_empty() => {
+                self.first_register_candidate()?
+            }
+            InvestigationMode::LoadLookup if !self.load_candidates.is_empty() => {
+                self.first_load_candidate()?
+            }
+            InvestigationMode::SaveLookup if !self.save_candidates.is_empty() => {
+                self.first_save_candidate()?
+            }
+            _ => {
+                // General mode or structured mode with no matching candidates: prefer the
+                // first non-lockfile source candidate; fall back to the first candidate overall.
+                self.first_source_candidate()
+                    .or_else(|| self.search_candidate_paths.first().map(String::as_str))?
+            }
+        };
+        Some(path.to_string())
+    }
+
     fn first_non_definition_candidate(&self) -> Option<&str> {
         self.search_candidate_paths
             .iter()
             .find(|path| !self.definition_only_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    /// Prefers candidates with substantive content: not definition-only and not import-only.
+    /// Falls back to any non-definition candidate when all non-definition files are import-only.
+    fn best_non_definition_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|p| {
+                !self.definition_only_candidates.contains(*p)
+                    && !self.import_only_candidates.contains(*p)
+            })
+            .or_else(|| {
+                self.search_candidate_paths
+                    .iter()
+                    .find(|p| !self.definition_only_candidates.contains(*p))
+            })
+            .map(String::as_str)
+    }
+
+    fn first_definition_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| self.definition_only_candidates.contains(*path))
             .map(String::as_str)
     }
 

@@ -1220,8 +1220,94 @@ impl Runtime {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
                     }
                     let post_tool_cause = infer_post_tool_round_cause(&results);
+
+                    // After the first non-empty search the runtime selects the best candidate
+                    // deterministically and dispatches read_file before the model generates.
+                    // The model sees search + read results together and synthesizes directly.
+                    let should_auto_read = investigation_required
+                        && search_budget.calls == 1
+                        && investigation.search_produced_results()
+                        && results.contains("=== tool_result: search_code ===");
+
                     self.conversation.push_user(results);
                     self.conversation.trim_tool_exchanges_if_needed();
+
+                    if should_auto_read {
+                        if let Some(path) =
+                            investigation.select_first_read_candidate(investigation_mode)
+                        {
+                            trace_runtime_decision(
+                                on_event,
+                                "first_read_dispatched",
+                                &[
+                                    ("mode", investigation_mode.as_str().into()),
+                                    ("path", path.clone()),
+                                ],
+                            );
+                            tool_rounds += 1;
+                            if tool_rounds < MAX_TOOL_ROUNDS {
+                                let t_read_start = turn_perf.enabled.then(std::time::Instant::now);
+                                match run_tool_round(
+                                    &self.registry,
+                                    vec![ToolInput::ReadFile { path }],
+                                    &mut last_call_key,
+                                    &mut search_budget,
+                                    &mut investigation,
+                                    &mut reads_this_turn,
+                                    &mut self.anchors,
+                                    tool_surface,
+                                    &mut disallowed_tool_attempts,
+                                    &mut weak_search_query_attempts,
+                                    mutation_allowed,
+                                    investigation_required,
+                                    investigation_mode,
+                                    requested_read_path.as_deref(),
+                                    &mut requested_read_completed,
+                                    investigation_path_scope.as_deref(),
+                                    on_event,
+                                ) {
+                                    ToolRoundOutcome::Completed {
+                                        results: read_results,
+                                        ..
+                                    } => {
+                                        if let Some(t) = t_read_start {
+                                            turn_perf.record_tool_elapsed(
+                                                t.elapsed().as_millis() as u64,
+                                            );
+                                        }
+                                        self.conversation.push_user(read_results);
+                                        self.conversation.trim_tool_exchanges_if_needed();
+                                    }
+                                    ToolRoundOutcome::TerminalAnswer {
+                                        results: read_results,
+                                        answer,
+                                        reason,
+                                    } => {
+                                        if let Some(t) = t_read_start {
+                                            turn_perf.record_tool_elapsed(
+                                                t.elapsed().as_millis() as u64,
+                                            );
+                                        }
+                                        self.conversation.push_user(read_results);
+                                        self.conversation.trim_tool_exchanges_if_needed();
+                                        self.finish_with_runtime_answer(
+                                            &answer,
+                                            AnswerSource::RuntimeTerminal {
+                                                reason,
+                                                rounds: tool_rounds,
+                                            },
+                                            on_event,
+                                        );
+                                        finish_turn!();
+                                    }
+                                    ToolRoundOutcome::ApprovalRequired { .. } => {
+                                        // read_file is always Immediate — unreachable in practice.
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if tool_surface == ToolSurface::GitReadOnly {
                         if let Some(answer) = git_acquisition_answer {
                             trace_runtime_decision(
@@ -1763,7 +1849,7 @@ mod tests {
         );
     }
 
-    // Phase 9.1.1 — bounded multi-step investigation
+    // Bounded multi-step investigation
 
     #[test]
     fn two_candidate_reads_both_insufficient_terminates_cleanly() {
@@ -1853,11 +1939,8 @@ mod tests {
         );
     }
 
-    // Phase 9.1.2 — Path-Scoped Investigation
-
-    // Phase 9.1.4 — Prompt Scope as Search Upper Bound
-
-    // Phase 9.1.3 — Candidate Selection Quality (import-only weak candidate rejection)
+    // Path-Scoped Investigation, Prompt Scope as Search Upper Bound, and 
+    // Candidate Selection Quality (import-only weak candidate rejection)
 
     #[test]
     fn config_lookup_second_non_config_candidate_after_recovery_is_not_accepted() {
@@ -2046,11 +2129,11 @@ mod tests {
         )
         .unwrap();
 
+        // Runtime auto-reads the init candidate after search; the model sees search+read
+        // results together and synthesizes directly without its own read call.
         let mut rt = make_runtime_in(
             vec![
                 "[search_code: logging]",
-                "[read_file: sandbox/services/logging_factory.py]",
-                "[read_file: sandbox/services/logging_setup.py]",
                 "Logging is initialized in sandbox/services/logging_setup.py.",
             ],
             tmp.path(),
