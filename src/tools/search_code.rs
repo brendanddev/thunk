@@ -209,23 +209,26 @@ fn sort_by_file_group_priority(matches: Vec<SearchMatch>, query: &str) -> Vec<Se
 }
 
 /// Returns true if the line defines exactly `query` as its top-level symbol.
-/// Requires `looks_like_definition` to pass, then checks that `query` appears preceded by a
-/// space and followed by a non-identifier character (or end of line).
+/// Trims leading whitespace, strips the definition keyword prefix (e.g., `class `, `def `, `fn `),
+/// extracts the first identifier after that prefix, and compares it exactly to `query`.
+/// Does NOT match type annotations in function parameters (e.g., `def foo(task: Task)`).
 /// Mirrors the heuristic in `runtime::tool_codec::is_exact_symbol_definition`.
 fn is_exact_symbol_definition(line: &str, query: &str) -> bool {
-    if !looks_like_definition(line) {
-        return false;
-    }
-    let needle = format!(" {query}");
-    let mut search_from = 0;
-    while let Some(rel_idx) = line[search_from..].find(needle.as_str()) {
-        let after_start = search_from + rel_idx + needle.len();
-        let next_char = line[after_start..].chars().next();
-        let is_boundary = next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
-        if is_boundary {
-            return true;
+    let line = line.trim_start();
+    let def_prefixes = [
+        "pub struct ", "pub const ", "pub static ", "pub enum ", "pub fn ",
+        "pub type ", "pub trait ", "function ", "interface ", "struct ",
+        "enum ", "class ", "impl ", "const ", "trait ", "def ", "func ",
+        "type ", "fn ",
+    ];
+    for prefix in def_prefixes {
+        if let Some(after_prefix) = line.strip_prefix(prefix) {
+            let first_ident = after_prefix.split(|c: char| !c.is_alphanumeric() && c != '_').next();
+            if let Some(ident) = first_ident {
+                return ident == query;
+            }
+            return false;
         }
-        search_from += rel_idx + 1;
     }
     false
 }
@@ -493,6 +496,14 @@ mod tests {
         assert!(!is_exact_symbol_definition("def TaskFactory(self):", "Task"));
         assert!(!is_exact_symbol_definition("struct TaskManager {", "Task"));
         assert!(!is_exact_symbol_definition("pub enum TaskState {", "Task"));
+    }
+
+    #[test]
+    fn is_exact_symbol_definition_rejects_type_annotations() {
+        // Type annotations in function signatures should not match as definitions.
+        assert!(!is_exact_symbol_definition("def _format_task(task: Task) -> str:", "Task"));
+        assert!(!is_exact_symbol_definition("fn process_data(data: Task) -> Result", "Task"));
+        assert!(!is_exact_symbol_definition("def create_instance(task: Task) -> None:", "Task"));
     }
 
     #[test]

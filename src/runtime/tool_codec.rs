@@ -663,23 +663,26 @@ pub fn looks_like_definition(line: &str) -> bool {
 }
 
 /// Returns true if the line defines exactly `query` as its top-level symbol.
-/// Requires `looks_like_definition` to pass, then checks that `query` appears preceded by a
-/// space and followed by a non-identifier character (or end of line).
+/// Trims leading whitespace, strips the definition keyword prefix,
+/// extracts the first identifier after that prefix, and compares it exactly to `query`.
+/// Does NOT match type annotations in function parameters.
 /// Mirrors the heuristic in `tools::search_code::is_exact_symbol_definition`.
 fn is_exact_symbol_definition(line: &str, query: &str) -> bool {
-    if !looks_like_definition(line) {
-        return false;
-    }
-    let needle = format!(" {query}");
-    let mut search_from = 0;
-    while let Some(rel_idx) = line[search_from..].find(needle.as_str()) {
-        let after_start = search_from + rel_idx + needle.len();
-        let next_char = line[after_start..].chars().next();
-        let is_boundary = next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
-        if is_boundary {
-            return true;
+    let line = line.trim_start();
+    let def_prefixes = [
+        "pub struct ", "pub const ", "pub static ", "pub enum ", "pub fn ",
+        "pub type ", "pub trait ", "function ", "interface ", "struct ",
+        "enum ", "class ", "impl ", "const ", "trait ", "def ", "func ",
+        "type ", "fn ",
+    ];
+    for prefix in def_prefixes {
+        if let Some(after_prefix) = line.strip_prefix(prefix) {
+            let first_ident = after_prefix.split(|c: char| !c.is_alphanumeric() && c != '_').next();
+            if let Some(ident) = first_ident {
+                return ident == query;
+            }
+            return false;
         }
-        search_from += rel_idx + 1;
     }
     false
 }
@@ -785,14 +788,16 @@ fn render_search_results_grouped(
     for (file, group_matches) in groups {
         let total_in_file = group_matches.len();
         let shown = total_in_file.min(MAX_LINES_PER_FILE);
-        if shown < total_in_file {
-            lines.push(format!(
-                "{} ({} matches, showing {})",
-                file, total_in_file, shown
-            ));
+        let is_exact_def = s.query.len() > 0
+            && group_matches.iter().any(|m| is_exact_symbol_definition(&m.line, &s.query));
+        let header = if is_exact_def {
+            format!("{} [EXACT DEFINITION] ({} matches)", file, total_in_file)
+        } else if shown < total_in_file {
+            format!("{} ({} matches, showing {})", file, total_in_file, shown)
         } else {
-            lines.push(format!("{} ({} matches)", file, total_in_file));
-        }
+            format!("{} ({} matches)", file, total_in_file)
+        };
+        lines.push(header);
         for m in &group_matches[..shown] {
             lines.push(format!("  {}: {}", m.line_number, m.line));
         }
