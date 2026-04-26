@@ -95,7 +95,7 @@ impl Tool for SearchCodeTool {
 
         let mut matches = Vec::new();
         walk_and_search(root, query, &mut matches)?;
-        matches.sort_by_key(|m| file_class_priority(&m.file));
+        let mut matches = sort_by_file_group_priority(matches, query);
 
         let total_matches = matches.len();
         let truncated = total_matches > MAX_RESULTS_SHOWN;
@@ -175,6 +175,84 @@ fn is_text_file(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| TEXT_EXTENSIONS.contains(&ext))
         .unwrap_or(false)
+}
+
+/// Groups matches by file and stable-sorts the groups so definition-containing source files
+/// appear before usage-only files within the same class tier.
+/// Within each priority bucket the original walk order (alphabetical DFS) is preserved.
+///
+/// Three-level key within each class tier:
+///   (class, !has_exact_def, !has_all_def)
+/// where has_exact_def = the query is defined exactly on at least one match line,
+/// and   has_all_def   = every match line looks like a definition.
+fn sort_by_file_group_priority(matches: Vec<SearchMatch>, query: &str) -> Vec<SearchMatch> {
+    let mut groups: Vec<(String, Vec<SearchMatch>)> = Vec::new();
+    for m in matches {
+        if let Some(group) = groups.iter_mut().find(|(f, _)| *f == m.file) {
+            group.1.push(m);
+        } else {
+            let file = m.file.clone();
+            groups.push((file, vec![m]));
+        }
+    }
+    groups.sort_by_key(|(file, file_matches)| {
+        let class = file_class_priority(file);
+        let has_exact_def = file_matches
+            .iter()
+            .any(|m| is_exact_symbol_definition(&m.line, query));
+        let has_all_def = file_matches
+            .iter()
+            .all(|m| looks_like_definition(&m.line));
+        (class, !has_exact_def, !has_all_def)
+    });
+    groups.into_iter().flat_map(|(_, ms)| ms).collect()
+}
+
+/// Returns true if the line defines exactly `query` as its top-level symbol.
+/// Requires `looks_like_definition` to pass, then checks that `query` appears preceded by a
+/// space and followed by a non-identifier character (or end of line).
+/// Mirrors the heuristic in `runtime::tool_codec::is_exact_symbol_definition`.
+fn is_exact_symbol_definition(line: &str, query: &str) -> bool {
+    if !looks_like_definition(line) {
+        return false;
+    }
+    let needle = format!(" {query}");
+    let mut search_from = 0;
+    while let Some(rel_idx) = line[search_from..].find(needle.as_str()) {
+        let after_start = search_from + rel_idx + needle.len();
+        let next_char = line[after_start..].chars().next();
+        let is_boundary = next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        if is_boundary {
+            return true;
+        }
+        search_from += rel_idx + 1;
+    }
+    false
+}
+
+/// Returns true if the line looks like a top-level definition in any supported language.
+/// Mirrors the heuristic in `runtime::tool_codec::looks_like_definition`.
+fn looks_like_definition(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("pub enum ")
+        || t.starts_with("pub struct ")
+        || t.starts_with("pub fn ")
+        || t.starts_with("pub type ")
+        || t.starts_with("pub trait ")
+        || t.starts_with("pub const ")
+        || t.starts_with("pub static ")
+        || t.starts_with("enum ")
+        || t.starts_with("struct ")
+        || t.starts_with("fn ")
+        || t.starts_with("type ")
+        || t.starts_with("const ")
+        || t.starts_with("trait ")
+        || t.starts_with("impl ")
+        || t.starts_with("class ")
+        || t.starts_with("def ")
+        || t.starts_with("func ")
+        || t.starts_with("function ")
+        || t.starts_with("interface ")
 }
 
 /// Returns a sort key that places source code files before config/data files,
@@ -390,5 +468,149 @@ mod tests {
         assert_eq!(file_class_priority("notes.txt"), 2);
         assert_eq!(file_class_priority("Cargo.lock"), 2);
         assert_eq!(file_class_priority("no_extension"), 2);
+    }
+
+    #[test]
+    fn is_exact_symbol_definition_matches_exact_symbol() {
+        assert!(is_exact_symbol_definition("class Task:", "Task"));
+        assert!(is_exact_symbol_definition("class Task(Base):", "Task"));
+        assert!(is_exact_symbol_definition("def Task(self):", "Task"));
+        assert!(is_exact_symbol_definition("struct Task {", "Task"));
+        assert!(is_exact_symbol_definition("pub struct Task {", "Task"));
+        assert!(is_exact_symbol_definition("fn Task(", "Task"));
+        assert!(is_exact_symbol_definition("pub fn Task(", "Task"));
+        assert!(is_exact_symbol_definition("interface Task {", "Task"));
+        assert!(is_exact_symbol_definition("func Task(", "Task"));
+        assert!(is_exact_symbol_definition("type Task =", "Task"));
+        assert!(is_exact_symbol_definition("enum Task {", "Task"));
+    }
+
+    #[test]
+    fn is_exact_symbol_definition_rejects_prefix_symbols() {
+        // "Task" should not match lines that define "TaskStatus", "TaskRunner", etc.
+        assert!(!is_exact_symbol_definition("class TaskStatus:", "Task"));
+        assert!(!is_exact_symbol_definition("class TaskRunner(", "Task"));
+        assert!(!is_exact_symbol_definition("def TaskFactory(self):", "Task"));
+        assert!(!is_exact_symbol_definition("struct TaskManager {", "Task"));
+        assert!(!is_exact_symbol_definition("pub enum TaskState {", "Task"));
+    }
+
+    #[test]
+    fn is_exact_symbol_definition_rejects_non_definition_lines() {
+        assert!(!is_exact_symbol_definition("x = Task()", "Task"));
+        assert!(!is_exact_symbol_definition("let t = Task::new();", "Task"));
+        assert!(!is_exact_symbol_definition("return Task.from_dict(data)", "Task"));
+        assert!(!is_exact_symbol_definition("from models import Task", "Task"));
+    }
+
+    #[test]
+    fn exact_def_file_promoted_over_prefix_def_file() {
+        // omega.py defines "class Task:" (exact), alpha.py defines "class TaskStatus:" (prefix).
+        // With query "Task", omega.py must appear first despite being alphabetically later.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("alpha.py"), "class TaskStatus:\n    pass\n").unwrap();
+        fs::write(tmp.path().join("omega.py"), "class Task:\n    pass\n").unwrap();
+
+        let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(sr.matches.len(), 2);
+        assert!(
+            sr.matches[0].file.ends_with("omega.py"),
+            "exact definition file must appear before prefix-definition file; first: {}",
+            sr.matches[0].file
+        );
+    }
+
+    #[test]
+    fn definition_file_promoted_over_usage_file_within_source_tier() {
+        let tmp = TempDir::new().unwrap();
+        // alpha.py alphabetically first; only usage lines
+        fs::write(tmp.path().join("alpha.py"), "x = Task()\ntask = Task.run()\n").unwrap();
+        // omega.py alphabetically later; has a definition line
+        fs::write(tmp.path().join("omega.py"), "class Task:\n    pass\n").unwrap();
+
+        let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(sr.matches.len(), 3);
+        assert!(
+            sr.matches[0].file.ends_with("omega.py"),
+            "definition file must appear before usage-only file; first: {}",
+            sr.matches[0].file
+        );
+    }
+
+    #[test]
+    fn non_definition_files_within_class_preserve_walk_order() {
+        let tmp = TempDir::new().unwrap();
+        // Both usage-only — walk order (alpha < beta) must be preserved.
+        fs::write(tmp.path().join("alpha.py"), "x = Task()\n").unwrap();
+        fs::write(tmp.path().join("beta.py"), "y = Task.run()\n").unwrap();
+
+        let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(sr.matches.len(), 2);
+        assert!(
+            sr.matches[0].file.ends_with("alpha.py"),
+            "walk order must be preserved for equal-priority files"
+        );
+        assert!(sr.matches[1].file.ends_with("beta.py"));
+    }
+
+    #[test]
+    fn class_priority_dominates_over_definition_signal() {
+        let tmp = TempDir::new().unwrap();
+        // source tier, usage-only
+        fs::write(tmp.path().join("alpha.py"), "needle()\n").unwrap();
+        // config tier, happens to contain a definition-keyword line ("fn = ...")
+        fs::write(tmp.path().join("beta.toml"), "fn = \"needle\"\n").unwrap();
+
+        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        let alpha_pos = sr.matches.iter().position(|m| m.file.ends_with("alpha.py")).unwrap();
+        let beta_pos = sr.matches.iter().position(|m| m.file.ends_with("beta.toml")).unwrap();
+        assert!(
+            alpha_pos < beta_pos,
+            "source tier must dominate over definition signal in config tier"
+        );
+    }
+
+    #[test]
+    fn definition_file_survives_cap_over_early_usage_file() {
+        // Regression: alphabetically-early usage file filling the cap must not cut off
+        // an alphabetically-later definition file.
+        let tmp = TempDir::new().unwrap();
+        // aaa.py: 16 usage lines — more than MAX_RESULTS_SHOWN on its own
+        let usage_lines: String = (0..16).map(|i| format!("x = Task()  # {i}\n")).collect();
+        fs::write(tmp.path().join("aaa.py"), &usage_lines).unwrap();
+        // zzz.py: the definition — alphabetically last
+        fs::write(tmp.path().join("zzz.py"), "class Task:\n    pass\n").unwrap();
+
+        let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert!(sr.truncated, "must be truncated (17 matches > cap of 15)");
+        assert!(
+            sr.matches[0].file.ends_with("zzz.py"),
+            "definition file must be promoted to first; first: {}",
+            sr.matches[0].file
+        );
+        let zzz_count = sr.matches.iter().filter(|m| m.file.ends_with("zzz.py")).count();
+        let aaa_count = sr.matches.iter().filter(|m| m.file.ends_with("aaa.py")).count();
+        assert_eq!(zzz_count, 1, "definition match must be within the cap");
+        assert_eq!(aaa_count, MAX_RESULTS_SHOWN - 1, "remaining slots go to usage file");
     }
 }

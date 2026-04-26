@@ -573,6 +573,24 @@ pub fn format_tool_result(name: &str, output: &ToolOutput) -> String {
     format!("=== tool_result: {name} ===\n{body}\n=== /tool_result ===\n\n")
 }
 
+/// Like format_tool_result but renders search results with definition candidates sorted first.
+/// For DefinitionLookup mode: source-tier files containing definition-like match lines appear
+/// before import/usage files, so the model is more likely to read the definition site first.
+/// Non-search-result outputs are rendered identically to format_tool_result.
+pub fn format_tool_result_definition_ordered(name: &str, output: &ToolOutput) -> String {
+    let body = match output {
+        ToolOutput::SearchResults(s) => {
+            if s.matches.is_empty() {
+                "No matches found.".to_string()
+            } else {
+                render_search_results_grouped(s, true)
+            }
+        }
+        other => render_output(other),
+    };
+    format!("=== tool_result: {name} ===\n{body}\n=== /tool_result ===\n\n")
+}
+
 /// Formats a tool dispatch error for insertion into the conversation.
 pub fn format_tool_error(name: &str, error: &str) -> String {
     format!("=== tool_error: {name} ===\n{error}\n=== /tool_error ===\n\n")
@@ -644,29 +662,72 @@ pub fn looks_like_definition(line: &str) -> bool {
         || t.starts_with("interface ")
 }
 
-/// Returns the path of the one source-tier file whose match lines contain a definition,
-/// or None if zero or more than one such file exists.
-/// The single-file guard keeps the hint conservative: suppress when ambiguous.
+/// Returns true if the line defines exactly `query` as its top-level symbol.
+/// Requires `looks_like_definition` to pass, then checks that `query` appears preceded by a
+/// space and followed by a non-identifier character (or end of line).
+/// Mirrors the heuristic in `tools::search_code::is_exact_symbol_definition`.
+fn is_exact_symbol_definition(line: &str, query: &str) -> bool {
+    if !looks_like_definition(line) {
+        return false;
+    }
+    let needle = format!(" {query}");
+    let mut search_from = 0;
+    while let Some(rel_idx) = line[search_from..].find(needle.as_str()) {
+        let after_start = search_from + rel_idx + needle.len();
+        let next_char = line[after_start..].chars().next();
+        let is_boundary = next_char.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        if is_boundary {
+            return true;
+        }
+        search_from += rel_idx + 1;
+    }
+    false
+}
+
+/// Returns the path of the definition-site file for `query`, or None when ambiguous.
+///
+/// Priority:
+///   Tier 1 — exactly one source-tier file where any match line is an exact symbol
+///             definition for `query` (e.g. "class Task:" for query "Task").
+///   Tier 2 — exactly one source-tier file where all match lines look like definitions
+///             (strict fallback for queries that don't trigger exact-match detection).
+///
+/// Returns None when zero or more than one candidate exists at the winning tier.
 fn definition_site_file<'a>(
     groups: &[(&'a str, Vec<&crate::tools::types::SearchMatch>)],
+    query: &str,
 ) -> Option<&'a str> {
-    let mut found: Option<&'a str> = None;
+    let mut exact_found: Option<&'a str> = None;
+    let mut exact_count: usize = 0;
+    let mut all_def_found: Option<&'a str> = None;
+    let mut all_def_count: usize = 0;
+
     for (file, matches) in groups {
         if !is_source_tier(file) {
             continue;
         }
-        if matches.iter().any(|m| looks_like_definition(&m.line)) {
-            if found.is_some() {
-                // More than one candidate — ambiguous; suppress the hint.
-                return None;
-            }
-            found = Some(file);
+        if matches.iter().any(|m| is_exact_symbol_definition(&m.line, query)) {
+            exact_count += 1;
+            exact_found = Some(file);
+        } else if matches.iter().all(|m| looks_like_definition(&m.line)) {
+            all_def_count += 1;
+            all_def_found = Some(file);
         }
     }
-    found
+
+    if exact_count == 1 {
+        exact_found
+    } else if exact_count == 0 && all_def_count == 1 {
+        all_def_found
+    } else {
+        None
+    }
 }
 
-fn render_search_results_grouped(s: &crate::tools::types::SearchResultsOutput) -> String {
+fn render_search_results_grouped(
+    s: &crate::tools::types::SearchResultsOutput,
+    sort_definitions_first: bool,
+) -> String {
     use crate::tools::types::SearchMatch;
 
     let mut lines: Vec<String> = Vec::new();
@@ -692,9 +753,29 @@ fn render_search_results_grouped(s: &crate::tools::types::SearchResultsOutput) -
         }
     }
 
+    // For DefinitionLookup: stable-sort groups using a three-level key so the most
+    // specific definition file appears first.  Relative order within each tier is
+    // preserved (sort_by_key is stable).
+    //
+    // Key: (!has_exact_def, !has_all_def)
+    //   (false, false) — source file where every match is an exact symbol definition
+    //   (false, true)  — source file with an exact definition but also usage lines
+    //   (true,  false) — source file where all matches are definitions (non-exact)
+    //   (true,  true)  — usage-only or non-source file
+    if sort_definitions_first {
+        let query = &s.query;
+        groups.sort_by_key(|(file, matches)| {
+            let has_exact_def = is_source_tier(file)
+                && matches.iter().any(|m| is_exact_symbol_definition(&m.line, query));
+            let has_all_def = is_source_tier(file)
+                && matches.iter().all(|m| looks_like_definition(&m.line));
+            (!has_exact_def, !has_all_def)
+        });
+    }
+
     // If exactly one source-tier file has a definition-like line, prepend a directive
     // so the model reads the definition site rather than a high-match usage file.
-    if let Some(def_file) = definition_site_file(&groups) {
+    if let Some(def_file) = definition_site_file(&groups, &s.query) {
         lines.push(format!(
             "[definition found in {} — read this file first]",
             def_file
@@ -833,7 +914,7 @@ pub(crate) fn render_output(output: &ToolOutput) -> String {
             if s.matches.is_empty() {
                 "No matches found.".to_string()
             } else {
-                render_search_results_grouped(s)
+                render_search_results_grouped(s, false)
             }
         }
         ToolOutput::GitStatus(g) => render_git_status(g),
@@ -2088,6 +2169,229 @@ mod tests {
         assert!(
             instructions.contains("Tag names are EXACT"),
             "must warn the model about exact tag names"
+        );
+    }
+
+    // Definition-ordered rendering (Slice 12.1.2)
+
+    #[test]
+    fn definition_ordered_puts_definition_file_before_import_file() {
+        // Definition file listed second in raw search order → must appear first after ordering
+        let output = make_search_output(
+            vec![
+                make_match("sandbox/cli/commands.py", 10, "from models.enums import TaskStatus"),
+                make_match("sandbox/models/enums.py", 5, "class TaskStatus(str, Enum):"),
+            ],
+            2,
+        );
+        let body = {
+            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            render_search_results_grouped(s, true)
+        };
+        let pos_enums = body.find("sandbox/models/enums.py").unwrap();
+        let pos_commands = body.find("sandbox/cli/commands.py").unwrap();
+        assert!(
+            pos_enums < pos_commands,
+            "definition file must appear before import file; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_ordered_preserves_relative_order_among_definition_files() {
+        // Two definition files: a.py before b.py in search order → that order is preserved
+        let output = make_search_output(
+            vec![
+                make_match("sandbox/models/a.py", 1, "class TypeA:"),
+                make_match("sandbox/models/b.py", 1, "class TypeB:"),
+                make_match("sandbox/cli/commands.py", 10, "from models.a import TypeA"),
+            ],
+            3,
+        );
+        let body = {
+            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            render_search_results_grouped(s, true)
+        };
+        let pos_a = body.find("sandbox/models/a.py").unwrap();
+        let pos_b = body.find("sandbox/models/b.py").unwrap();
+        let pos_cmd = body.find("sandbox/cli/commands.py").unwrap();
+        assert!(pos_a < pos_b, "a.py must remain before b.py among definition files");
+        assert!(pos_b < pos_cmd, "definition files must precede non-definition files");
+    }
+
+    #[test]
+    fn definition_ordered_preserves_relative_order_among_non_definition_files() {
+        // Two non-definition files: import.py before usage.py → preserved after sort
+        let output = make_search_output(
+            vec![
+                make_match("sandbox/models/enums.py", 1, "class TaskStatus(str, Enum):"),
+                make_match("sandbox/cli/import.py", 10, "from models.enums import TaskStatus"),
+                make_match("sandbox/cli/usage.py", 20, "status = TaskStatus.DONE"),
+            ],
+            3,
+        );
+        let body = {
+            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            render_search_results_grouped(s, true)
+        };
+        let pos_import = body.find("sandbox/cli/import.py").unwrap();
+        let pos_usage = body.find("sandbox/cli/usage.py").unwrap();
+        assert!(
+            pos_import < pos_usage,
+            "import.py must remain before usage.py among non-definition files"
+        );
+    }
+
+    #[test]
+    fn definition_ordered_false_matches_render_output_exactly() {
+        // sort_definitions_first=false must be bit-for-bit identical to render_output
+        let output = make_search_output(
+            vec![
+                make_match("sandbox/cli/commands.py", 10, "from models.enums import TaskStatus"),
+                make_match("sandbox/models/enums.py", 5, "class TaskStatus(str, Enum):"),
+            ],
+            2,
+        );
+        let unordered_body = render_output(&output);
+        let ToolOutput::SearchResults(ref s) = output else { panic!() };
+        let also_unordered = render_search_results_grouped(s, false);
+        assert_eq!(
+            unordered_body, also_unordered,
+            "sort_definitions_first=false must match render_output exactly"
+        );
+    }
+
+    #[test]
+    fn definition_ordered_groups_appear_before_imports_when_enabled() {
+        // Verify that definition file groups appear before non-definition groups in rendered output
+        // using two pure usage files (no preamble interference from definition_site_file).
+        let output = make_search_output(
+            vec![
+                make_match("sandbox/cli/commands.py", 10, "import TaskStatus"),
+                make_match("sandbox/cli/runners.py", 20, "let status = new_status();"),
+                make_match("sandbox/models/enums.py", 1, "class TaskStatus(str, Enum):"),
+            ],
+            3,
+        );
+        // With sort: enums.py (definition) must appear before both usage files
+        let body = {
+            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            render_search_results_grouped(s, true)
+        };
+        // Find positions of the file group headers (not preamble)
+        // The group header format is "path (N matches)" — find "enums.py (" to avoid preamble hit
+        let pos_enums_group = body.find("sandbox/models/enums.py (").unwrap();
+        let pos_commands_group = body.find("sandbox/cli/commands.py (").unwrap();
+        let pos_runners_group = body.find("sandbox/cli/runners.py (").unwrap();
+        assert!(
+            pos_enums_group < pos_commands_group,
+            "enums.py group must appear before commands.py group"
+        );
+        assert!(
+            pos_enums_group < pos_runners_group,
+            "enums.py group must appear before runners.py group"
+        );
+    }
+
+    #[test]
+    fn definition_ordered_non_source_tier_file_not_promoted() {
+        // README.md contains prose with "class" in it — docs tier, must not be promoted
+        let output = make_search_output(
+            vec![
+                make_match("README.md", 5, "class TaskStatus handles task state"),
+                make_match("sandbox/cli/commands.py", 10, "from models.enums import TaskStatus"),
+                make_match("sandbox/models/enums.py", 1, "class TaskStatus(str, Enum):"),
+            ],
+            3,
+        );
+        let body = {
+            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            render_search_results_grouped(s, true)
+        };
+        let pos_readme = body.find("README.md").unwrap();
+        let pos_enums = body.find("sandbox/models/enums.py").unwrap();
+        // enums.py (source-tier definition) must appear before README.md (docs-tier)
+        assert!(
+            pos_enums < pos_readme,
+            "source-tier definition file must appear before docs-tier file; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn is_exact_symbol_definition_matches_and_rejects() {
+        assert!(is_exact_symbol_definition("class Task:", "Task"));
+        assert!(is_exact_symbol_definition("class Task(Base):", "Task"));
+        assert!(is_exact_symbol_definition("pub struct Task {", "Task"));
+        assert!(is_exact_symbol_definition("fn Task(", "Task"));
+        // prefix symbols must not match
+        assert!(!is_exact_symbol_definition("class TaskStatus:", "Task"));
+        assert!(!is_exact_symbol_definition("struct TaskRunner {", "Task"));
+        // non-definition lines must not match even if query is present
+        assert!(!is_exact_symbol_definition("x = Task()", "Task"));
+    }
+
+    #[test]
+    fn definition_ordered_exact_def_beats_prefix_def() {
+        // enums.py defines "TaskStatus" (prefix of "Task"), task.py defines "Task" exactly.
+        // With query "Task", task.py must appear first.
+        let output = ToolOutput::SearchResults(crate::tools::types::SearchResultsOutput {
+            query: "Task".into(),
+            matches: vec![
+                make_match("sandbox/models/enums.py", 5, "class TaskStatus(str, Enum):"),
+                make_match("sandbox/models/task.py", 1, "class Task:"),
+            ],
+            total_matches: 2,
+            truncated: false,
+        });
+        let body = {
+            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            render_search_results_grouped(s, true)
+        };
+        let pos_task = body.find("sandbox/models/task.py").unwrap();
+        let pos_enums = body.find("sandbox/models/enums.py").unwrap();
+        assert!(
+            pos_task < pos_enums,
+            "exact definition file must appear before prefix-definition file; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn definition_site_file_prefers_exact_over_all_def() {
+        // When one file has an exact symbol definition and another has all-def lines,
+        // definition_site_file must return the exact-def file (not None).
+        let query = "Task";
+        let task_match = make_match("sandbox/models/task.py", 1, "class Task:");
+        let enums_match = make_match("sandbox/models/enums.py", 5, "class TaskStatus(str, Enum):");
+        let groups: Vec<(&str, Vec<&crate::tools::types::SearchMatch>)> = vec![
+            ("sandbox/models/enums.py", vec![&enums_match]),
+            ("sandbox/models/task.py", vec![&task_match]),
+        ];
+        let result = definition_site_file(&groups, query);
+        assert_eq!(
+            result,
+            Some("sandbox/models/task.py"),
+            "exact-def file must win over all-def prefix file"
+        );
+    }
+
+    #[test]
+    fn definition_ordered_all_usage_files_no_reordering() {
+        // All files are usage/import files — no definitions present — order unchanged
+        let output = make_search_output(
+            vec![
+                make_match("sandbox/cli/commands.py", 10, "from models.enums import TaskStatus"),
+                make_match("sandbox/services/task.py", 20, "status = TaskStatus.DONE"),
+            ],
+            2,
+        );
+        let unordered_body = render_output(&output);
+        let body = {
+            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            render_search_results_grouped(s, true)
+        };
+        // When no definition files exist, sort changes nothing
+        assert_eq!(
+            unordered_body, body,
+            "output must be identical when no definition files are present"
         );
     }
 }

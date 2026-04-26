@@ -1176,6 +1176,77 @@ impl InvestigationState {
             })
             .map(String::as_str)
     }
+
+    /// Returns a mode-specific candidate preference hint after a search, or None when:
+    /// - no search candidates are recorded yet, or
+    /// - all candidates are already of the preferred type (no misdirection possible), or
+    /// - the mode has no preferred candidate class (General, UsageLookup, DefinitionLookup).
+    ///
+    /// DefinitionLookup is intentionally excluded: the definition_site_file preamble in
+    /// tool_codec already handles that case directly in the rendered search output.
+    pub(super) fn candidate_preference_hint(&self, mode: InvestigationMode) -> Option<String> {
+        if self.search_candidate_paths.is_empty() {
+            return None;
+        }
+        match mode {
+            InvestigationMode::InitializationLookup
+                if !self.initialization_candidates.is_empty()
+                    && self.has_non_initialization_candidates =>
+            {
+                let path = self.first_initialization_candidate()?;
+                Some(format!(
+                    "[initialization match found in {path} — read this file first]"
+                ))
+            }
+            InvestigationMode::ConfigLookup
+                if !self.config_file_candidates.is_empty() && self.has_non_config_candidates =>
+            {
+                let path = self.first_config_candidate()?;
+                Some(format!(
+                    "[config file found in {path} — read this file first]"
+                ))
+            }
+            InvestigationMode::CreateLookup
+                if !self.create_candidates.is_empty() && self.has_non_create_candidates =>
+            {
+                let path = self.first_create_candidate()?;
+                Some(format!(
+                    "[create match found in {path} — read this file first]"
+                ))
+            }
+            InvestigationMode::RegisterLookup
+                if !self.register_candidates.is_empty() && self.has_non_register_candidates =>
+            {
+                let path = self.first_register_candidate()?;
+                Some(format!(
+                    "[register match found in {path} — read this file first]"
+                ))
+            }
+            InvestigationMode::LoadLookup
+                if !self.load_candidates.is_empty() && self.has_non_load_candidates =>
+            {
+                let path = self.first_load_candidate()?;
+                Some(format!(
+                    "[load match found in {path} — read this file first]"
+                ))
+            }
+            InvestigationMode::SaveLookup if !self.save_candidates.is_empty() => {
+                let has_non_save = self
+                    .search_candidate_paths
+                    .iter()
+                    .any(|p| !self.save_candidates.contains(p));
+                if has_non_save {
+                    let path = self.first_save_candidate()?;
+                    Some(format!(
+                        "[save match found in {path} — read this file first]"
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1667,5 +1738,184 @@ mod tests {
         assert!(contains_save_term("saved_at timestamp"));
         assert!(!contains_save_term("def handle_session(session):"));
         assert!(!contains_save_term("return session_id"));
+    }
+
+    // candidate_preference_hint tests
+
+    fn make_search_output_for_hint(
+        matches: Vec<(&str, &str)>,
+    ) -> crate::tools::ToolOutput {
+        use crate::tools::types::{SearchMatch, SearchResultsOutput};
+        let matches: Vec<SearchMatch> = matches
+            .into_iter()
+            .enumerate()
+            .map(|(i, (file, line))| SearchMatch {
+                file: file.to_string(),
+                line_number: i + 1,
+                line: line.to_string(),
+            })
+            .collect();
+        let total = matches.len();
+        crate::tools::ToolOutput::SearchResults(SearchResultsOutput {
+            query: "test".into(),
+            matches,
+            total_matches: total,
+            truncated: false,
+        })
+    }
+
+    #[test]
+    fn candidate_preference_hint_returns_none_when_no_candidates() {
+        let state = InvestigationState::new();
+        assert!(state.candidate_preference_hint(InvestigationMode::InitializationLookup).is_none());
+    }
+
+    #[test]
+    fn candidate_preference_hint_initialization_fires_with_mixed_candidates() {
+        let mut state = InvestigationState::new();
+        // z_init.py has an initialization term; commands.py does not
+        let output = make_search_output_for_hint(vec![
+            ("sandbox/cli/commands.py", "import logging"),
+            ("sandbox/init/z_init.py", "def initialize_logging(): pass"),
+        ]);
+        state.record_search_results(&output, &mut |_| {});
+        let hint = state.candidate_preference_hint(InvestigationMode::InitializationLookup);
+        assert!(hint.is_some(), "hint must fire when init candidate exists alongside non-init");
+        assert!(
+            hint.unwrap().contains("sandbox/init/z_init.py"),
+            "hint must name the initialization candidate"
+        );
+    }
+
+    #[test]
+    fn candidate_preference_hint_initialization_suppressed_when_all_init() {
+        let mut state = InvestigationState::new();
+        // Both files have initialization terms — no non-init candidates exist
+        let output = make_search_output_for_hint(vec![
+            ("sandbox/init/a.py", "logging.initialize()"),
+            ("sandbox/init/b.py", "def initialization_setup(): pass"),
+        ]);
+        state.record_search_results(&output, &mut |_| {});
+        let hint = state.candidate_preference_hint(InvestigationMode::InitializationLookup);
+        assert!(
+            hint.is_none(),
+            "hint must not fire when all candidates are initialization files"
+        );
+    }
+
+    #[test]
+    fn candidate_preference_hint_config_fires_with_mixed_candidates() {
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("services/database.py", "DATABASE_URL = os.getenv(\"DATABASE_URL\")"),
+            ("config/database.yaml", "database:\n  url: postgres://localhost/mydb"),
+        ]);
+        state.record_search_results(&output, &mut |_| {});
+        let hint = state.candidate_preference_hint(InvestigationMode::ConfigLookup);
+        assert!(hint.is_some(), "hint must fire when config candidate exists alongside source");
+        assert!(
+            hint.unwrap().contains("config/database.yaml"),
+            "hint must name the config file candidate"
+        );
+    }
+
+    #[test]
+    fn candidate_preference_hint_config_suppressed_when_no_config_candidates() {
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("services/database.py", "DATABASE_URL = os.getenv(\"DATABASE_URL\")"),
+            ("services/user.py", "USER = UserService()"),
+        ]);
+        state.record_search_results(&output, &mut |_| {});
+        let hint = state.candidate_preference_hint(InvestigationMode::ConfigLookup);
+        assert!(
+            hint.is_none(),
+            "hint must not fire when no config-file candidates exist"
+        );
+    }
+
+    #[test]
+    fn candidate_preference_hint_general_mode_returns_none() {
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("sandbox/init/z_init.py", "logging.basicConfig()"),
+            ("sandbox/cli/commands.py", "import logging"),
+        ]);
+        state.record_search_results(&output, &mut |_| {});
+        assert!(
+            state.candidate_preference_hint(InvestigationMode::General).is_none(),
+            "General mode must produce no candidate hint"
+        );
+    }
+
+    #[test]
+    fn candidate_preference_hint_definition_lookup_returns_none() {
+        // DefinitionLookup is handled by definition_site_file in rendering — no hint here
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("models/enums.py", "class TaskStatus(str, Enum):"),
+            ("cli/commands.py", "from models.enums import TaskStatus"),
+        ]);
+        state.record_search_results(&output, &mut |_| {});
+        assert!(
+            state.candidate_preference_hint(InvestigationMode::DefinitionLookup).is_none(),
+            "DefinitionLookup must not produce a candidate hint — handled by definition_site_file"
+        );
+    }
+
+    #[test]
+    fn candidate_preference_hint_names_first_init_candidate_in_search_order() {
+        let mut state = InvestigationState::new();
+        // Non-init first, then two init candidates — hint must name the first init candidate
+        let output = make_search_output_for_hint(vec![
+            ("sandbox/cli/commands.py", "import logging"),
+            ("sandbox/init/a.py", "logging.initialize()"),
+            ("sandbox/init/b.py", "def initialization_setup(): pass"),
+        ]);
+        state.record_search_results(&output, &mut |_| {});
+        let hint = state.candidate_preference_hint(InvestigationMode::InitializationLookup);
+        assert!(hint.is_some());
+        let hint = hint.unwrap();
+        assert!(
+            hint.contains("sandbox/init/a.py"),
+            "hint must name the first init candidate in search order, got: {hint}"
+        );
+        assert!(
+            !hint.contains("sandbox/init/b.py"),
+            "hint must not name second candidate when first already named"
+        );
+    }
+
+    #[test]
+    fn candidate_preference_hint_is_deterministic_for_same_inputs() {
+        let mut state1 = InvestigationState::new();
+        let mut state2 = InvestigationState::new();
+        let matches = vec![
+            ("sandbox/cli/commands.py", "import logging"),
+            ("sandbox/init/z_init.py", "def initialize_logging(): pass"),
+        ];
+        let output1 = make_search_output_for_hint(matches.clone());
+        let output2 = make_search_output_for_hint(matches);
+        state1.record_search_results(&output1, &mut |_| {});
+        state2.record_search_results(&output2, &mut |_| {});
+        assert_eq!(
+            state1.candidate_preference_hint(InvestigationMode::InitializationLookup),
+            state2.candidate_preference_hint(InvestigationMode::InitializationLookup),
+            "candidate_preference_hint must be deterministic for identical inputs"
+        );
+    }
+
+    #[test]
+    fn candidate_preference_hint_usage_lookup_returns_none() {
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("sandbox/init/z_init.py", "logging.basicConfig()"),
+            ("sandbox/cli/commands.py", "logger.info(\"hello\")"),
+        ]);
+        state.record_search_results(&output, &mut |_| {});
+        assert!(
+            state.candidate_preference_hint(InvestigationMode::UsageLookup).is_none(),
+            "UsageLookup must produce no candidate hint"
+        );
     }
 }
