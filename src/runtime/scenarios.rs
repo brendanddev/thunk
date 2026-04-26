@@ -686,10 +686,10 @@ mod tests {
         let file = dir.path().join("f.rs");
         fs::write(&file, "hello world").unwrap();
 
-        let first_bad_edit = "[edit_file]\npath: f.rs\n---replace---\nhello params\n[/edit_file]";
+        let first_bad_edit = "[edit_file]\npath: f.rs\n---replace---\nhello thunk\n[/edit_file]";
         let malformed_repair =
-            "[edit_file]\npath: f.rs\nFind: hello world\nReplace: hello params\n[/edit_file]";
-        let valid_edit = "[edit_file]\npath: f.rs\n---search---\nhello world\n---replace---\nhello params\n[/edit_file]";
+            "[edit_file]\npath: f.rs\nFind: hello world\nReplace: hello thunk\n[/edit_file]";
+        let valid_edit = "[edit_file]\npath: f.rs\n---search---\nhello world\n---replace---\nhello thunk\n[/edit_file]";
 
         let mut rt = make_runtime(
             &dir,
@@ -704,7 +704,7 @@ mod tests {
         let submit_events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "Edit f.rs and change hello world to hello params".into(),
+                text: "Edit f.rs and change hello world to hello thunk".into(),
             },
         );
         assert!(
@@ -728,7 +728,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
-            "hello params",
+            "hello thunk",
             "approved repaired edit must update the file"
         );
 

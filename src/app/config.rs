@@ -23,11 +23,11 @@ pub struct AppConfig {
     pub name: String,
 }
 
-/// Default app config with the name set to "params"
+/// Default app config with the name set to "thunk"
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            name: "params".to_string(),
+            name: "thunk".to_string(),
         }
     }
 }

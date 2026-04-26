@@ -174,13 +174,13 @@ fn edit_old_new_content_format_requests_approval_and_executes() {
     let file = tmp.path().join("test_phase82.txt");
     fs::write(&file, "hello world").unwrap();
 
-    let edit = "[edit_file]\npath: test_phase82.txt\nold content: hello world\nnew content: hello params\n[/edit_file]";
+    let edit = "[edit_file]\npath: test_phase82.txt\nold content: hello world\nnew content: hello thunk\n[/edit_file]";
     let mut rt = make_runtime_in(vec![edit, "Updated."], tmp.path());
 
     let submit_events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "Edit test_phase82.txt and change hello world to hello params".into(),
+            text: "Edit test_phase82.txt and change hello world to hello thunk".into(),
         },
     );
     assert!(
@@ -201,7 +201,7 @@ fn edit_old_new_content_format_requests_approval_and_executes() {
         !has_failed(&approve_events),
         "approve failed: {approve_events:?}"
     );
-    assert_eq!(fs::read_to_string(&file).unwrap(), "hello params");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello thunk");
 
     let snapshot = rt.messages_snapshot();
     assert!(

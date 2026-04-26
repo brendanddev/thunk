@@ -1,4 +1,4 @@
-# params-cli
+# thunk
 
 Local-first, personal AI coding assistant CLI focused on local-first workflows, modular architecture, privacy, and real coding actions.
 
@@ -8,7 +8,7 @@ Local-first, personal AI coding assistant CLI focused on local-first workflows, 
 
 ## Overview
 
-`params-cli` is a Rust-based personal AI coding assistant built around a small, explicit runtime:
+`thunk` is a Rust-based personal AI coding assistant built around a small, explicit runtime:
 
 - a terminal UI for chat and control commands
 - a runtime that owns conversation state and tool dispatch

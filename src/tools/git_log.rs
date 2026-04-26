@@ -286,7 +286,7 @@ mod tests {
                 "-c",
                 &format!("user.name={author}"),
                 "-c",
-                "user.email=params@example.invalid",
+                "user.email=thunk@example.invalid",
                 "commit",
                 "-m",
                 subject,
@@ -295,7 +295,7 @@ mod tests {
     }
 
     fn commit_file(path: &Path, file: &str, contents: &str, subject: &str) {
-        commit_file_with(path, file, contents, "params", subject);
+        commit_file_with(path, file, contents, "thunk", subject);
     }
 
     fn run_log(path: &Path) -> Result<ToolRunResult, ToolError> {
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(log.entries.len(), 2);
         assert_eq!(log.entries[0].subject, "second commit");
         assert_eq!(log.entries[1].subject, "first commit");
-        assert_eq!(log.entries[0].author, "params");
+        assert_eq!(log.entries[0].author, "thunk");
         assert_eq!(log.entries[0].date.len(), 10);
         assert!(!log.entries[0].hash.is_empty());
         assert!(!log.entries[0].short_hash.is_empty());
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn parse_git_log_marks_truncated_when_capture_was_capped() {
-        let stdout = "0123456789012345678901234567890123456789\x1f0123456\x1f2026-04-22\x1fparams\x1fsubject\x1e";
+        let stdout = "0123456789012345678901234567890123456789\x1f0123456\x1f2026-04-22\x1fthunk\x1fsubject\x1e";
         let log = parse_git_log_output(stdout, true);
 
         assert_eq!(log.entries.len(), 1);

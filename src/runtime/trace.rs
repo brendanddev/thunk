@@ -3,7 +3,7 @@ use crate::runtime::types::RuntimeEvent;
 /// Env flag to enable lightweight runtime decision tracing.
 ///
 /// When unset, all trace emission is a no-op (zero-cost fast path).
-pub(super) const RUNTIME_TRACE_ENV: &str = "PARAMS_TRACE_RUNTIME";
+pub(super) const RUNTIME_TRACE_ENV: &str = "THUNK_TRACE_RUNTIME";
 
 /// Emits a structured runtime trace line if tracing is enabled.
 ///

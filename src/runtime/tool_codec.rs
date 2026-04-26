@@ -1455,12 +1455,12 @@ mod tests {
 
     #[test]
     fn edit_block_old_new_content_labels_are_accepted() {
-        let text = "[edit_file]\npath: test_phase82.txt\nold content: hello world\nnew content: hello params\n[/edit_file]";
+        let text = "[edit_file]\npath: test_phase82.txt\nold content: hello world\nnew content: hello thunk\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(inputs.len(), 1);
         assert!(
             matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
-            if path == "test_phase82.txt" && search == "hello world" && replace == "hello params")
+            if path == "test_phase82.txt" && search == "hello world" && replace == "hello thunk")
         );
     }
 
@@ -1479,7 +1479,7 @@ mod tests {
     fn edit_block_generic_delimiters_accepted() {
         // Model derived delimiter names from prompt placeholder text instead of using
         // the canonical ---search---/---replace--- markers. Must still parse correctly.
-        let text = "[edit_file]\npath: test_phase82.txt\n---text to find---\nhello world\n---replacement text---\nhello params\n[/edit_file]";
+        let text = "[edit_file]\npath: test_phase82.txt\n---text to find---\nhello world\n---replacement text---\nhello thunk\n[/edit_file]";
         let inputs = parse_all_tool_inputs(text);
         assert_eq!(
             inputs.len(),
@@ -1488,7 +1488,7 @@ mod tests {
         );
         assert!(
             matches!(&inputs[0], ToolInput::EditFile { path, search, replace }
-            if path == "test_phase82.txt" && search == "hello world" && replace == "hello params")
+            if path == "test_phase82.txt" && search == "hello world" && replace == "hello thunk")
         );
     }
 
@@ -1636,7 +1636,7 @@ mod tests {
                 hash: "0123456789012345678901234567890123456789".into(),
                 short_hash: "0123456".into(),
                 date: "2026-04-22".into(),
-                author: "params".into(),
+                author: "thunk".into(),
                 subject: "add git log".into(),
             }],
             truncated: true,
@@ -1648,7 +1648,7 @@ mod tests {
         );
         let rendered = format_tool_result("git_log", &output);
         assert!(rendered.contains("[showing 1 recent commits; output truncated]"));
-        assert!(rendered.contains("0123456 2026-04-22 params - add git log"));
+        assert!(rendered.contains("0123456 2026-04-22 thunk - add git log"));
     }
 
     #[test]

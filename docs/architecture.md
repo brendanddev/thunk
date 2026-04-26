@@ -6,7 +6,7 @@ Defines the high-level architecture and design decisions of the app, including t
 
 ## System Overview
 
-`params-cli` is a local-first Rust TUI coding assistant. It runs a conversation loop against a selected model backend, lets the model request a small set of typed project-local tools through a constrained text protocol, and requires explicit user approval before mutating files.
+`thunk` is a local-first Rust TUI coding assistant. It runs a conversation loop against a selected model backend, lets the model request a small set of typed project-local tools through a constrained text protocol, and requires explicit user approval before mutating files.
 
 At startup, `src/main.rs` calls `app::run()`. The app layer discovers the project root from `config.toml`, loads config, builds the model backend and tool registry, opens optional session logging, restores the most recent session from SQLite, and launches the TUI. After that, the TUI talks only to `AppContext`; `AppContext` forwards requests into the runtime and persists the runtime transcript.
 

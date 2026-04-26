@@ -20,7 +20,7 @@ run:
     cargo run --release
 
 trace:
-    PARAMS_TRACE_RUNTIME=1 cargo run --release
+    THUNK_TRACE_RUNTIME=1 cargo run --release
 
 fresh:
     rm -f data/sessions.db

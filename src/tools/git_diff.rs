@@ -199,9 +199,9 @@ mod tests {
             path,
             &[
                 "-c",
-                "user.name=params",
+                "user.name=thunk",
                 "-c",
-                "user.email=params@example.invalid",
+                "user.email=thunk@example.invalid",
                 "commit",
                 "-m",
                 "initial",
@@ -286,7 +286,7 @@ mod tests {
         init_git_repo(tmp.path());
         fs::write(
             tmp.path().join(".gitattributes"),
-            "*.txt diff=params_textconv\n",
+            "*.txt diff=thunk_textconv\n",
         )
         .unwrap();
         fs::write(tmp.path().join("converted.txt"), "old\n").unwrap();
@@ -295,9 +295,9 @@ mod tests {
             tmp.path(),
             &[
                 "-c",
-                "user.name=params",
+                "user.name=thunk",
                 "-c",
-                "user.email=params@example.invalid",
+                "user.email=thunk@example.invalid",
                 "commit",
                 "-m",
                 "initial",
@@ -305,7 +305,7 @@ mod tests {
         );
         git(
             tmp.path(),
-            &["config", "diff.params_textconv.textconv", "false"],
+            &["config", "diff.thunk_textconv.textconv", "false"],
         );
         fs::write(tmp.path().join("converted.txt"), "new\n").unwrap();
 

@@ -1,4 +1,4 @@
-use params_cli::app;
+use thunk::app;
 
 /// Main entry point for the application
 fn main() -> app::Result<()> {

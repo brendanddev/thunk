@@ -1,5 +1,5 @@
 [app]
-name = "params"
+name = "thunk"
 
 [ui]
 show_activity = true

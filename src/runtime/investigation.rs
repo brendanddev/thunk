@@ -6,7 +6,7 @@ use crate::tools::ToolOutput;
 use super::paths::normalize_evidence_path;
 use super::types::RuntimeEvent;
 
-const RUNTIME_TRACE_ENV: &str = "PARAMS_TRACE_RUNTIME";
+const RUNTIME_TRACE_ENV: &str = "THUNK_TRACE_RUNTIME";
 
 // Exact substring triggers used for structured investigation modes.
 // Keep these narrow: broad matching increases false positives for small local models.
