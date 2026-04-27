@@ -229,6 +229,78 @@ fn resolve_custom_command(
     Some(Ok(req))
 }
 
+/// Converts a raw tool_result InfoMessage into a compact human-readable summary.
+/// Non-tool-result InfoMessages (query output, error text, etc.) pass through unchanged.
+fn summarize_command_output(text: &str) -> String {
+    let Some(after_prefix) = text.strip_prefix("=== tool_result: ") else {
+        return text.to_string();
+    };
+    let Some(name_end) = after_prefix.find(" ===\n") else {
+        return text.to_string();
+    };
+    let tool_name = &after_prefix[..name_end];
+    let header_len = "=== tool_result: ".len() + name_end + " ===\n".len();
+    let raw_body = text.get(header_len..).unwrap_or("").trim_end();
+    let body = raw_body
+        .strip_suffix("=== /tool_result ===")
+        .unwrap_or(raw_body)
+        .trim_end();
+
+    match tool_name {
+        "read_file" => {
+            let first = body.lines().next().unwrap_or("");
+            match parse_read_file_header(first) {
+                Some((n, false)) => format!("read: {n} lines"),
+                Some((n, true))  => format!("read: {n} lines (truncated)"),
+                None             => "read: done".to_string(),
+            }
+        }
+        "search_code" => {
+            if body.starts_with("No matches found.") {
+                return "search: no matches".to_string();
+            }
+            let first = body.lines().next().unwrap_or("");
+            // Truncated header: "[showing first M of N matches — ...]"
+            if let Some(inner) = first.strip_prefix("[showing first ") {
+                if let Some(of_pos) = inner.find(" of ") {
+                    let m = &inner[..of_pos];
+                    let after_of = &inner[of_pos + " of ".len()..];
+                    let n = after_of.split_whitespace().next().unwrap_or("?");
+                    return format!("search: {n} matches (showing {m})");
+                }
+            }
+            // Untruncated: match lines are indented "  <line_num>: <content>"
+            let count = body
+                .lines()
+                .filter(|l| {
+                    l.starts_with("  ")
+                        && l.trim_start()
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_digit())
+                            .unwrap_or(false)
+                })
+                .count();
+            if count > 0 {
+                format!("search: {count} matches")
+            } else {
+                "search: done".to_string()
+            }
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// Parses the first line of a read_file body: "[N lines]" or "[N lines — showing first M]".
+/// Returns `(total_lines, is_truncated)` or `None` if the format is not recognised.
+fn parse_read_file_header(line: &str) -> Option<(usize, bool)> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    let truncated = inner.contains(" — ");
+    let count_str = inner.split(" — ").next()?.split_whitespace().next()?;
+    let n: usize = count_str.parse().ok()?;
+    Some((n, truncated))
+}
+
 fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
     match event {
         RuntimeEvent::ActivityChanged(activity) => state.set_status(activity.label()),
@@ -258,9 +330,100 @@ fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
             ));
             state.set_status("awaiting approval");
         }
-        RuntimeEvent::InfoMessage(text) => state.add_system_message(text),
+        RuntimeEvent::InfoMessage(text) => {
+            state.add_system_message(summarize_command_output(&text))
+        }
         // Advisory only — absorbed by the logging layer before reaching here.
         RuntimeEvent::BackendTiming { .. } => {}
         RuntimeEvent::RuntimeTrace(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{summarize_command_output, parse_read_file_header};
+
+    fn tool_result(name: &str, body: &str) -> String {
+        format!("=== tool_result: {name} ===\n{body}\n=== /tool_result ===\n\n")
+    }
+
+    // parse_read_file_header
+
+    #[test]
+    fn parses_untruncated_header() {
+        assert_eq!(parse_read_file_header("[42 lines]"), Some((42, false)));
+    }
+
+    #[test]
+    fn parses_truncated_header() {
+        assert_eq!(
+            parse_read_file_header("[300 lines — showing first 200]"),
+            Some((300, true))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_header() {
+        assert_eq!(parse_read_file_header("no brackets here"), None);
+        assert_eq!(parse_read_file_header("[not a number lines]"), None);
+    }
+
+    // summarize_command_output — pass-through cases
+
+    #[test]
+    fn non_tool_result_passes_through_unchanged() {
+        let msg = "no conversation history";
+        assert_eq!(summarize_command_output(msg), msg);
+    }
+
+    #[test]
+    fn query_output_passes_through_unchanged() {
+        let msg = "last search: fn handle";
+        assert_eq!(summarize_command_output(msg), msg);
+    }
+
+    // summarize_command_output — read_file
+
+    #[test]
+    fn read_file_untruncated_shows_line_count() {
+        let body = "[42 lines]\nfn main() {}\n";
+        let summary = summarize_command_output(&tool_result("read_file", body));
+        assert_eq!(summary, "read: 42 lines");
+    }
+
+    #[test]
+    fn read_file_truncated_shows_line_count_and_truncated() {
+        let body = "[300 lines — showing first 200]\nfn main() {}\n[truncated: 100 lines not shown]";
+        let summary = summarize_command_output(&tool_result("read_file", body));
+        assert_eq!(summary, "read: 300 lines (truncated)");
+    }
+
+    // summarize_command_output — search_code
+
+    #[test]
+    fn search_no_matches_shows_no_matches() {
+        let body = "No matches found.";
+        let summary = summarize_command_output(&tool_result("search_code", body));
+        assert_eq!(summary, "search: no matches");
+    }
+
+    #[test]
+    fn search_truncated_shows_total_and_shown() {
+        let body = "[showing first 15 of 42 matches — read a specific matched file with read_file]\nsrc/main.rs (3 matches)\n  12: fn handle()";
+        let summary = summarize_command_output(&tool_result("search_code", body));
+        assert_eq!(summary, "search: 42 matches (showing 15)");
+    }
+
+    #[test]
+    fn search_untruncated_counts_match_lines() {
+        let body = "src/main.rs (2 matches)\n  12: fn handle_request() {}\n  45: fn handle_response() {}";
+        let summary = summarize_command_output(&tool_result("search_code", body));
+        assert_eq!(summary, "search: 2 matches");
+    }
+
+    #[test]
+    fn unknown_tool_passes_through_raw() {
+        let raw = tool_result("git_status", "clean");
+        assert_eq!(summarize_command_output(&raw), raw);
     }
 }
