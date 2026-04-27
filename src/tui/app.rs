@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::config::Config;
+use crate::app::config::{AllowedCommandTool, Config};
 use crate::app::paths::AppPaths;
 use crate::app::AppContext;
 use crate::app::Result;
@@ -30,7 +30,7 @@ pub(crate) fn run_app(
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => handle_key_event(stdout, &mut state, app, key)?,
+                Event::Key(key) => handle_key_event(stdout, &mut state, app, config, key)?,
                 Event::Paste(text) => state.insert_str(&text),
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -43,6 +43,7 @@ fn handle_key_event(
     stdout: &mut io::Stdout,
     state: &mut AppState,
     app: &mut AppContext,
+    config: &Config,
     key: KeyEvent,
 ) -> Result<()> {
     match (key.code, key.modifiers) {
@@ -55,6 +56,17 @@ fn handle_key_event(
                 match commands::parse(&input) {
                     None => submit_to_app(stdout, state, app, input)?,
                     Some(Ok(cmd)) => handle_command(stdout, state, app, cmd)?,
+                    Some(Err(commands::ParseError::UnknownCommand)) => {
+                        match resolve_custom_command(config, &input) {
+                            None => state.add_system_message(
+                                commands::ParseError::UnknownCommand.user_message(),
+                            ),
+                            Some(Err(msg)) => state.add_system_message(msg),
+                            Some(Ok(req)) => {
+                                dispatch_command_runtime_request(stdout, state, app, req)?
+                            }
+                        }
+                    }
                     Some(Err(e)) => state.add_system_message(e.user_message()),
                 }
             }
@@ -185,6 +197,36 @@ fn handle_command(
         }
     }
     Ok(())
+}
+
+/// Resolves a raw input string against the custom command definitions in config.
+///
+/// Returns:
+/// - `None`           — no custom command with this name; caller shows "unknown command"
+/// - `Some(Err(msg))` — command found but argument is missing
+/// - `Some(Ok(req))`  — resolved to a RuntimeRequest ready for dispatch
+fn resolve_custom_command(
+    config: &Config,
+    input: &str,
+) -> Option<std::result::Result<RuntimeRequest, String>> {
+    let trimmed = input.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let slash_name = parts.next()?;
+    let name = slash_name.strip_prefix('/')?;
+    let def = config.commands.get(name)?;
+
+    let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    let arg_str = match arg {
+        Some(a) => a.to_string(),
+        None => return Some(Err(format!("/{name}: argument required"))),
+    };
+
+    let value = def.template.replace("{input}", &arg_str);
+    let req = match def.tool {
+        AllowedCommandTool::ReadFile   => RuntimeRequest::ReadFile { path: value },
+        AllowedCommandTool::SearchCode => RuntimeRequest::SearchCode { query: value },
+    };
+    Some(Ok(req))
 }
 
 fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
