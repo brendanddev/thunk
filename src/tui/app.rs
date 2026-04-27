@@ -52,10 +52,10 @@ fn handle_key_event(
         }
         (KeyCode::Enter, _) => {
             if let Some(input) = state.submit_input() {
-                if let Some(cmd) = commands::parse(&input) {
-                    handle_command(stdout, state, app, cmd)?;
-                } else {
-                    submit_to_app(stdout, state, app, input)?;
+                match commands::parse(&input) {
+                    None => submit_to_app(stdout, state, app, input)?,
+                    Some(Ok(cmd)) => handle_command(stdout, state, app, cmd)?,
+                    Some(Err(e)) => state.add_system_message(e.user_message()),
                 }
             }
         }
