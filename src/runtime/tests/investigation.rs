@@ -269,13 +269,20 @@ fn usage_lookup_definition_only_read_does_not_satisfy_evidence_when_usage_candid
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
     let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        2,
+        "definition-only read must auto-dispatch the usage-file read (enums.py + task_service.py)"
+    );
     assert!(
-        snapshot.iter().any(|m| {
-            m.content
-                .contains("[runtime:correction] This is a usage lookup")
-                && m.content.contains("services/task_service.py]")
-        }),
-        "definition-only read must trigger a targeted usage-file recovery correction"
+        !all_user.contains("[runtime:correction] This is a usage lookup"),
+        "definition-only recovery must not inject a text correction when RuntimeDispatch is used"
     );
 
     let answer_source = events.iter().find_map(|e| {
@@ -648,7 +655,7 @@ fn third_candidate_read_after_two_insufficient_reads_is_blocked_pre_dispatch() {
     .unwrap();
     fs::write(
         tmp.path().join("services").join("task_service.py"),
-        "from models.enums import TaskStatus\nif task.status == TaskStatus.TODO:\n    pass\n",
+        "from models.enums import TaskStatus\n",
     )
     .unwrap();
 
@@ -709,8 +716,12 @@ fn third_candidate_read_after_two_insufficient_reads_is_blocked_pre_dispatch() {
         "blocked third read must be recorded as a runtime tool error"
     );
     assert!(
-        !all_user.contains("=== tool_result: read_file ===\npath: services/task_service.py"),
-        "usage candidate must not be read after the two-candidate cap"
+        all_user.contains("task_service.py"),
+        "runtime must auto-dispatch task_service.py as the second candidate read"
+    );
+    assert!(
+        !all_user.contains("=== tool_result: read_file ===\npath: models/alt_enums.py"),
+        "alt candidate must not be dispatched after the two-candidate cap"
     );
 }
 

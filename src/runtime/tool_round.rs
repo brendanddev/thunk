@@ -122,6 +122,14 @@ pub(super) enum ToolRoundOutcome {
         accumulated: String,
         pending: PendingAction,
     },
+
+    /// Runtime has selected the next tool call itself.
+    /// The caller must re-enter the normal tool execution loop with this call;
+    /// it must not dispatch the tool inline.
+    RuntimeDispatch {
+        accumulated: String,
+        call: ToolInput,
+    },
 }
 
 /// Dispatches one round of tool calls, accumulating results.
@@ -568,7 +576,12 @@ pub(super) fn run_tool_round(
                         &[("kind", kind.as_str().into()), ("path", path.clone())],
                     );
                     let correction = match kind {
-                        RecoveryKind::DefinitionOnly => usage_read_recovery_correction(&path),
+                        RecoveryKind::DefinitionOnly | RecoveryKind::NonDefinitionSite => {
+                            return ToolRoundOutcome::RuntimeDispatch {
+                                accumulated,
+                                call: ToolInput::ReadFile { path },
+                            };
+                        }
                         RecoveryKind::ImportOnly => import_read_recovery_correction(&path),
                         RecoveryKind::ConfigFile => config_read_recovery_correction(&path),
                         RecoveryKind::Initialization => {

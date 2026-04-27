@@ -252,11 +252,12 @@ impl TurnPerformance {
     }
 }
 
-fn estimate_generation_prompt_chars(conversation: &Conversation, tool_surface: ToolSurface) -> usize {
-    let hint = prompt::render_tool_surface_hint(
-        tool_surface.as_str(),
-        tool_surface.allowed_tool_names(),
-    );
+fn estimate_generation_prompt_chars(
+    conversation: &Conversation,
+    tool_surface: ToolSurface,
+) -> usize {
+    let hint =
+        prompt::render_tool_surface_hint(tool_surface.as_str(), tool_surface.allowed_tool_names());
     conversation
         .snapshot()
         .into_iter()
@@ -514,6 +515,16 @@ impl Runtime {
                 on_event(RuntimeEvent::ApprovalRequired(pending));
                 on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
             }
+            ToolRoundOutcome::RuntimeDispatch { .. } => {
+                debug_assert!(
+                    false,
+                    "RuntimeDispatch is not expected during last-read anchor replay"
+                );
+                on_event(RuntimeEvent::Failed {
+                    message: "Unexpected runtime dispatch during last-read replay.".to_string(),
+                });
+                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+            }
         }
     }
 
@@ -699,6 +710,7 @@ impl Runtime {
 
         let mut corrections = 0usize;
         let mut last_call_key: Option<String> = None;
+        let mut pending_runtime_call: Option<ToolInput> = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
         let mut turn_perf = TurnPerformance::new();
@@ -833,41 +845,48 @@ impl Runtime {
             } else {
                 0
             };
+
             turn_perf.start_round(next_round_label, next_round_cause, prompt_chars, on_event);
-            let response = {
-                let turn_perf = &mut turn_perf;
-                let mut perf_on_event = |event| {
-                    if let RuntimeEvent::BackendTiming { stage, elapsed_ms } = &event {
-                        turn_perf.record_backend_timing(stage, *elapsed_ms);
+
+            let (calls, response) = if let Some(call) = pending_runtime_call.take() {
+                (vec![call], None)
+            } else {
+                let response = {
+                    let turn_perf = &mut turn_perf;
+                    let mut perf_on_event = |event| {
+                        if let RuntimeEvent::BackendTiming { stage, elapsed_ms } = &event {
+                            turn_perf.record_backend_timing(stage, *elapsed_ms);
+                        }
+                        on_event(event);
+                    };
+
+                    match run_generate_turn(
+                        self.backend.as_mut(),
+                        &mut self.conversation,
+                        effective_surface,
+                        &mut perf_on_event,
+                    ) {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
+                            on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                            on_event(RuntimeEvent::Failed {
+                                message: format!("{} returned no output.", self.backend.name()),
+                            });
+                            finish_turn!();
+                        }
+                        Err(e) => {
+                            on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                            on_event(RuntimeEvent::Failed {
+                                message: e.to_string(),
+                            });
+                            finish_turn!();
+                        }
                     }
-                    on_event(event);
                 };
 
-                match run_generate_turn(
-                    self.backend.as_mut(),
-                    &mut self.conversation,
-                    effective_surface,
-                    &mut perf_on_event,
-                ) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => {
-                        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                        on_event(RuntimeEvent::Failed {
-                            message: format!("{} returned no output.", self.backend.name()),
-                        });
-                        finish_turn!();
-                    }
-                    Err(e) => {
-                        on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                        on_event(RuntimeEvent::Failed {
-                            message: e.to_string(),
-                        });
-                        finish_turn!();
-                    }
-                }
+                let calls = tool_codec::parse_all_tool_inputs(&response);
+                (calls, Some(response))
             };
-
-            let calls = tool_codec::parse_all_tool_inputs(&response);
 
             if let Some(phase) = answer_phase {
                 if !calls.is_empty() {
@@ -973,6 +992,8 @@ impl Runtime {
             }
 
             if calls.is_empty() {
+                let response = response.expect("response exists when calls are empty");
+                
                 // If the previous tool round ended in an edit_file error and the model's repair
                 // attempt contains edit_file tag syntax but produced no parseable tool calls,
                 // inject a targeted correction rather than silently accepting as Direct.
@@ -1141,8 +1162,7 @@ impl Runtime {
                             self.conversation
                                 .push_user(READ_BEFORE_ANSWERING.to_string());
                             next_round_label = GenerationRoundLabel::CorrectionRetry;
-                            next_round_cause =
-                                GenerationRoundCause::ReadBeforeAnsweringCorrection;
+                            next_round_cause = GenerationRoundCause::ReadBeforeAnsweringCorrection;
                             continue;
                         }
 
@@ -1289,6 +1309,17 @@ impl Runtime {
                     on_event(RuntimeEvent::ApprovalRequired(pending));
                     on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
                     finish_turn!();
+                }
+                ToolRoundOutcome::RuntimeDispatch { accumulated, call } => {
+                    if let Some(t) = t_tool_start {
+                        turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
+                    }
+                    if !accumulated.is_empty() {
+                        self.conversation.push_user(accumulated);
+                        self.conversation.trim_tool_exchanges_if_needed();
+                    }
+                    pending_runtime_call = Some(call);
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
                 }
             }
         }
@@ -1790,7 +1821,7 @@ mod tests {
         .unwrap();
         fs::write(
             tmp.path().join("services").join("task_service.py"),
-            "from models.enums import TaskStatus\nif task.status == TaskStatus.TODO:\n    pass\n",
+            "from models.enums import TaskStatus\n",
         )
         .unwrap();
 
@@ -1798,13 +1829,12 @@ mod tests {
             vec![
                 "[search_code: TaskStatus]",
                 // Round 2: reads first definition file.
-                // Runtime injects recovery correction pointing to task_service.py.
+                // Runtime auto-dispatches task_service.py (import-only, no usage evidence).
                 "[read_file: models/enums.py]",
-                // Round 3: model ignores correction and reads second definition file.
-                // candidate_reads_count reaches 2, evidence still not ready.
+                // Round 3: model tries second definition file.
+                // candidate_reads_count reaches 2 after the auto-dispatch; read is blocked.
                 "[read_file: models/alt_enums.py]",
-                // Round 4: model tries to synthesize without reading usage evidence.
-                // Runtime must terminate with InsufficientEvidence — not fire another correction.
+                // Round 4 would be model synthesis — not reached; runtime terminates first.
                 "TaskStatus is defined in models/enums.py.",
             ],
             tmp.path(),

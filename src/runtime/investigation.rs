@@ -295,6 +295,9 @@ pub(super) fn detect_investigation_mode(text: &str) -> InvestigationMode {
 pub(super) enum RecoveryKind {
     /// The file was definition-only on a usage lookup with usage candidates available.
     DefinitionOnly,
+    /// The file was not a definition-site candidate on a definition lookup when definition
+    /// candidates exist. Runtime dispatches the correct definition file directly.
+    NonDefinitionSite,
     /// The file had only import-declaration matches with substantive candidates available.
     ImportOnly,
     /// The file was a non-config source file on a config lookup when config-file candidates exist.
@@ -317,6 +320,7 @@ impl RecoveryKind {
     pub(super) fn as_str(&self) -> &'static str {
         match self {
             RecoveryKind::DefinitionOnly => "DefinitionOnly",
+            RecoveryKind::NonDefinitionSite => "NonDefinitionSite",
             RecoveryKind::ImportOnly => "ImportOnly",
             RecoveryKind::ConfigFile => "ConfigFile",
             RecoveryKind::Initialization => "Initialization",
@@ -989,6 +993,29 @@ impl InvestigationState {
                     ],
                 );
                 // Correction already issued: fall through without accepting.
+            }
+            // Gate 8 (DefinitionLookup): non-definition reads are structurally insufficient
+            // when definition-site candidates exist. No correction flag — the dispatched
+            // definition read satisfies evidence, preventing re-entry.
+            else if matches!(mode, InvestigationMode::DefinitionLookup)
+                && !is_def_only
+                && !self.definition_only_candidates.is_empty()
+            {
+                let suggested_path = self.first_definition_candidate().map(str::to_string);
+                trace_runtime_decision(
+                    on_event,
+                    "read_evidence",
+                    &[
+                        ("path", read_path.clone()),
+                        ("accepted", "false".into()),
+                        ("reason", "definition_lookup_non_definition_site".into()),
+                        (
+                            "recovery_path",
+                            suggested_path.clone().unwrap_or_else(|| "none".into()),
+                        ),
+                    ],
+                );
+                return suggested_path.map(|p| (p, RecoveryKind::NonDefinitionSite));
             } else {
                 if is_lockfile_candidate {
                     let suggested_path = self.first_source_candidate().map(str::to_string);
@@ -1116,6 +1143,13 @@ impl InvestigationState {
         self.search_candidate_paths
             .iter()
             .find(|path| !self.definition_only_candidates.contains(*path))
+            .map(String::as_str)
+    }
+
+    fn first_definition_candidate(&self) -> Option<&str> {
+        self.search_candidate_paths
+            .iter()
+            .find(|path| self.definition_only_candidates.contains(*path))
             .map(String::as_str)
     }
 
