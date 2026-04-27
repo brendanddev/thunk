@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::app::config::Config;
-use crate::llm::backend::{ModelBackend, Role};
+use crate::llm::backend::{BackendCapabilities, ModelBackend, Role};
 use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
 
 use super::anchors::{
@@ -32,6 +32,27 @@ const MAX_CORRECTIONS: usize = 1;
 /// prevent unbounded InfoMessage output from long or tool-heavy sessions.
 const MAX_HISTORY_MESSAGES: usize = 10;
 const MAX_MESSAGE_CHARS: usize = 200;
+
+/// Policy values derived once from backend capabilities at construction time.
+/// Both layers of capability-aware context management read from this struct.
+struct ContextPolicy {
+    /// Message count threshold at which conversation trimming fires (Layer 2).
+    trim_threshold: usize,
+    /// Maximum content lines per tool result block before it is capped (Layer 1).
+    tool_result_max_lines: usize,
+}
+
+impl ContextPolicy {
+    fn from_capabilities(caps: BackendCapabilities) -> Self {
+        match caps.context_window_tokens {
+            Some(t) if t >= 16_384 => Self { trim_threshold: 40, tool_result_max_lines: 200 },
+            Some(t) if t >= 8_192  => Self { trim_threshold: 30, tool_result_max_lines: 150 },
+            Some(t) if t >= 4_096  => Self { trim_threshold: 20, tool_result_max_lines: 80  },
+            Some(_)                => Self { trim_threshold: 12, tool_result_max_lines: 40  },
+            None                   => Self { trim_threshold: 40, tool_result_max_lines: 200 },
+        }
+    }
+}
 
 /// Explicit allowlist of tools that slash commands may invoke via the runtime.
 /// All command-to-registry dispatch passes through this type — no command handler
@@ -331,6 +352,7 @@ pub struct Runtime {
     registry: ToolRegistry,
     system_prompt: String,
     anchors: AnchorState,
+    context_policy: ContextPolicy,
     /// Holds a mutating tool action that is waiting for user approval.
     /// Set when a tool round suspends; cleared by Approve or Reject.
     /// At most one pending action exists at any time.
@@ -346,12 +368,14 @@ impl Runtime {
     ) -> Self {
         let specs = registry.specs();
         let system_prompt = prompt::build_system_prompt(&config.app.name, project_root, &specs);
+        let context_policy = ContextPolicy::from_capabilities(backend.capabilities());
         Self {
             conversation: Conversation::new(system_prompt.clone()),
             backend,
             registry,
             system_prompt,
             anchors: AnchorState::default(),
+            context_policy,
             pending_action: None,
         }
     }
@@ -447,6 +471,13 @@ impl Runtime {
         }
 
         on_event(RuntimeEvent::InfoMessage(lines.join("\n")));
+    }
+
+    /// Applies the Layer 1 context cap then commits the results to the conversation.
+    /// Must be used for all tool-origin push_user calls so the cap is applied consistently.
+    fn commit_tool_results(&mut self, results: String) {
+        let capped = cap_tool_result_blocks(&results, self.context_policy.tool_result_max_lines);
+        self.conversation.push_user(capped);
     }
 
     fn dispatch_command_tool(
@@ -651,8 +682,8 @@ impl Runtime {
             on_event,
         ) {
             ToolRoundOutcome::Completed { results, .. } => {
-                self.conversation.push_user(results);
-                self.conversation.trim_tool_exchanges_if_needed();
+                self.commit_tool_results(results);
+                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
                 self.run_turns_with_initial_reads(1, reads_this_turn, on_event);
             }
@@ -661,8 +692,8 @@ impl Runtime {
                 answer,
                 reason,
             } => {
-                self.conversation.push_user(results);
-                self.conversation.trim_tool_exchanges_if_needed();
+                self.commit_tool_results(results);
+                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 self.finish_with_runtime_answer(
                     &answer,
                     AnswerSource::RuntimeTerminal { reason, rounds: 1 },
@@ -674,8 +705,8 @@ impl Runtime {
                 pending,
             } => {
                 if !accumulated.is_empty() {
-                    self.conversation.push_user(accumulated);
-                    self.conversation.trim_tool_exchanges_if_needed();
+                    self.commit_tool_results(accumulated);
+                    self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 }
                 self.pending_action = Some(pending.clone());
                 on_event(RuntimeEvent::ApprovalRequired(pending));
@@ -737,9 +768,8 @@ impl Runtime {
                     name: name.clone(),
                     summary: Some(summary),
                 });
-                self.conversation
-                    .push_user(tool_codec::format_tool_result(&name, &output));
-                self.conversation.trim_tool_exchanges_if_needed();
+                self.commit_tool_results(tool_codec::format_tool_result(&name, &output));
+                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 self.finish_with_runtime_answer(
                     LAST_SEARCH_REPLAYED,
                     AnswerSource::ToolAssisted { rounds: 1 },
@@ -765,7 +795,7 @@ impl Runtime {
                 });
                 self.conversation
                     .push_user(tool_codec::format_tool_error(&name, &e.to_string()));
-                self.conversation.trim_tool_exchanges_if_needed();
+                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 self.finish_with_runtime_answer(
                     LAST_SEARCH_REPLAY_FAILED,
                     AnswerSource::RuntimeTerminal {
@@ -800,9 +830,8 @@ impl Runtime {
                     name: tool_name.clone(),
                     summary: Some(summary),
                 });
-                let result_text = tool_codec::format_tool_result(&tool_name, &output);
-                self.conversation.push_user(result_text);
-                self.conversation.trim_tool_exchanges_if_needed();
+                self.commit_tool_results(tool_codec::format_tool_result(&tool_name, &output));
+                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 self.finish_with_runtime_answer(
                     &final_answer,
                     AnswerSource::ToolAssisted { rounds: 1 },
@@ -1406,8 +1435,8 @@ impl Runtime {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
                     }
                     let post_tool_cause = infer_post_tool_round_cause(&results);
-                    self.conversation.push_user(results);
-                    self.conversation.trim_tool_exchanges_if_needed();
+                    self.commit_tool_results(results);
+                    self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                     if tool_surface == ToolSurface::GitReadOnly {
                         if let Some(answer) = git_acquisition_answer {
                             trace_runtime_decision(
@@ -1448,8 +1477,8 @@ impl Runtime {
                     if let Some(t) = t_tool_start {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
                     }
-                    self.conversation.push_user(results);
-                    self.conversation.trim_tool_exchanges_if_needed();
+                    self.commit_tool_results(results);
+                    self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                     self.finish_with_runtime_answer(
                         &answer,
                         AnswerSource::RuntimeTerminal {
@@ -1468,8 +1497,8 @@ impl Runtime {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
                     }
                     if !accumulated.is_empty() {
-                        self.conversation.push_user(accumulated);
-                        self.conversation.trim_tool_exchanges_if_needed();
+                        self.commit_tool_results(accumulated);
+                        self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                     }
                     self.pending_action = Some(pending.clone());
                     on_event(RuntimeEvent::ApprovalRequired(pending));
@@ -1481,8 +1510,8 @@ impl Runtime {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
                     }
                     if !accumulated.is_empty() {
-                        self.conversation.push_user(accumulated);
-                        self.conversation.trim_tool_exchanges_if_needed();
+                        self.commit_tool_results(accumulated);
+                        self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                     }
                     pending_runtime_call = Some(call);
                     on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
@@ -1511,6 +1540,72 @@ impl Runtime {
     pub(crate) fn set_pending_for_test(&mut self, action: PendingAction) {
         self.pending_action = Some(action);
     }
+}
+
+/// Caps tool result blocks in an accumulated results string to `max_lines` content lines each.
+///
+/// Only `=== tool_result: ... ===` blocks are affected. Error blocks, corrections, and other
+/// injected messages pass through unchanged. Top-aligned truncation: the first `max_lines`
+/// content lines are kept; a metadata note is appended when capping occurs.
+fn cap_tool_result_blocks(text: &str, max_lines: usize) -> String {
+    const HDR: &str = "=== tool_result:";
+    const FTR: &str = "=== /tool_result ===";
+
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+
+    while pos < text.len() {
+        match text[pos..].find(HDR) {
+            None => {
+                out.push_str(&text[pos..]);
+                break;
+            }
+            Some(rel) => {
+                let hdr_start = pos + rel;
+                out.push_str(&text[pos..hdr_start]);
+
+                let body_start = text[hdr_start..]
+                    .find('\n')
+                    .map(|i| hdr_start + i + 1)
+                    .unwrap_or(text.len());
+                out.push_str(&text[hdr_start..body_start]);
+
+                match text[body_start..].find(FTR) {
+                    None => {
+                        out.push_str(&text[body_start..]);
+                        pos = text.len();
+                    }
+                    Some(rel_ftr) => {
+                        let ftr_start = body_start + rel_ftr;
+                        let body = &text[body_start..ftr_start];
+                        let body_line_count = body.lines().count();
+
+                        if body_line_count > max_lines {
+                            for line in body.lines().take(max_lines) {
+                                out.push_str(line);
+                                out.push('\n');
+                            }
+                            out.push_str(&format!(
+                                "[capped at {max_lines} lines — original: {body_line_count} lines]\n"
+                            ));
+                        } else {
+                            out.push_str(body);
+                        }
+
+                        let ftr_end = ftr_start + FTR.len();
+                        let trailing = text[ftr_end..]
+                            .find(|c: char| c != '\n')
+                            .map(|i| ftr_end + i)
+                            .unwrap_or(text.len());
+                        out.push_str(&text[ftr_start..trailing]);
+                        pos = trailing;
+                    }
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// Returns true when the most recent user message in the conversation is an edit_file
@@ -1594,6 +1689,93 @@ mod tests {
         events
             .iter()
             .any(|e| matches!(e, RuntimeEvent::Failed { .. }))
+    }
+
+    // ── ContextPolicy tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn context_policy_none_uses_defaults() {
+        let policy = ContextPolicy::from_capabilities(BackendCapabilities {
+            context_window_tokens: None,
+            max_output_tokens: None,
+        });
+        assert_eq!(policy.trim_threshold, 40);
+        assert_eq!(policy.tool_result_max_lines, 200);
+    }
+
+    #[test]
+    fn context_policy_small_context_uses_tight_limits() {
+        let policy = ContextPolicy::from_capabilities(BackendCapabilities {
+            context_window_tokens: Some(2048),
+            max_output_tokens: None,
+        });
+        assert_eq!(policy.trim_threshold, 12);
+        assert_eq!(policy.tool_result_max_lines, 40);
+    }
+
+    #[test]
+    fn context_policy_mid_context_uses_intermediate_limits() {
+        let policy = ContextPolicy::from_capabilities(BackendCapabilities {
+            context_window_tokens: Some(4096),
+            max_output_tokens: None,
+        });
+        assert_eq!(policy.trim_threshold, 20);
+        assert_eq!(policy.tool_result_max_lines, 80);
+    }
+
+    #[test]
+    fn context_policy_large_context_uses_defaults() {
+        let policy = ContextPolicy::from_capabilities(BackendCapabilities {
+            context_window_tokens: Some(32768),
+            max_output_tokens: None,
+        });
+        assert_eq!(policy.trim_threshold, 40);
+        assert_eq!(policy.tool_result_max_lines, 200);
+    }
+
+    // ── cap_tool_result_blocks tests ─────────────────────────────────────────
+
+    #[test]
+    fn cap_under_limit_is_noop() {
+        let text = "=== tool_result: read_file ===\nline1\nline2\n=== /tool_result ===\n\n";
+        assert_eq!(cap_tool_result_blocks(text, 5), text);
+    }
+
+    #[test]
+    fn cap_over_limit_truncates_and_adds_note() {
+        let body_lines: Vec<String> = (1..=5).map(|i| format!("line{i}")).collect();
+        let body = body_lines.join("\n") + "\n";
+        let text = format!("=== tool_result: read_file ===\n{body}=== /tool_result ===\n\n");
+        let result = cap_tool_result_blocks(&text, 3);
+        assert!(result.contains("line1\nline2\nline3\n"), "first 3 lines must be kept");
+        assert!(!result.contains("line4"), "line4 must be removed");
+        assert!(result.contains("[capped at 3 lines — original: 5 lines]"));
+        assert!(result.contains("=== tool_result: read_file ==="));
+        assert!(result.contains("=== /tool_result ==="));
+    }
+
+    #[test]
+    fn cap_leaves_non_tool_result_content_unchanged() {
+        let text = "[runtime:correction] must not fabricate tool calls\n";
+        assert_eq!(cap_tool_result_blocks(text, 5), text);
+    }
+
+    #[test]
+    fn cap_processes_multi_block_independently() {
+        let block = |n: usize| {
+            let body: String = (1..=n).map(|i| format!("line{i}\n")).collect();
+            format!("=== tool_result: read_file ===\n{body}=== /tool_result ===\n\n")
+        };
+        // Two blocks, both over the limit of 2
+        let text = format!("{}{}", block(4), block(3));
+        let result = cap_tool_result_blocks(&text, 2);
+        assert_eq!(result.matches("[capped at 2 lines").count(), 2);
+    }
+
+    #[test]
+    fn cap_error_blocks_pass_through_unchanged() {
+        let text = "=== tool_error: read_file ===\nfile not found\n=== /tool_error ===\n\n";
+        assert_eq!(cap_tool_result_blocks(text, 1), text);
     }
 
     #[test]

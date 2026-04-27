@@ -131,8 +131,8 @@ impl Conversation {
     /// - The most recent LIVE_TRIM_KEEP_RECENT messages are never removed.
     /// - Only complete pairs are removed; conversational messages are never touched.
     /// - If no pairs exist in the eligible window, the method is a no-op.
-    pub fn trim_tool_exchanges_if_needed(&mut self) {
-        if self.messages.len() <= LIVE_TRIM_THRESHOLD {
+    pub fn trim_tool_exchanges_if_needed(&mut self, threshold: usize) {
+        if self.messages.len() <= threshold {
             return;
         }
 
@@ -170,7 +170,7 @@ impl Conversation {
         let mut remove: Vec<usize> = Vec::new();
         let mut projected = len;
         for &start in &pair_starts {
-            if projected <= LIVE_TRIM_THRESHOLD {
+            if projected <= threshold {
                 break;
             }
             remove.push(start);
@@ -249,7 +249,7 @@ mod tests {
         // 1 system + 2 pairs (4 messages) + 2 conv (4 messages) = 9 total — well below 40
         let mut c = make_conversation_with_pairs(2, 2);
         let before = c.message_count();
-        c.trim_tool_exchanges_if_needed();
+        c.trim_tool_exchanges_if_needed(LIVE_TRIM_THRESHOLD);
         assert_eq!(
             c.message_count(),
             before,
@@ -263,7 +263,7 @@ mod tests {
         // After trimming, should be at or below LIVE_TRIM_THRESHOLD (40)
         let mut c = make_conversation_with_pairs(20, 5);
         assert!(c.message_count() > LIVE_TRIM_THRESHOLD);
-        c.trim_tool_exchanges_if_needed();
+        c.trim_tool_exchanges_if_needed(LIVE_TRIM_THRESHOLD);
         assert!(
             c.message_count() <= LIVE_TRIM_THRESHOLD,
             "expected <= {LIVE_TRIM_THRESHOLD}, got {}",
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn trim_preserves_system_prompt() {
         let mut c = make_conversation_with_pairs(20, 5);
-        c.trim_tool_exchanges_if_needed();
+        c.trim_tool_exchanges_if_needed(LIVE_TRIM_THRESHOLD);
         let messages = c.snapshot();
         assert_eq!(
             messages[0].content, "system",
@@ -291,7 +291,7 @@ mod tests {
         let tail_before: Vec<_> =
             messages_before[messages_before.len() - LIVE_TRIM_KEEP_RECENT..].to_vec();
 
-        c.trim_tool_exchanges_if_needed();
+        c.trim_tool_exchanges_if_needed(LIVE_TRIM_THRESHOLD);
 
         let messages_after = c.snapshot();
         let tail_after = &messages_after[messages_after.len() - LIVE_TRIM_KEEP_RECENT..];
@@ -316,7 +316,7 @@ mod tests {
         }
         let before = c.message_count();
         assert!(before > LIVE_TRIM_THRESHOLD);
-        c.trim_tool_exchanges_if_needed();
+        c.trim_tool_exchanges_if_needed(LIVE_TRIM_THRESHOLD);
         assert_eq!(
             c.message_count(),
             before,
