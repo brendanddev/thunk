@@ -71,6 +71,37 @@ fn handle_key_event(
     Ok(())
 }
 
+// Used by Approve and Reject: applies Failed event before propagating render errors.
+// submit_to_app has a different post-handle ordering and is kept separate.
+fn dispatch_command_runtime_request(
+    stdout: &mut io::Stdout,
+    state: &mut AppState,
+    app: &mut AppContext,
+    req: RuntimeRequest,
+) -> Result<()> {
+    let mut render_error = None;
+    if let Err(e) = app.handle(req, &mut |event| {
+        if render_error.is_some() {
+            return;
+        }
+        apply_runtime_event(state, event);
+        if let Err(e) = render(stdout, state) {
+            render_error = Some(e);
+        }
+    }) {
+        apply_runtime_event(
+            state,
+            RuntimeEvent::Failed {
+                message: e.to_string(),
+            },
+        );
+    }
+    if let Some(e) = render_error {
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn submit_to_app(
     stdout: &mut io::Stdout,
     state: &mut AppState,
@@ -106,70 +137,46 @@ fn submit_to_app(
     Ok(())
 }
 
+enum CommandAction {
+    Quit,
+    ShowHelp,
+    ClearSession,
+    Runtime(RuntimeRequest),
+}
+
+fn resolve_command(cmd: commands::Command) -> CommandAction {
+    match cmd {
+        commands::Command::Help    => CommandAction::ShowHelp,
+        commands::Command::Quit    => CommandAction::Quit,
+        commands::Command::Clear   => CommandAction::ClearSession,
+        commands::Command::Approve => CommandAction::Runtime(RuntimeRequest::Approve),
+        commands::Command::Reject  => CommandAction::Runtime(RuntimeRequest::Reject),
+    }
+}
+
 fn handle_command(
     stdout: &mut io::Stdout,
     state: &mut AppState,
     app: &mut AppContext,
     cmd: commands::Command,
 ) -> Result<()> {
-    match cmd {
-        commands::Command::Help => {
+    match resolve_command(cmd) {
+        CommandAction::ShowHelp => {
             state.add_system_message(
                 "Commands: /help — show this message  |  /clear — clear history  |  /quit — exit  |  /approve — confirm pending action  |  /reject — cancel pending action",
             );
         }
-        commands::Command::Quit => {
+        CommandAction::Quit => {
             state.should_quit = true;
         }
-        commands::Command::Clear => {
+        CommandAction::ClearSession => {
             state.clear_messages();
             if let Err(e) = app.reset() {
                 state.add_system_message(format!("session reset failed: {e}"));
             }
         }
-        commands::Command::Approve => {
-            let mut render_error = None;
-            if let Err(e) = app.handle(RuntimeRequest::Approve, &mut |event| {
-                if render_error.is_some() {
-                    return;
-                }
-                apply_runtime_event(state, event);
-                if let Err(e) = render(stdout, state) {
-                    render_error = Some(e);
-                }
-            }) {
-                apply_runtime_event(
-                    state,
-                    RuntimeEvent::Failed {
-                        message: e.to_string(),
-                    },
-                );
-            }
-            if let Some(e) = render_error {
-                return Err(e);
-            }
-        }
-        commands::Command::Reject => {
-            let mut render_error = None;
-            if let Err(e) = app.handle(RuntimeRequest::Reject, &mut |event| {
-                if render_error.is_some() {
-                    return;
-                }
-                apply_runtime_event(state, event);
-                if let Err(e) = render(stdout, state) {
-                    render_error = Some(e);
-                }
-            }) {
-                apply_runtime_event(
-                    state,
-                    RuntimeEvent::Failed {
-                        message: e.to_string(),
-                    },
-                );
-            }
-            if let Some(e) = render_error {
-                return Err(e);
-            }
+        CommandAction::Runtime(req) => {
+            dispatch_command_runtime_request(stdout, state, app, req)?;
         }
     }
     Ok(())
