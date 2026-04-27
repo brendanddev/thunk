@@ -7,6 +7,7 @@ pub enum Command {
     Clear,
     Approve,
     Reject,
+    Last,
 }
 
 /// Returns a `Command` if `input` is a recognized slash command, or `None` if
@@ -18,6 +19,7 @@ pub fn parse(input: &str) -> Option<Command> {
         "/clear" => Some(Command::Clear),
         "/approve" => Some(Command::Approve),
         "/reject" => Some(Command::Reject),
+        "/last" => Some(Command::Last),
         _ => None,
     }
 }
@@ -66,6 +68,11 @@ mod tests {
     #[test]
     fn parses_reject() {
         assert_eq!(parse("/reject"), Some(Command::Reject));
+    }
+
+    #[test]
+    fn parses_last() {
+        assert_eq!(parse("/last"), Some(Command::Last));
     }
 
     #[test]

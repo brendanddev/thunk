@@ -66,6 +66,9 @@ pub enum RuntimeRequest {
     Approve,
     /// Cancels a pending tool action without executing it.
     Reject,
+    /// Read-only query: returns the last assistant message as an InfoMessage event.
+    /// Does not mutate conversation state or trigger session save.
+    QueryLast,
 }
 
 /// Events emitted by the runtime for UI rendering, logging, and lifecycle handling.
@@ -91,6 +94,9 @@ pub enum RuntimeEvent {
     Failed {
         message: String,
     },
+    /// Informational output from a read-only runtime query (e.g. /last).
+    /// Rendered by the TUI as a system message; never added to conversation state.
+    InfoMessage(String),
     /// Advisory timing event routed from the backend. Consumed by the logging layer only;
     /// must not be forwarded to the TUI or drive any control flow.
     BackendTiming {

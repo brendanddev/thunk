@@ -151,6 +151,7 @@ fn resolve_command(cmd: commands::Command) -> CommandAction {
         commands::Command::Clear   => CommandAction::ClearSession,
         commands::Command::Approve => CommandAction::Runtime(RuntimeRequest::Approve),
         commands::Command::Reject  => CommandAction::Runtime(RuntimeRequest::Reject),
+        commands::Command::Last    => CommandAction::Runtime(RuntimeRequest::QueryLast),
     }
 }
 
@@ -211,6 +212,7 @@ fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
             ));
             state.set_status("awaiting approval");
         }
+        RuntimeEvent::InfoMessage(text) => state.add_system_message(text),
         // Advisory only — absorbed by the logging layer before reaching here.
         RuntimeEvent::BackendTiming { .. } => {}
         RuntimeEvent::RuntimeTrace(_) => {}

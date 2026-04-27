@@ -137,6 +137,7 @@ fn request_label(request: &RuntimeRequest) -> &'static str {
         RuntimeRequest::Reset => "reset",
         RuntimeRequest::Approve => "approve",
         RuntimeRequest::Reject => "reject",
+        RuntimeRequest::QueryLast => "query_last",
     }
 }
 
@@ -147,6 +148,7 @@ fn event_label(event: &RuntimeEvent) -> Option<String> {
         RuntimeEvent::AnswerReady(source) => Some(format!("answer ready: {source:?}")),
         RuntimeEvent::Failed { message } => Some(format!("failed: {message}")),
         RuntimeEvent::ApprovalRequired(p) => Some(format!("approval required: {}", p.summary)),
+        RuntimeEvent::InfoMessage(text) => Some(format!("info: {text}")),
         // Handled with timing in handle():
         RuntimeEvent::AssistantMessageStarted
         | RuntimeEvent::AssistantMessageFinished

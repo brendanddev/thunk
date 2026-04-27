@@ -346,7 +346,16 @@ impl Runtime {
             RuntimeRequest::Reset => self.handle_reset(on_event),
             RuntimeRequest::Approve => self.handle_approve(on_event),
             RuntimeRequest::Reject => self.handle_reject(on_event),
+            RuntimeRequest::QueryLast => self.handle_query_last(on_event),
         }
+    }
+
+    fn handle_query_last(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        let text = match self.conversation.last_assistant_content() {
+            Some(content) => content.to_string(),
+            None => "No previous response.".to_string(),
+        };
+        on_event(RuntimeEvent::InfoMessage(text));
     }
 
     fn handle_reset(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
