@@ -1,6 +1,6 @@
 use thunk::app;
 
-/// Main entry point for the application
 fn main() -> app::Result<()> {
-    app::run()
+    let cli = app::cli::Cli::parse();
+    app::run(cli)
 }

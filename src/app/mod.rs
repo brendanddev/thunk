@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod config;
 pub mod context;
 pub mod error;
@@ -13,11 +14,14 @@ use crate::tui;
 
 // Bootstraps the application: prepares paths and config, builds the backend and tools, restores session state,
 // attaches logging, and starts the TUI.
-pub fn run() -> Result<()> {
+pub fn run(cli: cli::Cli) -> Result<()> {
     let paths = paths::AppPaths::discover()?;
     paths.ensure_runtime_dirs()?;
 
-    let config = config::load(&paths.config_file)?.resolve_paths(&paths.root_dir);
+    let mut config = config::load(&paths.config_file)?.resolve_paths(&paths.root_dir);
+    if let Some(model) = cli.model {
+        config.llm.provider = model;
+    }
     let backend = build_backend(&config)?;
     let registry = default_registry(paths.root_dir.clone());
     let log = crate::logging::SessionLog::open(&paths.logs_dir);
