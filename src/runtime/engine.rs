@@ -487,10 +487,31 @@ impl Runtime {
     }
 
     fn handle_read_file(&mut self, path: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        let p = std::path::Path::new(&path);
+        if p.is_absolute() {
+            on_event(RuntimeEvent::InfoMessage(
+                "error: path must be relative".to_string(),
+            ));
+            return;
+        }
+        if p.components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            on_event(RuntimeEvent::InfoMessage(
+                "error: path must not contain '..' components".to_string(),
+            ));
+            return;
+        }
         self.dispatch_command_tool(CommandTool::ReadFile { path }, on_event);
     }
 
     fn handle_search_code(&mut self, query: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        if query.trim().len() < 2 {
+            on_event(RuntimeEvent::InfoMessage(
+                "error: search query must be at least 2 characters".to_string(),
+            ));
+            return;
+        }
         self.dispatch_command_tool(CommandTool::SearchCode { query }, on_event);
     }
 
@@ -2703,6 +2724,99 @@ mod tests {
                 .any(|m| m.content.contains("=== tool_error: read_file ===")
                     && m.content.contains("read limit")),
             "read cap must block the 4th read"
+        );
+    }
+
+    #[test]
+    fn read_file_command_rejects_absolute_path() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(Vec::<String>::new(), tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::ReadFile {
+                path: "/etc/passwd".to_string(),
+            },
+        );
+        let info: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let RuntimeEvent::InfoMessage(m) = e {
+                    Some(m.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            info.iter().any(|m| m.contains("path must be relative")),
+            "expected absolute path error, got: {info:?}"
+        );
+        assert!(
+            rt.anchors.last_read_file().is_none(),
+            "anchor must not be updated on rejected path"
+        );
+    }
+
+    #[test]
+    fn read_file_command_rejects_parent_traversal() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(Vec::<String>::new(), tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::ReadFile {
+                path: "src/../../etc/passwd".to_string(),
+            },
+        );
+        let info: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let RuntimeEvent::InfoMessage(m) = e {
+                    Some(m.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            info.iter().any(|m| m.contains("'..' components")),
+            "expected parent traversal error, got: {info:?}"
+        );
+        assert!(
+            rt.anchors.last_read_file().is_none(),
+            "anchor must not be updated on rejected path"
+        );
+    }
+
+    #[test]
+    fn search_code_command_rejects_short_query() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let mut rt = make_runtime_in(Vec::<String>::new(), tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::SearchCode {
+                query: "a".to_string(),
+            },
+        );
+        let info: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let RuntimeEvent::InfoMessage(m) = e {
+                    Some(m.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            info.iter().any(|m| m.contains("at least 2 characters")),
+            "expected short query error, got: {info:?}"
+        );
+        assert!(
+            rt.anchors.last_search_query().is_none(),
+            "anchor must not be updated on rejected query"
         );
     }
 }
