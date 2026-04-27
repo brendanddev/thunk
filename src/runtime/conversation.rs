@@ -55,16 +55,19 @@ impl Conversation {
         self.messages.clone()
     }
 
-    /// Returns only human-visible messages: real user prompts and all assistant messages.
-    /// Excludes the system prompt and any runtime-injected user messages (tool results,
-    /// tool errors, and correction sentinels), as identified by `is_runtime_injected`.
+    /// Returns only human-visible messages: real user prompts and final assistant responses.
+    /// Excludes:
+    /// - system prompt
+    /// - runtime-injected user messages (tool results, errors, correction sentinels)
+    /// - assistant tool-call messages (lines beginning with `[`, the same heuristic
+    ///   used by `trim_tool_exchanges_if_needed`)
     pub fn human_visible_snapshot(&self) -> Vec<Message> {
         self.messages
             .iter()
             .filter(|m| match m.role {
-                Role::System => false,
-                Role::User => !is_runtime_injected(&m.content),
-                Role::Assistant => true,
+                Role::System    => false,
+                Role::User      => !is_runtime_injected(&m.content),
+                Role::Assistant => !is_assistant_tool_call(&m.content),
             })
             .cloned()
             .collect()
@@ -189,6 +192,13 @@ fn is_runtime_injected(content: &str) -> bool {
     content.starts_with("=== tool_result:")
         || content.starts_with("=== tool_error:")
         || content.starts_with("[runtime:correction]")
+}
+
+/// Returns true for assistant messages that are tool-call requests rather than
+/// natural-language responses. Uses the same bracket-start heuristic as
+/// `trim_tool_exchanges_if_needed`.
+fn is_assistant_tool_call(content: &str) -> bool {
+    content.trim_start().starts_with('[')
 }
 
 #[cfg(test)]
