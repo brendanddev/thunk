@@ -1,5 +1,6 @@
 mod llama_cpp;
 mod mock;
+mod openai;
 
 use crate::app::config::Config;
 use crate::app::{AppError, Result};
@@ -8,6 +9,7 @@ use crate::llm::backend::ModelBackend;
 pub use llama_cpp::LlamaCppBackend;
 
 use mock::MockBackend;
+use openai::OpenAiBackend;
 
 type BackendFactory = fn(&Config) -> Result<Box<dyn ModelBackend>>;
 
@@ -19,9 +21,14 @@ fn make_llama_cpp(config: &Config) -> Result<Box<dyn ModelBackend>> {
     Ok(Box::new(LlamaCppBackend::new(config.llama_cpp.clone())))
 }
 
+fn make_openai(config: &Config) -> Result<Box<dyn ModelBackend>> {
+    Ok(Box::new(OpenAiBackend::new(config.openai.clone())))
+}
+
 const BACKEND_REGISTRY: &[(&str, BackendFactory)] = &[
     ("mock",      make_mock),
     ("llama_cpp", make_llama_cpp),
+    ("openai",    make_openai),
 ];
 
 pub fn build_backend(config: &Config) -> Result<Box<dyn ModelBackend>> {

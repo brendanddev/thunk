@@ -21,6 +21,12 @@ temperature = 0.3
 # Enable for debugging llama.cpp internals
 show_native_logs = false
 
+[openai]
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+max_tokens = 512
+temperature = 0.2
+
 # Custom command definitions
 [commands.find_def]
 tool = "search_code"

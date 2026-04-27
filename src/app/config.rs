@@ -130,6 +130,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub llm: LlmConfig,
     pub llama_cpp: LlamaCppConfig,
+    pub openai: OpenAiConfig,
     pub commands: HashMap<String, CustomCommandDef>,
 }
 
@@ -204,6 +205,27 @@ impl Default for LlamaCppConfig {
             max_tokens: 512,
             temperature: 0.7,
             show_native_logs: false,
+        }
+    }
+}
+
+/// OpenAI provider configuration
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct OpenAiConfig {
+    pub model: String,
+    pub base_url: String,
+    pub max_tokens: usize,
+    pub temperature: f32,
+}
+
+impl Default for OpenAiConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            max_tokens: 512,
+            temperature: 0.2,
         }
     }
 }
