@@ -69,6 +69,9 @@ pub enum RuntimeRequest {
     /// Read-only query: returns the last assistant message as an InfoMessage event.
     /// Does not mutate conversation state or trigger session save.
     QueryLast,
+    /// Read-only query: returns current anchor state as an InfoMessage event.
+    /// Does not mutate any state or trigger session save.
+    QueryAnchors,
 }
 
 /// Events emitted by the runtime for UI rendering, logging, and lifecycle handling.

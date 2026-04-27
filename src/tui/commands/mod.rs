@@ -8,6 +8,7 @@ pub enum Command {
     Approve,
     Reject,
     Last,
+    Anchors,
 }
 
 /// Returns a `Command` if `input` is a recognized slash command, or `None` if
@@ -20,6 +21,7 @@ pub fn parse(input: &str) -> Option<Command> {
         "/approve" => Some(Command::Approve),
         "/reject" => Some(Command::Reject),
         "/last" => Some(Command::Last),
+        "/anchors" => Some(Command::Anchors),
         _ => None,
     }
 }
@@ -73,6 +75,11 @@ mod tests {
     #[test]
     fn parses_last() {
         assert_eq!(parse("/last"), Some(Command::Last));
+    }
+
+    #[test]
+    fn parses_anchors() {
+        assert_eq!(parse("/anchors"), Some(Command::Anchors));
     }
 
     #[test]

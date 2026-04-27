@@ -346,7 +346,8 @@ impl Runtime {
             RuntimeRequest::Reset => self.handle_reset(on_event),
             RuntimeRequest::Approve => self.handle_approve(on_event),
             RuntimeRequest::Reject => self.handle_reject(on_event),
-            RuntimeRequest::QueryLast => self.handle_query_last(on_event),
+            RuntimeRequest::QueryLast    => self.handle_query_last(on_event),
+            RuntimeRequest::QueryAnchors => self.handle_query_anchors(on_event),
         }
     }
 
@@ -354,6 +355,25 @@ impl Runtime {
         let text = match self.conversation.last_assistant_content() {
             Some(content) => content.to_string(),
             None => "No previous response.".to_string(),
+        };
+        on_event(RuntimeEvent::InfoMessage(text));
+    }
+
+    fn handle_query_anchors(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        let mut parts = Vec::new();
+        if let Some(path) = self.anchors.last_read_file() {
+            parts.push(format!("last read:   {path}"));
+        }
+        if let Some((query, scope)) = self.anchors.last_search() {
+            match scope {
+                Some(s) => parts.push(format!("last search: {query} (in {s})")),
+                None => parts.push(format!("last search: {query}")),
+            }
+        }
+        let text = if parts.is_empty() {
+            "no anchors set".to_string()
+        } else {
+            parts.join("\n")
         };
         on_event(RuntimeEvent::InfoMessage(text));
     }
