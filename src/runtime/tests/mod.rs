@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::app::config::Config;
-use crate::llm::backend::{BackendEvent, GenerateRequest, ModelBackend};
+use crate::llm::backend::{BackendCapabilities, BackendEvent, GenerateRequest, ModelBackend};
 use crate::tools::default_registry;
 
 pub use super::{AnswerSource, PendingAction, RiskLevel, Runtime, RuntimeEvent, RuntimeRequest};
@@ -38,6 +38,13 @@ impl TestBackend {
 impl ModelBackend for TestBackend {
     fn name(&self) -> &str {
         "test"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            context_window_tokens: None,
+            max_output_tokens: None,
+        }
     }
 
     fn generate(
@@ -81,6 +88,13 @@ impl RecordingBackend {
 impl ModelBackend for RecordingBackend {
     fn name(&self) -> &str {
         "recording-test"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            context_window_tokens: None,
+            max_output_tokens: None,
+        }
     }
 
     fn generate(

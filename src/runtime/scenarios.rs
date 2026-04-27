@@ -10,7 +10,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::app::config::Config;
-    use crate::llm::backend::{BackendEvent, GenerateRequest, ModelBackend};
+    use crate::llm::backend::{BackendCapabilities, BackendEvent, GenerateRequest, ModelBackend};
     use crate::runtime::types::{RuntimeEvent, RuntimeRequest};
     use crate::runtime::Runtime;
     use crate::tools::default_registry;
@@ -34,6 +34,13 @@ mod tests {
     impl ModelBackend for TestBackend {
         fn name(&self) -> &str {
             "test"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                context_window_tokens: None,
+                max_output_tokens: None,
+            }
         }
 
         fn generate(

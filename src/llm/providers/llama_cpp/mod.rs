@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use crate::app::config::LlamaCppConfig;
 use crate::app::{AppError, Result};
-use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend};
+use crate::llm::backend::{
+    BackendCapabilities, BackendEvent, BackendStatus, GenerateRequest, ModelBackend,
+};
 
 use native::{load_model, run_generation, LoadedLlama};
 use prompt::format_messages;
@@ -65,6 +67,19 @@ impl ModelBackend for LlamaCppBackend {
     // Returns the display name of the backend, which includes the model name if available.
     fn name(&self) -> &str {
         &self.display_name
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            // context_tokens == 0 means "defer to the model's trained context window at load
+            // time" — report None since the true limit is not known until the model is loaded.
+            context_window_tokens: if self.config.context_tokens > 0 {
+                Some(self.config.context_tokens)
+            } else {
+                None
+            },
+            max_output_tokens: Some(self.config.max_tokens),
+        }
     }
 
     // Builds the prompt, ensures the model is loaded, and streams generation events.

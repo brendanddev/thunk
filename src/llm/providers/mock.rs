@@ -1,5 +1,7 @@
 use crate::app::Result;
-use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, ModelBackend, Role};
+use crate::llm::backend::{
+    BackendCapabilities, BackendEvent, BackendStatus, GenerateRequest, ModelBackend, Role,
+};
 
 pub struct MockBackend {
     app_name: String,
@@ -34,6 +36,13 @@ impl MockBackend {
 impl ModelBackend for MockBackend {
     fn name(&self) -> &str {
         "mock"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            context_window_tokens: None,
+            max_output_tokens: None,
+        }
     }
 
     fn generate(

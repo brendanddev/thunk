@@ -1527,7 +1527,7 @@ fn last_injected_was_edit_error(conversation: &Conversation) -> bool {
 mod tests {
     use super::*;
     use crate::app::config::Config;
-    use crate::llm::backend::{BackendEvent, GenerateRequest};
+    use crate::llm::backend::{BackendCapabilities, BackendEvent, GenerateRequest};
     use crate::tools::default_registry;
 
     struct TestBackend {
@@ -1547,6 +1547,13 @@ mod tests {
     impl ModelBackend for TestBackend {
         fn name(&self) -> &str {
             "test"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                context_window_tokens: None,
+                max_output_tokens: None,
+            }
         }
 
         fn generate(
