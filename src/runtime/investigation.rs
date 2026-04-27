@@ -148,6 +148,47 @@ pub(super) fn looks_like_import(line: &str) -> bool {
         || (t.starts_with("from ") && t.contains(" import "))
 }
 
+/// Returns true if the line defines the exact identifier `symbol`.
+/// Strips each known definition prefix, extracts the first alphanumeric+underscore token,
+/// and requires exact equality — so "class TaskStatus:" does not match symbol "Task".
+/// Coverage mirrors `looks_like_definition`.
+pub(super) fn looks_like_definition_of_symbol(line: &str, symbol: &str) -> bool {
+    let t = line.trim_start();
+    const PREFIXES: &[&str] = &[
+        "pub enum ",
+        "pub struct ",
+        "pub fn ",
+        "pub type ",
+        "pub trait ",
+        "pub const ",
+        "pub static ",
+        "enum ",
+        "struct ",
+        "fn ",
+        "type ",
+        "const ",
+        "trait ",
+        "impl ",
+        "class ",
+        "def ",
+        "func ",
+        "function ",
+        "interface ",
+    ];
+    for prefix in PREFIXES {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let ident = rest
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if ident == symbol {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Returns true if the line (after stripping leading whitespace) looks like a symbol definition.
 /// Coverage: Rust, Python, Go, TypeScript, JavaScript.
 /// C/C++ patterns are excluded — too many false positives without a type parser.
@@ -345,6 +386,10 @@ pub(super) struct InvestigationState {
     /// Candidate paths where every matched line looks like a definition site.
     /// Populated during record_search_results alongside search_candidate_paths.
     definition_only_candidates: HashSet<String>,
+    /// Candidate paths where at least one matched line is an exact definition of the
+    /// queried symbol (weaker than definition_only_candidates, which requires all lines).
+    /// Used exclusively by DefinitionLookup: Gate 8 and first_definition_candidate.
+    definition_site_candidates: HashSet<String>,
     /// True if at least one candidate in the current search results has a
     /// non-definition match line (i.e. a usage file is available).
     has_non_definition_candidates: bool,
@@ -434,6 +479,7 @@ impl InvestigationState {
             files_read_count: 0,
             search_candidate_paths: Vec::new(),
             definition_only_candidates: HashSet::new(),
+            definition_site_candidates: HashSet::new(),
             has_non_definition_candidates: false,
             read_useful_candidate: false,
             premature_synthesis_correction_issued: false,
@@ -516,6 +562,7 @@ impl InvestigationState {
     pub(super) fn record_search_results(
         &mut self,
         output: &ToolOutput,
+        query: Option<&str>,
         on_event: &mut dyn FnMut(RuntimeEvent),
     ) -> bool {
         let ToolOutput::SearchResults(results) = output else {
@@ -528,6 +575,7 @@ impl InvestigationState {
             self.search_produced_results = true;
             self.search_candidate_paths.clear();
             self.definition_only_candidates.clear();
+            self.definition_site_candidates.clear();
             self.has_non_definition_candidates = false;
             self.import_only_candidates.clear();
             self.has_non_import_candidates = false;
@@ -560,6 +608,7 @@ impl InvestigationState {
             // save: at least one matched line contains an exact save term.
             // lockfile: exact filename match against known lockfile basenames.
             let mut file_has_non_def: HashSet<String> = HashSet::new();
+            let mut file_has_exact_def: HashSet<String> = HashSet::new();
             let mut file_has_non_import: HashSet<String> = HashSet::new();
             let mut file_has_initialization: HashSet<String> = HashSet::new();
             let mut file_has_create: HashSet<String> = HashSet::new();
@@ -567,8 +616,16 @@ impl InvestigationState {
             let mut file_has_load: HashSet<String> = HashSet::new();
             let mut file_has_save: HashSet<String> = HashSet::new();
             for m in &results.matches {
-                if !looks_like_definition(&m.line) {
+                if match query {
+                    Some(sym) => !looks_like_definition_of_symbol(&m.line, sym),
+                    None => !looks_like_definition(&m.line),
+                } {
                     file_has_non_def.insert(m.file.clone());
+                }
+                if let Some(sym) = query {
+                    if looks_like_definition_of_symbol(&m.line, sym) {
+                        file_has_exact_def.insert(m.file.clone());
+                    }
                 }
                 if !looks_like_import(&m.line) {
                     file_has_non_import.insert(m.file.clone());
@@ -594,6 +651,9 @@ impl InvestigationState {
                     self.has_non_definition_candidates = true;
                 } else {
                     self.definition_only_candidates.insert(path.clone());
+                }
+                if file_has_exact_def.contains(path) {
+                    self.definition_site_candidates.insert(path.clone());
                 }
                 if file_has_non_import.contains(path) {
                     self.has_non_import_candidates = true;
@@ -994,12 +1054,18 @@ impl InvestigationState {
                 );
                 // Correction already issued: fall through without accepting.
             }
-            // Gate 8 (DefinitionLookup): non-definition reads are structurally insufficient
-            // when definition-site candidates exist. No correction flag — the dispatched
-            // definition read satisfies evidence, preventing re-entry.
+            // Gate 8 (DefinitionLookup): all non-definition-site reads are rejected.
+            // A file passes when it is in definition_only_candidates (all lines are defs)
+            // OR definition_site_candidates (at least one line is an exact definition).
+            // When a definition candidate exists, RuntimeDispatch redirects to it.
+            // When no definition candidate was classified, first_definition_candidate()
+            // returns None and the gate returns None — the read does not satisfy evidence.
             else if matches!(mode, InvestigationMode::DefinitionLookup)
                 && !is_def_only
-                && !self.definition_only_candidates.is_empty()
+                && !self
+                    .definition_site_candidates
+                    .iter()
+                    .any(|c| normalize_evidence_path(c) == read_path)
             {
                 let suggested_path = self.first_definition_candidate().map(str::to_string);
                 trace_runtime_decision(
@@ -1149,7 +1215,10 @@ impl InvestigationState {
     fn first_definition_candidate(&self) -> Option<&str> {
         self.search_candidate_paths
             .iter()
-            .find(|path| self.definition_only_candidates.contains(*path))
+            .find(|path| {
+                self.definition_only_candidates.contains(*path)
+                    || self.definition_site_candidates.contains(*path)
+            })
             .map(String::as_str)
     }
 
@@ -1812,7 +1881,7 @@ mod tests {
             ("sandbox/cli/commands.py", "import logging"),
             ("sandbox/init/z_init.py", "def initialize_logging(): pass"),
         ]);
-        state.record_search_results(&output, &mut |_| {});
+        state.record_search_results(&output, None, &mut |_| {});
         let hint = state.candidate_preference_hint(InvestigationMode::InitializationLookup);
         assert!(hint.is_some(), "hint must fire when init candidate exists alongside non-init");
         assert!(
@@ -1829,7 +1898,7 @@ mod tests {
             ("sandbox/init/a.py", "logging.initialize()"),
             ("sandbox/init/b.py", "def initialization_setup(): pass"),
         ]);
-        state.record_search_results(&output, &mut |_| {});
+        state.record_search_results(&output, None, &mut |_| {});
         let hint = state.candidate_preference_hint(InvestigationMode::InitializationLookup);
         assert!(
             hint.is_none(),
@@ -1844,7 +1913,7 @@ mod tests {
             ("services/database.py", "DATABASE_URL = os.getenv(\"DATABASE_URL\")"),
             ("config/database.yaml", "database:\n  url: postgres://localhost/mydb"),
         ]);
-        state.record_search_results(&output, &mut |_| {});
+        state.record_search_results(&output, None, &mut |_| {});
         let hint = state.candidate_preference_hint(InvestigationMode::ConfigLookup);
         assert!(hint.is_some(), "hint must fire when config candidate exists alongside source");
         assert!(
@@ -1860,7 +1929,7 @@ mod tests {
             ("services/database.py", "DATABASE_URL = os.getenv(\"DATABASE_URL\")"),
             ("services/user.py", "USER = UserService()"),
         ]);
-        state.record_search_results(&output, &mut |_| {});
+        state.record_search_results(&output, None, &mut |_| {});
         let hint = state.candidate_preference_hint(InvestigationMode::ConfigLookup);
         assert!(
             hint.is_none(),
@@ -1875,7 +1944,7 @@ mod tests {
             ("sandbox/init/z_init.py", "logging.basicConfig()"),
             ("sandbox/cli/commands.py", "import logging"),
         ]);
-        state.record_search_results(&output, &mut |_| {});
+        state.record_search_results(&output, None, &mut |_| {});
         assert!(
             state.candidate_preference_hint(InvestigationMode::General).is_none(),
             "General mode must produce no candidate hint"
@@ -1890,7 +1959,7 @@ mod tests {
             ("models/enums.py", "class TaskStatus(str, Enum):"),
             ("cli/commands.py", "from models.enums import TaskStatus"),
         ]);
-        state.record_search_results(&output, &mut |_| {});
+        state.record_search_results(&output, None, &mut |_| {});
         assert!(
             state.candidate_preference_hint(InvestigationMode::DefinitionLookup).is_none(),
             "DefinitionLookup must not produce a candidate hint — handled by definition_site_file"
@@ -1906,7 +1975,7 @@ mod tests {
             ("sandbox/init/a.py", "logging.initialize()"),
             ("sandbox/init/b.py", "def initialization_setup(): pass"),
         ]);
-        state.record_search_results(&output, &mut |_| {});
+        state.record_search_results(&output, None, &mut |_| {});
         let hint = state.candidate_preference_hint(InvestigationMode::InitializationLookup);
         assert!(hint.is_some());
         let hint = hint.unwrap();
@@ -1930,8 +1999,8 @@ mod tests {
         ];
         let output1 = make_search_output_for_hint(matches.clone());
         let output2 = make_search_output_for_hint(matches);
-        state1.record_search_results(&output1, &mut |_| {});
-        state2.record_search_results(&output2, &mut |_| {});
+        state1.record_search_results(&output1, None, &mut |_| {});
+        state2.record_search_results(&output2, None, &mut |_| {});
         assert_eq!(
             state1.candidate_preference_hint(InvestigationMode::InitializationLookup),
             state2.candidate_preference_hint(InvestigationMode::InitializationLookup),
@@ -1946,10 +2015,87 @@ mod tests {
             ("sandbox/init/z_init.py", "logging.basicConfig()"),
             ("sandbox/cli/commands.py", "logger.info(\"hello\")"),
         ]);
-        state.record_search_results(&output, &mut |_| {});
+        state.record_search_results(&output, None, &mut |_| {});
         assert!(
             state.candidate_preference_hint(InvestigationMode::UsageLookup).is_none(),
             "UsageLookup must produce no candidate hint"
+        );
+    }
+
+    #[test]
+    fn definition_of_symbol_rejects_superstring_identifier() {
+        assert!(!looks_like_definition_of_symbol("class TaskStatus:", "Task"));
+        assert!(!looks_like_definition_of_symbol("class TaskStatusEnum:", "Task"));
+        assert!(!looks_like_definition_of_symbol("pub struct TaskRunner {", "Task"));
+        assert!(!looks_like_definition_of_symbol("fn create_task()", "task"));
+    }
+
+    #[test]
+    fn definition_of_symbol_accepts_exact_identifier() {
+        assert!(looks_like_definition_of_symbol("class Task:", "Task"));
+        assert!(looks_like_definition_of_symbol("class Task(Base):", "Task"));
+        assert!(looks_like_definition_of_symbol("class Task(str, Enum):", "Task"));
+    }
+
+    #[test]
+    fn definition_of_symbol_accepts_exact_symbol_across_languages() {
+        assert!(looks_like_definition_of_symbol("class TaskStatus(str, Enum):", "TaskStatus"));
+        assert!(looks_like_definition_of_symbol("pub struct TaskStatus {", "TaskStatus"));
+        assert!(looks_like_definition_of_symbol("pub enum TaskStatus {", "TaskStatus"));
+        assert!(looks_like_definition_of_symbol("def TaskStatus(self):", "TaskStatus"));
+        assert!(looks_like_definition_of_symbol("func TaskStatus() error {", "TaskStatus"));
+        assert!(looks_like_definition_of_symbol("function TaskStatus() {", "TaskStatus"));
+        assert!(looks_like_definition_of_symbol("interface TaskStatus {", "TaskStatus"));
+    }
+
+    #[test]
+    fn definition_only_classification_uses_exact_symbol_when_query_given() {
+        // query="Task": "class TaskStatus:" must NOT be definition-only —
+        // the file has a non-definition match for the symbol Task.
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("models/task_status.py", "class TaskStatus(str, Enum):"),
+        ]);
+        state.record_search_results(&output, Some("Task"), &mut |_| {});
+        assert!(
+            !state.definition_only_candidates.contains("models/task_status.py"),
+            "class TaskStatus must not be definition-only for symbol 'Task'"
+        );
+        assert!(
+            state.has_non_definition_candidates,
+            "has_non_definition_candidates must be set when no exact-symbol definition exists"
+        );
+    }
+
+    #[test]
+    fn definition_only_classification_accepts_exact_symbol_match() {
+        // query="Task": "class Task:" IS a definition-only line.
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("models/task.py", "class Task(Base):"),
+        ]);
+        state.record_search_results(&output, Some("Task"), &mut |_| {});
+        assert!(
+            state.definition_only_candidates.contains("models/task.py"),
+            "class Task must be definition-only for symbol 'Task'"
+        );
+        assert!(
+            !state.has_non_definition_candidates,
+            "has_non_definition_candidates must not be set when only exact definition exists"
+        );
+    }
+
+    #[test]
+    fn definition_only_classification_taskstatus_still_works() {
+        // Regression: query="TaskStatus" — "class TaskStatus:" must still be definition-only.
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("models/enums.py", "class TaskStatus(str, Enum):"),
+        ]);
+        state.record_search_results(&output, Some("TaskStatus"), &mut |_| {});
+        assert!(
+            state.definition_only_candidates.contains("models/enums.py"),
+            "class TaskStatus must be definition-only for symbol 'TaskStatus'"
         );
     }
 }

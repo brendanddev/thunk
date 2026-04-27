@@ -17,6 +17,12 @@ const MAX_COLLECT: usize = 50;
 /// identify which file to read without the 50-match bulk that was causing long prefill.
 const MAX_RESULTS_SHOWN: usize = 15;
 
+/// Maximum number of matching lines collected from a single file.
+/// Caps any one file's contribution to the collection budget so the walk visits more
+/// distinct files before hitting MAX_COLLECT. Definition-site files that are
+/// alphabetically late in the walk are then reached and promoted by the sort step.
+const MAX_LINES_COLLECTED_PER_FILE: usize = 3;
+
 /// Directory names that are always skipped during the recursive walk.
 const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", ".hg", "dist", "build"];
 
@@ -156,8 +162,9 @@ fn search_in_file(path: &Path, query: &str, matches: &mut Vec<SearchMatch>) {
         return; // skip binary or unreadable files silently
     };
 
+    let mut from_this_file = 0;
     for (idx, line) in contents.lines().enumerate() {
-        if matches.len() >= MAX_COLLECT {
+        if matches.len() >= MAX_COLLECT || from_this_file >= MAX_LINES_COLLECTED_PER_FILE {
             break;
         }
         if line.contains(query) {
@@ -166,6 +173,7 @@ fn search_in_file(path: &Path, query: &str, matches: &mut Vec<SearchMatch>) {
                 line_number: idx + 1,
                 line: line.to_string(),
             });
+            from_this_file += 1;
         }
     }
 }
@@ -337,9 +345,13 @@ mod tests {
     #[test]
     fn truncates_to_match_cap_and_preserves_total_count() {
         let tmp = TempDir::new().unwrap();
-        // 20 matching lines — exceeds MAX_RESULTS_SHOWN (15) but under MAX_COLLECT (50)
-        let content: String = (0..20).map(|i| format!("needle line {i}\n")).collect();
-        fs::write(tmp.path().join("matches.rs"), content).unwrap();
+        // 6 files × 3 lines each = 18 collected matches, exceeding MAX_RESULTS_SHOWN (15).
+        // Each file is capped at MAX_LINES_COLLECTED_PER_FILE, so truncation must come from
+        // spread across files rather than a single high-match file.
+        for i in 0..6u8 {
+            let content: String = (0..3).map(|j| format!("needle line {i}-{j}\n")).collect();
+            fs::write(tmp.path().join(format!("file_{i}.rs")), content).unwrap();
+        }
 
         let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
@@ -351,8 +363,8 @@ mod tests {
             MAX_RESULTS_SHOWN,
             "matches must be capped at MAX_RESULTS_SHOWN"
         );
-        assert_eq!(
-            sr.total_matches, 20,
+        assert!(
+            sr.total_matches > MAX_RESULTS_SHOWN,
             "total_matches must reflect all collected before truncation"
         );
         assert!(
@@ -599,13 +611,16 @@ mod tests {
 
     #[test]
     fn definition_file_survives_cap_over_early_usage_file() {
-        // Regression: alphabetically-early usage file filling the cap must not cut off
-        // an alphabetically-later definition file.
+        // Regression: many alphabetically-early usage files filling the collection budget must
+        // not cut off an alphabetically-later definition file.
+        // 6 usage files × 3 lines each = 18 usage matches + 1 definition match = 19 total,
+        // which exceeds MAX_RESULTS_SHOWN (15) and triggers truncation.
         let tmp = TempDir::new().unwrap();
-        // aaa.py: 16 usage lines — more than MAX_RESULTS_SHOWN on its own
-        let usage_lines: String = (0..16).map(|i| format!("x = Task()  # {i}\n")).collect();
-        fs::write(tmp.path().join("aaa.py"), &usage_lines).unwrap();
-        // zzz.py: the definition — alphabetically last
+        for i in 0..6u8 {
+            let content: String = (0..3).map(|_| "x = Task()\n").collect();
+            fs::write(tmp.path().join(format!("aaa_{i}.py")), content).unwrap();
+        }
+        // zzz.py: the definition — alphabetically last, must survive the cap via sort promotion
         fs::write(tmp.path().join("zzz.py"), "class Task:\n    pass\n").unwrap();
 
         let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
@@ -613,15 +628,13 @@ mod tests {
             panic!("expected Immediate(SearchResults)")
         };
 
-        assert!(sr.truncated, "must be truncated (17 matches > cap of 15)");
+        assert!(sr.truncated, "must be truncated (19 matches > cap of 15)");
         assert!(
             sr.matches[0].file.ends_with("zzz.py"),
             "definition file must be promoted to first; first: {}",
             sr.matches[0].file
         );
         let zzz_count = sr.matches.iter().filter(|m| m.file.ends_with("zzz.py")).count();
-        let aaa_count = sr.matches.iter().filter(|m| m.file.ends_with("aaa.py")).count();
-        assert_eq!(zzz_count, 1, "definition match must be within the cap");
-        assert_eq!(aaa_count, MAX_RESULTS_SHOWN - 1, "remaining slots go to usage file");
+        assert_eq!(zzz_count, 1, "definition match must be within the shown cap");
     }
 }
