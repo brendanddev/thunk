@@ -55,6 +55,21 @@ impl Conversation {
         self.messages.clone()
     }
 
+    /// Returns only human-visible messages: real user prompts and all assistant messages.
+    /// Excludes the system prompt and any runtime-injected user messages (tool results,
+    /// tool errors, and correction sentinels), as identified by `is_runtime_injected`.
+    pub fn human_visible_snapshot(&self) -> Vec<Message> {
+        self.messages
+            .iter()
+            .filter(|m| match m.role {
+                Role::System => false,
+                Role::User => !is_runtime_injected(&m.content),
+                Role::Assistant => true,
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Returns the content of the most recently added user message, if any.
     /// Used by the engine to inspect the last injected tool result or error.
     pub fn last_user_content(&self) -> Option<&str> {

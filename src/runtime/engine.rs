@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::app::config::Config;
-use crate::llm::backend::ModelBackend;
+use crate::llm::backend::{ModelBackend, Role};
 use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
 
 use super::anchors::{
@@ -27,6 +27,11 @@ const MAX_TOOL_ROUNDS: usize = 10;
 /// model fabricates twice in a row the prompt fix is insufficient and we surface
 /// the failure rather than looping silently.
 const MAX_CORRECTIONS: usize = 1;
+
+/// Bounds for /history output. Limits messages shown and chars per message to
+/// prevent unbounded InfoMessage output from long or tool-heavy sessions.
+const MAX_HISTORY_MESSAGES: usize = 10;
+const MAX_MESSAGE_CHARS: usize = 200;
 
 use super::response_text::*;
 use super::trace::{trace_runtime_decision, RUNTIME_TRACE_ENV};
@@ -348,6 +353,7 @@ impl Runtime {
             RuntimeRequest::Reject => self.handle_reject(on_event),
             RuntimeRequest::QueryLast    => self.handle_query_last(on_event),
             RuntimeRequest::QueryAnchors => self.handle_query_anchors(on_event),
+            RuntimeRequest::QueryHistory => self.handle_query_history(on_event),
         }
     }
 
@@ -376,6 +382,44 @@ impl Runtime {
             parts.join("\n")
         };
         on_event(RuntimeEvent::InfoMessage(text));
+    }
+
+    fn handle_query_history(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        let messages = self.conversation.human_visible_snapshot();
+
+        if messages.is_empty() {
+            on_event(RuntimeEvent::InfoMessage("no conversation history".to_string()));
+            return;
+        }
+
+        let tail = if messages.len() > MAX_HISTORY_MESSAGES {
+            messages[messages.len() - MAX_HISTORY_MESSAGES..].to_vec()
+        } else {
+            messages
+        };
+
+        let mut lines = vec!["history:".to_string()];
+        let mut first = true;
+        for msg in &tail {
+            let label = match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => continue,
+            };
+            if msg.role == Role::User && !first {
+                lines.push(String::new());
+            }
+            let content = if msg.content.chars().count() > MAX_MESSAGE_CHARS {
+                let truncated: String = msg.content.chars().take(MAX_MESSAGE_CHARS).collect();
+                format!("{truncated}...")
+            } else {
+                msg.content.clone()
+            };
+            lines.push(format!("[{label}] {content}"));
+            first = false;
+        }
+
+        on_event(RuntimeEvent::InfoMessage(lines.join("\n")));
     }
 
     fn handle_reset(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {

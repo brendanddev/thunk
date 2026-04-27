@@ -138,7 +138,8 @@ fn request_label(request: &RuntimeRequest) -> &'static str {
         RuntimeRequest::Approve => "approve",
         RuntimeRequest::Reject => "reject",
         RuntimeRequest::QueryLast    => "query_last",
-        RuntimeRequest::QueryAnchors => "query_anchors",
+        RuntimeRequest::QueryAnchors  => "query_anchors",
+        RuntimeRequest::QueryHistory  => "query_history",
     }
 }
 

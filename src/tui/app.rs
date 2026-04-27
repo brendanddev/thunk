@@ -152,7 +152,8 @@ fn resolve_command(cmd: commands::Command) -> CommandAction {
         commands::Command::Approve => CommandAction::Runtime(RuntimeRequest::Approve),
         commands::Command::Reject  => CommandAction::Runtime(RuntimeRequest::Reject),
         commands::Command::Last    => CommandAction::Runtime(RuntimeRequest::QueryLast),
-        commands::Command::Anchors => CommandAction::Runtime(RuntimeRequest::QueryAnchors),
+        commands::Command::Anchors  => CommandAction::Runtime(RuntimeRequest::QueryAnchors),
+        commands::Command::History  => CommandAction::Runtime(RuntimeRequest::QueryHistory),
     }
 }
 

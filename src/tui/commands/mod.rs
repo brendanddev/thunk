@@ -9,6 +9,7 @@ pub enum Command {
     Reject,
     Last,
     Anchors,
+    History,
 }
 
 /// Returns a `Command` if `input` is a recognized slash command, or `None` if
@@ -22,6 +23,7 @@ pub fn parse(input: &str) -> Option<Command> {
         "/reject" => Some(Command::Reject),
         "/last" => Some(Command::Last),
         "/anchors" => Some(Command::Anchors),
+        "/history" => Some(Command::History),
         _ => None,
     }
 }
@@ -80,6 +82,11 @@ mod tests {
     #[test]
     fn parses_anchors() {
         assert_eq!(parse("/anchors"), Some(Command::Anchors));
+    }
+
+    #[test]
+    fn parses_history() {
+        assert_eq!(parse("/history"), Some(Command::History));
     }
 
     #[test]

@@ -72,6 +72,9 @@ pub enum RuntimeRequest {
     /// Read-only query: returns current anchor state as an InfoMessage event.
     /// Does not mutate any state or trigger session save.
     QueryAnchors,
+    /// Read-only query: returns bounded recent conversation history as an InfoMessage event.
+    /// Does not mutate any state or trigger session save.
+    QueryHistory,
 }
 
 /// Events emitted by the runtime for UI rendering, logging, and lifecycle handling.
