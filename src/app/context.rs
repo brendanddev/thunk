@@ -140,6 +140,8 @@ fn request_label(request: &RuntimeRequest) -> &'static str {
         RuntimeRequest::QueryLast    => "query_last",
         RuntimeRequest::QueryAnchors  => "query_anchors",
         RuntimeRequest::QueryHistory  => "query_history",
+        RuntimeRequest::ReadFile { .. }   => "read_file",
+        RuntimeRequest::SearchCode { .. } => "search_code",
     }
 }
 

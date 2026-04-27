@@ -154,6 +154,8 @@ fn resolve_command(cmd: commands::Command) -> CommandAction {
         commands::Command::Last    => CommandAction::Runtime(RuntimeRequest::QueryLast),
         commands::Command::Anchors  => CommandAction::Runtime(RuntimeRequest::QueryAnchors),
         commands::Command::History  => CommandAction::Runtime(RuntimeRequest::QueryHistory),
+        commands::Command::Read(path)   => CommandAction::Runtime(RuntimeRequest::ReadFile { path }),
+        commands::Command::Search(query) => CommandAction::Runtime(RuntimeRequest::SearchCode { query }),
     }
 }
 
@@ -166,7 +168,7 @@ fn handle_command(
     match resolve_command(cmd) {
         CommandAction::ShowHelp => {
             state.add_system_message(
-                "Commands: /help — show this message  |  /clear — clear history  |  /quit — exit  |  /approve — confirm pending action  |  /reject — cancel pending action",
+                "Commands: /help — show this message  |  /clear — clear history  |  /quit — exit  |  /approve — confirm pending action  |  /reject — cancel pending action  |  /read <path> — read file  |  /search <query> — search code  |  /last — last response  |  /anchors — anchor state  |  /history — conversation history",
             );
         }
         CommandAction::Quit => {

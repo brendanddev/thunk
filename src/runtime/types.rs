@@ -75,6 +75,12 @@ pub enum RuntimeRequest {
     /// Read-only query: returns bounded recent conversation history as an InfoMessage event.
     /// Does not mutate any state or trigger session save.
     QueryHistory,
+    /// Command-triggered read_file invocation. Goes through CommandTool allowlist.
+    /// Does not mutate conversation or trigger session save.
+    ReadFile { path: String },
+    /// Command-triggered search_code invocation. Goes through CommandTool allowlist.
+    /// Does not mutate conversation or trigger session save.
+    SearchCode { query: String },
 }
 
 /// Events emitted by the runtime for UI rendering, logging, and lifecycle handling.

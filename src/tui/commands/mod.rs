@@ -10,6 +10,8 @@ pub enum Command {
     Last,
     Anchors,
     History,
+    Read(String),
+    Search(String),
 }
 
 /// A parse-level error for slash commands. Returned when input begins with `/`
@@ -44,7 +46,9 @@ pub fn parse(input: &str) -> Option<Result<Command, ParseError>> {
         return None;
     }
 
-    let name = trimmed.split_whitespace().next().unwrap_or(trimmed);
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or(trimmed);
+    let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
 
     match name {
         "/help"           => Some(Ok(Command::Help)),
@@ -55,6 +59,14 @@ pub fn parse(input: &str) -> Option<Result<Command, ParseError>> {
         "/last"           => Some(Ok(Command::Last)),
         "/anchors"        => Some(Ok(Command::Anchors)),
         "/history"        => Some(Ok(Command::History)),
+        "/read" => match arg {
+            Some(path)  => Some(Ok(Command::Read(path.to_string()))),
+            None        => Some(Err(ParseError::MissingArgument { command: "/read" })),
+        },
+        "/search" => match arg {
+            Some(query) => Some(Ok(Command::Search(query.to_string()))),
+            None        => Some(Err(ParseError::MissingArgument { command: "/search" })),
+        },
         _                 => Some(Err(ParseError::UnknownCommand)),
     }
 }
@@ -143,5 +155,45 @@ mod tests {
     fn missing_argument_error_message() {
         let e = ParseError::MissingArgument { command: "/read" };
         assert_eq!(e.user_message(), "/read: argument required");
+    }
+
+    #[test]
+    fn parses_read_with_path() {
+        assert_eq!(
+            parse("/read src/main.rs"),
+            Some(Ok(Command::Read("src/main.rs".to_string())))
+        );
+    }
+
+    #[test]
+    fn parses_search_with_query() {
+        assert_eq!(
+            parse("/search fn handle"),
+            Some(Ok(Command::Search("fn handle".to_string())))
+        );
+    }
+
+    #[test]
+    fn read_without_arg_returns_missing_argument() {
+        assert_eq!(
+            parse("/read"),
+            Some(Err(ParseError::MissingArgument { command: "/read" }))
+        );
+        assert_eq!(
+            parse("/read   "),
+            Some(Err(ParseError::MissingArgument { command: "/read" }))
+        );
+    }
+
+    #[test]
+    fn search_without_arg_returns_missing_argument() {
+        assert_eq!(
+            parse("/search"),
+            Some(Err(ParseError::MissingArgument { command: "/search" }))
+        );
+        assert_eq!(
+            parse("/search   "),
+            Some(Err(ParseError::MissingArgument { command: "/search" }))
+        );
     }
 }

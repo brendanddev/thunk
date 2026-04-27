@@ -33,6 +33,31 @@ const MAX_CORRECTIONS: usize = 1;
 const MAX_HISTORY_MESSAGES: usize = 10;
 const MAX_MESSAGE_CHARS: usize = 200;
 
+/// Explicit allowlist of tools that slash commands may invoke via the runtime.
+/// All command-to-registry dispatch passes through this type — no command handler
+/// calls registry.dispatch() directly or constructs ToolInput outside this enum.
+/// Mutating tools are excluded by omission; adding one requires an explicit variant.
+enum CommandTool {
+    ReadFile { path: String },
+    SearchCode { query: String },
+}
+
+impl CommandTool {
+    fn into_input(self) -> ToolInput {
+        match self {
+            Self::ReadFile { path }    => ToolInput::ReadFile { path },
+            Self::SearchCode { query } => ToolInput::SearchCode { query, path: None },
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::ReadFile { .. }    => "read_file",
+            Self::SearchCode { .. } => "search_code",
+        }
+    }
+}
+
 use super::response_text::*;
 use super::trace::{trace_runtime_decision, RUNTIME_TRACE_ENV};
 
@@ -354,6 +379,8 @@ impl Runtime {
             RuntimeRequest::QueryLast    => self.handle_query_last(on_event),
             RuntimeRequest::QueryAnchors => self.handle_query_anchors(on_event),
             RuntimeRequest::QueryHistory => self.handle_query_history(on_event),
+            RuntimeRequest::ReadFile { path }    => self.handle_read_file(path, on_event),
+            RuntimeRequest::SearchCode { query } => self.handle_search_code(query, on_event),
         }
     }
 
@@ -420,6 +447,51 @@ impl Runtime {
         }
 
         on_event(RuntimeEvent::InfoMessage(lines.join("\n")));
+    }
+
+    fn dispatch_command_tool(
+        &mut self,
+        tool: CommandTool,
+        on_event: &mut dyn FnMut(RuntimeEvent),
+    ) {
+        if self.pending_action.is_some() {
+            on_event(RuntimeEvent::Failed {
+                message: "cannot run command while a tool approval is pending".to_string(),
+            });
+            return;
+        }
+        let search_query = match &tool {
+            CommandTool::SearchCode { query } => Some(query.clone()),
+            CommandTool::ReadFile { .. } => None,
+        };
+        let name = tool.name();
+        let input = tool.into_input();
+        match self.registry.dispatch(input) {
+            Ok(ToolRunResult::Immediate(output)) => {
+                self.anchors.record_successful_read(&output);
+                if let Some(query) = search_query {
+                    self.anchors.record_successful_search(&output, query, None);
+                }
+                on_event(RuntimeEvent::InfoMessage(
+                    tool_codec::format_tool_result(name, &output),
+                ));
+            }
+            Ok(ToolRunResult::Approval(pending)) => {
+                self.pending_action = Some(pending.clone());
+                on_event(RuntimeEvent::ApprovalRequired(pending));
+            }
+            Err(e) => {
+                on_event(RuntimeEvent::InfoMessage(format!("error: {e}")));
+            }
+        }
+    }
+
+    fn handle_read_file(&mut self, path: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        self.dispatch_command_tool(CommandTool::ReadFile { path }, on_event);
+    }
+
+    fn handle_search_code(&mut self, query: String, on_event: &mut dyn FnMut(RuntimeEvent)) {
+        self.dispatch_command_tool(CommandTool::SearchCode { query }, on_event);
     }
 
     fn handle_reset(&mut self, on_event: &mut dyn FnMut(RuntimeEvent)) {
