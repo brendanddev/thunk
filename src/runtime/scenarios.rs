@@ -1560,13 +1560,12 @@ mod tests {
         use std::io::Write;
 
         use crate::tools::RiskLevel;
-        use tempfile::NamedTempFile;
 
         let dir = TempDir::new().unwrap();
 
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "hello").unwrap();
-        let path = f.path().to_string_lossy().into_owned();
+        let path = dir.path().join("hello.txt");
+        writeln!(std::fs::File::create(&path).unwrap(), "hello").unwrap();
+        let path = path.to_string_lossy().into_owned();
 
         let payload = format!("{}\x00hello\x00world", path);
 

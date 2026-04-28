@@ -124,8 +124,7 @@ mod tests {
     #[test]
     fn relative_display_returns_root_relative_path() {
         assert_eq!(
-            relative_display(Path::new("/project/src/main.rs"), Path::new("/project"))
-                .as_deref(),
+            relative_display(Path::new("/project/src/main.rs"), Path::new("/project")).as_deref(),
             Some("src/main.rs")
         );
     }
@@ -142,17 +141,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn relative_display_returns_none_outside_root() {
-        assert!(
-            relative_display(Path::new("/other/file.rs"), Path::new("/project")).is_none()
-        );
+        assert!(relative_display(Path::new("/other/file.rs"), Path::new("/project")).is_none());
     }
 
     #[cfg(unix)]
     #[test]
     fn relative_display_handles_deep_nesting() {
         assert_eq!(
-            relative_display(Path::new("/project/a/b/c/d.rs"), Path::new("/project"))
-                .as_deref(),
+            relative_display(Path::new("/project/a/b/c/d.rs"), Path::new("/project")).as_deref(),
             Some("a/b/c/d.rs")
         );
     }
@@ -160,10 +156,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn relative_display_uses_forward_slashes() {
-        let result =
-            relative_display(Path::new("/project/src/runtime/engine.rs"), Path::new("/project"))
-                .unwrap();
-        assert!(!result.contains('\\'), "must not contain backslashes: {result}");
+        let result = relative_display(
+            Path::new("/project/src/runtime/engine.rs"),
+            Path::new("/project"),
+        )
+        .unwrap();
+        assert!(
+            !result.contains('\\'),
+            "must not contain backslashes: {result}"
+        );
         assert!(result.contains('/'));
     }
 

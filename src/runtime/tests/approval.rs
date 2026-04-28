@@ -215,16 +215,14 @@ fn edit_old_new_content_format_requests_approval_and_executes() {
 fn approve_produces_runtime_owned_answer_after_successful_mutation() {
     // After approving a mutation, the runtime must finalize directly without
     // re-entering model generation. The answer is built from the tool output summary.
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    let mut f = NamedTempFile::new().unwrap();
-    writeln!(f, "hello").unwrap();
-    let path = f.path().to_string_lossy().into_owned();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("hello.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    let path = path.to_string_lossy().into_owned();
     let payload = format!("{}\x00hello\x00world", path);
 
     // No model responses needed — the runtime owns the answer.
-    let mut rt = make_runtime(Vec::<&str>::new());
+    let mut rt = make_runtime_in(Vec::<&str>::new(), tmp.path());
     let before_count = rt.messages_snapshot().len();
 
     rt.set_pending_for_test(PendingAction {
