@@ -12,7 +12,7 @@ mod tests {
     use crate::app::config::Config;
     use crate::llm::backend::{BackendCapabilities, BackendEvent, GenerateRequest, ModelBackend};
     use crate::runtime::types::{RuntimeEvent, RuntimeRequest};
-    use crate::runtime::Runtime;
+    use crate::runtime::{ProjectRoot, Runtime};
     use crate::tools::default_registry;
 
     // Test backend
@@ -65,11 +65,12 @@ mod tests {
     // Helpers
 
     fn make_runtime(dir: &TempDir, responses: Vec<impl Into<String>>) -> Runtime {
+        let project_root = ProjectRoot::new(dir.path().to_path_buf()).unwrap();
         Runtime::new(
             &Config::default(),
-            dir.path(),
+            project_root.clone(),
             Box::new(TestBackend::new(responses)),
-            default_registry(dir.path().to_path_buf()),
+            default_registry(project_root.as_path_buf()),
         )
     }
 

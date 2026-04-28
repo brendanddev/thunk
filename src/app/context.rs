@@ -1,8 +1,7 @@
-use std::path::Path;
 use std::time::Instant;
 
 use crate::logging::SessionLog;
-use crate::runtime::{Runtime, RuntimeEvent, RuntimeRequest};
+use crate::runtime::{ProjectRoot, Runtime, RuntimeEvent, RuntimeRequest};
 use crate::tools::ToolRegistry;
 
 use super::config::Config;
@@ -111,7 +110,7 @@ impl AppContext {
     /// Initializes the AppContext by building a Runtime and loading the session history.
     pub fn build(
         config: &Config,
-        project_root: &Path,
+        project_root: ProjectRoot,
         backend: Box<dyn crate::llm::backend::ModelBackend>,
         registry: ToolRegistry,
         session: ActiveSession,

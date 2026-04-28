@@ -239,14 +239,15 @@ fn path_qualified_file_prompt_reads_before_first_model_generation() {
     .unwrap();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(RecordingBackend::new(
             vec!["sandbox/main.py defines main()."],
             Arc::clone(&requests),
         )),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     let events = collect_events(
@@ -293,14 +294,15 @@ fn explicit_directory_prompt_lists_before_first_model_generation() {
     .unwrap();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(RecordingBackend::new(
             vec!["sandbox contains main.py."],
             Arc::clone(&requests),
         )),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     let events = collect_events(
@@ -338,14 +340,15 @@ fn structural_directory_prompt_lists_before_first_model_generation() {
     fs::write(tmp.path().join("main.py"), "def main():\n    pass\n").unwrap();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(RecordingBackend::new(
             vec!["The project root contains main.py."],
             Arc::clone(&requests),
         )),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     let events = collect_events(
@@ -388,9 +391,10 @@ fn investigation_prompt_still_generates_before_first_tool() {
     .unwrap();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(RecordingBackend::new(
             vec![
                 "[search_code: helper]",
@@ -399,7 +403,7 @@ fn investigation_prompt_still_generates_before_first_tool() {
             ],
             Arc::clone(&requests),
         )),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     let events = collect_events(
@@ -624,9 +628,10 @@ fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
     fs::write(tmp.path().join("sandbox/main.py"), "def main(): pass\n").unwrap();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(RecordingBackend::new(
             vec![
                 "[read_file: sandbox/main.py]", // round 1: model reads the requested file
@@ -634,7 +639,7 @@ fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
             ],
             Arc::clone(&requests),
         )),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     collect_events(
@@ -703,9 +708,10 @@ fn answer_only_surface_hint_sent_after_second_runtime_owned_usage_read() {
     .unwrap();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(RecordingBackend::new(
             vec![
                 "[search_code: TaskStatus]",
@@ -713,7 +719,7 @@ fn answer_only_surface_hint_sent_after_second_runtime_owned_usage_read() {
             ],
             Arc::clone(&requests),
         )),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     collect_events(
@@ -765,14 +771,15 @@ fn seeded_list_dir_synthesis_receives_answer_only_surface() {
     fs::write(tmp.path().join("sandbox/main.py"), "def main(): pass\n").unwrap();
 
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(RecordingBackend::new(
             vec!["sandbox/ contains main.py."],
             Arc::clone(&requests),
         )),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     let events = collect_events(
@@ -823,14 +830,15 @@ fn seeded_list_dir_blocks_post_listing_search_code() {
     fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
     fs::write(tmp.path().join("sandbox/main.py"), "def main(): pass\n").unwrap();
 
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(TestBackend::new(vec![
-            "[search_code: main]",         // model attempts search after listing
-            "sandbox/ contains main.py.",  // correction causes re-generation
+            "[search_code: main]",        // model attempts search after listing
+            "sandbox/ contains main.py.", // correction causes re-generation
         ])),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     let events = collect_events(
@@ -858,14 +866,15 @@ fn seeded_list_dir_blocks_post_listing_read_file() {
     fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
     fs::write(tmp.path().join("sandbox/main.py"), "def main(): pass\n").unwrap();
 
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
     let mut rt = Runtime::new(
         &Config::default(),
-        tmp.path(),
+        project_root.clone(),
         Box::new(TestBackend::new(vec![
             "[read_file: sandbox/main.py]", // model attempts read after listing
             "sandbox/ contains main.py.",   // correction causes re-generation
         ])),
-        default_registry(tmp.path().to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     );
 
     let events = collect_events(

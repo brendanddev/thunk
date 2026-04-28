@@ -5,7 +5,9 @@ use crate::app::config::Config;
 use crate::llm::backend::{BackendCapabilities, BackendEvent, GenerateRequest, ModelBackend};
 use crate::tools::default_registry;
 
-pub use super::{AnswerSource, PendingAction, RiskLevel, Runtime, RuntimeEvent, RuntimeRequest};
+pub use super::{
+    AnswerSource, PendingAction, ProjectRoot, RiskLevel, Runtime, RuntimeEvent, RuntimeRequest,
+};
 
 mod anchors;
 mod approval;
@@ -118,20 +120,22 @@ impl ModelBackend for RecordingBackend {
 }
 
 pub fn make_runtime(responses: Vec<impl Into<String>>) -> Runtime {
+    let root = ProjectRoot::new(PathBuf::from(".")).unwrap();
     Runtime::new(
         &Config::default(),
-        &PathBuf::from("."),
+        root.clone(),
         Box::new(TestBackend::new(responses)),
-        default_registry(PathBuf::from(".")),
+        default_registry(root.as_path_buf()),
     )
 }
 
 pub fn make_runtime_in(responses: Vec<impl Into<String>>, root: &std::path::Path) -> Runtime {
+    let project_root = ProjectRoot::new(root.to_path_buf()).unwrap();
     Runtime::new(
         &Config::default(),
-        root,
+        project_root.clone(),
         Box::new(TestBackend::new(responses)),
-        default_registry(root.to_path_buf()),
+        default_registry(project_root.as_path_buf()),
     )
 }
 
@@ -139,11 +143,12 @@ pub fn make_runtime_with_recorded_requests(
     responses: Vec<impl Into<String>>,
 ) -> (Runtime, Arc<Mutex<Vec<GenerateRequest>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let root = ProjectRoot::new(PathBuf::from(".")).unwrap();
     let runtime = Runtime::new(
         &Config::default(),
-        &PathBuf::from("."),
+        root.clone(),
         Box::new(RecordingBackend::new(responses, Arc::clone(&requests))),
-        default_registry(PathBuf::from(".")),
+        default_registry(root.as_path_buf()),
     );
     (runtime, requests)
 }

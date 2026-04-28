@@ -12,6 +12,7 @@ use super::anchors::{
 use super::conversation::Conversation;
 use super::generation::{emit_visible_assistant_message, run_generate_turn};
 use super::investigation::{detect_investigation_mode, InvestigationMode, InvestigationState};
+use super::project_root::ProjectRoot;
 use super::prompt;
 use super::tool_codec;
 use super::tool_round::{
@@ -384,6 +385,8 @@ use super::prompt_analysis::{
 };
 
 pub struct Runtime {
+    #[allow(dead_code)]
+    project_root: ProjectRoot,
     conversation: Conversation,
     backend: Box<dyn ModelBackend>,
     registry: ToolRegistry,
@@ -399,14 +402,16 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(
         config: &Config,
-        project_root: &Path,
+        project_root: ProjectRoot,
         backend: Box<dyn ModelBackend>,
         registry: ToolRegistry,
     ) -> Self {
         let specs = registry.specs();
-        let system_prompt = prompt::build_system_prompt(&config.app.name, project_root, &specs);
+        let system_prompt =
+            prompt::build_system_prompt(&config.app.name, project_root.path(), &specs);
         let context_policy = ContextPolicy::from_capabilities(backend.capabilities());
         Self {
+            project_root,
             conversation: Conversation::new(system_prompt.clone()),
             backend,
             registry,
@@ -1728,6 +1733,7 @@ mod tests {
     use super::*;
     use crate::app::config::Config;
     use crate::llm::backend::{BackendCapabilities, BackendEvent, GenerateRequest};
+    use crate::runtime::ProjectRoot;
     use crate::tools::default_registry;
 
     struct TestBackend {
@@ -1776,11 +1782,12 @@ mod tests {
     }
 
     fn make_runtime_in(responses: Vec<impl Into<String>>, root: &std::path::Path) -> Runtime {
+        let project_root = ProjectRoot::new(root.to_path_buf()).unwrap();
         Runtime::new(
             &Config::default(),
-            root,
+            project_root.clone(),
             Box::new(TestBackend::new(responses)),
-            default_registry(root.to_path_buf()),
+            default_registry(project_root.as_path_buf()),
         )
     }
 

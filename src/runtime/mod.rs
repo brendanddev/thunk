@@ -4,6 +4,7 @@ mod engine;
 mod generation;
 mod investigation;
 mod paths;
+mod project_root;
 mod prompt;
 mod prompt_analysis;
 mod response_text;
@@ -20,4 +21,5 @@ mod types;
 
 pub use crate::tools::{PendingAction, RiskLevel};
 pub use engine::Runtime;
+pub use project_root::{ProjectRoot, ProjectRootError};
 pub use types::{AnswerSource, RuntimeEvent, RuntimeRequest};

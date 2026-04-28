@@ -161,8 +161,8 @@ fn initialization_lookup_non_initialization_read_triggers_recovery() {
     );
 
     let snapshot = rt.messages_snapshot();
-    let expected_recovery_path = tmp
-        .path()
+    let canonical_root = std::fs::canonicalize(tmp.path()).unwrap();
+    let expected_recovery_path = canonical_root
         .join("services")
         .join("logging_setup.py")
         .to_string_lossy()

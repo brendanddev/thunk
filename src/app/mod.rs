@@ -23,13 +23,15 @@ pub fn run(cli: cli::Cli) -> Result<()> {
         config.llm.provider = model;
     }
     let backend = build_backend(&config)?;
-    let registry = default_registry(paths.root_dir.clone());
+    let project_root = crate::runtime::ProjectRoot::new(paths.root_dir.clone())
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    let registry = default_registry(project_root.as_path_buf());
     let log = crate::logging::SessionLog::open(&paths.logs_dir);
 
     let (active_session, history) = session::ActiveSession::open_or_restore(&paths.session_db)?;
     let app = AppContext::build(
         &config,
-        &paths.root_dir,
+        project_root,
         backend,
         registry,
         active_session,
