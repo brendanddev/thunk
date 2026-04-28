@@ -1949,10 +1949,16 @@ mod tests {
             &mut |e| events.push(e),
         );
 
-        assert!(
-            matches!(outcome, ToolRoundOutcome::Completed { .. }),
-            "search round must complete"
-        );
+        match outcome {
+            ToolRoundOutcome::RuntimeDispatch {
+                call: ToolInput::ReadFile { path },
+                ..
+            } => assert!(
+                path.ends_with("sandbox/in_scope.py"),
+                "usage lookup should auto-read the in-scope preferred candidate: {path}"
+            ),
+            _ => panic!("usage lookup search should now runtime-dispatch a preferred read"),
+        }
         assert_eq!(anchors.last_search_query(), Some("needle"));
         assert_eq!(anchors.last_search_scope(), Some("sandbox/"));
     }

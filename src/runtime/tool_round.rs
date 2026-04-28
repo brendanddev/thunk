@@ -570,6 +570,25 @@ pub(super) fn run_tool_round(
                         accumulated.push_str(&hint);
                         accumulated.push_str("\n\n");
                     }
+                    if let Some(message) = search_closed_message {
+                        accumulated.push_str(message);
+                        accumulated.push_str("\n\n");
+                    }
+                    if matches!(investigation_mode, InvestigationMode::UsageLookup) {
+                        if let Some(path) = investigation.preferred_usage_candidate() {
+                            trace_runtime_decision(
+                                on_event,
+                                "usage_candidate_selected",
+                                &[("path", path.to_string())],
+                            );
+                            return ToolRoundOutcome::RuntimeDispatch {
+                                accumulated,
+                                call: ToolInput::ReadFile {
+                                    path: path.to_string(),
+                                },
+                            };
+                        }
+                    }
                 }
                 if let Some((path, kind)) = read_recovery {
                     trace_runtime_decision(
@@ -596,10 +615,6 @@ pub(super) fn run_tool_round(
                         RecoveryKind::Lockfile => lockfile_read_recovery_correction(&path),
                     };
                     accumulated.push_str(&correction);
-                    accumulated.push_str("\n\n");
-                }
-                if let Some(message) = search_closed_message {
-                    accumulated.push_str(message);
                     accumulated.push_str("\n\n");
                 }
                 *last_call_key = Some(key);

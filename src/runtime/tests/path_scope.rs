@@ -179,7 +179,6 @@ fn scope_upper_bound_clamps_broader_model_path() {
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: services/task_service.py]",
             "TaskStatus is used in services/task_service.py.",
         ],
         tmp.path(),
@@ -205,6 +204,16 @@ fn scope_upper_bound_clamps_broader_model_path() {
         "scoped search must admit synthesis: {answer_source:?}"
     );
     let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all_user.contains("pass\n"),
+        "scoped usage query should read the in-scope candidate before synthesis: {all_user}"
+    );
     let last_assistant = snapshot
         .iter()
         .rev()
@@ -240,7 +249,6 @@ fn no_scope_search_behavior_unchanged() {
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: services/task_service.py]",
             "TaskStatus is used in services/task_service.py.",
         ],
         tmp.path(),
@@ -283,6 +291,16 @@ fn no_scope_search_behavior_unchanged() {
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
         "unscoped search + read must admit synthesis: {answer_source:?}"
+    );
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all_user.contains("pass\n"),
+        "unscoped usage query should still deterministically read the preferred candidate: {all_user}"
     );
 }
 
@@ -368,6 +386,12 @@ fn scope_upper_bound_clamped_to_cli_not_sandbox() {
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join("sandbox/cli")).unwrap();
     fs::create_dir_all(tmp.path().join("sandbox/models")).unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/cli").join("header.py"),
+        "from sandbox.models.enums import TaskStatus\n",
+    )
+    .unwrap();
     fs::write(
         tmp.path().join("sandbox/cli").join("handler.py"),
         "if task.status == TaskStatus.PENDING:\n    handle(task)\n",
@@ -378,11 +402,15 @@ fn scope_upper_bound_clamped_to_cli_not_sandbox() {
         "class TaskStatus(str, Enum):\n    PENDING = \"pending\"\n",
     )
     .unwrap();
+    fs::write(
+        tmp.path().join("sandbox/services").join("runner.py"),
+        "if task.status == TaskStatus.PENDING:\n    run()\nTaskStatus.PENDING\n",
+    )
+    .unwrap();
 
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: sandbox/cli/handler.py]",
             "TaskStatus is used in sandbox/cli/handler.py.",
         ],
         tmp.path(),
@@ -411,5 +439,23 @@ fn scope_upper_bound_clamped_to_cli_not_sandbox() {
     assert!(
         !search_result.contains("sandbox/models/enums.py"),
         "scoped search must exclude out-of-scope sandbox/models/ candidate: {search_result}"
+    );
+    assert!(
+        !search_result.contains("sandbox/services/runner.py"),
+        "scoped search must exclude out-of-scope sandbox/services/ candidate: {search_result}"
+    );
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all_user.contains("handle(task)"),
+        "preferred candidate selection must stay inside the scoped directory: {all_user}"
+    );
+    assert!(
+        !all_user.contains("run()"),
+        "out-of-scope substantive candidates must not be read: {all_user}"
     );
 }

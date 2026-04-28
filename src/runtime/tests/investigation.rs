@@ -232,12 +232,13 @@ fn read_must_come_from_current_search_results() {
 }
 
 #[test]
-fn usage_lookup_definition_only_read_does_not_satisfy_evidence_when_usage_candidates_exist() {
+fn usage_lookup_runtime_dispatches_preferred_substantive_candidate_after_search() {
     use std::fs;
     use tempfile::TempDir;
 
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join("models")).unwrap();
+    fs::create_dir_all(tmp.path().join("cli")).unwrap();
     fs::create_dir_all(tmp.path().join("services")).unwrap();
     fs::write(
         tmp.path().join("models").join("enums.py"),
@@ -245,17 +246,20 @@ fn usage_lookup_definition_only_read_does_not_satisfy_evidence_when_usage_candid
     )
     .unwrap();
     fs::write(
-        tmp.path().join("services").join("task_service.py"),
-        "from models.enums import TaskStatus\n\nif task.status == TaskStatus.TODO:\n    pass\n",
+        tmp.path().join("cli").join("header.py"),
+        "from models.enums import TaskStatus\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("services").join("runner.py"),
+        "from models.enums import TaskStatus\n\nif task.status == TaskStatus.TODO:\n    run()\nif previous_status == TaskStatus.TODO:\n    audit()\n",
     )
     .unwrap();
 
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: models/enums.py]",
-            "[read_file: services/task_service.py]",
-            "TaskStatus is used in services/task_service.py.",
+            "TaskStatus is used in services/runner.py.",
         ],
         tmp.path(),
     );
@@ -277,12 +281,19 @@ fn usage_lookup_definition_only_read_does_not_satisfy_evidence_when_usage_candid
         .join("\n");
     assert_eq!(
         all_user.matches("=== tool_result: read_file ===").count(),
-        2,
-        "definition-only read must auto-dispatch the usage-file read (enums.py + task_service.py)"
+        1,
+        "runtime should dispatch exactly one preferred usage read after search"
     );
     assert!(
-        !all_user.contains("[runtime:correction] This is a usage lookup"),
-        "definition-only recovery must not inject a text correction when RuntimeDispatch is used"
+        all_user.contains("audit()"),
+        "preferred substantive candidate should be read first: {all_user}"
+    );
+    assert!(
+        !all_user.contains("TODO = \"todo\"")
+            && !all_user.contains(
+                "=== tool_result: read_file ===\n[1 lines]\nfrom models.enums import TaskStatus"
+            ),
+        "definition-only and import-only files must not be selected first: {all_user}"
     );
 
     let answer_source = events.iter().find_map(|e| {
@@ -303,7 +314,7 @@ fn usage_lookup_definition_only_read_does_not_satisfy_evidence_when_usage_candid
         .map(|m| m.content.as_str());
     assert_eq!(
         last_assistant,
-        Some("TaskStatus is used in services/task_service.py.")
+        Some("TaskStatus is used in services/runner.py.")
     );
 }
 
@@ -323,7 +334,6 @@ fn usage_lookup_all_definition_candidates_fallback_allows_definition_read() {
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: models/enums.py]",
             "Only the TaskStatus definition was found.",
         ],
         tmp.path(),
@@ -338,6 +348,21 @@ fn usage_lookup_all_definition_candidates_fallback_allows_definition_read() {
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
     let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        1,
+        "all-definition fallback should perform exactly one read"
+    );
+    assert!(
+        all_user.contains("TODO = \"todo\""),
+        "all-definition fallback should still read the definition candidate: {all_user}"
+    );
     assert!(
         !snapshot
             .iter()
@@ -373,7 +398,6 @@ fn usage_lookup_mixed_definition_and_usage_file_is_useful_immediately() {
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: models/task_status.py]",
             "TaskStatus is defined and used in models/task_status.py.",
         ],
         tmp.path(),
@@ -388,6 +412,21 @@ fn usage_lookup_mixed_definition_and_usage_file_is_useful_immediately() {
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
     let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        1,
+        "mixed candidate should still be read exactly once"
+    );
+    assert!(
+        all_user.contains("TODO = \"todo\""),
+        "mixed definition+usage candidate should still be read before synthesis: {all_user}"
+    );
     assert!(
         !snapshot
             .iter()
@@ -568,35 +607,34 @@ fn repeated_pre_evidence_synthesis_is_suppressed_until_read() {
 }
 
 #[test]
-fn two_candidate_reads_second_satisfies_evidence_admits_synthesis() {
-    // Usage lookup: two search candidates (definition + usage).
-    // First read is definition-only -> recovery correction fires.
-    // Second read is a usage candidate -> evidence ready -> synthesis admitted.
-    // Validates that candidate_reads_count reaching 2 does not prematurely terminate
-    // when the second read satisfies evidence.
+fn usage_lookup_prefers_normal_source_over_initialization_candidate() {
     use std::fs;
     use tempfile::TempDir;
 
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join("models")).unwrap();
-    fs::create_dir_all(tmp.path().join("services")).unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox/init")).unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
     fs::write(
         tmp.path().join("models").join("enums.py"),
         "class TaskStatus(str, Enum):\n    PENDING = \"pending\"\n",
     )
     .unwrap();
     fs::write(
-        tmp.path().join("services").join("runner.py"),
-        "from models.enums import TaskStatus\nif task.status == TaskStatus.PENDING:\n    run()\n",
+        tmp.path().join("sandbox/init").join("bootstrap.py"),
+        "initialize_task_status(TaskStatus.PENDING)\nINITIALIZED_STATUS = TaskStatus.PENDING\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("sandbox/services").join("runner.py"),
+        "if task.status == TaskStatus.PENDING:\n    run()\n",
     )
     .unwrap();
 
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: models/enums.py]",
-            "[read_file: services/runner.py]",
-            "TaskStatus is used in services/runner.py.",
+            "TaskStatus is used in sandbox/services/runner.py.",
         ],
         tmp.path(),
     );
@@ -604,11 +642,26 @@ fn two_candidate_reads_second_satisfies_evidence_admits_synthesis() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "Where is TaskStatus used?".into(),
+            text: "Where is TaskStatus used in sandbox/".into(),
         },
     );
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all_user.contains("run()"),
+        "normal source file should win over initialization candidate: {all_user}"
+    );
+    assert!(
+        !all_user.contains("=== tool_result: read_file ===\n[2 lines]\ninitialize_task_status("),
+        "initialization candidate must not be selected first when a normal source file exists: {all_user}"
+    );
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -618,9 +671,8 @@ fn two_candidate_reads_second_satisfies_evidence_admits_synthesis() {
     });
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
-        "second candidate read satisfying evidence must admit synthesis: {answer_source:?}"
+        "preferred usage candidate should admit synthesis immediately: {answer_source:?}"
     );
-    let snapshot = rt.messages_snapshot();
     let last_assistant = snapshot
         .iter()
         .rev()
@@ -628,7 +680,7 @@ fn two_candidate_reads_second_satisfies_evidence_admits_synthesis() {
         .map(|m| m.content.as_str());
     assert_eq!(
         last_assistant,
-        Some("TaskStatus is used in services/runner.py.")
+        Some("TaskStatus is used in sandbox/services/runner.py.")
     );
 }
 
@@ -720,17 +772,13 @@ fn third_candidate_read_after_two_insufficient_reads_is_blocked_pre_dispatch() {
         "runtime must auto-dispatch task_service.py as the second candidate read"
     );
     assert!(
-        !all_user.contains("=== tool_result: read_file ===\npath: models/alt_enums.py"),
+        !all_user.contains("DONE = \"done\""),
         "alt candidate must not be dispatched after the two-candidate cap"
     );
 }
 
 #[test]
 fn import_only_candidate_rejected_when_non_import_candidate_exists() {
-    // File A: only an import line -> classified import-only.
-    // File B: a usage line -> classified as non-import candidate.
-    // Model reads A first -> correction fires pointing to B.
-    // Model reads B -> evidence ready -> ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -751,8 +799,6 @@ fn import_only_candidate_rejected_when_non_import_candidate_exists() {
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: init/header.py]",
-            "[read_file: services/task_service.py]",
             "TaskStatus is used in services/task_service.py.",
         ],
         tmp.path(),
@@ -766,6 +812,28 @@ fn import_only_candidate_rejected_when_non_import_candidate_exists() {
     );
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        1,
+        "runtime should select one preferred candidate read"
+    );
+    assert!(
+        all_user.contains("pass\n"),
+        "substantive usage file must be selected: {all_user}"
+    );
+    assert!(
+        !all_user.contains(
+            "=== tool_result: read_file ===\n[1 lines]\nfrom models.enums import TaskStatus"
+        ),
+        "import-only candidate must lose to substantive usage file: {all_user}"
+    );
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -775,9 +843,8 @@ fn import_only_candidate_rejected_when_non_import_candidate_exists() {
     });
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
-        "import-only rejection + non-import read must admit synthesis: {answer_source:?}"
+        "preferred substantive usage read must admit synthesis: {answer_source:?}"
     );
-    let snapshot = rt.messages_snapshot();
     let last_assistant = snapshot
         .iter()
         .rev()
@@ -808,7 +875,6 @@ fn import_only_fallback_accepts_when_all_candidates_are_import_only() {
     let mut rt = make_runtime_in(
         vec![
             "[search_code: TaskStatus]",
-            "[read_file: models/enums.py]",
             "TaskStatus is imported from models.enums.",
         ],
         tmp.path(),
@@ -822,6 +888,22 @@ fn import_only_fallback_accepts_when_all_candidates_are_import_only() {
     );
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        1,
+        "all-import fallback should perform exactly one read"
+    );
+    assert!(
+        all_user.contains("from models.enums import TaskStatus"),
+        "all-import fallback should still read the single candidate: {all_user}"
+    );
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -833,7 +915,6 @@ fn import_only_fallback_accepts_when_all_candidates_are_import_only() {
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
         "all-import-only candidates must fall back to accepting the read: {answer_source:?}"
     );
-    let snapshot = rt.messages_snapshot();
     let last_assistant = snapshot
         .iter()
         .rev()

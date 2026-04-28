@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::tools::ToolOutput;
@@ -386,6 +386,10 @@ pub(super) struct InvestigationState {
     /// Candidate paths where every matched line looks like a definition site.
     /// Populated during record_search_results alongside search_candidate_paths.
     definition_only_candidates: HashSet<String>,
+    /// Count of matched lines per candidate that are not definition sites.
+    /// Preserves only search-result-local evidence and is used for UsageLookup
+    /// candidate quality ranking after search_code succeeds.
+    non_definition_match_counts: HashMap<String, usize>,
     /// Candidate paths where at least one matched line is an exact definition of the
     /// queried symbol (weaker than definition_only_candidates, which requires all lines).
     /// Used exclusively by DefinitionLookup: Gate 8 and first_definition_candidate.
@@ -479,6 +483,7 @@ impl InvestigationState {
             files_read_count: 0,
             search_candidate_paths: Vec::new(),
             definition_only_candidates: HashSet::new(),
+            non_definition_match_counts: HashMap::new(),
             definition_site_candidates: HashSet::new(),
             has_non_definition_candidates: false,
             read_useful_candidate: false,
@@ -575,6 +580,7 @@ impl InvestigationState {
             self.search_produced_results = true;
             self.search_candidate_paths.clear();
             self.definition_only_candidates.clear();
+            self.non_definition_match_counts.clear();
             self.definition_site_candidates.clear();
             self.has_non_definition_candidates = false;
             self.import_only_candidates.clear();
@@ -608,6 +614,7 @@ impl InvestigationState {
             // save: at least one matched line contains an exact save term.
             // lockfile: exact filename match against known lockfile basenames.
             let mut file_has_non_def: HashSet<String> = HashSet::new();
+            let mut file_non_definition_counts: HashMap<String, usize> = HashMap::new();
             let mut file_has_exact_def: HashSet<String> = HashSet::new();
             let mut file_has_non_import: HashSet<String> = HashSet::new();
             let mut file_has_initialization: HashSet<String> = HashSet::new();
@@ -621,6 +628,9 @@ impl InvestigationState {
                     None => !looks_like_definition(&m.line),
                 } {
                     file_has_non_def.insert(m.file.clone());
+                    *file_non_definition_counts
+                        .entry(m.file.clone())
+                        .or_insert(0) += 1;
                 }
                 if let Some(sym) = query {
                     if looks_like_definition_of_symbol(&m.line, sym) {
@@ -649,6 +659,10 @@ impl InvestigationState {
             for path in &self.search_candidate_paths {
                 if file_has_non_def.contains(path) {
                     self.has_non_definition_candidates = true;
+                    if let Some(count) = file_non_definition_counts.get(path) {
+                        self.non_definition_match_counts
+                            .insert(path.clone(), *count);
+                    }
                 } else {
                     self.definition_only_candidates.insert(path.clone());
                 }
@@ -1212,6 +1226,21 @@ impl InvestigationState {
             .map(String::as_str)
     }
 
+    pub(super) fn preferred_usage_candidate(&self) -> Option<&str> {
+        let mut best_index = None;
+        let mut best_key = None;
+
+        for (index, path) in self.search_candidate_paths.iter().enumerate() {
+            let key = self.usage_candidate_quality_key(path, index);
+            if best_key.as_ref().is_none_or(|current| key < *current) {
+                best_key = Some(key);
+                best_index = Some(index);
+            }
+        }
+
+        best_index.map(|index| self.search_candidate_paths[index].as_str())
+    }
+
     fn first_definition_candidate(&self) -> Option<&str> {
         self.search_candidate_paths
             .iter()
@@ -1278,6 +1307,28 @@ impl InvestigationState {
                 !self.lockfile_candidates.contains(*path) && is_source_candidate_path(path)
             })
             .map(String::as_str)
+    }
+
+    fn usage_candidate_quality_key(&self, path: &str, index: usize) -> (u8, u8, u8, usize, usize) {
+        let is_definition_only = self.definition_only_candidates.contains(path);
+        let is_import_only = self.import_only_candidates.contains(path);
+        let is_normal_source = is_source_candidate_path(path)
+            && !self.config_file_candidates.contains(path)
+            && !self.initialization_candidates.contains(path)
+            && !self.lockfile_candidates.contains(path);
+        let non_definition_match_count = self
+            .non_definition_match_counts
+            .get(path)
+            .copied()
+            .unwrap_or(0);
+
+        (
+            u8::from(is_definition_only),
+            u8::from(is_import_only),
+            u8::from(!is_normal_source),
+            usize::MAX - non_definition_match_count,
+            index,
+        )
     }
 
     /// Returns a mode-specific candidate preference hint after a search, or None when:
@@ -2040,6 +2091,78 @@ mod tests {
                 .candidate_preference_hint(InvestigationMode::UsageLookup)
                 .is_none(),
             "UsageLookup must produce no candidate hint"
+        );
+    }
+
+    #[test]
+    fn preferred_usage_candidate_prefers_substantive_source_over_import_only_and_definition() {
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("models/enums.py", "class TaskStatus(str, Enum):"),
+            ("cli/header.py", "from models.enums import TaskStatus"),
+            (
+                "services/runner.py",
+                "if task.status == TaskStatus.PENDING:",
+            ),
+            ("services/runner.py", "audit_status(TaskStatus.PENDING)"),
+        ]);
+        state.record_search_results(&output, Some("TaskStatus"), &mut |_| {});
+
+        assert_eq!(
+            state.preferred_usage_candidate(),
+            Some("services/runner.py"),
+            "substantive source file should outrank definition-only and import-only candidates"
+        );
+    }
+
+    #[test]
+    fn preferred_usage_candidate_prefers_normal_source_over_initialization_candidate() {
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("models/enums.py", "class TaskStatus(str, Enum):"),
+            (
+                "sandbox/init/bootstrap.py",
+                "initialize_task_status(TaskStatus.PENDING)",
+            ),
+            (
+                "sandbox/init/bootstrap.py",
+                "INITIALIZED_STATUS = TaskStatus.PENDING",
+            ),
+            (
+                "sandbox/services/runner.py",
+                "if task.status == TaskStatus.PENDING:",
+            ),
+        ]);
+        state.record_search_results(&output, Some("TaskStatus"), &mut |_| {});
+
+        assert_eq!(
+            state.preferred_usage_candidate(),
+            Some("sandbox/services/runner.py"),
+            "normal source files should outrank initialization candidates for UsageLookup"
+        );
+    }
+
+    #[test]
+    fn preferred_usage_candidate_is_deterministic_for_same_inputs() {
+        let matches = vec![
+            ("models/enums.py", "class TaskStatus(str, Enum):"),
+            ("cli/header.py", "from models.enums import TaskStatus"),
+            (
+                "services/runner.py",
+                "if task.status == TaskStatus.PENDING:",
+            ),
+        ];
+        let mut state1 = InvestigationState::new();
+        let mut state2 = InvestigationState::new();
+        let output1 = make_search_output_for_hint(matches.clone());
+        let output2 = make_search_output_for_hint(matches);
+        state1.record_search_results(&output1, Some("TaskStatus"), &mut |_| {});
+        state2.record_search_results(&output2, Some("TaskStatus"), &mut |_| {});
+
+        assert_eq!(
+            state1.preferred_usage_candidate(),
+            state2.preferred_usage_candidate(),
+            "preferred usage candidate selection must be deterministic"
         );
     }
 
