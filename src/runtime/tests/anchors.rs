@@ -489,15 +489,13 @@ fn repeat_last_search_dispatches_one_search_code() {
 
     let search_starts = events
         .iter()
-        .filter(
-            |e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "search_code"),
-        )
+        .filter(|e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "search_code"))
         .count();
     assert_eq!(search_starts, 1, "replay must dispatch exactly one search");
     assert!(
-        !events.iter().any(
-            |e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "read_file")
-        ),
+        !events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "read_file")),
         "search replay must not auto-read candidates: {events:?}"
     );
     assert!(

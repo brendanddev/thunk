@@ -26,9 +26,9 @@ fn make_openai(config: &Config) -> Result<Box<dyn ModelBackend>> {
 }
 
 const BACKEND_REGISTRY: &[(&str, BackendFactory)] = &[
-    ("mock",      make_mock),
+    ("mock", make_mock),
     ("llama_cpp", make_llama_cpp),
-    ("openai",    make_openai),
+    ("openai", make_openai),
 ];
 
 pub fn build_backend(config: &Config) -> Result<Box<dyn ModelBackend>> {

@@ -208,9 +208,7 @@ fn sort_by_file_group_priority(matches: Vec<SearchMatch>, query: &str) -> Vec<Se
         let has_exact_def = file_matches
             .iter()
             .any(|m| is_exact_symbol_definition(&m.line, query));
-        let has_all_def = file_matches
-            .iter()
-            .all(|m| looks_like_definition(&m.line));
+        let has_all_def = file_matches.iter().all(|m| looks_like_definition(&m.line));
         (class, !has_exact_def, !has_all_def)
     });
     groups.into_iter().flat_map(|(_, ms)| ms).collect()
@@ -224,14 +222,31 @@ fn sort_by_file_group_priority(matches: Vec<SearchMatch>, query: &str) -> Vec<Se
 fn is_exact_symbol_definition(line: &str, query: &str) -> bool {
     let line = line.trim_start();
     let def_prefixes = [
-        "pub struct ", "pub const ", "pub static ", "pub enum ", "pub fn ",
-        "pub type ", "pub trait ", "function ", "interface ", "struct ",
-        "enum ", "class ", "impl ", "const ", "trait ", "def ", "func ",
-        "type ", "fn ",
+        "pub struct ",
+        "pub const ",
+        "pub static ",
+        "pub enum ",
+        "pub fn ",
+        "pub type ",
+        "pub trait ",
+        "function ",
+        "interface ",
+        "struct ",
+        "enum ",
+        "class ",
+        "impl ",
+        "const ",
+        "trait ",
+        "def ",
+        "func ",
+        "type ",
+        "fn ",
     ];
     for prefix in def_prefixes {
         if let Some(after_prefix) = line.strip_prefix(prefix) {
-            let first_ident = after_prefix.split(|c: char| !c.is_alphanumeric() && c != '_').next();
+            let first_ident = after_prefix
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next();
             if let Some(ident) = first_ident {
                 return ident == query;
             }
@@ -505,7 +520,10 @@ mod tests {
         // "Task" should not match lines that define "TaskStatus", "TaskRunner", etc.
         assert!(!is_exact_symbol_definition("class TaskStatus:", "Task"));
         assert!(!is_exact_symbol_definition("class TaskRunner(", "Task"));
-        assert!(!is_exact_symbol_definition("def TaskFactory(self):", "Task"));
+        assert!(!is_exact_symbol_definition(
+            "def TaskFactory(self):",
+            "Task"
+        ));
         assert!(!is_exact_symbol_definition("struct TaskManager {", "Task"));
         assert!(!is_exact_symbol_definition("pub enum TaskState {", "Task"));
     }
@@ -513,17 +531,32 @@ mod tests {
     #[test]
     fn is_exact_symbol_definition_rejects_type_annotations() {
         // Type annotations in function signatures should not match as definitions.
-        assert!(!is_exact_symbol_definition("def _format_task(task: Task) -> str:", "Task"));
-        assert!(!is_exact_symbol_definition("fn process_data(data: Task) -> Result", "Task"));
-        assert!(!is_exact_symbol_definition("def create_instance(task: Task) -> None:", "Task"));
+        assert!(!is_exact_symbol_definition(
+            "def _format_task(task: Task) -> str:",
+            "Task"
+        ));
+        assert!(!is_exact_symbol_definition(
+            "fn process_data(data: Task) -> Result",
+            "Task"
+        ));
+        assert!(!is_exact_symbol_definition(
+            "def create_instance(task: Task) -> None:",
+            "Task"
+        ));
     }
 
     #[test]
     fn is_exact_symbol_definition_rejects_non_definition_lines() {
         assert!(!is_exact_symbol_definition("x = Task()", "Task"));
         assert!(!is_exact_symbol_definition("let t = Task::new();", "Task"));
-        assert!(!is_exact_symbol_definition("return Task.from_dict(data)", "Task"));
-        assert!(!is_exact_symbol_definition("from models import Task", "Task"));
+        assert!(!is_exact_symbol_definition(
+            "return Task.from_dict(data)",
+            "Task"
+        ));
+        assert!(!is_exact_symbol_definition(
+            "from models import Task",
+            "Task"
+        ));
     }
 
     #[test]
@@ -551,7 +584,11 @@ mod tests {
     fn definition_file_promoted_over_usage_file_within_source_tier() {
         let tmp = TempDir::new().unwrap();
         // alpha.py alphabetically first; only usage lines
-        fs::write(tmp.path().join("alpha.py"), "x = Task()\ntask = Task.run()\n").unwrap();
+        fs::write(
+            tmp.path().join("alpha.py"),
+            "x = Task()\ntask = Task.run()\n",
+        )
+        .unwrap();
         // omega.py alphabetically later; has a definition line
         fs::write(tmp.path().join("omega.py"), "class Task:\n    pass\n").unwrap();
 
@@ -601,8 +638,16 @@ mod tests {
             panic!("expected Immediate(SearchResults)")
         };
 
-        let alpha_pos = sr.matches.iter().position(|m| m.file.ends_with("alpha.py")).unwrap();
-        let beta_pos = sr.matches.iter().position(|m| m.file.ends_with("beta.toml")).unwrap();
+        let alpha_pos = sr
+            .matches
+            .iter()
+            .position(|m| m.file.ends_with("alpha.py"))
+            .unwrap();
+        let beta_pos = sr
+            .matches
+            .iter()
+            .position(|m| m.file.ends_with("beta.toml"))
+            .unwrap();
         assert!(
             alpha_pos < beta_pos,
             "source tier must dominate over definition signal in config tier"
@@ -634,7 +679,14 @@ mod tests {
             "definition file must be promoted to first; first: {}",
             sr.matches[0].file
         );
-        let zzz_count = sr.matches.iter().filter(|m| m.file.ends_with("zzz.py")).count();
-        assert_eq!(zzz_count, 1, "definition match must be within the shown cap");
+        let zzz_count = sr
+            .matches
+            .iter()
+            .filter(|m| m.file.ends_with("zzz.py"))
+            .count();
+        assert_eq!(
+            zzz_count, 1,
+            "definition match must be within the shown cap"
+        );
     }
 }

@@ -1,6 +1,6 @@
+use super::super::tool_surface::{select_tool_surface, ToolSurface};
 use super::*;
 use crate::runtime::types::RuntimeTerminalReason;
-use super::super::tool_surface::{select_tool_surface, ToolSurface};
 
 #[test]
 fn weak_search_query_rejects_first_attempt_then_allows_specific_recovery() {
@@ -41,7 +41,8 @@ fn weak_search_query_rejects_first_attempt_then_allows_specific_recovery() {
         snapshot
             .iter()
             .any(|m| m.content.contains("=== tool_error: search_code ===")
-                && m.content.contains("too broad for an investigation turn (git)")),
+                && m.content
+                    .contains("too broad for an investigation turn (git)")),
         "first weak search must be rejected with a runtime correction"
     );
     assert!(
@@ -143,7 +144,8 @@ fn rendered_lookup_enables_weak_query_guard_after_surface_rejection() {
         snapshot
             .iter()
             .any(|m| m.content.contains("=== tool_error: search_code ===")
-                && m.content.contains("too broad for an investigation turn (git)")),
+                && m.content
+                    .contains("too broad for an investigation turn (git)")),
         "first weak git search should receive the weak-query correction"
     );
     assert!(

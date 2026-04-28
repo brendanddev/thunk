@@ -670,14 +670,31 @@ pub fn looks_like_definition(line: &str) -> bool {
 fn is_exact_symbol_definition(line: &str, query: &str) -> bool {
     let line = line.trim_start();
     let def_prefixes = [
-        "pub struct ", "pub const ", "pub static ", "pub enum ", "pub fn ",
-        "pub type ", "pub trait ", "function ", "interface ", "struct ",
-        "enum ", "class ", "impl ", "const ", "trait ", "def ", "func ",
-        "type ", "fn ",
+        "pub struct ",
+        "pub const ",
+        "pub static ",
+        "pub enum ",
+        "pub fn ",
+        "pub type ",
+        "pub trait ",
+        "function ",
+        "interface ",
+        "struct ",
+        "enum ",
+        "class ",
+        "impl ",
+        "const ",
+        "trait ",
+        "def ",
+        "func ",
+        "type ",
+        "fn ",
     ];
     for prefix in def_prefixes {
         if let Some(after_prefix) = line.strip_prefix(prefix) {
-            let first_ident = after_prefix.split(|c: char| !c.is_alphanumeric() && c != '_').next();
+            let first_ident = after_prefix
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next();
             if let Some(ident) = first_ident {
                 return ident == query;
             }
@@ -709,7 +726,10 @@ fn definition_site_file<'a>(
         if !is_source_tier(file) {
             continue;
         }
-        if matches.iter().any(|m| is_exact_symbol_definition(&m.line, query)) {
+        if matches
+            .iter()
+            .any(|m| is_exact_symbol_definition(&m.line, query))
+        {
             exact_count += 1;
             exact_found = Some(file);
         } else if matches.iter().all(|m| looks_like_definition(&m.line)) {
@@ -769,9 +789,11 @@ fn render_search_results_grouped(
         let query = &s.query;
         groups.sort_by_key(|(file, matches)| {
             let has_exact_def = is_source_tier(file)
-                && matches.iter().any(|m| is_exact_symbol_definition(&m.line, query));
-            let has_all_def = is_source_tier(file)
-                && matches.iter().all(|m| looks_like_definition(&m.line));
+                && matches
+                    .iter()
+                    .any(|m| is_exact_symbol_definition(&m.line, query));
+            let has_all_def =
+                is_source_tier(file) && matches.iter().all(|m| looks_like_definition(&m.line));
             (!has_exact_def, !has_all_def)
         });
     }
@@ -789,7 +811,9 @@ fn render_search_results_grouped(
         let total_in_file = group_matches.len();
         let shown = total_in_file.min(MAX_LINES_PER_FILE);
         let is_exact_def = s.query.len() > 0
-            && group_matches.iter().any(|m| is_exact_symbol_definition(&m.line, &s.query));
+            && group_matches
+                .iter()
+                .any(|m| is_exact_symbol_definition(&m.line, &s.query));
         let header = if is_exact_def {
             format!("{} [EXACT DEFINITION] ({} matches)", file, total_in_file)
         } else if shown < total_in_file {
@@ -2184,13 +2208,19 @@ mod tests {
         // Definition file listed second in raw search order → must appear first after ordering
         let output = make_search_output(
             vec![
-                make_match("sandbox/cli/commands.py", 10, "from models.enums import TaskStatus"),
+                make_match(
+                    "sandbox/cli/commands.py",
+                    10,
+                    "from models.enums import TaskStatus",
+                ),
                 make_match("sandbox/models/enums.py", 5, "class TaskStatus(str, Enum):"),
             ],
             2,
         );
         let body = {
-            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            let ToolOutput::SearchResults(ref s) = output else {
+                panic!()
+            };
             render_search_results_grouped(s, true)
         };
         let pos_enums = body.find("sandbox/models/enums.py").unwrap();
@@ -2213,14 +2243,22 @@ mod tests {
             3,
         );
         let body = {
-            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            let ToolOutput::SearchResults(ref s) = output else {
+                panic!()
+            };
             render_search_results_grouped(s, true)
         };
         let pos_a = body.find("sandbox/models/a.py").unwrap();
         let pos_b = body.find("sandbox/models/b.py").unwrap();
         let pos_cmd = body.find("sandbox/cli/commands.py").unwrap();
-        assert!(pos_a < pos_b, "a.py must remain before b.py among definition files");
-        assert!(pos_b < pos_cmd, "definition files must precede non-definition files");
+        assert!(
+            pos_a < pos_b,
+            "a.py must remain before b.py among definition files"
+        );
+        assert!(
+            pos_b < pos_cmd,
+            "definition files must precede non-definition files"
+        );
     }
 
     #[test]
@@ -2229,13 +2267,19 @@ mod tests {
         let output = make_search_output(
             vec![
                 make_match("sandbox/models/enums.py", 1, "class TaskStatus(str, Enum):"),
-                make_match("sandbox/cli/import.py", 10, "from models.enums import TaskStatus"),
+                make_match(
+                    "sandbox/cli/import.py",
+                    10,
+                    "from models.enums import TaskStatus",
+                ),
                 make_match("sandbox/cli/usage.py", 20, "status = TaskStatus.DONE"),
             ],
             3,
         );
         let body = {
-            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            let ToolOutput::SearchResults(ref s) = output else {
+                panic!()
+            };
             render_search_results_grouped(s, true)
         };
         let pos_import = body.find("sandbox/cli/import.py").unwrap();
@@ -2251,13 +2295,19 @@ mod tests {
         // sort_definitions_first=false must be bit-for-bit identical to render_output
         let output = make_search_output(
             vec![
-                make_match("sandbox/cli/commands.py", 10, "from models.enums import TaskStatus"),
+                make_match(
+                    "sandbox/cli/commands.py",
+                    10,
+                    "from models.enums import TaskStatus",
+                ),
                 make_match("sandbox/models/enums.py", 5, "class TaskStatus(str, Enum):"),
             ],
             2,
         );
         let unordered_body = render_output(&output);
-        let ToolOutput::SearchResults(ref s) = output else { panic!() };
+        let ToolOutput::SearchResults(ref s) = output else {
+            panic!()
+        };
         let also_unordered = render_search_results_grouped(s, false);
         assert_eq!(
             unordered_body, also_unordered,
@@ -2279,7 +2329,9 @@ mod tests {
         );
         // With sort: enums.py (definition) must appear before both usage files
         let body = {
-            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            let ToolOutput::SearchResults(ref s) = output else {
+                panic!()
+            };
             render_search_results_grouped(s, true)
         };
         // Find positions of the file group headers (not preamble)
@@ -2303,13 +2355,19 @@ mod tests {
         let output = make_search_output(
             vec![
                 make_match("README.md", 5, "class TaskStatus handles task state"),
-                make_match("sandbox/cli/commands.py", 10, "from models.enums import TaskStatus"),
+                make_match(
+                    "sandbox/cli/commands.py",
+                    10,
+                    "from models.enums import TaskStatus",
+                ),
                 make_match("sandbox/models/enums.py", 1, "class TaskStatus(str, Enum):"),
             ],
             3,
         );
         let body = {
-            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            let ToolOutput::SearchResults(ref s) = output else {
+                panic!()
+            };
             render_search_results_grouped(s, true)
         };
         let pos_readme = body.find("README.md").unwrap();
@@ -2348,7 +2406,9 @@ mod tests {
             truncated: false,
         });
         let body = {
-            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            let ToolOutput::SearchResults(ref s) = output else {
+                panic!()
+            };
             render_search_results_grouped(s, true)
         };
         let pos_task = body.find("sandbox/models/task.py").unwrap();
@@ -2383,14 +2443,20 @@ mod tests {
         // All files are usage/import files — no definitions present — order unchanged
         let output = make_search_output(
             vec![
-                make_match("sandbox/cli/commands.py", 10, "from models.enums import TaskStatus"),
+                make_match(
+                    "sandbox/cli/commands.py",
+                    10,
+                    "from models.enums import TaskStatus",
+                ),
                 make_match("sandbox/services/task.py", 20, "status = TaskStatus.DONE"),
             ],
             2,
         );
         let unordered_body = render_output(&output);
         let body = {
-            let ToolOutput::SearchResults(ref s) = output else { panic!() };
+            let ToolOutput::SearchResults(ref s) = output else {
+                panic!()
+            };
             render_search_results_grouped(s, true)
         };
         // When no definition files exist, sort changes nothing

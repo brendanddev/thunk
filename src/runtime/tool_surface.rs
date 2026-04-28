@@ -162,7 +162,15 @@ fn prompt_requests_directory_navigation(prompt: &str) -> bool {
     let tokens = normalized_prompt_tokens(prompt);
     const NAV_VERBS: &[&str] = &["list", "show", "display", "tree", "explore"];
     const STRUCTURAL_KEYWORDS: &[&str] = &[
-        "files", "file", "directory", "dir", "dirs", "structure", "contents", "folders", "folder",
+        "files",
+        "file",
+        "directory",
+        "dir",
+        "dirs",
+        "structure",
+        "contents",
+        "folders",
+        "folder",
     ];
     let has_nav_verb = tokens.iter().any(|t| NAV_VERBS.contains(&t.as_str()));
     if !has_nav_verb {

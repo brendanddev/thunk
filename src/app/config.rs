@@ -18,15 +18,15 @@ pub enum AllowedCommandTool {
 impl AllowedCommandTool {
     fn from_str(s: &str) -> Option<Self> {
         match s {
-            "read_file"   => Some(Self::ReadFile),
+            "read_file" => Some(Self::ReadFile),
             "search_code" => Some(Self::SearchCode),
-            _             => None,
+            _ => None,
         }
     }
 
     fn required_arg_key(self) -> &'static str {
         match self {
-            Self::ReadFile   => "path",
+            Self::ReadFile => "path",
             Self::SearchCode => "query",
         }
     }
@@ -94,8 +94,8 @@ impl<'de> Deserialize<'de> for CustomCommandDef {
 
 /// Built-in command names that custom commands must not shadow.
 const BUILTIN_COMMAND_NAMES: &[&str] = &[
-    "help", "quit", "exit", "clear", "approve", "reject",
-    "last", "anchors", "history", "read", "search",
+    "help", "quit", "exit", "clear", "approve", "reject", "last", "anchors", "history", "read",
+    "search",
 ];
 
 fn validate_command_names(commands: &HashMap<String, CustomCommandDef>) -> Result<()> {
@@ -272,7 +272,9 @@ pub fn load(path: &Path) -> Result<Config> {
 mod tests {
     use std::path::Path;
 
-    use super::{AllowedCommandTool, Config, CustomCommandDef, LlamaCppConfig, validate_command_names};
+    use super::{
+        validate_command_names, AllowedCommandTool, Config, CustomCommandDef, LlamaCppConfig,
+    };
 
     fn parse_config(toml: &str) -> Config {
         toml::from_str(toml).expect("config parse failed")
@@ -287,11 +289,13 @@ mod tests {
 
     #[test]
     fn custom_search_command_parses_correctly() {
-        let cfg = parse_config(r#"
+        let cfg = parse_config(
+            r#"
             [commands.find_def]
             tool = "search_code"
             args = { query = "{input}" }
-        "#);
+        "#,
+        );
         let def = cfg.commands.get("find_def").expect("find_def missing");
         assert_eq!(def.tool, AllowedCommandTool::SearchCode);
         assert_eq!(def.template, "{input}");
@@ -299,11 +303,13 @@ mod tests {
 
     #[test]
     fn custom_read_command_parses_correctly() {
-        let cfg = parse_config(r#"
+        let cfg = parse_config(
+            r#"
             [commands.show]
             tool = "read_file"
             args = { path = "src/{input}" }
-        "#);
+        "#,
+        );
         let def = cfg.commands.get("show").expect("show missing");
         assert_eq!(def.tool, AllowedCommandTool::ReadFile);
         assert_eq!(def.template, "src/{input}");
@@ -311,51 +317,67 @@ mod tests {
 
     #[test]
     fn unknown_tool_is_rejected() {
-        let err = parse_config_err(r#"
+        let err = parse_config_err(
+            r#"
             [commands.bad]
             tool = "write_file"
             args = { path = "{input}" }
-        "#);
+        "#,
+        );
         assert!(err.contains("unknown tool"), "unexpected error: {err}");
     }
 
     #[test]
     fn wrong_arg_key_is_rejected() {
-        let err = parse_config_err(r#"
+        let err = parse_config_err(
+            r#"
             [commands.bad]
             tool = "search_code"
             args = { path = "{input}" }
-        "#);
-        assert!(err.contains("missing required arg key"), "unexpected error: {err}");
+        "#,
+        );
+        assert!(
+            err.contains("missing required arg key"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn extra_arg_key_is_rejected() {
-        let err = parse_config_err(r#"
+        let err = parse_config_err(
+            r#"
             [commands.bad]
             tool = "search_code"
             args = { query = "{input}", extra = "value" }
-        "#);
-        assert!(err.contains("exactly one arg key"), "unexpected error: {err}");
+        "#,
+        );
+        assert!(
+            err.contains("exactly one arg key"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn missing_input_placeholder_is_rejected() {
-        let err = parse_config_err(r#"
+        let err = parse_config_err(
+            r#"
             [commands.bad]
             tool = "search_code"
             args = { query = "hardcoded" }
-        "#);
+        "#,
+        );
         assert!(err.contains("exactly once"), "unexpected error: {err}");
     }
 
     #[test]
     fn duplicate_input_placeholder_is_rejected() {
-        let err = parse_config_err(r#"
+        let err = parse_config_err(
+            r#"
             [commands.bad]
             tool = "search_code"
             args = { query = "{input}{input}" }
-        "#);
+        "#,
+        );
         assert!(err.contains("exactly once"), "unexpected error: {err}");
     }
 
@@ -365,7 +387,10 @@ mod tests {
         let mut commands = HashMap::new();
         commands.insert(
             "bad-name".to_string(),
-            CustomCommandDef { tool: AllowedCommandTool::SearchCode, template: "{input}".to_string() },
+            CustomCommandDef {
+                tool: AllowedCommandTool::SearchCode,
+                template: "{input}".to_string(),
+            },
         );
         let err = validate_command_names(&commands).unwrap_err();
         assert!(err.to_string().contains("lowercase letters"), "{err}");
@@ -377,10 +402,16 @@ mod tests {
         let mut commands = HashMap::new();
         commands.insert(
             "search".to_string(),
-            CustomCommandDef { tool: AllowedCommandTool::SearchCode, template: "{input}".to_string() },
+            CustomCommandDef {
+                tool: AllowedCommandTool::SearchCode,
+                template: "{input}".to_string(),
+            },
         );
         let err = validate_command_names(&commands).unwrap_err();
-        assert!(err.to_string().contains("conflicts with a built-in"), "{err}");
+        assert!(
+            err.to_string().contains("conflicts with a built-in"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -51,23 +51,23 @@ pub fn parse(input: &str) -> Option<Result<Command, ParseError>> {
     let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
 
     match name {
-        "/help"           => Some(Ok(Command::Help)),
+        "/help" => Some(Ok(Command::Help)),
         "/quit" | "/exit" => Some(Ok(Command::Quit)),
-        "/clear"          => Some(Ok(Command::Clear)),
-        "/approve"        => Some(Ok(Command::Approve)),
-        "/reject"         => Some(Ok(Command::Reject)),
-        "/last"           => Some(Ok(Command::Last)),
-        "/anchors"        => Some(Ok(Command::Anchors)),
-        "/history"        => Some(Ok(Command::History)),
+        "/clear" => Some(Ok(Command::Clear)),
+        "/approve" => Some(Ok(Command::Approve)),
+        "/reject" => Some(Ok(Command::Reject)),
+        "/last" => Some(Ok(Command::Last)),
+        "/anchors" => Some(Ok(Command::Anchors)),
+        "/history" => Some(Ok(Command::History)),
         "/read" => match arg {
-            Some(path)  => Some(Ok(Command::Read(path.to_string()))),
-            None        => Some(Err(ParseError::MissingArgument { command: "/read" })),
+            Some(path) => Some(Ok(Command::Read(path.to_string()))),
+            None => Some(Err(ParseError::MissingArgument { command: "/read" })),
         },
         "/search" => match arg {
             Some(query) => Some(Ok(Command::Search(query.to_string()))),
-            None        => Some(Err(ParseError::MissingArgument { command: "/search" })),
+            None => Some(Err(ParseError::MissingArgument { command: "/search" })),
         },
-        _                 => Some(Err(ParseError::UnknownCommand)),
+        _ => Some(Err(ParseError::UnknownCommand)),
     }
 }
 

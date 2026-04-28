@@ -269,8 +269,8 @@ fn missing_read_file_error_terminates_without_retry_loop() {
         })
         .count();
     assert_eq!(
-        assistant_read_calls, 1,
-        "read_file must not be retried in a loop"
+        assistant_read_calls, 0,
+        "seeded direct-read failure must not consume any backend retry"
     );
     assert!(
         !events

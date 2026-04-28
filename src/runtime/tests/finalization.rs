@@ -148,14 +148,14 @@ fn initialization_recovery_extra_tool_after_evidence_ready_enters_answer_only_mo
         "runtime must switch to answer-only mode after accepted recovery evidence"
     );
     assert!(
-        !all_user.contains(
-            "=== tool_result: read_file ===\npath: sandbox/services/logging_usage.py\n"
-        ) || all_user
-            .matches(
-                "=== tool_result: read_file ===\npath: sandbox/services/logging_usage.py\n"
-            )
-            .count()
-            == 1,
+        !all_user
+            .contains("=== tool_result: read_file ===\npath: sandbox/services/logging_usage.py\n")
+            || all_user
+                .matches(
+                    "=== tool_result: read_file ===\npath: sandbox/services/logging_usage.py\n"
+                )
+                .count()
+                == 1,
         "extra post-evidence read of the usage file must not dispatch"
     );
     let last_assistant = snapshot
@@ -272,7 +272,7 @@ fn direct_read_blocks_post_read_tool_call_with_answer_phase_correction() {
 
     let final_answer = "foo.rs defines a single function.";
     let mut rt = make_runtime_in(
-        vec!["[read_file: foo.rs]", "[search_code: foo]", final_answer],
+        vec!["[search_code: foo]", final_answer],
         tmp.path(),
     );
 

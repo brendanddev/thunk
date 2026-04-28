@@ -158,16 +158,18 @@ enum CommandAction {
 
 fn resolve_command(cmd: commands::Command) -> CommandAction {
     match cmd {
-        commands::Command::Help    => CommandAction::ShowHelp,
-        commands::Command::Quit    => CommandAction::Quit,
-        commands::Command::Clear   => CommandAction::ClearSession,
+        commands::Command::Help => CommandAction::ShowHelp,
+        commands::Command::Quit => CommandAction::Quit,
+        commands::Command::Clear => CommandAction::ClearSession,
         commands::Command::Approve => CommandAction::Runtime(RuntimeRequest::Approve),
-        commands::Command::Reject  => CommandAction::Runtime(RuntimeRequest::Reject),
-        commands::Command::Last    => CommandAction::Runtime(RuntimeRequest::QueryLast),
-        commands::Command::Anchors  => CommandAction::Runtime(RuntimeRequest::QueryAnchors),
-        commands::Command::History  => CommandAction::Runtime(RuntimeRequest::QueryHistory),
-        commands::Command::Read(path)   => CommandAction::Runtime(RuntimeRequest::ReadFile { path }),
-        commands::Command::Search(query) => CommandAction::Runtime(RuntimeRequest::SearchCode { query }),
+        commands::Command::Reject => CommandAction::Runtime(RuntimeRequest::Reject),
+        commands::Command::Last => CommandAction::Runtime(RuntimeRequest::QueryLast),
+        commands::Command::Anchors => CommandAction::Runtime(RuntimeRequest::QueryAnchors),
+        commands::Command::History => CommandAction::Runtime(RuntimeRequest::QueryHistory),
+        commands::Command::Read(path) => CommandAction::Runtime(RuntimeRequest::ReadFile { path }),
+        commands::Command::Search(query) => {
+            CommandAction::Runtime(RuntimeRequest::SearchCode { query })
+        }
     }
 }
 
@@ -223,7 +225,7 @@ fn resolve_custom_command(
 
     let value = def.template.replace("{input}", &arg_str);
     let req = match def.tool {
-        AllowedCommandTool::ReadFile   => RuntimeRequest::ReadFile { path: value },
+        AllowedCommandTool::ReadFile => RuntimeRequest::ReadFile { path: value },
         AllowedCommandTool::SearchCode => RuntimeRequest::SearchCode { query: value },
     };
     Some(Ok(req))
@@ -251,8 +253,8 @@ fn summarize_command_output(text: &str) -> String {
             let first = body.lines().next().unwrap_or("");
             match parse_read_file_header(first) {
                 Some((n, false)) => format!("read: {n} lines"),
-                Some((n, true))  => format!("read: {n} lines (truncated)"),
-                None             => "read: done".to_string(),
+                Some((n, true)) => format!("read: {n} lines (truncated)"),
+                None => "read: done".to_string(),
             }
         }
         "search_code" => {
@@ -341,7 +343,7 @@ fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{summarize_command_output, parse_read_file_header};
+    use super::{parse_read_file_header, summarize_command_output};
 
     fn tool_result(name: &str, body: &str) -> String {
         format!("=== tool_result: {name} ===\n{body}\n=== /tool_result ===\n\n")
@@ -393,7 +395,8 @@ mod tests {
 
     #[test]
     fn read_file_truncated_shows_line_count_and_truncated() {
-        let body = "[300 lines — showing first 200]\nfn main() {}\n[truncated: 100 lines not shown]";
+        let body =
+            "[300 lines — showing first 200]\nfn main() {}\n[truncated: 100 lines not shown]";
         let summary = summarize_command_output(&tool_result("read_file", body));
         assert_eq!(summary, "read: 300 lines (truncated)");
     }
@@ -416,7 +419,8 @@ mod tests {
 
     #[test]
     fn search_untruncated_counts_match_lines() {
-        let body = "src/main.rs (2 matches)\n  12: fn handle_request() {}\n  45: fn handle_response() {}";
+        let body =
+            "src/main.rs (2 matches)\n  12: fn handle_request() {}\n  45: fn handle_response() {}";
         let summary = summarize_command_output(&tool_result("search_code", body));
         assert_eq!(summary, "search: 2 matches");
     }

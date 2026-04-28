@@ -1,10 +1,10 @@
-use super::*;
-use crate::llm::backend::Role;
-use crate::tools::ToolInput;
 use super::super::prompt;
 use super::super::tool_surface::{
     select_tool_surface, tool_allowed_for_surface, SurfaceTool, ToolSurface,
 };
+use super::*;
+use crate::llm::backend::Role;
+use crate::tools::ToolInput;
 use std::sync::{Arc, Mutex};
 
 #[test]
@@ -14,7 +14,12 @@ fn tool_surface_defaults_to_retrieval_first_for_code_investigation_prompts() {
         ToolSurface::RetrievalFirst
     );
     assert_eq!(
-        select_tool_surface("Find where database is configured in sandbox/", true, false, false),
+        select_tool_surface(
+            "Find where database is configured in sandbox/",
+            true,
+            false,
+            false
+        ),
         ToolSurface::RetrievalFirst
     );
 }
@@ -161,10 +166,7 @@ fn tool_surface_find_without_secondary_condition_is_answer_only() {
     // common enough to warrant promotion, extend prompt_requests_directory_navigation to
     // catch path-scoped "find" queries, or add the missing secondary terms.  Do not widen
     // the policy until that data exists.
-    for prompt_text in [
-        "find where status is computed",
-        "find git helper in src/",
-    ] {
+    for prompt_text in ["find where status is computed", "find git helper in src/"] {
         assert_eq!(
             select_tool_surface(prompt_text, false, false, false),
             ToolSurface::AnswerOnly,
@@ -209,8 +211,7 @@ fn tool_surface_enforcement_uses_canonical_surface_membership() {
 
     for surface in [ToolSurface::RetrievalFirst, ToolSurface::GitReadOnly] {
         for input in &inputs {
-            let tool =
-                SurfaceTool::from_input(input).expect("test inputs are surface-controlled");
+            let tool = SurfaceTool::from_input(input).expect("test inputs are surface-controlled");
             assert_eq!(
                 tool_allowed_for_surface(input, surface),
                 surface.tools().contains(&tool),
@@ -220,6 +221,246 @@ fn tool_surface_enforcement_uses_canonical_surface_membership() {
             );
         }
     }
+}
+
+// Phase 14.1.3 retrieval tool choice discipline tests
+
+#[test]
+fn path_qualified_file_prompt_reads_before_first_model_generation() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/main.py"),
+        "def main():\n    pass\n",
+    )
+    .unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(RecordingBackend::new(
+            vec!["sandbox/main.py defines main()."],
+            Arc::clone(&requests),
+        )),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "What is in sandbox/main.py?".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let first_tool = events.iter().find_map(|e| match e {
+        RuntimeEvent::ToolCallStarted { name } => Some(name.clone()),
+        _ => None,
+    });
+    assert_eq!(first_tool.as_deref(), Some("read_file"));
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "model must not generate before read_file"
+    );
+    let first = requests.first().expect("backend request must be recorded");
+    assert!(
+        first
+            .messages
+            .iter()
+            .any(|m| m.content.contains("=== tool_result: read_file ===")),
+        "first backend request must occur after read_file"
+    );
+}
+
+#[test]
+fn explicit_directory_prompt_lists_before_first_model_generation() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/main.py"),
+        "def main():\n    pass\n",
+    )
+    .unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(RecordingBackend::new(
+            vec!["sandbox contains main.py."],
+            Arc::clone(&requests),
+        )),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "explore sandbox/".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let first_tool = events.iter().find_map(|e| match e {
+        RuntimeEvent::ToolCallStarted { name } => Some(name.clone()),
+        _ => None,
+    });
+    assert_eq!(first_tool.as_deref(), Some("list_dir"));
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "model must not generate before list_dir");
+    let first = requests.first().expect("backend request must be recorded");
+    assert!(
+        first
+            .messages
+            .iter()
+            .any(|m| m.content.contains("=== tool_result: list_dir ===")),
+        "first backend request must occur after list_dir"
+    );
+}
+
+#[test]
+fn structural_directory_prompt_lists_before_first_model_generation() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("main.py"), "def main():\n    pass\n").unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(RecordingBackend::new(
+            vec!["The project root contains main.py."],
+            Arc::clone(&requests),
+        )),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "explore the files".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let first_tool = events.iter().find_map(|e| match e {
+        RuntimeEvent::ToolCallStarted { name } => Some(name.clone()),
+        _ => None,
+    });
+    assert_eq!(first_tool.as_deref(), Some("list_dir"));
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "model must not generate before list_dir");
+    let first = requests.first().expect("backend request must be recorded");
+    assert!(
+        first
+            .messages
+            .iter()
+            .any(|m| m.content.contains("=== tool_result: list_dir ===")),
+        "first backend request must occur after list_dir"
+    );
+}
+
+#[test]
+fn investigation_prompt_still_generates_before_first_tool() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/helper.py"),
+        "def helper():\n    return 1\n",
+    )
+    .unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(RecordingBackend::new(
+            vec![
+                "[search_code: helper]",
+                "[read_file: sandbox/helper.py]",
+                "The helper function is in sandbox/helper.py.",
+            ],
+            Arc::clone(&requests),
+        )),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Where is helper function in sandbox/".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let first_tool = events.iter().find_map(|e| match e {
+        RuntimeEvent::ToolCallStarted { name } => Some(name.clone()),
+        _ => None,
+    });
+    assert_eq!(first_tool.as_deref(), Some("search_code"));
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "investigation turn must still generate first"
+    );
+    let first = requests.first().expect("backend request must be recorded");
+    assert!(
+        !first
+            .messages
+            .iter()
+            .any(|m| m.content.contains("=== tool_result:")),
+        "initial investigation request must reach the model before any tool result exists"
+    );
+}
+
+#[test]
+fn bare_explore_remains_answer_only_with_no_seeded_tool() {
+    let (mut rt, requests) = make_runtime_with_recorded_requests(vec!["Done."]);
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "explore".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { .. })),
+        "bare explore must not seed a retrieval tool"
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "bare explore must generate directly");
+    let first = requests.first().expect("backend request must be recorded");
+    assert!(
+        first.messages.iter().any(|m| {
+            m.role == Role::System
+                && m.content
+                    == "Active tool surface: AnswerOnly. No tools are available. Provide your final answer now."
+        }),
+        "bare explore must remain AnswerOnly"
+    );
 }
 
 #[test]
@@ -389,7 +630,7 @@ fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
         Box::new(RecordingBackend::new(
             vec![
                 "[read_file: sandbox/main.py]", // round 1: model reads the requested file
-                "Here is what I found.",         // round 2: synthesis — must get AnswerOnly hint
+                "Here is what I found.",        // round 2: synthesis — must get AnswerOnly hint
             ],
             Arc::clone(&requests),
         )),

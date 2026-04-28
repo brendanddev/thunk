@@ -494,7 +494,10 @@ fn register_lookup_no_register_candidates_degrades_cleanly() {
         .rev()
         .find(|m| m.role == crate::llm::backend::Role::Assistant)
         .map(|m| m.content.as_str());
-    assert_eq!(last_assistant, Some("Commands are handled in cli/handlers.py."));
+    assert_eq!(
+        last_assistant,
+        Some("Commands are handled in cli/handlers.py.")
+    );
 }
 
 #[test]

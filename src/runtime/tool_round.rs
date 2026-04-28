@@ -556,18 +556,16 @@ pub(super) fn run_tool_round(
                         &tool_codec::render_output(&output),
                     ));
                 }
-                let result_formatted =
-                    if name == "search_code"
-                        && matches!(investigation_mode, InvestigationMode::DefinitionLookup)
-                    {
-                        tool_codec::format_tool_result_definition_ordered(&name, &output)
-                    } else {
-                        tool_codec::format_tool_result(&name, &output)
-                    };
+                let result_formatted = if name == "search_code"
+                    && matches!(investigation_mode, InvestigationMode::DefinitionLookup)
+                {
+                    tool_codec::format_tool_result_definition_ordered(&name, &output)
+                } else {
+                    tool_codec::format_tool_result(&name, &output)
+                };
                 accumulated.push_str(&result_formatted);
                 if name == "search_code" {
-                    if let Some(hint) =
-                        investigation.candidate_preference_hint(investigation_mode)
+                    if let Some(hint) = investigation.candidate_preference_hint(investigation_mode)
                     {
                         accumulated.push_str(&hint);
                         accumulated.push_str("\n\n");

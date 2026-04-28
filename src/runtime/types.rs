@@ -77,10 +77,14 @@ pub enum RuntimeRequest {
     QueryHistory,
     /// Command-triggered read_file invocation. Goes through CommandTool allowlist.
     /// Does not mutate conversation or trigger session save.
-    ReadFile { path: String },
+    ReadFile {
+        path: String,
+    },
     /// Command-triggered search_code invocation. Goes through CommandTool allowlist.
     /// Does not mutate conversation or trigger session save.
-    SearchCode { query: String },
+    SearchCode {
+        query: String,
+    },
 }
 
 /// Events emitted by the runtime for UI rendering, logging, and lifecycle handling.

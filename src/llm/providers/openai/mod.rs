@@ -17,7 +17,10 @@ pub struct OpenAiBackend {
 impl OpenAiBackend {
     pub fn new(config: OpenAiConfig) -> Self {
         let display_name = format!("openai/{}", config.model);
-        Self { config, display_name }
+        Self {
+            config,
+            display_name,
+        }
     }
 }
 

@@ -53,14 +53,20 @@ pub(super) fn prompt_requires_investigation(text: &str) -> bool {
 /// strings like "3.14" or "v2.3" do not match.
 fn prompt_contains_code_file_token(text: &str) -> bool {
     const CODE_EXTENSIONS: &[&str] = &[
-        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h", "hpp",
-        "yaml", "yml", "toml", "json", "ini", "cfg", "conf", "md",
+        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h", "hpp", "yaml", "yml",
+        "toml", "json", "ini", "cfg", "conf", "md",
     ];
     for token in text.split_whitespace() {
         let stripped = token.trim_end_matches(|c: char| {
-            matches!(c, '.' | ',' | '?' | '!' | ';' | ':' | ')' | ']' | '}' | '"' | '\'')
+            matches!(
+                c,
+                '.' | ',' | '?' | '!' | ';' | ':' | ')' | ']' | '}' | '"' | '\''
+            )
         });
-        if let Some(ext) = std::path::Path::new(stripped).extension().and_then(|e| e.to_str()) {
+        if let Some(ext) = std::path::Path::new(stripped)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
             if CODE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
                 return true;
             }
@@ -95,8 +101,8 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
     // unambiguously code-domain references that don't need an additional secondary verb.
     if contains_word(&lower, "where") {
         const CODE_NOUNS: &[&str] = &[
-            "function", "method", "module", "class", "struct", "enum", "trait",
-            "type", "variable", "constant", "file", "command", "tool",
+            "function", "method", "module", "class", "struct", "enum", "trait", "type", "variable",
+            "constant", "file", "command", "tool",
         ];
         if CODE_NOUNS.iter().any(|noun| contains_word(&lower, noun)) {
             return true;
@@ -349,6 +355,92 @@ pub(super) fn looks_like_file_path(path: &str) -> bool {
             || path.eq_ignore_ascii_case("README"))
 }
 
+/// Runtime-owned first-tool decision for RetrievalFirst turns.
+///
+/// Computed once from the original user prompt before the generation loop starts.
+/// When non-None, the engine seeds `pending_runtime_call` directly — the model
+/// never generates before the first tool executes.
+pub(super) enum RetrievalIntent {
+    None,
+    DirectRead { path: String },
+    DirectoryListing { path: String },
+}
+
+/// Classifies a prompt into a runtime-owned retrieval intent.
+///
+/// Checks direct-read first (path-qualified "what is in" or "read" forms),
+/// then directory navigation (nav verb + path token or structural cue).
+/// Returns None when neither applies, including all investigation-required turns.
+pub(super) fn classify_retrieval_intent(text: &str) -> RetrievalIntent {
+    if let Some(path) = requested_read_path(text) {
+        return RetrievalIntent::DirectRead { path };
+    }
+    if let Some(path) = extract_directory_target(text) {
+        return RetrievalIntent::DirectoryListing { path };
+    }
+    RetrievalIntent::None
+}
+
+/// Extracts a directory target from navigation prompts.
+///
+/// Fires when a nav verb is present AND either:
+/// - an explicit path token containing `/` is found → returns that path, or
+/// - a structural cue word is found with no qualifying path token → returns `"."`
+///
+/// Returns None when the nav verb is absent, when only a plain non-path word
+/// is present (no slash, no structural cue), or when multiple path tokens are
+/// found (ambiguous).
+fn extract_directory_target(text: &str) -> Option<String> {
+    const NAV_VERBS: &[&str] = &["explore", "list", "show", "display", "tree"];
+    const STRUCTURAL_CUES: &[&str] = &[
+        "files",
+        "file",
+        "directory",
+        "dir",
+        "dirs",
+        "folder",
+        "folders",
+        "contents",
+    ];
+
+    let tokens = normalized_prompt_tokens(text);
+    let has_nav_verb = tokens.iter().any(|t| NAV_VERBS.contains(&t.as_str()));
+    if !has_nav_verb {
+        return None;
+    }
+
+    let mut found_path: Option<String> = None;
+    for token in text.split_whitespace() {
+        let stripped = token.trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '.' | ',' | '?' | '!' | ';' | ':' | ')' | ']' | '}' | '"' | '\''
+            )
+        });
+        if stripped.is_empty() || !stripped.contains('/') {
+            continue;
+        }
+        if stripped.starts_with("http://") || stripped.starts_with("https://") {
+            continue;
+        }
+        if found_path.is_some() {
+            return None; // ambiguous
+        }
+        found_path = Some(stripped.to_string());
+    }
+
+    if let Some(path) = found_path {
+        return Some(path);
+    }
+
+    let has_structural_cue = tokens.iter().any(|t| STRUCTURAL_CUES.contains(&t.as_str()));
+    if has_structural_cue {
+        return Some(".".to_string());
+    }
+
+    None
+}
+
 /// snake_case: contains underscore, ≥2 segments, each segment ≥2 alphanumeric chars.
 pub(super) fn is_snake_case_identifier(token: &str) -> bool {
     if !token.contains('_') {
@@ -547,7 +639,10 @@ mod tests {
             None
         );
         // non-file query must not match
-        assert_eq!(requested_read_path("What is in this project?").as_deref(), None);
+        assert_eq!(
+            requested_read_path("What is in this project?").as_deref(),
+            None
+        );
     }
 
     #[test]
@@ -567,7 +662,9 @@ mod tests {
 
     #[test]
     fn prompt_requires_investigation_detects_where_is_code_noun() {
-        assert!(prompt_requires_investigation("Where is the helper function?"));
+        assert!(prompt_requires_investigation(
+            "Where is the helper function?"
+        ));
         assert!(prompt_requires_investigation("Where is the config module?"));
         assert!(prompt_requires_investigation("Where is the parser file?"));
         assert!(prompt_requires_investigation("Where is the command?"));
@@ -576,9 +673,13 @@ mod tests {
 
     #[test]
     fn prompt_requires_investigation_rejects_where_is_non_code_noun() {
-        assert!(!prompt_requires_investigation("Where is the best place to start?"));
+        assert!(!prompt_requires_investigation(
+            "Where is the best place to start?"
+        ));
         assert!(!prompt_requires_investigation("Where is the issue?"));
-        assert!(!prompt_requires_investigation("Where is the project summary?"));
+        assert!(!prompt_requires_investigation(
+            "Where is the project summary?"
+        ));
     }
 
     #[test]

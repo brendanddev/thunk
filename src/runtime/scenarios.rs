@@ -804,8 +804,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            assistant_read_calls, 1,
-            "runtime must not consume the backend's second read attempt"
+            assistant_read_calls, 0,
+            "seeded direct-read failure must terminate before consuming any backend retry"
         );
         assert!(
             last_assistant_content(&snapshot)
@@ -1454,30 +1454,36 @@ mod tests {
 
         let snapshot = rt.messages_snapshot();
         assert!(
-            snapshot.iter().any(|m| {
-                m.content.contains("=== tool_error: read_file ===")
-                    && m.content.contains("does not match the requested path")
-            }),
-            "unrelated read must be blocked before file contents are injected"
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_error: read_file ===")),
+            "seeded missing-file read must surface a read_file tool_error"
         );
         assert!(
             !snapshot
                 .iter()
                 .any(|m| m.content.contains("=== tool_result: read_file ===")),
-            "unrelated large file must not be read into context"
+            "no file contents should be read into context"
         );
         assert!(
             !snapshot.iter().any(|m| m.content.contains("unrelated_499")),
             "large unrelated file content must not enter the conversation"
         );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("[search_code: unrelated]")
+                    || m.content.contains("[read_file: engine.rs]")
+                    || m.content.contains("probably represented by engine.rs")),
+            "seeded direct-read failure must not consume later backend guesses"
+        );
 
         let chunks = assistant_chunks(&events);
-        assert_eq!(
-            chunks,
-            vec![
-                "I couldn't read `missing_file_phase84x.rs` because the model tried to read `engine.rs` instead. No file contents were read.".to_string()
-            ],
-            "visible output should be the runtime terminal only"
+        assert_eq!(chunks.len(), 1, "visible output should be one runtime terminal");
+        assert!(
+            chunks[0].contains("I couldn't read `missing_file_phase84x.rs`")
+                && chunks[0].contains("No file contents were read."),
+            "visible output should explain the missing direct read: {chunks:?}"
         );
         let answer_source = events.iter().find_map(|e| {
             if let RuntimeEvent::AnswerReady(s) = e {
@@ -1494,7 +1500,7 @@ mod tests {
                     ..
                 })
             ),
-            "blocked mismatch must end as ReadFileFailed terminal: {answer_source:?}"
+            "seeded missing-file read must end as ReadFileFailed terminal: {answer_source:?}"
         );
     }
 

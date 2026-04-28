@@ -49,8 +49,7 @@ fn git_diff_does_not_update_anchors() {
 
     let tmp = TempDir::new().unwrap();
     init_git_repo(tmp.path());
-    let mut rt =
-        make_runtime_in(vec!["[git_diff]", "Working tree diff checked."], tmp.path());
+    let mut rt = make_runtime_in(vec!["[git_diff]", "Working tree diff checked."], tmp.path());
 
     let events = collect_events(
         &mut rt,
@@ -90,8 +89,7 @@ fn git_log_does_not_update_anchors() {
 
     let tmp = TempDir::new().unwrap();
     init_git_repo(tmp.path());
-    let mut rt =
-        make_runtime_in(vec!["[git_log]", "Recent commits checked."], tmp.path());
+    let mut rt = make_runtime_in(vec!["[git_log]", "Recent commits checked."], tmp.path());
 
     let events = collect_events(
         &mut rt,
@@ -441,11 +439,9 @@ fn second_disallowed_git_tool_on_retrieval_first_turn_terminates_policy_violatio
     );
     let snapshot = rt.messages_snapshot();
     assert!(
-        snapshot
-            .iter()
-            .any(|m| m
-                .content
-                .contains("repeated unavailable tool use for this retrieval-first turn")),
+        snapshot.iter().any(|m| m
+            .content
+            .contains("repeated unavailable tool use for this retrieval-first turn")),
         "terminal policy error must be surfaced"
     );
     assert!(
@@ -801,11 +797,9 @@ fn second_disallowed_retrieval_tool_on_git_read_only_turn_terminates_policy_viol
     );
     let snapshot = rt.messages_snapshot();
     assert!(
-        snapshot
-            .iter()
-            .any(|m| m
-                .content
-                .contains("repeated unavailable tool use for this Git read-only turn")),
+        snapshot.iter().any(|m| m
+            .content
+            .contains("repeated unavailable tool use for this Git read-only turn")),
         "terminal policy error must be surfaced"
     );
     assert!(

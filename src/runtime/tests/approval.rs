@@ -39,8 +39,7 @@ fn reject_uses_runtime_cancellation_even_if_model_would_claim_success() {
     let submit_events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "Create a file reject_test_phase75.txt with the content should not exist"
-                .into(),
+            text: "Create a file reject_test_phase75.txt with the content should not exist".into(),
         },
     );
     assert!(

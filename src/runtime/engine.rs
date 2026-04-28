@@ -45,11 +45,26 @@ struct ContextPolicy {
 impl ContextPolicy {
     fn from_capabilities(caps: BackendCapabilities) -> Self {
         match caps.context_window_tokens {
-            Some(t) if t >= 16_384 => Self { trim_threshold: 40, tool_result_max_lines: 200 },
-            Some(t) if t >= 8_192  => Self { trim_threshold: 30, tool_result_max_lines: 150 },
-            Some(t) if t >= 4_096  => Self { trim_threshold: 20, tool_result_max_lines: 80  },
-            Some(_)                => Self { trim_threshold: 12, tool_result_max_lines: 40  },
-            None                   => Self { trim_threshold: 40, tool_result_max_lines: 200 },
+            Some(t) if t >= 16_384 => Self {
+                trim_threshold: 40,
+                tool_result_max_lines: 200,
+            },
+            Some(t) if t >= 8_192 => Self {
+                trim_threshold: 30,
+                tool_result_max_lines: 150,
+            },
+            Some(t) if t >= 4_096 => Self {
+                trim_threshold: 20,
+                tool_result_max_lines: 80,
+            },
+            Some(_) => Self {
+                trim_threshold: 12,
+                tool_result_max_lines: 40,
+            },
+            None => Self {
+                trim_threshold: 40,
+                tool_result_max_lines: 200,
+            },
         }
     }
 }
@@ -66,14 +81,14 @@ enum CommandTool {
 impl CommandTool {
     fn into_input(self) -> ToolInput {
         match self {
-            Self::ReadFile { path }    => ToolInput::ReadFile { path },
+            Self::ReadFile { path } => ToolInput::ReadFile { path },
             Self::SearchCode { query } => ToolInput::SearchCode { query, path: None },
         }
     }
 
     fn name(&self) -> &'static str {
         match self {
-            Self::ReadFile { .. }    => "read_file",
+            Self::ReadFile { .. } => "read_file",
             Self::SearchCode { .. } => "search_code",
         }
     }
@@ -342,8 +357,8 @@ use super::tool_surface::{select_tool_surface, ToolSurface};
 /// Returns true if the prompt contains a token that looks like a code identifier.
 /// Only two structural patterns are checked — no NLP, no heuristics.
 use super::prompt_analysis::{
-    extract_investigation_path_scope, prompt_requires_investigation, requested_read_path,
-    user_requested_mutation,
+    classify_retrieval_intent, extract_investigation_path_scope, prompt_requires_investigation,
+    user_requested_mutation, RetrievalIntent,
 };
 
 pub struct Runtime {
@@ -400,10 +415,10 @@ impl Runtime {
             RuntimeRequest::Reset => self.handle_reset(on_event),
             RuntimeRequest::Approve => self.handle_approve(on_event),
             RuntimeRequest::Reject => self.handle_reject(on_event),
-            RuntimeRequest::QueryLast    => self.handle_query_last(on_event),
+            RuntimeRequest::QueryLast => self.handle_query_last(on_event),
             RuntimeRequest::QueryAnchors => self.handle_query_anchors(on_event),
             RuntimeRequest::QueryHistory => self.handle_query_history(on_event),
-            RuntimeRequest::ReadFile { path }    => self.handle_read_file(path, on_event),
+            RuntimeRequest::ReadFile { path } => self.handle_read_file(path, on_event),
             RuntimeRequest::SearchCode { query } => self.handle_search_code(query, on_event),
         }
     }
@@ -439,7 +454,9 @@ impl Runtime {
         let messages = self.conversation.human_visible_snapshot();
 
         if messages.is_empty() {
-            on_event(RuntimeEvent::InfoMessage("no conversation history".to_string()));
+            on_event(RuntimeEvent::InfoMessage(
+                "no conversation history".to_string(),
+            ));
             return;
         }
 
@@ -480,11 +497,7 @@ impl Runtime {
         self.conversation.push_user(capped);
     }
 
-    fn dispatch_command_tool(
-        &mut self,
-        tool: CommandTool,
-        on_event: &mut dyn FnMut(RuntimeEvent),
-    ) {
+    fn dispatch_command_tool(&mut self, tool: CommandTool, on_event: &mut dyn FnMut(RuntimeEvent)) {
         if self.pending_action.is_some() {
             on_event(RuntimeEvent::Failed {
                 message: "cannot run command while a tool approval is pending".to_string(),
@@ -503,9 +516,9 @@ impl Runtime {
                 if let Some(query) = search_query {
                     self.anchors.record_successful_search(&output, query, None);
                 }
-                on_event(RuntimeEvent::InfoMessage(
-                    tool_codec::format_tool_result(name, &output),
-                ));
+                on_event(RuntimeEvent::InfoMessage(tool_codec::format_tool_result(
+                    name, &output,
+                )));
             }
             Ok(ToolRunResult::Approval(pending)) => {
                 self.pending_action = Some(pending.clone());
@@ -525,9 +538,7 @@ impl Runtime {
             ));
             return;
         }
-        if p.components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
+        if p.components().any(|c| c == std::path::Component::ParentDir) {
             on_event(RuntimeEvent::InfoMessage(
                 "error: path must not contain '..' components".to_string(),
             ));
@@ -683,7 +694,8 @@ impl Runtime {
         ) {
             ToolRoundOutcome::Completed { results, .. } => {
                 self.commit_tool_results(results);
-                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                self.conversation
+                    .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
                 self.run_turns_with_initial_reads(1, reads_this_turn, on_event);
             }
@@ -693,7 +705,8 @@ impl Runtime {
                 reason,
             } => {
                 self.commit_tool_results(results);
-                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                self.conversation
+                    .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 self.finish_with_runtime_answer(
                     &answer,
                     AnswerSource::RuntimeTerminal { reason, rounds: 1 },
@@ -706,7 +719,8 @@ impl Runtime {
             } => {
                 if !accumulated.is_empty() {
                     self.commit_tool_results(accumulated);
-                    self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                    self.conversation
+                        .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 }
                 self.pending_action = Some(pending.clone());
                 on_event(RuntimeEvent::ApprovalRequired(pending));
@@ -769,7 +783,8 @@ impl Runtime {
                     summary: Some(summary),
                 });
                 self.commit_tool_results(tool_codec::format_tool_result(&name, &output));
-                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                self.conversation
+                    .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 self.finish_with_runtime_answer(
                     LAST_SEARCH_REPLAYED,
                     AnswerSource::ToolAssisted { rounds: 1 },
@@ -795,7 +810,8 @@ impl Runtime {
                 });
                 self.conversation
                     .push_user(tool_codec::format_tool_error(&name, &e.to_string()));
-                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                self.conversation
+                    .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 self.finish_with_runtime_answer(
                     LAST_SEARCH_REPLAY_FAILED,
                     AnswerSource::RuntimeTerminal {
@@ -831,7 +847,8 @@ impl Runtime {
                     summary: Some(summary),
                 });
                 self.commit_tool_results(tool_codec::format_tool_result(&tool_name, &output));
-                self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                self.conversation
+                    .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 self.finish_with_runtime_answer(
                     &final_answer,
                     AnswerSource::ToolAssisted { rounds: 1 },
@@ -897,6 +914,11 @@ impl Runtime {
         mut reads_this_turn: HashSet<String>,
         on_event: &mut dyn FnMut(RuntimeEvent),
     ) {
+        struct PendingRuntimeCall {
+            input: ToolInput,
+            seeded_pre_generation: bool,
+        }
+
         #[derive(Clone, Copy)]
         enum AnswerPhaseKind {
             PostRead,
@@ -905,7 +927,7 @@ impl Runtime {
 
         let mut corrections = 0usize;
         let mut last_call_key: Option<String> = None;
-        let mut pending_runtime_call: Option<ToolInput> = None;
+        let mut pending_runtime_call: Option<PendingRuntimeCall> = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
         let mut turn_perf = TurnPerformance::new();
@@ -917,6 +939,7 @@ impl Runtime {
         let mut weak_search_query_attempts = 0usize;
         let mut answer_phase: Option<AnswerPhaseKind> = None;
         let mut post_answer_phase_tool_attempts = 0usize;
+        let mut seeded_tool_executed = false;
 
         macro_rules! finish_turn {
             () => {{
@@ -931,7 +954,13 @@ impl Runtime {
                 && !c.starts_with("=== tool_error:")
                 && !c.starts_with("[runtime:correction]")
         });
-        let requested_read_path = original_user_prompt.and_then(requested_read_path);
+        let retrieval_intent = original_user_prompt
+            .map(classify_retrieval_intent)
+            .unwrap_or(RetrievalIntent::None);
+        let requested_read_path: Option<String> = match &retrieval_intent {
+            RetrievalIntent::DirectRead { path } => Some(path.clone()),
+            _ => None,
+        };
         let investigation_required = original_user_prompt
             .map(|prompt| {
                 requested_read_path.is_none()
@@ -943,12 +972,14 @@ impl Runtime {
             .map(user_requested_mutation)
             .unwrap_or(false);
         let tool_surface = original_user_prompt
-            .map(|p| select_tool_surface(
-                p,
-                investigation_required,
-                mutation_allowed,
-                requested_read_path.is_some() || !reads_this_turn.is_empty(),
-            ))
+            .map(|p| {
+                select_tool_surface(
+                    p,
+                    investigation_required,
+                    mutation_allowed,
+                    requested_read_path.is_some() || !reads_this_turn.is_empty(),
+                )
+            })
             .unwrap_or(if reads_this_turn.is_empty() {
                 ToolSurface::AnswerOnly
             } else {
@@ -1027,6 +1058,23 @@ impl Runtime {
             "tool_surface_selected",
             &[("surface", tool_surface.as_str().into())],
         );
+        if !investigation_required {
+            match &retrieval_intent {
+                RetrievalIntent::DirectRead { path } => {
+                    pending_runtime_call = Some(PendingRuntimeCall {
+                        input: ToolInput::ReadFile { path: path.clone() },
+                        seeded_pre_generation: true,
+                    });
+                }
+                RetrievalIntent::DirectoryListing { path } => {
+                    pending_runtime_call = Some(PendingRuntimeCall {
+                        input: ToolInput::ListDir { path: path.clone() },
+                        seeded_pre_generation: true,
+                    });
+                }
+                RetrievalIntent::None => {}
+            }
+        }
         loop {
             // Bind answer-phase synthesis to a no-tool surface so the model is never offered
             // tool access after evidence is accepted. This eliminates the extra generation
@@ -1052,8 +1100,10 @@ impl Runtime {
 
             turn_perf.start_round(next_round_label, next_round_cause, prompt_chars, on_event);
 
-            let (calls, response) = if let Some(call) = pending_runtime_call.take() {
-                (vec![call], None)
+            let (calls, response, seeded_pre_generation) = if let Some(pending) =
+                pending_runtime_call.take()
+            {
+                (vec![pending.input], None, pending.seeded_pre_generation)
             } else {
                 let response = {
                     let turn_perf = &mut turn_perf;
@@ -1089,7 +1139,7 @@ impl Runtime {
                 };
 
                 let calls = tool_codec::parse_all_tool_inputs(&response);
-                (calls, Some(response))
+                (calls, Some(response), false)
             };
 
             if let Some(phase) = answer_phase {
@@ -1197,7 +1247,7 @@ impl Runtime {
 
             if calls.is_empty() {
                 let response = response.expect("response exists when calls are empty");
-                
+
                 // If the previous tool round ended in an edit_file error and the model's repair
                 // attempt contains edit_file tag syntax but produced no parseable tool calls,
                 // inject a targeted correction rather than silently accepting as Direct.
@@ -1390,7 +1440,11 @@ impl Runtime {
                 }
 
                 let source = if tool_rounds == 0 {
-                    AnswerSource::Direct
+                    if seeded_tool_executed {
+                        AnswerSource::ToolAssisted { rounds: 1 }
+                    } else {
+                        AnswerSource::Direct
+                    }
                 } else {
                     AnswerSource::ToolAssisted {
                         rounds: tool_rounds,
@@ -1402,12 +1456,14 @@ impl Runtime {
                 finish_turn!();
             }
 
-            tool_rounds += 1;
+            if !seeded_pre_generation {
+                tool_rounds += 1;
 
-            if tool_rounds >= MAX_TOOL_ROUNDS {
-                on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolLimitReached));
-                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                finish_turn!();
+                if tool_rounds >= MAX_TOOL_ROUNDS {
+                    on_event(RuntimeEvent::AnswerReady(AnswerSource::ToolLimitReached));
+                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    finish_turn!();
+                }
             }
 
             on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
@@ -1440,12 +1496,17 @@ impl Runtime {
                     results,
                     git_acquisition_answer,
                 } => {
+                    if seeded_pre_generation {
+                        seeded_tool_executed = true;
+                        last_call_key = None;
+                    }
                     if let Some(t) = t_tool_start {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
                     }
                     let post_tool_cause = infer_post_tool_round_cause(&results);
                     self.commit_tool_results(results);
-                    self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                    self.conversation
+                        .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                     if tool_surface == ToolSurface::GitReadOnly {
                         if let Some(answer) = git_acquisition_answer {
                             trace_runtime_decision(
@@ -1487,7 +1548,8 @@ impl Runtime {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
                     }
                     self.commit_tool_results(results);
-                    self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                    self.conversation
+                        .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                     self.finish_with_runtime_answer(
                         &answer,
                         AnswerSource::RuntimeTerminal {
@@ -1507,7 +1569,8 @@ impl Runtime {
                     }
                     if !accumulated.is_empty() {
                         self.commit_tool_results(accumulated);
-                        self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                        self.conversation
+                            .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                     }
                     self.pending_action = Some(pending.clone());
                     on_event(RuntimeEvent::ApprovalRequired(pending));
@@ -1520,9 +1583,13 @@ impl Runtime {
                     }
                     if !accumulated.is_empty() {
                         self.commit_tool_results(accumulated);
-                        self.conversation.trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                        self.conversation
+                            .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                     }
-                    pending_runtime_call = Some(call);
+                    pending_runtime_call = Some(PendingRuntimeCall {
+                        input: call,
+                        seeded_pre_generation: false,
+                    });
                     on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
                 }
             }
@@ -1756,7 +1823,10 @@ mod tests {
         let body = body_lines.join("\n") + "\n";
         let text = format!("=== tool_result: read_file ===\n{body}=== /tool_result ===\n\n");
         let result = cap_tool_result_blocks(&text, 3);
-        assert!(result.contains("line1\nline2\nline3\n"), "first 3 lines must be kept");
+        assert!(
+            result.contains("line1\nline2\nline3\n"),
+            "first 3 lines must be kept"
+        );
         assert!(!result.contains("line4"), "line4 must be removed");
         assert!(result.contains("[capped at 3 lines — original: 5 lines]"));
         assert!(result.contains("=== tool_result: read_file ==="));

@@ -146,9 +146,13 @@ fn search_budget_closes_after_empty_retry_across_rounds() {
         }
     });
     assert!(
-        matches!(answer_source, Some(AnswerSource::RuntimeTerminal {
-            reason: RuntimeTerminalReason::InsufficientEvidence, ..
-        })),
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::InsufficientEvidence,
+                ..
+            })
+        ),
         "empty-search no-read turn must produce InsufficientEvidence terminal: {answer_source:?}"
     );
     let last_assistant = snapshot

@@ -65,8 +65,8 @@ impl Conversation {
         self.messages
             .iter()
             .filter(|m| match m.role {
-                Role::System    => false,
-                Role::User      => !is_runtime_injected(&m.content),
+                Role::System => false,
+                Role::User => !is_runtime_injected(&m.content),
                 Role::Assistant => !is_assistant_tool_call(&m.content),
             })
             .cloned()
