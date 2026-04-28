@@ -282,7 +282,7 @@ fn usage_lookup_runtime_dispatches_preferred_substantive_candidate_after_search(
     assert_eq!(
         all_user.matches("=== tool_result: read_file ===").count(),
         1,
-        "runtime should dispatch exactly one preferred usage read after search"
+        "one viable substantive candidate should stay single-read after search"
     );
     assert!(
         all_user.contains("audit()"),
@@ -316,6 +316,90 @@ fn usage_lookup_runtime_dispatches_preferred_substantive_candidate_after_search(
         last_assistant,
         Some("TaskStatus is used in services/runner.py.")
     );
+}
+
+#[test]
+fn broad_usage_lookup_two_substantive_candidates_are_auto_read_before_synthesis() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("models")).unwrap();
+    fs::create_dir_all(tmp.path().join("cli")).unwrap();
+    fs::create_dir_all(tmp.path().join("services")).unwrap();
+    fs::write(
+        tmp.path().join("models").join("enums.py"),
+        "class TaskStatus(str, Enum):\n    UNUSED_ENUM_MEMBER = \"unused\"\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("cli").join("header.py"),
+        "from models.enums import TaskStatus\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("services").join("runner_primary.py"),
+        "if task.status == TaskStatus.PENDING:\n    primary()\nif previous_status == TaskStatus.PENDING:\n    audit_primary()\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("services").join("runner_secondary.py"),
+        "status = TaskStatus.PENDING\nsecondary()\n",
+    )
+    .unwrap();
+
+    let final_answer =
+        "TaskStatus is used in services/runner_primary.py and services/runner_secondary.py.";
+    let mut rt = make_runtime_in(vec!["[search_code: TaskStatus]", final_answer], tmp.path());
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Where is TaskStatus used?".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        2,
+        "broad usage lookup should auto-read two substantive candidates"
+    );
+    assert!(
+        all_user.contains("primary()") && all_user.contains("secondary()"),
+        "both substantive usage files must be read before synthesis: {all_user}"
+    );
+    assert!(
+        !all_user.contains("UNUSED_ENUM_MEMBER")
+            && !all_user.contains(
+                "=== tool_result: read_file ===\n[1 lines]\nfrom models.enums import TaskStatus"
+            ),
+        "definition-only and import-only fallbacks must not be auto-read when two substantive candidates exist: {all_user}"
+    );
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "two runtime-owned usage reads should still admit synthesis: {answer_source:?}"
+    );
+    let last_assistant = snapshot
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str());
+    assert_eq!(last_assistant, Some(final_answer));
 }
 
 #[test]
@@ -654,13 +738,35 @@ fn usage_lookup_prefers_normal_source_over_initialization_candidate() {
         .map(|m| m.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        all_user.contains("run()"),
-        "normal source file should win over initialization candidate: {all_user}"
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        2,
+        "broad scoped usage lookup should auto-read both substantive candidates"
     );
     assert!(
-        !all_user.contains("=== tool_result: read_file ===\n[2 lines]\ninitialize_task_status("),
-        "initialization candidate must not be selected first when a normal source file exists: {all_user}"
+        all_user.contains("run()"),
+        "normal source file should still win the first ranking slot: {all_user}"
+    );
+    assert!(
+        all_user.contains("initialize_task_status("),
+        "the second substantive candidate should also be auto-read for broad usage lookup: {all_user}"
+    );
+    let read_results: Vec<&str> = snapshot
+        .iter()
+        .filter(|m| {
+            m.role == crate::llm::backend::Role::User
+                && m.content.contains("=== tool_result: read_file ===")
+        })
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        read_results
+            .first()
+            .is_some_and(|body| body.contains("run()"))
+            && read_results
+                .get(1)
+                .is_some_and(|body| body.contains("initialize_task_status(")),
+        "normal source file must still be selected before the initialization candidate: {read_results:?}"
     );
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
@@ -682,6 +788,95 @@ fn usage_lookup_prefers_normal_source_over_initialization_candidate() {
         last_assistant,
         Some("TaskStatus is used in sandbox/services/runner.py.")
     );
+}
+
+#[test]
+fn broad_scoped_usage_lookup_reads_two_in_scope_substantive_files_only() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox/controllers")).unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox/models")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/services").join("runner_primary.py"),
+        "if task.status == TaskStatus.PENDING:\n    primary_service()\nif previous_status == TaskStatus.PENDING:\n    audit_service()\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path()
+            .join("sandbox/services")
+            .join("runner_secondary.py"),
+        "status = TaskStatus.PENDING\nsecondary_service()\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path()
+            .join("sandbox/controllers")
+            .join("runner_outside.py"),
+        "if task.status == TaskStatus.PENDING:\n    outside_controller()\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("sandbox/models").join("enums.py"),
+        "class TaskStatus(str, Enum):\n    UNUSED_ENUM_MEMBER = \"unused\"\n",
+    )
+    .unwrap();
+
+    let final_answer = "TaskStatus is used in sandbox/services/runner_primary.py and sandbox/services/runner_secondary.py.";
+    let mut rt = make_runtime_in(vec!["[search_code: TaskStatus]", final_answer], tmp.path());
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Where is TaskStatus used in sandbox/services/".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    let snapshot = rt.messages_snapshot();
+    let search_result = snapshot
+        .iter()
+        .find(|m| m.content.contains("=== tool_result: search_code ==="))
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    assert!(
+        search_result.contains("sandbox/services/runner_primary.py")
+            && search_result.contains("sandbox/services/runner_secondary.py"),
+        "scoped search must include both in-scope substantive candidates: {search_result}"
+    );
+    assert!(
+        !search_result.contains("sandbox/controllers/runner_outside.py")
+            && !search_result.contains("sandbox/models/enums.py"),
+        "scoped search must exclude out-of-scope candidates: {search_result}"
+    );
+
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        2,
+        "broad scoped usage lookup should auto-read two in-scope substantive files"
+    );
+    assert!(
+        all_user.contains("primary_service()") && all_user.contains("secondary_service()"),
+        "both in-scope substantive usage files must be read: {all_user}"
+    );
+    assert!(
+        !all_user.contains("outside_controller()") && !all_user.contains("UNUSED_ENUM_MEMBER"),
+        "out-of-scope and fallback candidates must not be read: {all_user}"
+    );
+    let last_assistant = snapshot
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str());
+    assert_eq!(last_assistant, Some(final_answer));
 }
 
 #[test]

@@ -590,6 +590,7 @@ pub(super) fn run_tool_round(
                         }
                     }
                 }
+                let has_read_recovery = read_recovery.is_some();
                 if let Some((path, kind)) = read_recovery {
                     trace_runtime_decision(
                         on_event,
@@ -616,6 +617,31 @@ pub(super) fn run_tool_round(
                     };
                     accumulated.push_str(&correction);
                     accumulated.push_str("\n\n");
+                }
+                if name == "read_file"
+                    && !has_read_recovery
+                    && matches!(investigation_mode, InvestigationMode::UsageLookup)
+                {
+                    if let Some(path) = investigation.next_usage_evidence_candidate() {
+                        trace_runtime_decision(
+                            on_event,
+                            "usage_candidate_selected",
+                            &[
+                                ("path", path.to_string()),
+                                ("reason", "additional_usage_evidence".into()),
+                                (
+                                    "useful_candidate_reads",
+                                    investigation.useful_candidate_reads_count().to_string(),
+                                ),
+                            ],
+                        );
+                        return ToolRoundOutcome::RuntimeDispatch {
+                            accumulated,
+                            call: ToolInput::ReadFile {
+                                path: path.to_string(),
+                            },
+                        };
+                    }
                 }
                 *last_call_key = Some(key);
             }

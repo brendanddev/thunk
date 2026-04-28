@@ -397,10 +397,14 @@ pub(super) struct InvestigationState {
     /// True if at least one candidate in the current search results has a
     /// non-definition match line (i.e. a usage file is available).
     has_non_definition_candidates: bool,
-    /// True once a search candidate has been read that provides useful evidence.
-    /// Definition-only files are useful only when no non-definition candidates
-    /// exist in the current result set.
-    read_useful_candidate: bool,
+    /// Number of accepted matched-candidate reads that counted as useful evidence.
+    /// Kept separate from candidate_reads_count so the runtime can distinguish
+    /// broad UsageLookup happy-path reads from rejected or fallback reads.
+    useful_accepted_candidate_reads: usize,
+    /// Normalized paths of accepted matched-candidate reads that counted as useful evidence.
+    /// Used to deterministically exclude already-read candidates when broad UsageLookup
+    /// requires a second runtime-owned evidence read.
+    useful_accepted_candidate_paths: HashSet<String>,
     /// True after the read-before-answering correction has been issued once.
     /// Prevents the correction from firing more than once per turn.
     premature_synthesis_correction_issued: bool,
@@ -416,6 +420,13 @@ pub(super) struct InvestigationState {
     /// insufficient; after two candidate reads the runtime terminates cleanly if
     /// evidence_ready() is still false.
     candidate_reads_count: usize,
+    /// True when this turn is a broad UsageLookup prompt eligible for the
+    /// multi-candidate evidence policy.
+    broad_usage_lookup: bool,
+    /// Runtime-owned target for how many accepted useful matched-candidate reads
+    /// are required before evidence is ready. Defaults to 1; broad UsageLookup
+    /// may raise it to 2 when two substantive candidates are available.
+    useful_candidate_reads_target: usize,
     /// Candidate paths where every matched line looks like an import declaration.
     /// Populated during record_search_results alongside search_candidate_paths.
     import_only_candidates: HashSet<String>,
@@ -486,11 +497,14 @@ impl InvestigationState {
             non_definition_match_counts: HashMap::new(),
             definition_site_candidates: HashSet::new(),
             has_non_definition_candidates: false,
-            read_useful_candidate: false,
+            useful_accepted_candidate_reads: 0,
+            useful_accepted_candidate_paths: HashSet::new(),
             premature_synthesis_correction_issued: false,
             direct_answer_correction_issued: false,
             search_attempted: false,
             candidate_reads_count: 0,
+            broad_usage_lookup: false,
+            useful_candidate_reads_target: 1,
             import_only_candidates: HashSet::new(),
             has_non_import_candidates: false,
             import_correction_issued: false,
@@ -516,8 +530,13 @@ impl InvestigationState {
         }
     }
 
+    pub(super) fn configure_usage_evidence_policy(&mut self, broad_usage_lookup: bool) {
+        self.broad_usage_lookup = broad_usage_lookup;
+    }
+
     pub(super) fn evidence_ready(&self) -> bool {
-        self.search_produced_results && self.read_useful_candidate
+        self.search_produced_results
+            && self.useful_accepted_candidate_reads >= self.useful_candidate_reads_target
     }
 
     pub(super) fn search_produced_results(&self) -> bool {
@@ -530,6 +549,10 @@ impl InvestigationState {
 
     pub(super) fn candidate_reads_count(&self) -> usize {
         self.candidate_reads_count
+    }
+
+    pub(super) fn useful_candidate_reads_count(&self) -> usize {
+        self.useful_accepted_candidate_reads
     }
 
     pub(super) fn search_attempted(&self) -> bool {
@@ -597,7 +620,9 @@ impl InvestigationState {
             self.has_non_load_candidates = false;
             self.save_candidates.clear();
             self.lockfile_candidates.clear();
-            self.read_useful_candidate = false;
+            self.useful_accepted_candidate_reads = 0;
+            self.useful_accepted_candidate_paths.clear();
+            self.useful_candidate_reads_target = 1;
 
             for result in &results.matches {
                 push_unique_path(&mut self.search_candidate_paths, &result.file);
@@ -706,6 +731,10 @@ impl InvestigationState {
                     self.lockfile_candidates.insert(path.clone());
                 }
             }
+
+            if self.broad_usage_lookup && self.substantive_usage_candidate_count() >= 2 {
+                self.useful_candidate_reads_target = 2;
+            }
         }
         trace_runtime_decision(
             on_event,
@@ -752,6 +781,11 @@ impl InvestigationState {
                 ("has_non_load", self.has_non_load_candidates.to_string()),
                 ("save_files", self.save_candidates.len().to_string()),
                 ("lockfiles", self.lockfile_candidates.len().to_string()),
+                (
+                    "useful_target",
+                    self.useful_candidate_reads_target.to_string(),
+                ),
+                ("broad_usage_lookup", self.broad_usage_lookup.to_string()),
             ],
         );
         was_empty
@@ -1153,7 +1187,9 @@ impl InvestigationState {
                     );
                     return suggested_path.map(|p| (p, RecoveryKind::ImportOnly));
                 }
-                self.read_useful_candidate = true;
+                self.useful_accepted_candidate_reads += 1;
+                self.useful_accepted_candidate_paths
+                    .insert(read_path.clone());
                 trace_runtime_decision(
                     on_event,
                     "read_evidence",
@@ -1165,6 +1201,10 @@ impl InvestigationState {
                             self.acceptance_reason(mode, is_def_only, is_import_only),
                         ),
                         ("candidate_reads", self.candidate_reads_count.to_string()),
+                        (
+                            "useful_candidate_reads",
+                            self.useful_accepted_candidate_reads.to_string(),
+                        ),
                     ],
                 );
             }
@@ -1227,10 +1267,34 @@ impl InvestigationState {
     }
 
     pub(super) fn preferred_usage_candidate(&self) -> Option<&str> {
+        self.preferred_usage_candidate_with_filters(&HashSet::new(), false)
+    }
+
+    pub(super) fn next_usage_evidence_candidate(&self) -> Option<&str> {
+        if self.useful_accepted_candidate_reads == 0
+            || self.useful_accepted_candidate_reads >= self.useful_candidate_reads_target
+        {
+            return None;
+        }
+
+        self.preferred_usage_candidate_with_filters(&self.useful_accepted_candidate_paths, true)
+    }
+
+    fn preferred_usage_candidate_with_filters(
+        &self,
+        excluded: &HashSet<String>,
+        substantive_only: bool,
+    ) -> Option<&str> {
         let mut best_index = None;
         let mut best_key = None;
 
         for (index, path) in self.search_candidate_paths.iter().enumerate() {
+            if excluded.contains(&normalize_evidence_path(path)) {
+                continue;
+            }
+            if substantive_only && !self.is_substantive_usage_candidate(path) {
+                continue;
+            }
             let key = self.usage_candidate_quality_key(path, index);
             if best_key.as_ref().is_none_or(|current| key < *current) {
                 best_key = Some(key);
@@ -1239,6 +1303,19 @@ impl InvestigationState {
         }
 
         best_index.map(|index| self.search_candidate_paths[index].as_str())
+    }
+
+    fn substantive_usage_candidate_count(&self) -> usize {
+        self.search_candidate_paths
+            .iter()
+            .filter(|path| self.is_substantive_usage_candidate(path))
+            .count()
+    }
+
+    fn is_substantive_usage_candidate(&self, path: &str) -> bool {
+        !self.definition_only_candidates.contains(path)
+            && !self.import_only_candidates.contains(path)
+            && !self.lockfile_candidates.contains(path)
     }
 
     fn first_definition_candidate(&self) -> Option<&str> {

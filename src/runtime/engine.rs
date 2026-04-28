@@ -125,6 +125,28 @@ fn trace_insufficient_evidence_terminal(
     );
 }
 
+fn usage_lookup_is_broad(
+    mode: InvestigationMode,
+    requested_read_path: Option<&str>,
+    investigation_path_scope: Option<&str>,
+) -> bool {
+    if !matches!(mode, InvestigationMode::UsageLookup) || requested_read_path.is_some() {
+        return false;
+    }
+
+    match investigation_path_scope {
+        None => true,
+        Some(scope) => !path_scope_looks_like_file(scope),
+    }
+}
+
+fn path_scope_looks_like_file(scope: &str) -> bool {
+    Path::new(scope)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains('.'))
+}
+
 #[derive(Clone, Copy)]
 enum GenerationRoundLabel {
     Initial,
@@ -1034,6 +1056,11 @@ impl Runtime {
             } else {
                 None
             };
+        investigation.configure_usage_evidence_policy(usage_lookup_is_broad(
+            investigation_mode,
+            requested_read_path.as_deref(),
+            investigation_path_scope.as_deref(),
+        ));
         trace_runtime_decision(
             on_event,
             "investigation_mode_detected",

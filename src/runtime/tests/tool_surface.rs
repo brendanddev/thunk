@@ -675,3 +675,80 @@ fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
         surface_hint.content
     );
 }
+
+#[test]
+fn answer_only_surface_hint_sent_after_second_runtime_owned_usage_read() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox/models")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/services").join("runner_primary.py"),
+        "if task.status == TaskStatus.PENDING:\n    primary_service()\nif previous_status == TaskStatus.PENDING:\n    audit_service()\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path()
+            .join("sandbox/services")
+            .join("runner_secondary.py"),
+        "status = TaskStatus.PENDING\nsecondary_service()\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("sandbox/models").join("enums.py"),
+        "class TaskStatus(str, Enum):\n    UNUSED_ENUM_MEMBER = \"unused\"\n",
+    )
+    .unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(RecordingBackend::new(
+            vec![
+                "[search_code: TaskStatus]",
+                "TaskStatus is used in sandbox/services/runner_primary.py and sandbox/services/runner_secondary.py.",
+            ],
+            Arc::clone(&requests),
+        )),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Where is TaskStatus used in sandbox/services/".into(),
+        },
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected exactly 2 backend calls (search + synthesis after two runtime-owned reads): {requests:?}"
+    );
+
+    let synthesis = &requests[1];
+    let surface_hint = synthesis
+        .messages
+        .iter()
+        .find(|m| m.role == Role::System && m.content.starts_with("Active tool surface:"))
+        .expect("synthesis request must carry a surface hint");
+    assert!(
+        surface_hint.content.contains("AnswerOnly"),
+        "synthesis surface hint must name AnswerOnly after the second runtime-owned usage read: {}",
+        surface_hint.content
+    );
+    assert!(
+        !surface_hint.content.contains("search_code"),
+        "AnswerOnly surface hint must not offer search_code: {}",
+        surface_hint.content
+    );
+    assert!(
+        !surface_hint.content.contains("read_file"),
+        "AnswerOnly surface hint must not offer read_file: {}",
+        surface_hint.content
+    );
+}
