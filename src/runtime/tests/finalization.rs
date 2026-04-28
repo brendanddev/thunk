@@ -342,7 +342,7 @@ fn general_retrieval_blocks_post_read_search_with_answer_phase_correction() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files in src/".into(),
+            text: "display the structure".into(),
         },
     );
 

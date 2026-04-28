@@ -752,3 +752,134 @@ fn answer_only_surface_hint_sent_after_second_runtime_owned_usage_read() {
         surface_hint.content
     );
 }
+
+// Phase 14.3.2 — Directory Listing Finalization Fence tests
+
+#[test]
+fn seeded_list_dir_synthesis_receives_answer_only_surface() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(tmp.path().join("sandbox/main.py"), "def main(): pass\n").unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(RecordingBackend::new(
+            vec!["sandbox/ contains main.py."],
+            Arc::clone(&requests),
+        )),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "explore sandbox/".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "exactly one backend call (synthesis) must occur after seeded list_dir: {requests:?}"
+    );
+
+    let synthesis = &requests[0];
+    let surface_hint = synthesis
+        .messages
+        .iter()
+        .find(|m| m.role == Role::System && m.content.starts_with("Active tool surface:"))
+        .expect("synthesis request must carry a surface hint");
+    assert!(
+        surface_hint.content.contains("AnswerOnly"),
+        "synthesis surface hint must name AnswerOnly after seeded list_dir: {}",
+        surface_hint.content
+    );
+    assert!(
+        !surface_hint.content.contains("search_code"),
+        "AnswerOnly surface hint must not offer search_code after seeded list_dir: {}",
+        surface_hint.content
+    );
+    assert!(
+        !surface_hint.content.contains("read_file"),
+        "AnswerOnly surface hint must not offer read_file after seeded list_dir: {}",
+        surface_hint.content
+    );
+}
+
+#[test]
+fn seeded_list_dir_blocks_post_listing_search_code() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(tmp.path().join("sandbox/main.py"), "def main(): pass\n").unwrap();
+
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(TestBackend::new(vec![
+            "[search_code: main]",         // model attempts search after listing
+            "sandbox/ contains main.py.",  // correction causes re-generation
+        ])),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "explore sandbox/".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "search_code")),
+        "search_code must never be dispatched after seeded list_dir"
+    );
+}
+
+#[test]
+fn seeded_list_dir_blocks_post_listing_read_file() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(tmp.path().join("sandbox/main.py"), "def main(): pass\n").unwrap();
+
+    let mut rt = Runtime::new(
+        &Config::default(),
+        tmp.path(),
+        Box::new(TestBackend::new(vec![
+            "[read_file: sandbox/main.py]", // model attempts read after listing
+            "sandbox/ contains main.py.",   // correction causes re-generation
+        ])),
+        default_registry(tmp.path().to_path_buf()),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "explore sandbox/".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "read_file")),
+        "read_file must never be dispatched after seeded list_dir"
+    );
+}

@@ -442,7 +442,7 @@ fn successful_search_code_updates_last_search_anchor() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
     assert!(!has_failed(&events), "unexpected failure: {events:?}");
@@ -476,7 +476,7 @@ fn repeat_last_search_dispatches_one_search_code() {
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
 
@@ -525,7 +525,7 @@ fn unscoped_search_replays_with_no_scope() {
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
 
@@ -614,7 +614,7 @@ fn reset_clears_last_search_anchor() {
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
     collect_events(&mut rt, RuntimeRequest::Reset);

@@ -914,7 +914,7 @@ mod tests {
         collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "list files".into(),
+                text: "display the structure".into(),
             },
         );
 

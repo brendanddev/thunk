@@ -317,7 +317,7 @@ fn disallowed_git_tool_does_not_update_anchors() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
 

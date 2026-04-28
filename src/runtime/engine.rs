@@ -1525,6 +1525,9 @@ impl Runtime {
                     if seeded_pre_generation {
                         seeded_tool_executed = true;
                         last_call_key = None;
+                        if matches!(retrieval_intent, RetrievalIntent::DirectoryListing { .. }) {
+                            answer_phase = Some(AnswerPhaseKind::PostRead);
+                        }
                     }
                     if let Some(t) = t_tool_start {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);

@@ -45,7 +45,7 @@ fn search_budget_closes_after_first_search_with_results_across_rounds() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
     assert!(
@@ -106,7 +106,7 @@ fn search_budget_closes_after_empty_retry_across_rounds() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
     assert!(

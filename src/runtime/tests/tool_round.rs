@@ -9,7 +9,7 @@ fn cycle_detection_blocks_second_identical_call() {
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
 
@@ -37,7 +37,7 @@ fn cycle_detection_allows_different_args() {
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
 
@@ -58,7 +58,7 @@ fn tool_round_followed_by_synthesized_answer() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
 
@@ -110,7 +110,7 @@ fn multi_tool_round_synthesizes_after_all_rounds() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
 
@@ -195,7 +195,7 @@ fn cycle_detection_allows_retry_after_tool_error() {
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "list files".into(),
+            text: "display the structure".into(),
         },
     );
 
