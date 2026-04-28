@@ -3,7 +3,9 @@ use std::path::Path;
 
 use crate::app::config::Config;
 use crate::llm::backend::{BackendCapabilities, ModelBackend, Role};
-use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
+use crate::tools::{
+    ExecutionKind, PendingAction, ToolError, ToolInput, ToolRegistry, ToolRunResult,
+};
 
 use super::anchors::{
     has_same_scope_reference, is_last_read_file_anchor_prompt, is_last_search_anchor_prompt,
@@ -14,6 +16,7 @@ use super::generation::{emit_visible_assistant_message, run_generate_turn};
 use super::investigation::{detect_investigation_mode, InvestigationMode, InvestigationState};
 use super::project_root::ProjectRoot;
 use super::prompt;
+use super::resolve;
 use super::tool_codec;
 use super::tool_round::{
     run_tool_round, SearchBudget, ToolRoundOutcome, MAX_CANDIDATE_READS_PER_INVESTIGATION,
@@ -537,7 +540,15 @@ impl Runtime {
         };
         let name = tool.name();
         let input = tool.into_input();
-        match self.registry.dispatch(input) {
+        let resolved = match resolve(&self.project_root, &input) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let tool_error: ToolError = error.into();
+                on_event(RuntimeEvent::InfoMessage(format!("error: {}", tool_error)));
+                return;
+            }
+        };
+        match self.registry.dispatch(resolved) {
             Ok(ToolRunResult::Immediate(output)) => {
                 self.anchors.record_successful_read(&output);
                 if let Some(query) = search_query {
@@ -701,6 +712,7 @@ impl Runtime {
 
         on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
         match run_tool_round(
+            &self.project_root,
             &self.registry,
             vec![ToolInput::ReadFile { path }],
             &mut last_call_key,
@@ -781,7 +793,33 @@ impl Runtime {
         on_event(RuntimeEvent::ActivityChanged(Activity::ExecutingTools));
         on_event(RuntimeEvent::ToolCallStarted { name: name.clone() });
 
-        match self.registry.dispatch(input) {
+        let resolved = match resolve(&self.project_root, &input) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let tool_error: ToolError = error.into();
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: None,
+                });
+                self.conversation.push_user(tool_codec::format_tool_error(
+                    &name,
+                    &tool_error.to_string(),
+                ));
+                self.conversation
+                    .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                self.finish_with_runtime_answer(
+                    LAST_SEARCH_REPLAY_FAILED,
+                    AnswerSource::RuntimeTerminal {
+                        reason: RuntimeTerminalReason::InsufficientEvidence,
+                        rounds: 1,
+                    },
+                    on_event,
+                );
+                return;
+            }
+        };
+
+        match self.registry.dispatch(resolved) {
             Ok(ToolRunResult::Immediate(output)) => {
                 debug_assert!(
                     self.registry
@@ -1505,6 +1543,7 @@ impl Runtime {
             };
 
             match run_tool_round(
+                &self.project_root,
                 &self.registry,
                 calls,
                 &mut last_call_key,
@@ -1952,7 +1991,8 @@ mod tests {
         fs::write(tmp.path().join("sandbox/in_scope.py"), "needle = True\n").unwrap();
         fs::write(tmp.path().join("src/outside.py"), "needle = False\n").unwrap();
 
-        let registry = default_registry(tmp.path().to_path_buf());
+        let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
+        let registry = default_registry(project_root.as_path_buf());
         let mut last_call_key = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
@@ -1964,6 +2004,7 @@ mod tests {
         let mut events = Vec::new();
 
         let outcome = run_tool_round(
+            &project_root,
             &registry,
             vec![ToolInput::SearchCode {
                 query: "needle".into(),
@@ -2008,7 +2049,9 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("a.rs"), "fn needle() {}\n").unwrap();
-        let registry = default_registry(tmp.path().to_path_buf());
+        fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+        let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
+        let registry = default_registry(project_root.as_path_buf());
         let mut last_call_key = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
@@ -2020,6 +2063,7 @@ mod tests {
         let mut events = Vec::new();
 
         let seed_outcome = run_tool_round(
+            &project_root,
             &registry,
             vec![ToolInput::SearchCode {
                 query: "needle".into(),
@@ -2049,6 +2093,7 @@ mod tests {
         assert_eq!(anchors.last_search_scope(), Some("sandbox/"));
 
         let outcome = run_tool_round(
+            &project_root,
             &registry,
             vec![ToolInput::SearchCode {
                 query: "".into(),
@@ -2176,7 +2221,8 @@ mod tests {
         )
         .unwrap();
 
-        let registry = default_registry(tmp.path().to_path_buf());
+        let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
+        let registry = default_registry(project_root.as_path_buf());
         let mut anchors = AnchorState::default();
         let mut events = Vec::new();
 
@@ -2188,6 +2234,7 @@ mod tests {
         let mut seed_disallowed_tool_attempts = 0usize;
         let mut seed_weak_search_query_attempts = 0usize;
         let seed_outcome = run_tool_round(
+            &project_root,
             &registry,
             vec![ToolInput::SearchCode {
                 query: "logging".into(),
@@ -2230,6 +2277,7 @@ mod tests {
         let mut disallowed_tool_attempts = 0usize;
         let mut weak_search_query_attempts = 0usize;
         let outcome = run_tool_round(
+            &project_root,
             &registry,
             vec![ToolInput::SearchCode {
                 query: "database".into(),

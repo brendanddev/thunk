@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use crate::tools::{ExecutionKind, PendingAction, ToolInput, ToolRegistry, ToolRunResult};
+use crate::tools::{
+    ExecutionKind, PendingAction, ToolError, ToolInput, ToolRegistry, ToolRunResult,
+};
 
 use super::anchors::AnchorState;
 use super::investigation::{InvestigationMode, InvestigationState, RecoveryKind};
@@ -11,6 +13,7 @@ use super::tool_codec;
 use super::tool_surface::{is_git_read_only_tool_input, tool_allowed_for_surface, ToolSurface};
 use super::trace::trace_runtime_decision;
 use super::types::{RuntimeEvent, RuntimeTerminalReason};
+use super::{resolve, ProjectRoot};
 
 /// Maximum number of successful read_file calls allowed in a single turn.
 /// Each read injects up to MAX_LINES lines into the prompt; this cap bounds worst-case
@@ -142,6 +145,7 @@ pub(super) enum ToolRoundOutcome {
 /// rounds. If the current call matches it, a cycle error is injected instead of
 /// dispatching. The key is updated after every non-cycle, non-approval dispatch.
 pub(super) fn run_tool_round(
+    project_root: &ProjectRoot,
     registry: &ToolRegistry,
     calls: Vec<ToolInput>,
     last_call_key: &mut Option<String>,
@@ -479,7 +483,31 @@ pub(super) fn run_tool_round(
             continue;
         }
 
-        match registry.dispatch(input) {
+        let resolved = match resolve(project_root, &input) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let tool_error: ToolError = error.into();
+                let error = tool_error.to_string();
+                on_event(RuntimeEvent::ToolCallFinished {
+                    name: name.clone(),
+                    summary: None,
+                });
+                if is_git_read_only_tool {
+                    git_answer_sections.push(git_acquisition_answer_section(&name, &error));
+                }
+                accumulated.push_str(&tool_codec::format_tool_error(&name, &error));
+                if let Some(path) = read_path {
+                    return ToolRoundOutcome::TerminalAnswer {
+                        results: accumulated,
+                        answer: read_failure_final_answer(&path, &error),
+                        reason: RuntimeTerminalReason::ReadFileFailed,
+                    };
+                }
+                continue;
+            }
+        };
+
+        match registry.dispatch(resolved) {
             Ok(ToolRunResult::Immediate(output)) => {
                 // Guard: spec must agree that this tool is Immediate.
                 // A mismatch means the spec() and run() implementations are out of sync.
@@ -685,5 +713,288 @@ pub(super) fn run_tool_round(
     ToolRoundOutcome::Completed {
         results: accumulated,
         git_acquisition_answer: render_git_acquisition_answer(git_answer_sections),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::fs;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::runtime::ProjectRoot;
+    use crate::tools::types::FileContentsOutput;
+    use crate::tools::{
+        default_registry, ExecutionKind, Tool, ToolError, ToolOutput, ToolRunResult, ToolSpec,
+    };
+
+    struct CountingReadTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Tool for CountingReadTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "read_file",
+                description: "counting read tool",
+                input_hint: "path",
+                execution_kind: ExecutionKind::Immediate,
+                default_risk: None,
+            }
+        }
+
+        fn run(&self, _input: &crate::tools::ToolInput) -> Result<ToolRunResult, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolRunResult::Immediate(ToolOutput::FileContents(
+                FileContentsOutput {
+                    path: "counted.txt".into(),
+                    contents: "counted".into(),
+                    total_lines: 1,
+                    truncated: false,
+                },
+            )))
+        }
+    }
+
+    fn temp_root() -> (TempDir, ProjectRoot, ToolRegistry) {
+        let dir = TempDir::new().unwrap();
+        let root = ProjectRoot::new(dir.path().to_path_buf()).unwrap();
+        let registry = default_registry(root.as_path_buf());
+        (dir, root, registry)
+    }
+
+    fn run_round(
+        root: &ProjectRoot,
+        registry: &ToolRegistry,
+        calls: Vec<ToolInput>,
+        tool_surface: ToolSurface,
+        investigation_required: bool,
+    ) -> ToolRoundOutcome {
+        let mut last_call_key = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn = HashSet::new();
+        let mut anchors = AnchorState::default();
+        let mut requested_read_completed = false;
+        let mut disallowed_tool_attempts = 0usize;
+        let mut weak_search_query_attempts = 0usize;
+
+        run_tool_round(
+            root,
+            registry,
+            calls,
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            tool_surface,
+            &mut disallowed_tool_attempts,
+            &mut weak_search_query_attempts,
+            false,
+            investigation_required,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        )
+    }
+
+    #[test]
+    fn resolver_runs_before_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let root = ProjectRoot::new(dir.path().to_path_buf()).unwrap();
+        let outside_file = root.path().parent().unwrap().join(format!(
+            "outside-{}.txt",
+            dir.path()
+                .file_name()
+                .expect("temp dir has a file name")
+                .to_string_lossy()
+        ));
+        fs::write(&outside_file, "outside\n").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        registry.register(CountingReadTool {
+            calls: Arc::clone(&calls),
+        });
+
+        let outcome = run_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: "../outside.txt".into(),
+            }],
+            ToolSurface::RetrievalFirst,
+            false,
+        );
+
+        assert!(matches!(outcome, ToolRoundOutcome::TerminalAnswer { .. }));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "resolver failure must prevent tool dispatch"
+        );
+        fs::remove_file(outside_file).unwrap();
+    }
+
+    #[test]
+    fn invalid_read_outside_root_becomes_tool_error() {
+        let (_dir, root, registry) = temp_root();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, "outside\n").unwrap();
+
+        let outcome = run_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: outside_file.display().to_string(),
+            }],
+            ToolSurface::RetrievalFirst,
+            false,
+        );
+
+        let ToolRoundOutcome::TerminalAnswer { results, .. } = outcome else {
+            panic!("read failure should terminate");
+        };
+        assert!(results.contains("=== tool_error: read_file ==="));
+        assert!(results.contains("invalid tool input:"));
+        assert!(results.contains("escapes project root"));
+    }
+
+    #[test]
+    fn invalid_list_scope_outside_root_becomes_tool_error() {
+        let (_dir, root, registry) = temp_root();
+        let outside = TempDir::new().unwrap();
+
+        let outcome = run_round(
+            &root,
+            &registry,
+            vec![ToolInput::ListDir {
+                path: outside.path().display().to_string(),
+            }],
+            ToolSurface::RetrievalFirst,
+            false,
+        );
+
+        let ToolRoundOutcome::Completed { results, .. } = outcome else {
+            panic!("invalid list_dir scope should stay in the tool-error path");
+        };
+        assert!(results.contains("=== tool_error: list_dir ==="));
+        assert!(results.contains("invalid tool input:"));
+        assert!(results.contains("escapes project root"));
+    }
+
+    #[test]
+    fn invalid_search_scope_outside_root_becomes_tool_error() {
+        let (_dir, root, registry) = temp_root();
+        let outside = TempDir::new().unwrap();
+
+        let outcome = run_round(
+            &root,
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "needle".into(),
+                path: Some(outside.path().display().to_string()),
+            }],
+            ToolSurface::RetrievalFirst,
+            false,
+        );
+
+        let ToolRoundOutcome::Completed { results, .. } = outcome else {
+            panic!("invalid search scope should stay in the tool-error path");
+        };
+        assert!(results.contains("=== tool_error: search_code ==="));
+        assert!(results.contains("invalid tool input:"));
+        assert!(results.contains("escapes project root"));
+    }
+
+    #[test]
+    fn valid_read_search_and_list_still_work() {
+        let (_dir, root, registry) = temp_root();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(
+            root.path().join("src/main.rs"),
+            "const NEEDLE: &str = \"needle\";\n",
+        )
+        .unwrap();
+
+        let outcome = run_round(
+            &root,
+            &registry,
+            vec![
+                ToolInput::SearchCode {
+                    query: "needle".into(),
+                    path: Some("src".into()),
+                },
+                ToolInput::ListDir { path: "src".into() },
+                ToolInput::ReadFile {
+                    path: "src/main.rs".into(),
+                },
+            ],
+            ToolSurface::RetrievalFirst,
+            false,
+        );
+
+        let ToolRoundOutcome::Completed { results, .. } = outcome else {
+            panic!("valid read/search/list calls should complete");
+        };
+        assert!(results.contains("=== tool_result: search_code ==="));
+        assert!(results.contains("=== tool_result: list_dir ==="));
+        assert!(results.contains("=== tool_result: read_file ==="));
+    }
+
+    #[test]
+    fn gate_checks_happen_before_resolution() {
+        let (_dir, root, registry) = temp_root();
+        let outside = TempDir::new().unwrap();
+
+        let outcome = run_round(
+            &root,
+            &registry,
+            vec![ToolInput::ListDir {
+                path: outside.path().display().to_string(),
+            }],
+            ToolSurface::RetrievalFirst,
+            true,
+        );
+
+        let ToolRoundOutcome::Completed { results, .. } = outcome else {
+            panic!("list_dir-before-search should stay in the tool-error path");
+        };
+        assert!(results.contains("=== tool_error: list_dir ==="));
+        assert!(results.contains(LIST_DIR_BEFORE_SEARCH_BLOCKED));
+        assert!(!results.contains("escapes project root"));
+    }
+
+    #[test]
+    fn disallowed_tools_are_rejected_before_resolution() {
+        let (_dir, root, registry) = temp_root();
+        let outside = TempDir::new().unwrap();
+
+        let outcome = run_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: outside.path().join("outside.txt").display().to_string(),
+            }],
+            ToolSurface::AnswerOnly,
+            false,
+        );
+
+        let ToolRoundOutcome::Completed { results, .. } = outcome else {
+            panic!("disallowed read should stay in the tool-error path");
+        };
+        assert!(results.contains("=== tool_error: read_file ==="));
+        assert!(results.contains(surface_policy_correction(ToolSurface::AnswerOnly)));
+        assert!(!results.contains("invalid tool input:"));
     }
 }

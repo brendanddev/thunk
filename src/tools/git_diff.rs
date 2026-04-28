@@ -228,7 +228,9 @@ mod tests {
         init_git_repo(tmp.path());
         let registry = crate::tools::default_registry(tmp.path().to_path_buf());
 
-        let out = registry.dispatch(ToolInput::GitDiff).unwrap();
+        let out = registry
+            .dispatch(crate::runtime::ResolvedToolInput::GitDiff { path: None })
+            .unwrap();
         assert!(matches!(
             out,
             ToolRunResult::Immediate(ToolOutput::GitDiff(_))

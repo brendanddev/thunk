@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::tools::ToolInput;
+use crate::tools::{ToolError, ToolInput};
 
 use super::{
     project_path::relative_display, ProjectPath, ProjectRoot, ProjectScope, ResolvedToolInput,
@@ -31,6 +31,33 @@ pub enum PathResolutionError {
 
     #[error("invalid path '{raw}': {reason}")]
     InvalidPath { raw: String, reason: String },
+}
+
+impl From<PathResolutionError> for ToolError {
+    fn from(error: PathResolutionError) -> Self {
+        match error {
+            PathResolutionError::EscapesRoot { raw, root } => ToolError::InvalidInput(format!(
+                "path escapes project root: '{raw}' is outside {}",
+                root.display()
+            )),
+            PathResolutionError::NotFound { raw } => {
+                ToolError::InvalidInput(format!("path not found: '{raw}'"))
+            }
+            PathResolutionError::NotADirectory { raw } => {
+                ToolError::InvalidInput(format!("path is not a directory: '{raw}'"))
+            }
+            PathResolutionError::SymlinkParent { raw, component } => ToolError::InvalidInput(
+                format!("path uses symlink parent: '{raw}' via '{component}'"),
+            ),
+            PathResolutionError::SymlinkTarget { raw, target } => ToolError::InvalidInput(format!(
+                "path resolves to symlink target: '{raw}' -> {}",
+                target.display()
+            )),
+            PathResolutionError::InvalidPath { raw, reason } => {
+                ToolError::InvalidInput(format!("invalid path: '{raw}': {reason}"))
+            }
+        }
+    }
 }
 
 pub fn resolve(
@@ -548,5 +575,19 @@ mod tests {
 
         assert_eq!(resolved.absolute(), root.path().join("a/file.txt"));
         assert_eq!(resolved.display(), "a/file.txt");
+    }
+
+    #[test]
+    fn path_resolution_error_maps_to_structured_tool_error() {
+        let tool_error: crate::tools::ToolError = PathResolutionError::EscapesRoot {
+            raw: "../secret.txt".into(),
+            root: PathBuf::from("/project"),
+        }
+        .into();
+
+        assert_eq!(
+            tool_error.to_string(),
+            "invalid tool input: path escapes project root: '../secret.txt' is outside /project"
+        );
     }
 }

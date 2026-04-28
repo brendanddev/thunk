@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::runtime::ResolvedToolInput;
+
 use super::pending::PendingAction;
 use super::types::{ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
@@ -27,11 +29,12 @@ impl ToolRegistry {
 
     /// Dispatches a typed input to the correct tool and returns the run result.
     /// Returns ToolError::NotFound if no tool is registered for the input's tool_name.
-    pub fn dispatch(&self, input: ToolInput) -> Result<ToolRunResult, ToolError> {
+    pub fn dispatch(&self, input: ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
         let name = input.tool_name();
         let tool = self.tools.get(name).ok_or_else(|| ToolError::NotFound {
             name: name.to_string(),
         })?;
+        let input: ToolInput = input.into();
         tool.run(&input)
     }
 
@@ -79,13 +82,23 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::runtime::{ProjectPath, ProjectRoot, ProjectScope};
     use crate::tools::context::ToolContext;
     use crate::tools::list_dir::ListDirTool;
     use crate::tools::read_file::ReadFileTool;
-    use crate::tools::types::{ToolInput, ToolOutput, ToolRunResult};
+    use crate::tools::types::{ToolOutput, ToolRunResult};
 
     fn ctx() -> ToolContext {
         ToolContext::new(PathBuf::from("."))
+    }
+
+    fn resolved_root_path() -> ProjectPath {
+        let root = ProjectRoot::new(PathBuf::from(".")).unwrap();
+        ProjectPath::from_trusted(root.path().to_path_buf(), ".".to_string())
+    }
+
+    fn resolved_root_scope() -> ProjectScope {
+        ProjectScope::from_trusted_path(resolved_root_path())
     }
 
     #[test]
@@ -105,7 +118,9 @@ mod tests {
     fn dispatch_returns_not_found_for_unregistered_tool() {
         let registry = ToolRegistry::new();
         let err = registry
-            .dispatch(ToolInput::ReadFile { path: "any".into() })
+            .dispatch(ResolvedToolInput::ReadFile {
+                path: ProjectPath::from_trusted(PathBuf::from("/tmp/any"), "any".into()),
+            })
             .unwrap_err();
         assert!(matches!(err, ToolError::NotFound { .. }));
     }
@@ -115,7 +130,9 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(ListDirTool::new(ctx()));
 
-        let result = registry.dispatch(ToolInput::ListDir { path: ".".into() });
+        let result = registry.dispatch(ResolvedToolInput::ListDir {
+            path: resolved_root_scope(),
+        });
         assert!(result.is_ok());
         let ToolRunResult::Immediate(ToolOutput::DirectoryListing(_)) = result.unwrap() else {
             panic!("expected Immediate(DirectoryListing)");
