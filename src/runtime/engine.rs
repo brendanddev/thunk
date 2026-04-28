@@ -1100,47 +1100,46 @@ impl Runtime {
 
             turn_perf.start_round(next_round_label, next_round_cause, prompt_chars, on_event);
 
-            let (calls, response, seeded_pre_generation) = if let Some(pending) =
-                pending_runtime_call.take()
-            {
-                (vec![pending.input], None, pending.seeded_pre_generation)
-            } else {
-                let response = {
-                    let turn_perf = &mut turn_perf;
-                    let mut perf_on_event = |event| {
-                        if let RuntimeEvent::BackendTiming { stage, elapsed_ms } = &event {
-                            turn_perf.record_backend_timing(stage, *elapsed_ms);
+            let (calls, response, seeded_pre_generation) =
+                if let Some(pending) = pending_runtime_call.take() {
+                    (vec![pending.input], None, pending.seeded_pre_generation)
+                } else {
+                    let response = {
+                        let turn_perf = &mut turn_perf;
+                        let mut perf_on_event = |event| {
+                            if let RuntimeEvent::BackendTiming { stage, elapsed_ms } = &event {
+                                turn_perf.record_backend_timing(stage, *elapsed_ms);
+                            }
+                            on_event(event);
+                        };
+
+                        match run_generate_turn(
+                            self.backend.as_mut(),
+                            &mut self.conversation,
+                            effective_surface,
+                            &mut perf_on_event,
+                        ) {
+                            Ok(Some(r)) => r,
+                            Ok(None) => {
+                                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                                on_event(RuntimeEvent::Failed {
+                                    message: format!("{} returned no output.", self.backend.name()),
+                                });
+                                finish_turn!();
+                            }
+                            Err(e) => {
+                                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                                on_event(RuntimeEvent::Failed {
+                                    message: e.to_string(),
+                                });
+                                finish_turn!();
+                            }
                         }
-                        on_event(event);
                     };
 
-                    match run_generate_turn(
-                        self.backend.as_mut(),
-                        &mut self.conversation,
-                        effective_surface,
-                        &mut perf_on_event,
-                    ) {
-                        Ok(Some(r)) => r,
-                        Ok(None) => {
-                            on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                            on_event(RuntimeEvent::Failed {
-                                message: format!("{} returned no output.", self.backend.name()),
-                            });
-                            finish_turn!();
-                        }
-                        Err(e) => {
-                            on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
-                            on_event(RuntimeEvent::Failed {
-                                message: e.to_string(),
-                            });
-                            finish_turn!();
-                        }
-                    }
+                    let calls = tool_codec::parse_all_tool_inputs(&response);
+                    (calls, Some(response), false)
                 };
-
-                let calls = tool_codec::parse_all_tool_inputs(&response);
-                (calls, Some(response), false)
-            };
 
             if let Some(phase) = answer_phase {
                 if !calls.is_empty() {

@@ -1479,7 +1479,11 @@ mod tests {
         );
 
         let chunks = assistant_chunks(&events);
-        assert_eq!(chunks.len(), 1, "visible output should be one runtime terminal");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "visible output should be one runtime terminal"
+        );
         assert!(
             chunks[0].contains("I couldn't read `missing_file_phase84x.rs`")
                 && chunks[0].contains("No file contents were read."),

@@ -271,10 +271,7 @@ fn direct_read_blocks_post_read_tool_call_with_answer_phase_correction() {
     fs::write(tmp.path().join("foo.rs"), "fn foo() {}\n").unwrap();
 
     let final_answer = "foo.rs defines a single function.";
-    let mut rt = make_runtime_in(
-        vec!["[search_code: foo]", final_answer],
-        tmp.path(),
-    );
+    let mut rt = make_runtime_in(vec!["[search_code: foo]", final_answer], tmp.path());
 
     let events = collect_events(
         &mut rt,
