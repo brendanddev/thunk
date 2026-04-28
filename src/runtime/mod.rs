@@ -4,6 +4,7 @@ mod engine;
 mod generation;
 mod investigation;
 mod paths;
+mod project_path;
 mod project_root;
 mod prompt;
 mod prompt_analysis;
