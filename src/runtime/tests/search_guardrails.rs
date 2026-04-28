@@ -111,7 +111,7 @@ fn rendered_lookup_enables_weak_query_guard_after_surface_rejection() {
     );
 
     assert_eq!(
-        select_tool_surface("where is git status rendered"),
+        select_tool_surface("where is git status rendered", true, false, false),
         ToolSurface::RetrievalFirst
     );
     let answer_source = events.iter().find_map(|event| {

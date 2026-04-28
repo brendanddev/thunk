@@ -21,7 +21,7 @@ fn read_cap_blocks_reads_beyond_limit() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "explore the files".into(),
+            text: "read a.rs".into(),
         },
     );
 
@@ -78,7 +78,7 @@ fn duplicate_read_is_blocked_within_same_turn() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "What is in engine.rs?".into(),
+            text: "read engine.rs".into(),
         },
     );
 

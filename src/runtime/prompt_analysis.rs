@@ -35,7 +35,38 @@ pub(super) fn prompt_requires_investigation(text: &str) -> bool {
         }
     }
 
+    if prompt_contains_code_file_token(text) {
+        return true;
+    }
+
     natural_language_code_lookup_requires_investigation(text)
+}
+
+/// Returns true when the prompt contains a whitespace-delimited token whose file
+/// extension is in the recognized source or config extension set.
+///
+/// Uses whitespace splitting (not the identifier splitter) so "engine.rs" is not
+/// fragmented. Strips trailing punctuation before extension matching to handle
+/// "engine.rs?" and "engine.rs,".
+///
+/// Intentionally narrow: only fires on recognized extensions so that version
+/// strings like "3.14" or "v2.3" do not match.
+fn prompt_contains_code_file_token(text: &str) -> bool {
+    const CODE_EXTENSIONS: &[&str] = &[
+        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h", "hpp",
+        "yaml", "yml", "toml", "json", "ini", "cfg", "conf", "md",
+    ];
+    for token in text.split_whitespace() {
+        let stripped = token.trim_end_matches(|c: char| {
+            matches!(c, '.' | ',' | '?' | '!' | ';' | ':' | ')' | ']' | '}' | '"' | '\'')
+        });
+        if let Some(ext) = std::path::Path::new(stripped).extension().and_then(|e| e.to_str()) {
+            if CODE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Detects investigation intent from natural-language lookup phrasing.
@@ -58,6 +89,18 @@ fn natural_language_code_lookup_requires_investigation(text: &str) -> bool {
     // conversational phrasing like "find a good approach".
     if contains_word(&lower, "search") {
         return true;
+    }
+
+    // "where is/are the <code-noun>" is a self-sufficient trigger — these nouns are
+    // unambiguously code-domain references that don't need an additional secondary verb.
+    if contains_word(&lower, "where") {
+        const CODE_NOUNS: &[&str] = &[
+            "function", "method", "module", "class", "struct", "enum", "trait",
+            "type", "variable", "constant", "file", "command", "tool",
+        ];
+        if CODE_NOUNS.iter().any(|noun| contains_word(&lower, noun)) {
+            return true;
+        }
     }
 
     [
@@ -233,6 +276,10 @@ pub(super) fn extract_investigation_path_scope(text: &str) -> Option<String> {
 /// Accepts "read <path>" and "read file <path>" forms. Returns None if the
 /// structure does not match or the candidate does not resemble a file path.
 pub(super) fn requested_read_path(text: &str) -> Option<String> {
+    path_from_read_verb(text).or_else(|| path_from_what_is_in_query(text))
+}
+
+fn path_from_read_verb(text: &str) -> Option<String> {
     let mut tokens = text.split_whitespace();
     let first = tokens.next()?;
     if !first.eq_ignore_ascii_case("read") {
@@ -251,6 +298,39 @@ pub(super) fn requested_read_path(text: &str) -> Option<String> {
         )
     });
     if looks_like_file_path(path) {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
+/// Extracts a path-qualified direct-read target from "what is in <path>" queries.
+///
+/// Only fires when the path token contains `/` — bare filenames like "engine.rs"
+/// are intentionally excluded because they are ambiguous and should enter
+/// investigation mode instead.
+///
+/// Accepted forms:
+///   "What is in src/runtime/engine.rs?"       → Some("src/runtime/engine.rs")
+///   "What is in the sandbox/main.py?"         → Some("sandbox/main.py")
+fn path_from_what_is_in_query(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if !lower.starts_with("what is in ") {
+        return None;
+    }
+    let rest = &text["what is in ".len()..].trim_start();
+    let mut tokens = rest.split_whitespace();
+    let mut candidate = tokens.next()?;
+    if matches!(candidate.to_ascii_lowercase().as_str(), "the" | "a" | "an") {
+        candidate = tokens.next()?;
+    }
+    let path = candidate.trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '?' | '!'
+        )
+    });
+    if path.contains('/') && looks_like_file_path(path) {
         Some(path.to_string())
     } else {
         None
@@ -449,6 +529,56 @@ mod tests {
             Some("src/runtime/engine.rs")
         );
         assert_eq!(requested_read_path("Read about logging"), None);
+    }
+
+    #[test]
+    fn requested_read_path_detects_path_qualified_what_is_in_query() {
+        assert_eq!(
+            requested_read_path("What is in src/runtime/engine.rs?").as_deref(),
+            Some("src/runtime/engine.rs")
+        );
+        assert_eq!(
+            requested_read_path("What is in the sandbox/main.py?").as_deref(),
+            Some("sandbox/main.py")
+        );
+        // bare filename (no slash) must NOT become a direct-read
+        assert_eq!(
+            requested_read_path("What is in engine.rs?").as_deref(),
+            None
+        );
+        // non-file query must not match
+        assert_eq!(requested_read_path("What is in this project?").as_deref(), None);
+    }
+
+    #[test]
+    fn prompt_requires_investigation_detects_bare_filename_tokens() {
+        assert!(prompt_requires_investigation("What is in engine.rs?"));
+        assert!(prompt_requires_investigation("What does main.py do?"));
+        assert!(prompt_requires_investigation("Explain tool_surface.rs"));
+        assert!(prompt_requires_investigation("Show me Cargo.toml"));
+    }
+
+    #[test]
+    fn prompt_requires_investigation_rejects_non_code_extension_tokens() {
+        // Version strings and other numeric dot-separated tokens must not trigger.
+        assert!(!prompt_requires_investigation("Python 3.10 syntax is fine"));
+        assert!(!prompt_requires_investigation("version 1.0 released"));
+    }
+
+    #[test]
+    fn prompt_requires_investigation_detects_where_is_code_noun() {
+        assert!(prompt_requires_investigation("Where is the helper function?"));
+        assert!(prompt_requires_investigation("Where is the config module?"));
+        assert!(prompt_requires_investigation("Where is the parser file?"));
+        assert!(prompt_requires_investigation("Where is the command?"));
+        assert!(prompt_requires_investigation("Where is the main class?"));
+    }
+
+    #[test]
+    fn prompt_requires_investigation_rejects_where_is_non_code_noun() {
+        assert!(!prompt_requires_investigation("Where is the best place to start?"));
+        assert!(!prompt_requires_investigation("Where is the issue?"));
+        assert!(!prompt_requires_investigation("Where is the project summary?"));
     }
 
     #[test]

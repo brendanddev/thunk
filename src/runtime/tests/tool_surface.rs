@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn tool_surface_defaults_to_retrieval_first_for_code_investigation_prompts() {
     assert_eq!(
-        select_tool_surface("Where is TaskStatus used in sandbox/?"),
+        select_tool_surface("Where is TaskStatus used in sandbox/?", true, false, false),
         ToolSurface::RetrievalFirst
     );
     assert_eq!(
-        select_tool_surface("Find where database is configured in sandbox/"),
+        select_tool_surface("Find where database is configured in sandbox/", true, false, false),
         ToolSurface::RetrievalFirst
     );
 }
@@ -40,7 +40,7 @@ fn tool_surface_selects_git_read_only_for_explicit_git_prompts() {
         "show latest git log",
     ] {
         assert_eq!(
-            select_tool_surface(prompt_text),
+            select_tool_surface(prompt_text, false, false, false),
             ToolSurface::GitReadOnly,
             "prompt should select GitReadOnly: {prompt_text}"
         );
@@ -49,19 +49,126 @@ fn tool_surface_selects_git_read_only_for_explicit_git_prompts() {
 
 #[test]
 fn tool_surface_does_not_use_bare_overlapping_tokens() {
+    // These prompts contain git-related words (status, diff, log, git, commit) but are
+    // code investigation requests — the runtime sets investigation_required=true for them.
+    // They must NOT be routed to GitReadOnly; RetrievalFirst is correct.
     for prompt_text in [
-        "find where status is computed",
         "where is diff rendered",
         "find log initialization in sandbox/",
         "where is commit saved",
         "where is git integration implemented",
-        "find git helper in src/",
         "where is git status rendered",
     ] {
         assert_eq!(
-            select_tool_surface(prompt_text),
+            select_tool_surface(prompt_text, true, false, false),
             ToolSurface::RetrievalFirst,
             "prompt should remain RetrievalFirst: {prompt_text}"
+        );
+    }
+}
+
+// Phase 14.1.2 surface routing tests
+
+#[test]
+fn tool_surface_where_is_code_noun_selects_retrieval_first() {
+    // "Where is <X> <code-noun>?" must reach RetrievalFirst without a secondary verb.
+    for prompt_text in [
+        "Where is the helper function?",
+        "Where is the config module?",
+        "Where is the parser file?",
+        "Where is the command?",
+        "Where is the tool?",
+        "Where is the main class?",
+    ] {
+        assert_eq!(
+            select_tool_surface(prompt_text, true, false, false),
+            ToolSurface::RetrievalFirst,
+            "code-noun where-is prompt should select RetrievalFirst: {prompt_text}"
+        );
+    }
+}
+
+#[test]
+fn tool_surface_where_is_code_noun_does_not_match_non_code_nouns() {
+    // "Where is <non-code-noun>?" must NOT promote to RetrievalFirst on the noun alone.
+    // These prompts have no identifier signal, so investigation_required is false.
+    for prompt_text in [
+        "Where is the best place to start?",
+        "Where is the issue?",
+        "Where is the project summary?",
+    ] {
+        assert_eq!(
+            select_tool_surface(prompt_text, false, false, false),
+            ToolSurface::AnswerOnly,
+            "non-code-noun where-is should remain AnswerOnly: {prompt_text}"
+        );
+    }
+}
+
+#[test]
+fn tool_surface_bare_filename_selects_retrieval_first() {
+    // A prompt containing a bare filename (known extension) must reach RetrievalFirst
+    // via investigation_required even without a secondary condition verb.
+    for prompt_text in [
+        "What is in engine.rs?",
+        "What does main.py do?",
+        "Explain tool_surface.rs",
+    ] {
+        assert_eq!(
+            select_tool_surface(prompt_text, true, false, false),
+            ToolSurface::RetrievalFirst,
+            "bare-filename prompt should select RetrievalFirst: {prompt_text}"
+        );
+    }
+}
+
+#[test]
+fn tool_surface_explore_with_structural_cue_selects_retrieval_first() {
+    for prompt_text in [
+        "explore the files",
+        "explore this directory",
+        "explore the folder contents",
+        "explore src/",
+    ] {
+        assert_eq!(
+            select_tool_surface(prompt_text, false, false, false),
+            ToolSurface::RetrievalFirst,
+            "explore + structural cue should select RetrievalFirst: {prompt_text}"
+        );
+    }
+}
+
+#[test]
+fn tool_surface_bare_explore_remains_answer_only() {
+    assert_eq!(
+        select_tool_surface("explore", false, false, false),
+        ToolSurface::AnswerOnly,
+        "bare explore without structural cue must remain AnswerOnly"
+    );
+    assert_eq!(
+        select_tool_surface("explore ideas", false, false, false),
+        ToolSurface::AnswerOnly,
+        "explore + non-structural noun must remain AnswerOnly"
+    );
+}
+
+#[test]
+fn tool_surface_find_without_secondary_condition_is_answer_only() {
+    // TODO(Phase 14.1.x): "find X in path/" and "find where X is computed" reach this test
+    // as AnswerOnly because prompt_requires_investigation returns false for them — they lack
+    // a recognised secondary condition ("implemented", "configured", "rendered", etc.) even
+    // though they express clear code-search intent.  If benchmarks show these patterns are
+    // common enough to warrant promotion, extend prompt_requests_directory_navigation to
+    // catch path-scoped "find" queries, or add the missing secondary terms.  Do not widen
+    // the policy until that data exists.
+    for prompt_text in [
+        "find where status is computed",
+        "find git helper in src/",
+    ] {
+        assert_eq!(
+            select_tool_surface(prompt_text, false, false, false),
+            ToolSurface::AnswerOnly,
+            "prompt has no detected investigation intent and should be AnswerOnly: {prompt_text}"
         );
     }
 }
@@ -116,7 +223,9 @@ fn tool_surface_enforcement_uses_canonical_surface_membership() {
 }
 
 #[test]
-fn retrieval_first_surface_hint_is_sent_to_model() {
+fn answer_only_surface_sent_for_plain_conversational_prompt() {
+    // Phase 14.1: plain conversational prompts with no investigation intent, no mutation
+    // request, and no direct read path receive the AnswerOnly surface — not RetrievalFirst.
     let (mut rt, requests) = make_runtime_with_recorded_requests(vec!["Done."]);
     collect_events(
         &mut rt,
@@ -131,9 +240,9 @@ fn retrieval_first_surface_hint_is_sent_to_model() {
         first.messages.iter().any(|m| {
             m.role == Role::System
                 && m.content
-                    == "Active tool surface: RetrievalFirst. Available this turn: search_code, read_file, list_dir."
+                    == "Active tool surface: AnswerOnly. No tools are available. Provide your final answer now."
         }),
-        "RetrievalFirst surface hint must be injected into backend request: {:?}",
+        "AnswerOnly surface hint must be injected for plain conversational prompt: {:?}",
         first.messages
     );
 }

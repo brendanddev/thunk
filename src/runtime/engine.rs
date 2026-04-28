@@ -943,8 +943,17 @@ impl Runtime {
             .map(user_requested_mutation)
             .unwrap_or(false);
         let tool_surface = original_user_prompt
-            .map(select_tool_surface)
-            .unwrap_or(ToolSurface::RetrievalFirst);
+            .map(|p| select_tool_surface(
+                p,
+                investigation_required,
+                mutation_allowed,
+                requested_read_path.is_some() || !reads_this_turn.is_empty(),
+            ))
+            .unwrap_or(if reads_this_turn.is_empty() {
+                ToolSurface::AnswerOnly
+            } else {
+                ToolSurface::RetrievalFirst
+            });
         let investigation_mode = original_user_prompt
             .map(detect_investigation_mode)
             .unwrap_or(InvestigationMode::General);

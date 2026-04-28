@@ -227,7 +227,7 @@ mod tests {
         let events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "find main".into(),
+                text: "search main".into(),
             },
         );
         assert!(
@@ -508,7 +508,7 @@ mod tests {
         let events = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "What does main do?".into(),
+                text: "search main".into(),
             },
         );
         assert!(
@@ -591,7 +591,7 @@ mod tests {
         let events1 = collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "Where is the helper function?".into(),
+                text: "search helper".into(),
             },
         );
         assert!(!has_failed(&events1), "turn 1 must not fail: {events1:?}");
@@ -914,7 +914,7 @@ mod tests {
         collect_events(
             &mut rt,
             RuntimeRequest::Submit {
-                text: "list both".into(),
+                text: "list files".into(),
             },
         );
 

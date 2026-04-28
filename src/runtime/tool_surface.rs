@@ -116,15 +116,22 @@ impl ToolSurface {
     }
 }
 
-/// Selects the tool surface for a user turn using explicit structural phrasing only.
-///
-/// This intentionally avoids fuzzy matching so ambiguous prompts stay on the
-/// safer RetrievalFirst surface.
-pub(super) fn select_tool_surface(prompt: &str) -> ToolSurface {
+pub(super) fn select_tool_surface(
+    prompt: &str,
+    investigation_required: bool,
+    mutation_allowed: bool,
+    has_direct_read: bool,
+) -> ToolSurface {
     if is_explicit_git_tooling_prompt(prompt) {
         ToolSurface::GitReadOnly
-    } else {
+    } else if investigation_required
+        || mutation_allowed
+        || has_direct_read
+        || prompt_requests_directory_navigation(prompt)
+    {
         ToolSurface::RetrievalFirst
+    } else {
+        ToolSurface::AnswerOnly
     }
 }
 
@@ -149,6 +156,23 @@ fn is_explicit_git_tooling_prompt(prompt: &str) -> bool {
         || starts_with_token_phrase(&tokens, &["show", "latest", "git", "status"])
         || starts_with_token_phrase(&tokens, &["show", "latest", "git", "diff"])
         || starts_with_token_phrase(&tokens, &["show", "latest", "git", "log"])
+}
+
+fn prompt_requests_directory_navigation(prompt: &str) -> bool {
+    let tokens = normalized_prompt_tokens(prompt);
+    const NAV_VERBS: &[&str] = &["list", "show", "display", "tree", "explore"];
+    const STRUCTURAL_KEYWORDS: &[&str] = &[
+        "files", "file", "directory", "dir", "dirs", "structure", "contents", "folders", "folder",
+    ];
+    let has_nav_verb = tokens.iter().any(|t| NAV_VERBS.contains(&t.as_str()));
+    if !has_nav_verb {
+        return false;
+    }
+    let has_structural_keyword = tokens
+        .iter()
+        .any(|t| STRUCTURAL_KEYWORDS.contains(&t.as_str()));
+    let has_path_token = prompt.split_whitespace().any(|t| t.contains('/'));
+    has_structural_keyword || has_path_token
 }
 
 fn starts_with_token_phrase(tokens: &[String], phrase: &[&str]) -> bool {
