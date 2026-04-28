@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use crate::runtime::ResolvedToolInput;
+
 use super::context::ToolContext;
 use super::pending::{PendingAction, RiskLevel};
 use super::types::{
@@ -15,6 +17,45 @@ pub struct WriteFileTool {
 impl WriteFileTool {
     pub fn new(context: ToolContext) -> Self {
         Self { context }
+    }
+
+    fn run_legacy(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
+        let ToolInput::WriteFile { path, content } = input else {
+            return Err(ToolError::InvalidInput(
+                "write_file received wrong input variant".into(),
+            ));
+        };
+
+        if path.is_empty() {
+            return Err(ToolError::InvalidInput("path must not be empty".into()));
+        }
+
+        check_path_safety(path, &self.context.root)?;
+
+        let resolved = self.context.resolve(path);
+        let file_exists = resolved.exists();
+        let line_count = content.lines().count();
+
+        let (summary, risk) = if file_exists {
+            (
+                format!("overwrite {path} ({line_count} lines)"),
+                RiskLevel::High,
+            )
+        } else {
+            (
+                format!("create {path} ({line_count} lines)"),
+                RiskLevel::Medium,
+            )
+        };
+
+        let payload = encode_payload(path, content);
+
+        Ok(ToolRunResult::Approval(PendingAction {
+            tool_name: "write_file".to_string(),
+            summary,
+            risk,
+            payload,
+        }))
     }
 }
 
@@ -57,43 +98,22 @@ impl Tool for WriteFileTool {
         }
     }
 
-    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
-        let ToolInput::WriteFile { path, content } = input else {
-            return Err(ToolError::InvalidInput(
-                "write_file received wrong input variant".into(),
-            ));
+    fn run(&self, input: &ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
+        // Temporary Slice 15.3.3 shim: keep legacy write_file behavior unchanged
+        // until the resolved-input-native migration lands in 15.3.4.
+        let legacy = match input {
+            ResolvedToolInput::WriteFile { path, content } => ToolInput::WriteFile {
+                path: path.display().to_string(),
+                content: content.clone(),
+            },
+            _ => {
+                return Err(ToolError::InvalidInput(
+                    "write_file received wrong input variant".into(),
+                ))
+            }
         };
 
-        if path.is_empty() {
-            return Err(ToolError::InvalidInput("path must not be empty".into()));
-        }
-
-        check_path_safety(path, &self.context.root)?;
-
-        let resolved = self.context.resolve(path);
-        let file_exists = resolved.exists();
-        let line_count = content.lines().count();
-
-        let (summary, risk) = if file_exists {
-            (
-                format!("overwrite {path} ({line_count} lines)"),
-                RiskLevel::High,
-            )
-        } else {
-            (
-                format!("create {path} ({line_count} lines)"),
-                RiskLevel::Medium,
-            )
-        };
-
-        let payload = encode_payload(path, content);
-
-        Ok(ToolRunResult::Approval(PendingAction {
-            tool_name: "write_file".to_string(),
-            summary,
-            risk,
-            payload,
-        }))
+        self.run_legacy(&legacy)
     }
 
     fn execute_approved(&self, payload: &str) -> Result<ToolOutput, ToolError> {
@@ -140,7 +160,7 @@ mod tests {
         path: &str,
         content: &str,
     ) -> Result<ToolRunResult, ToolError> {
-        tool.run(&ToolInput::WriteFile {
+        tool.run_legacy(&ToolInput::WriteFile {
             path: path.to_string(),
             content: content.to_string(),
         })
@@ -222,7 +242,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = tool_in(&dir);
         let err = tool
-            .run(&ToolInput::ReadFile {
+            .run_legacy(&ToolInput::ReadFile {
                 path: "f.rs".into(),
             })
             .unwrap_err();

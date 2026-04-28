@@ -2,6 +2,8 @@ use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 
+use crate::runtime::ResolvedToolInput;
+
 use super::context::ToolContext;
 use super::types::{
     ExecutionKind, GitLogEntry, GitLogOutput, ToolError, ToolInput, ToolOutput, ToolRunResult,
@@ -24,20 +26,8 @@ impl GitLogTool {
     pub fn new(context: ToolContext) -> Self {
         Self { context }
     }
-}
 
-impl Tool for GitLogTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "git_log",
-            description: "Show read-only recent git commit history for the project.",
-            input_hint: "",
-            execution_kind: ExecutionKind::Immediate,
-            default_risk: None,
-        }
-    }
-
-    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
+    fn run_legacy(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
         let ToolInput::GitLog = input else {
             return Err(ToolError::InvalidInput(
                 "git_log received wrong input variant".into(),
@@ -59,6 +49,33 @@ impl Tool for GitLogTool {
         Ok(ToolRunResult::Immediate(ToolOutput::GitLog(
             parse_git_log_output(&stdout, output.stdout.truncated),
         )))
+    }
+}
+
+impl Tool for GitLogTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_log",
+            description: "Show read-only recent git commit history for the project.",
+            input_hint: "",
+            execution_kind: ExecutionKind::Immediate,
+            default_risk: None,
+        }
+    }
+
+    fn run(&self, input: &ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
+        // Temporary Slice 15.3.3 shim: keep legacy git_log behavior unchanged
+        // until the resolved-input-native migration lands in 15.3.5.
+        let legacy = match input {
+            ResolvedToolInput::GitLog => ToolInput::GitLog,
+            _ => {
+                return Err(ToolError::InvalidInput(
+                    "git_log received wrong input variant".into(),
+                ))
+            }
+        };
+
+        self.run_legacy(&legacy)
     }
 }
 
@@ -299,7 +316,7 @@ mod tests {
     }
 
     fn run_log(path: &Path) -> Result<ToolRunResult, ToolError> {
-        GitLogTool::new(ToolContext::new(PathBuf::from(path))).run(&ToolInput::GitLog)
+        GitLogTool::new(ToolContext::new(PathBuf::from(path))).run_legacy(&ToolInput::GitLog)
     }
 
     #[test]

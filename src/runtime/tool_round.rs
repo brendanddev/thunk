@@ -749,7 +749,10 @@ mod tests {
             }
         }
 
-        fn run(&self, _input: &crate::tools::ToolInput) -> Result<ToolRunResult, ToolError> {
+        fn run(
+            &self,
+            _input: &crate::runtime::ResolvedToolInput,
+        ) -> Result<ToolRunResult, ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolRunResult::Immediate(ToolOutput::FileContents(
                 FileContentsOutput {

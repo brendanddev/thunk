@@ -1,8 +1,10 @@
 use std::fs;
 
+use crate::runtime::ResolvedToolInput;
+
 use super::context::ToolContext;
 use super::types::{
-    ExecutionKind, FileContentsOutput, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec,
+    ExecutionKind, FileContentsOutput, ToolError, ToolOutput, ToolRunResult, ToolSpec,
 };
 use super::Tool;
 
@@ -10,13 +12,11 @@ use super::Tool;
 /// Files with more lines are truncated; the metadata line reports total vs shown.
 const MAX_LINES: usize = 200;
 
-pub struct ReadFileTool {
-    context: ToolContext,
-}
+pub struct ReadFileTool;
 
 impl ReadFileTool {
-    pub fn new(context: ToolContext) -> Self {
-        Self { context }
+    pub fn new(_context: ToolContext) -> Self {
+        Self
     }
 }
 
@@ -31,15 +31,14 @@ impl Tool for ReadFileTool {
         }
     }
 
-    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
-        let ToolInput::ReadFile { path } = input else {
+    fn run(&self, input: &ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
+        let ResolvedToolInput::ReadFile { path } = input else {
             return Err(ToolError::InvalidInput(
                 "read_file received wrong input variant".into(),
             ));
         };
 
-        let path = self.context.resolve(path);
-        let raw = fs::read(&path)?;
+        let raw = fs::read(path.absolute())?;
         let full = String::from_utf8_lossy(&raw).into_owned();
         let total_lines = full.lines().count();
 
@@ -52,7 +51,7 @@ impl Tool for ReadFileTool {
 
         Ok(ToolRunResult::Immediate(ToolOutput::FileContents(
             FileContentsOutput {
-                path: path.to_string_lossy().into_owned(),
+                path: path.display().to_string(),
                 contents,
                 total_lines,
                 truncated,
@@ -63,27 +62,34 @@ impl Tool for ReadFileTool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
+    use crate::runtime::ProjectPath;
+    use std::fs;
+    use tempfile::TempDir;
 
-    fn read(path: &str) -> Result<ToolRunResult, ToolError> {
-        ReadFileTool::new(ToolContext::new(PathBuf::from("."))).run(&ToolInput::ReadFile {
-            path: path.to_string(),
-        })
+    fn resolved_path(root: &TempDir, relative: &str) -> ProjectPath {
+        let absolute = root.path().canonicalize().unwrap().join(relative);
+        ProjectPath::from_trusted(absolute, relative.to_string())
+    }
+
+    fn read(root: &TempDir, relative: &str) -> Result<ToolRunResult, ToolError> {
+        ReadFileTool::new(ToolContext::new(root.path().to_path_buf())).run(
+            &ResolvedToolInput::ReadFile {
+                path: resolved_path(root, relative),
+            },
+        )
     }
 
     #[test]
     fn reads_file_contents() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "line one").unwrap();
-        writeln!(f, "line two").unwrap();
-        let out = read(f.path().to_str().unwrap()).unwrap();
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("notes.txt"), "line one\nline two\n").unwrap();
+
+        let out = read(&root, "notes.txt").unwrap();
         let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else {
             panic!("expected Immediate(FileContents)")
         };
+        assert_eq!(fc.path, "notes.txt");
         assert!(fc.contents.contains("line one"));
         assert_eq!(fc.total_lines, 2);
         assert!(!fc.truncated);
@@ -91,26 +97,26 @@ mod tests {
 
     #[test]
     fn truncates_at_line_cap_and_reports_total() {
-        let mut f = NamedTempFile::new().unwrap();
-        // Write MAX_LINES + 5 lines (205 total)
-        for i in 0..205 {
-            writeln!(f, "line {i}").unwrap();
-        }
-        let out = read(f.path().to_str().unwrap()).unwrap();
+        let root = TempDir::new().unwrap();
+        let contents = (0..205).map(|i| format!("line {i}\n")).collect::<String>();
+        fs::write(root.path().join("big.txt"), contents).unwrap();
+
+        let out = read(&root, "big.txt").unwrap();
         let ToolRunResult::Immediate(ToolOutput::FileContents(fc)) = out else {
             panic!("expected Immediate(FileContents)")
         };
+        assert_eq!(fc.path, "big.txt");
         assert!(fc.truncated);
         assert_eq!(fc.total_lines, 205);
-        // contents must have exactly MAX_LINES lines
         assert_eq!(fc.contents.lines().count(), MAX_LINES);
         assert!(fc.contents.contains("line 0"));
-        assert!(!fc.contents.contains("line 200")); // line 200 is the 201st line, beyond cap
+        assert!(!fc.contents.contains("line 200"));
     }
 
     #[test]
     fn returns_io_error_for_missing_file() {
-        let err = read("/nonexistent/path/file.rs").unwrap_err();
+        let root = TempDir::new().unwrap();
+        let err = read(&root, "missing.rs").unwrap_err();
         assert!(matches!(err, ToolError::Io(_)));
     }
 }

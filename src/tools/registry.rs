@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::runtime::ResolvedToolInput;
 
 use super::pending::PendingAction;
-use super::types::{ExecutionKind, ToolError, ToolInput, ToolOutput, ToolRunResult, ToolSpec};
+use super::types::{ExecutionKind, ToolError, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
 
 /// Owns all registered tools. Responsibilities: registration, spec enumeration, dispatch.
@@ -34,8 +34,13 @@ impl ToolRegistry {
         let tool = self.tools.get(name).ok_or_else(|| ToolError::NotFound {
             name: name.to_string(),
         })?;
-        let input: ToolInput = input.into();
-        tool.run(&input)
+        match name {
+            "read_file" | "list_dir" | "search_code" => tool.run(&input),
+            // Temporary Slice 15.3.3 split: the remaining tools still perform
+            // their own local legacy-input adaptation until 15.3.4 / 15.3.5.
+            "write_file" | "edit_file" | "git_status" | "git_diff" | "git_log" => tool.run(&input),
+            _ => tool.run(&input),
+        }
     }
 
     /// Applies a previously approved mutation by delegating to the correct tool's

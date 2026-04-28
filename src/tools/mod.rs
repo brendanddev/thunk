@@ -13,6 +13,8 @@ mod write_file;
 
 use std::path::PathBuf;
 
+use crate::runtime::ResolvedToolInput;
+
 use edit_file::EditFileTool;
 use git_diff::GitDiffTool;
 use git_log::GitLogTool;
@@ -39,7 +41,7 @@ pub trait Tool: Send + Sync {
 
     /// Phase 1 of execution: validate input and return either an immediate result
     /// or a PendingAction describing the proposed mutation.
-    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError>;
+    fn run(&self, input: &ResolvedToolInput) -> Result<ToolRunResult, ToolError>;
 
     /// Phase 2 of execution: apply a previously approved mutation and return the
     /// result. Only mutating tools implement this — read-only tools never produce
@@ -53,8 +55,8 @@ pub trait Tool: Send + Sync {
 }
 
 /// Builds a ToolRegistry pre-loaded with all tools.
-/// Each tool receives a ToolContext so it can resolve relative paths against
-/// the project root rather than the process working directory.
+/// Each tool still receives a ToolContext for compatibility during the staged
+/// migration to runtime-owned path resolution.
 pub fn default_registry(root: PathBuf) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ReadFileTool::new(ToolContext::new(root.clone())));

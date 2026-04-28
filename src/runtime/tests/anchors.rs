@@ -16,11 +16,7 @@ fn successful_read_file_updates_last_read_file_anchor() {
     )
     .unwrap();
 
-    let expected_path = tmp
-        .path()
-        .join("src/runtime/engine.rs")
-        .to_string_lossy()
-        .into_owned();
+    let expected_path = "src/runtime/engine.rs";
     let mut rt = make_runtime_in(
         vec![
             "[read_file: src/runtime/engine.rs]",
@@ -93,11 +89,7 @@ fn read_that_file_again_dispatches_one_read_to_anchor() {
         .filter(|e| matches!(e, RuntimeEvent::ToolCallStarted { name } if name == "read_file"))
         .count();
     assert_eq!(read_starts, 1, "anchor prompt must dispatch one read");
-    let expected_path = tmp
-        .path()
-        .join("src/anchor.rs")
-        .to_string_lossy()
-        .into_owned();
+    let expected_path = "src/anchor.rs";
     assert!(
         events.iter().any(|e| {
             matches!(
@@ -151,11 +143,7 @@ fn open_the_last_file_resolves_to_last_read_file_anchor() {
         },
     );
 
-    let expected_path = tmp
-        .path()
-        .join("src/last.rs")
-        .to_string_lossy()
-        .into_owned();
+    let expected_path = "src/last.rs";
     assert!(
         events.iter().any(|e| {
             matches!(
@@ -215,11 +203,7 @@ fn failed_read_file_does_not_update_last_read_file_anchor() {
     fs::create_dir_all(tmp.path().join("src")).unwrap();
     fs::write(tmp.path().join("src/good.rs"), "fn good() {}\n").unwrap();
 
-    let good_path = tmp
-        .path()
-        .join("src/good.rs")
-        .to_string_lossy()
-        .into_owned();
+    let good_path = "src/good.rs";
     let mut rt = make_runtime_in(
         vec![
             "[read_file: src/good.rs]",

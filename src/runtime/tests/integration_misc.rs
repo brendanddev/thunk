@@ -161,12 +161,7 @@ fn initialization_lookup_non_initialization_read_triggers_recovery() {
     );
 
     let snapshot = rt.messages_snapshot();
-    let canonical_root = std::fs::canonicalize(tmp.path()).unwrap();
-    let expected_recovery_path = canonical_root
-        .join("services")
-        .join("logging_setup.py")
-        .to_string_lossy()
-        .into_owned();
+    let expected_recovery_path = "services/logging_setup.py";
     assert!(
         snapshot.iter().any(|m| {
             m.content.contains("This is an initialization lookup")

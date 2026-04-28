@@ -2,6 +2,8 @@ use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 
+use crate::runtime::ResolvedToolInput;
+
 use super::context::ToolContext;
 use super::types::{
     ExecutionKind, GitStatusEntry, GitStatusOutput, ToolError, ToolInput, ToolOutput,
@@ -22,20 +24,8 @@ impl GitStatusTool {
     pub fn new(context: ToolContext) -> Self {
         Self { context }
     }
-}
 
-impl Tool for GitStatusTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "git_status",
-            description: "Show read-only git working tree status for the project.",
-            input_hint: "",
-            execution_kind: ExecutionKind::Immediate,
-            default_risk: None,
-        }
-    }
-
-    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
+    fn run_legacy(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
         let ToolInput::GitStatus = input else {
             return Err(ToolError::InvalidInput(
                 "git_status received wrong input variant".into(),
@@ -52,6 +42,33 @@ impl Tool for GitStatusTool {
         Ok(ToolRunResult::Immediate(ToolOutput::GitStatus(
             parse_git_status_output(&stdout, output.stdout.truncated),
         )))
+    }
+}
+
+impl Tool for GitStatusTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_status",
+            description: "Show read-only git working tree status for the project.",
+            input_hint: "",
+            execution_kind: ExecutionKind::Immediate,
+            default_risk: None,
+        }
+    }
+
+    fn run(&self, input: &ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
+        // Temporary Slice 15.3.3 shim: keep legacy git_status behavior unchanged
+        // until the resolved-input-native migration lands in 15.3.5.
+        let legacy = match input {
+            ResolvedToolInput::GitStatus => ToolInput::GitStatus,
+            _ => {
+                return Err(ToolError::InvalidInput(
+                    "git_status received wrong input variant".into(),
+                ))
+            }
+        };
+
+        self.run_legacy(&legacy)
     }
 }
 
@@ -275,7 +292,7 @@ mod tests {
     }
 
     fn run_status(path: &Path) -> Result<ToolRunResult, ToolError> {
-        GitStatusTool::new(ToolContext::new(PathBuf::from(path))).run(&ToolInput::GitStatus)
+        GitStatusTool::new(ToolContext::new(PathBuf::from(path))).run_legacy(&ToolInput::GitStatus)
     }
 
     #[test]

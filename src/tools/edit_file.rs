@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use crate::runtime::ResolvedToolInput;
+
 use super::context::ToolContext;
 use super::pending::{PendingAction, RiskLevel};
 use super::types::{
@@ -15,6 +17,53 @@ pub struct EditFileTool {
 impl EditFileTool {
     pub fn new(context: ToolContext) -> Self {
         Self { context }
+    }
+
+    fn run_legacy(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
+        let ToolInput::EditFile {
+            path,
+            search,
+            replace,
+        } = input
+        else {
+            return Err(ToolError::InvalidInput(
+                "edit_file received wrong input variant".into(),
+            ));
+        };
+
+        if path.is_empty() {
+            return Err(ToolError::InvalidInput("path must not be empty".into()));
+        }
+        if search.is_empty() {
+            return Err(ToolError::InvalidInput(
+                "missing ---search--- section. The [edit_file] block requires both \
+                 ---search--- (the exact text to find) and ---replace--- (the replacement). \
+                 Re-emit the [edit_file] block with both sections included."
+                    .into(),
+            ));
+        }
+
+        check_path_safety(path, &self.context.root)?;
+
+        let resolved = self.context.resolve(path);
+        let contents = fs::read_to_string(&resolved)?;
+
+        if !contents.contains(search.as_str()) {
+            return Err(ToolError::InvalidInput(format!(
+                "search text not found in {path}"
+            )));
+        }
+
+        let lines_in_search = search.lines().count().max(1);
+        let summary = format!("edit {path}: replace {lines_in_search} line(s)");
+        let payload = encode_payload(path, search, replace);
+
+        Ok(ToolRunResult::Approval(PendingAction {
+            tool_name: "edit_file".to_string(),
+            summary,
+            risk: RiskLevel::Medium,
+            payload,
+        }))
     }
 }
 
@@ -62,51 +111,27 @@ impl Tool for EditFileTool {
         }
     }
 
-    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
-        let ToolInput::EditFile {
-            path,
-            search,
-            replace,
-        } = input
-        else {
-            return Err(ToolError::InvalidInput(
-                "edit_file received wrong input variant".into(),
-            ));
+    fn run(&self, input: &ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
+        // Temporary Slice 15.3.3 shim: keep legacy edit_file behavior unchanged
+        // until the resolved-input-native migration lands in 15.3.4.
+        let legacy = match input {
+            ResolvedToolInput::EditFile {
+                path,
+                search,
+                replace,
+            } => ToolInput::EditFile {
+                path: path.display().to_string(),
+                search: search.clone(),
+                replace: replace.clone(),
+            },
+            _ => {
+                return Err(ToolError::InvalidInput(
+                    "edit_file received wrong input variant".into(),
+                ))
+            }
         };
 
-        if path.is_empty() {
-            return Err(ToolError::InvalidInput("path must not be empty".into()));
-        }
-        if search.is_empty() {
-            return Err(ToolError::InvalidInput(
-                "missing ---search--- section. The [edit_file] block requires both \
-                 ---search--- (the exact text to find) and ---replace--- (the replacement). \
-                 Re-emit the [edit_file] block with both sections included."
-                    .into(),
-            ));
-        }
-
-        check_path_safety(path, &self.context.root)?;
-
-        let resolved = self.context.resolve(path);
-        let contents = fs::read_to_string(&resolved)?;
-
-        if !contents.contains(search.as_str()) {
-            return Err(ToolError::InvalidInput(format!(
-                "search text not found in {path}"
-            )));
-        }
-
-        let lines_in_search = search.lines().count().max(1);
-        let summary = format!("edit {path}: replace {lines_in_search} line(s)");
-        let payload = encode_payload(path, search, replace);
-
-        Ok(ToolRunResult::Approval(PendingAction {
-            tool_name: "edit_file".to_string(),
-            summary,
-            risk: RiskLevel::Medium,
-            payload,
-        }))
+        self.run_legacy(&legacy)
     }
 
     fn execute_approved(&self, payload: &str) -> Result<ToolOutput, ToolError> {
@@ -153,7 +178,7 @@ mod tests {
         search: &str,
         replace: &str,
     ) -> Result<ToolRunResult, ToolError> {
-        tool.run(&ToolInput::EditFile {
+        tool.run_legacy(&ToolInput::EditFile {
             path: path.to_string(),
             search: search.to_string(),
             replace: replace.to_string(),
@@ -337,7 +362,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tool = tool_in(&dir);
         let err = tool
-            .run(&ToolInput::ReadFile {
+            .run_legacy(&ToolInput::ReadFile {
                 path: "f.rs".into(),
             })
             .unwrap_err();

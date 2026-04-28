@@ -1,19 +1,19 @@
 use std::fs;
 
+use crate::runtime::ResolvedToolInput;
+
 use super::context::ToolContext;
 use super::types::{
-    DirEntry, DirectoryListingOutput, EntryKind, ExecutionKind, ToolError, ToolInput, ToolOutput,
+    DirEntry, DirectoryListingOutput, EntryKind, ExecutionKind, ToolError, ToolOutput,
     ToolRunResult, ToolSpec,
 };
 use super::Tool;
 
-pub struct ListDirTool {
-    context: ToolContext,
-}
+pub struct ListDirTool;
 
 impl ListDirTool {
-    pub fn new(context: ToolContext) -> Self {
-        Self { context }
+    pub fn new(_context: ToolContext) -> Self {
+        Self
     }
 }
 
@@ -28,15 +28,14 @@ impl Tool for ListDirTool {
         }
     }
 
-    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
-        let ToolInput::ListDir { path } = input else {
+    fn run(&self, input: &ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
+        let ResolvedToolInput::ListDir { path } = input else {
             return Err(ToolError::InvalidInput(
                 "list_dir received wrong input variant".into(),
             ));
         };
 
-        let dir = self.context.resolve(path);
-        let read = fs::read_dir(&dir)?;
+        let read = fs::read_dir(path.absolute())?;
 
         let mut entries: Vec<DirEntry> = read
             .filter_map(|entry| entry.ok())
@@ -71,7 +70,7 @@ impl Tool for ListDirTool {
 
         Ok(ToolRunResult::Immediate(ToolOutput::DirectoryListing(
             DirectoryListingOutput {
-                path: dir.to_string_lossy().into_owned(),
+                path: path.display().to_string(),
                 entries,
             },
         )))
@@ -80,29 +79,42 @@ impl Tool for ListDirTool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
+    use crate::runtime::{ProjectPath, ProjectScope};
     use std::fs;
     use tempfile::TempDir;
 
-    fn list(path: &str) -> Result<ToolRunResult, ToolError> {
-        ListDirTool::new(ToolContext::new(PathBuf::from("."))).run(&ToolInput::ListDir {
-            path: path.to_string(),
-        })
+    fn resolved_scope(root: &TempDir, relative: &str) -> ProjectScope {
+        let root_absolute = root.path().canonicalize().unwrap();
+        let absolute = if relative == "." {
+            root_absolute
+        } else {
+            root_absolute.join(relative)
+        };
+        let path = ProjectPath::from_trusted(absolute, relative.to_string());
+        ProjectScope::from_trusted_path(path)
+    }
+
+    fn list(root: &TempDir, relative: &str) -> Result<ToolRunResult, ToolError> {
+        ListDirTool::new(ToolContext::new(root.path().to_path_buf())).run(
+            &ResolvedToolInput::ListDir {
+                path: resolved_scope(root, relative),
+            },
+        )
     }
 
     #[test]
     fn lists_files_and_dirs() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("a.rs"), "").unwrap();
-        fs::create_dir(tmp.path().join("subdir")).unwrap();
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("a.rs"), "").unwrap();
+        fs::create_dir(root.path().join("subdir")).unwrap();
 
-        let result = list(tmp.path().to_str().unwrap()).unwrap();
+        let result = list(&root, ".").unwrap();
         let ToolRunResult::Immediate(ToolOutput::DirectoryListing(dl)) = result else {
             panic!("expected Immediate(DirectoryListing)")
         };
 
+        assert_eq!(dl.path, ".");
         assert_eq!(dl.entries.len(), 2);
         // Directories come first
         assert_eq!(dl.entries[0].name, "subdir");
@@ -113,7 +125,8 @@ mod tests {
 
     #[test]
     fn returns_io_error_for_missing_dir() {
-        let err = list("/nonexistent/path/dir").unwrap_err();
+        let root = TempDir::new().unwrap();
+        let err = list(&root, "missing").unwrap_err();
         assert!(matches!(err, ToolError::Io(_)));
     }
 }

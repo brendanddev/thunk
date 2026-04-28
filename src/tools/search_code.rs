@@ -1,10 +1,11 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::runtime::{ProjectScope, ResolvedToolInput};
 
 use super::context::ToolContext;
 use super::types::{
-    ExecutionKind, SearchMatch, SearchResultsOutput, ToolError, ToolInput, ToolOutput,
-    ToolRunResult, ToolSpec,
+    ExecutionKind, SearchMatch, SearchResultsOutput, ToolError, ToolOutput, ToolRunResult, ToolSpec,
 };
 use super::Tool;
 
@@ -60,12 +61,13 @@ const TEXT_EXTENSIONS: &[&str] = &[
 ];
 
 pub struct SearchCodeTool {
-    context: ToolContext,
+    root: PathBuf,
 }
 
 impl SearchCodeTool {
     pub fn new(context: ToolContext) -> Self {
-        Self { context }
+        let root = context.root.canonicalize().unwrap_or(context.root);
+        Self { root }
     }
 }
 
@@ -80,8 +82,8 @@ impl Tool for SearchCodeTool {
         }
     }
 
-    fn run(&self, input: &ToolInput) -> Result<ToolRunResult, ToolError> {
-        let ToolInput::SearchCode { query, path } = input else {
+    fn run(&self, input: &ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
+        let ResolvedToolInput::SearchCode { query, scope } = input else {
             return Err(ToolError::InvalidInput(
                 "search_code received wrong input variant".into(),
             ));
@@ -93,14 +95,13 @@ impl Tool for SearchCodeTool {
             ));
         }
 
-        let root = match path.as_deref() {
-            Some(p) => self.context.resolve(p),
-            None => self.context.root.clone(),
-        };
-        let root = root.as_path();
+        let scope_root = scope
+            .as_ref()
+            .map(ProjectScope::absolute)
+            .unwrap_or(self.root.as_path());
 
         let mut matches = Vec::new();
-        walk_and_search(root, query, &mut matches)?;
+        walk_and_search(self.root.as_path(), scope_root, query, &mut matches)?;
         let mut matches = sort_by_file_group_priority(matches, query);
 
         let total_matches = matches.len();
@@ -119,6 +120,7 @@ impl Tool for SearchCodeTool {
 }
 
 fn walk_and_search(
+    project_root: &Path,
     dir: &Path,
     query: &str,
     matches: &mut Vec<SearchMatch>,
@@ -147,19 +149,22 @@ fn walk_and_search(
 
         if path.is_dir() {
             if !name_str.starts_with('.') && !SKIP_DIRS.contains(&name_str.as_ref()) {
-                walk_and_search(&path, query, matches)?;
+                walk_and_search(project_root, &path, query, matches)?;
             }
         } else if is_text_file(&path) {
-            search_in_file(&path, query, matches);
+            search_in_file(project_root, &path, query, matches);
         }
     }
 
     Ok(())
 }
 
-fn search_in_file(path: &Path, query: &str, matches: &mut Vec<SearchMatch>) {
+fn search_in_file(project_root: &Path, path: &Path, query: &str, matches: &mut Vec<SearchMatch>) {
     let Ok(contents) = fs::read_to_string(path) else {
         return; // skip binary or unreadable files silently
+    };
+    let Some(display_path) = project_relative_display(path, project_root) else {
+        return;
     };
 
     let mut from_this_file = 0;
@@ -169,13 +174,24 @@ fn search_in_file(path: &Path, query: &str, matches: &mut Vec<SearchMatch>) {
         }
         if line.contains(query) {
             matches.push(SearchMatch {
-                file: path.to_string_lossy().into_owned(),
+                file: display_path.clone(),
                 line_number: idx + 1,
                 line: line.to_string(),
             });
             from_this_file += 1;
         }
     }
+}
+
+fn project_relative_display(path: &Path, root: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    Some(
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 fn is_text_file(path: &Path) -> bool {
@@ -303,17 +319,33 @@ fn file_class_priority(path: &str) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
+    use crate::runtime::{ProjectPath, ProjectScope};
     use std::fs;
     use tempfile::TempDir;
 
-    fn search(query: &str, path: &str) -> Result<ToolRunResult, ToolError> {
-        SearchCodeTool::new(ToolContext::new(PathBuf::from("."))).run(&ToolInput::SearchCode {
-            query: query.to_string(),
-            path: Some(path.to_string()),
-        })
+    fn resolved_scope(root: &TempDir, relative: &str) -> ProjectScope {
+        let root_absolute = root.path().canonicalize().unwrap();
+        let absolute = if relative == "." {
+            root_absolute
+        } else {
+            root_absolute.join(relative)
+        };
+        let path = ProjectPath::from_trusted(absolute, relative.to_string());
+        ProjectScope::from_trusted_path(path)
+    }
+
+    fn search(
+        root: &TempDir,
+        query: &str,
+        scope: Option<&str>,
+    ) -> Result<ToolRunResult, ToolError> {
+        SearchCodeTool::new(ToolContext::new(root.path().to_path_buf())).run(
+            &ResolvedToolInput::SearchCode {
+                query: query.to_string(),
+                scope: scope.map(|relative| resolved_scope(root, relative)),
+            },
+        )
     }
 
     #[test]
@@ -321,12 +353,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("lib.rs"), "fn foo() {}\nfn bar() {}\n").unwrap();
 
-        let out = search("fn foo", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "fn foo", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
 
         assert_eq!(sr.matches.len(), 1);
+        assert_eq!(sr.matches[0].file, "lib.rs");
         assert_eq!(sr.matches[0].line_number, 1);
         assert!(sr.matches[0].line.contains("fn foo"));
     }
@@ -339,7 +372,7 @@ mod tests {
         fs::write(target.join("output.rs"), "needle in target").unwrap();
         fs::write(tmp.path().join("main.rs"), "no match here").unwrap();
 
-        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "needle", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -348,10 +381,11 @@ mod tests {
 
     #[test]
     fn returns_error_on_empty_query() {
-        let err = SearchCodeTool::new(ToolContext::new(PathBuf::from(".")))
-            .run(&ToolInput::SearchCode {
+        let root = TempDir::new().unwrap();
+        let err = SearchCodeTool::new(ToolContext::new(root.path().to_path_buf()))
+            .run(&ResolvedToolInput::SearchCode {
                 query: "".into(),
-                path: None,
+                scope: None,
             })
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
@@ -368,7 +402,7 @@ mod tests {
             fs::write(tmp.path().join(format!("file_{i}.rs")), content).unwrap();
         }
 
-        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "needle", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -395,7 +429,7 @@ mod tests {
         fs::create_dir(&sub).unwrap();
         fs::write(sub.join("mod.rs"), "pub fn deep_fn() {}").unwrap();
 
-        let out = search("deep_fn", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "deep_fn", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -409,7 +443,7 @@ mod tests {
         fs::write(tmp.path().join("README.md"), "needle in docs").unwrap();
         fs::write(tmp.path().join("lib.rs"), "fn needle() {}").unwrap();
 
-        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "needle", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -433,7 +467,7 @@ mod tests {
         fs::write(tmp.path().join("Cargo.toml"), "needle = true").unwrap();
         fs::write(tmp.path().join("lib.rs"), "fn needle() {}").unwrap();
 
-        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "needle", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -458,7 +492,7 @@ mod tests {
         fs::write(tmp.path().join("a.rs"), "fn needle() {}").unwrap();
         fs::write(tmp.path().join("b.rs"), "fn needle() {}").unwrap();
 
-        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "needle", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -478,7 +512,7 @@ mod tests {
         fs::write(tmp.path().join("README.md"), "needle in readme").unwrap();
         fs::write(tmp.path().join("NOTES.md"), "needle in notes").unwrap();
 
-        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "needle", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -567,7 +601,7 @@ mod tests {
         fs::write(tmp.path().join("alpha.py"), "class TaskStatus:\n    pass\n").unwrap();
         fs::write(tmp.path().join("omega.py"), "class Task:\n    pass\n").unwrap();
 
-        let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "Task", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -592,7 +626,7 @@ mod tests {
         // omega.py alphabetically later; has a definition line
         fs::write(tmp.path().join("omega.py"), "class Task:\n    pass\n").unwrap();
 
-        let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "Task", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -612,7 +646,7 @@ mod tests {
         fs::write(tmp.path().join("alpha.py"), "x = Task()\n").unwrap();
         fs::write(tmp.path().join("beta.py"), "y = Task.run()\n").unwrap();
 
-        let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "Task", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -633,7 +667,7 @@ mod tests {
         // config tier, happens to contain a definition-keyword line ("fn = ...")
         fs::write(tmp.path().join("beta.toml"), "fn = \"needle\"\n").unwrap();
 
-        let out = search("needle", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "needle", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
@@ -668,7 +702,7 @@ mod tests {
         // zzz.py: the definition — alphabetically last, must survive the cap via sort promotion
         fs::write(tmp.path().join("zzz.py"), "class Task:\n    pass\n").unwrap();
 
-        let out = search("Task", tmp.path().to_str().unwrap()).unwrap();
+        let out = search(&tmp, "Task", Some(".")).unwrap();
         let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
             panic!("expected Immediate(SearchResults)")
         };
