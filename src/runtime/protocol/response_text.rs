@@ -323,3 +323,17 @@ pub(crate) fn insufficient_evidence_final_answer() -> &'static str {
 pub(crate) fn ungrounded_investigation_final_answer() -> &'static str {
     "I don't have enough grounded file evidence to answer. No final answer was accepted before a matching file was read."
 }
+
+/// Injected when a read_file call targets a file that was not returned by the most recent
+/// search.  Fires only on investigation turns after search results exist.
+/// First offense: model is corrected and may retry with a matched file.
+pub(crate) fn non_candidate_read_correction(path: &str) -> String {
+    format!(
+        "[runtime:correction] `{path}` was not returned by the search — \
+         read one of the matched files from the search results instead."
+    )
+}
+
+pub(crate) fn non_candidate_read_terminal_answer() -> &'static str {
+    "I could not continue because the model attempted to read a file that was not in the search results."
+}

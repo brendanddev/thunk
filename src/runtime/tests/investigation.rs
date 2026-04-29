@@ -199,18 +199,20 @@ fn read_must_come_from_current_search_results() {
     );
 
     let snapshot = rt.messages_snapshot();
-    assert!(
-        snapshot
-            .iter()
-            .any(|m| m.content.contains("=== tool_result: read_file ===")),
-        "unmatched read still executes as normal context"
-    );
+    // Phase 16.1: non-candidate reads are now blocked before dispatch.
+    // The read produces tool_error (not tool_result) with a correction message.
     assert!(
         snapshot.iter().any(|m| {
-            m.content.starts_with("[runtime:correction]")
-                && m.content.contains("no matched file has been read")
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
         }),
-        "unmatched read must not satisfy evidence readiness"
+        "non-candidate read must be blocked before dispatch with a correction: {snapshot:?}"
+    );
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("=== tool_result: read_file ===")),
+        "blocked non-candidate read must not produce a tool_result"
     );
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
@@ -227,7 +229,7 @@ fn read_must_come_from_current_search_results() {
                 ..
             })
         ),
-        "read outside search candidates must not admit synthesis: {answer_source:?}"
+        "blocked non-candidate read must not admit synthesis: {answer_source:?}"
     );
 }
 
@@ -1119,4 +1121,162 @@ fn import_only_fallback_accepts_when_all_candidates_are_import_only() {
         last_assistant,
         Some("TaskStatus is imported from models.enums.")
     );
+}
+
+// Phase 16.1: Retrieval Candidate Discipline
+
+#[test]
+fn non_candidate_read_after_search_produces_correction() {
+    // After search returns a candidate, the model reads a file that was NOT in the
+    // search results.  The guard must block the read before dispatch and inject a
+    // [runtime:correction] message naming the path that was not a candidate.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/init.rs"),
+        "fn initialize_logging() {}\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("unrelated.rs"), "fn other() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: initialize_logging]",
+            "[read_file: unrelated.rs]",
+            "Logging is initialized in sandbox/init.rs.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Find where logging is initialized in sandbox/".into(),
+        },
+    );
+
+    let snapshot = rt.messages_snapshot();
+
+    assert!(
+        snapshot.iter().any(|m| {
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
+        }),
+        "non-candidate read must produce a tool_error correction before dispatch: {snapshot:?}"
+    );
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("=== tool_result: read_file ===")),
+        "non-candidate read must not reach dispatch"
+    );
+    let _ = events; // turn may end at InsufficientEvidence — that is acceptable
+}
+
+#[test]
+fn candidate_read_after_search_passes_guard() {
+    // After search returns a candidate, the model reads that exact candidate.
+    // The guard must NOT fire — the read should proceed and evidence should be ready.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/init.rs"),
+        "fn initialize_logging() {}\n",
+    )
+    .unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: initialize_logging]",
+            "[read_file: sandbox/init.rs]",
+            "Logging is initialized in sandbox/init.rs.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Find where logging is initialized in sandbox/".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "candidate read must not fail: {events:?}");
+
+    let snapshot = rt.messages_snapshot();
+    assert!(
+        snapshot
+            .iter()
+            .any(|m| m.content.contains("=== tool_result: read_file ===")),
+        "candidate read must reach dispatch and produce a tool_result"
+    );
+    assert!(
+        !snapshot.iter().any(|m| {
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
+        }),
+        "guard must not fire for a file that is in the search results"
+    );
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "candidate read must admit synthesis: {answer_source:?}"
+    );
+}
+
+#[test]
+fn non_candidate_read_before_search_is_not_blocked() {
+    // The guard only activates after search_produced_results() is true.
+    // A read_file call on an investigation turn with no prior search must reach
+    // dispatch normally (tool_result present), even though it will not satisfy
+    // evidence readiness.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[read_file: engine.rs]",
+            "run_turns drives the loop.",
+            "Still drives it.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "What does run_turns do?".into(),
+        },
+    );
+
+    let snapshot = rt.messages_snapshot();
+    assert!(
+        snapshot
+            .iter()
+            .any(|m| m.content.contains("=== tool_result: read_file ===")),
+        "read before search must reach dispatch — guard must not fire without prior search results"
+    );
+    assert!(
+        !snapshot.iter().any(|m| {
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
+        }),
+        "guard must not fire when no search has been performed"
+    );
+    let _ = events; // turn ends at InsufficientEvidence since no search was done — acceptable
 }

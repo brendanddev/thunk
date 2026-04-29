@@ -170,6 +170,7 @@ pub(super) fn run_tool_round(
 ) -> ToolRoundOutcome {
     let mut accumulated = String::new();
     let mut git_answer_sections = Vec::new();
+    let mut non_candidate_read_attempts = 0usize;
 
     for mut input in calls {
         simplify_search_input(&mut input);
@@ -387,6 +388,52 @@ pub(super) fn run_tool_round(
                     DUPLICATE_READ_REJECTED,
                 ));
                 continue;
+            }
+        }
+
+        // Non-candidate read guard: after search results are known, block read_file calls
+        // that target files outside the candidate set.  Skipped before any search has
+        // produced results (guard condition: search_produced_results()) and on direct-read
+        // turns (requested_read_path.is_some()).  Mutation and git flows are unaffected
+        // because investigation_required is false on those turns.
+        // First offense: correction injected, model may retry with a matched file.
+        // Repeated offense within the same round: terminal.
+        if investigation_required
+            && investigation.search_produced_results()
+            && requested_read_path.is_none()
+        {
+            if let Some(rp) = read_path.as_deref() {
+                if !investigation.is_search_candidate_path(rp) {
+                    non_candidate_read_attempts += 1;
+                    trace_runtime_decision(
+                        on_event,
+                        "non_candidate_read_rejected",
+                        &[
+                            ("path", normalize_evidence_path(rp)),
+                            ("attempts", non_candidate_read_attempts.to_string()),
+                        ],
+                    );
+                    on_event(RuntimeEvent::ToolCallFinished {
+                        name: name.clone(),
+                        summary: None,
+                    });
+                    if non_candidate_read_attempts == 1 {
+                        accumulated.push_str(&tool_codec::format_tool_error(
+                            &name,
+                            &non_candidate_read_correction(rp),
+                        ));
+                        continue;
+                    }
+                    accumulated.push_str(&tool_codec::format_tool_error(
+                        &name,
+                        &format!("`{rp}` is not in the search results — repeated non-candidate read."),
+                    ));
+                    return ToolRoundOutcome::TerminalAnswer {
+                        results: accumulated,
+                        answer: non_candidate_read_terminal_answer().to_string(),
+                        reason: RuntimeTerminalReason::ReadFileFailed,
+                    };
+                }
             }
         }
 
