@@ -348,8 +348,12 @@ fn estimate_generation_prompt_chars(
     conversation: &Conversation,
     tool_surface: ToolSurface,
 ) -> usize {
-    let hint =
-        prompt::render_tool_surface_hint(tool_surface.as_str(), tool_surface.allowed_tool_names());
+    let hint = prompt::render_tool_surface_hint(
+        tool_surface.as_str(),
+        tool_surface
+            .allowed_tool_names()
+            .chain(tool_surface.mutation_tool_names().iter().copied()),
+    );
     conversation
         .snapshot()
         .into_iter()
@@ -1004,6 +1008,7 @@ impl Runtime {
         let mut weak_search_query_attempts = 0usize;
         let mut answer_phase: Option<AnswerPhaseKind> = None;
         let mut post_answer_phase_tool_attempts = 0usize;
+        let mut post_answer_phase_correction_echo_retries = 0usize;
         let mut seeded_tool_executed = false;
 
         macro_rules! finish_turn {
@@ -1317,6 +1322,55 @@ impl Runtime {
             if calls.is_empty() {
                 let response = response.expect("response exists when calls are empty");
 
+                if let Some(phase) = answer_phase {
+                    // Detect correction echoes by sentinel prefix OR by known correction
+                    // substrings. The latter catches cases where the model parrots the
+                    // correction text back without the [runtime:correction] prefix.
+                    let is_correction_echo =
+                        response.trim_start().starts_with("[runtime:correction]")
+                            || response.contains("The file was already read this turn")
+                            || response.contains("Evidence is already ready from the file");
+                    if is_correction_echo {
+                        self.conversation.discard_last_if_assistant();
+                        if post_answer_phase_correction_echo_retries == 0 {
+                            post_answer_phase_correction_echo_retries += 1;
+                            let (label, cause) = match phase {
+                                AnswerPhaseKind::PostRead => (
+                                    GenerationRoundLabel::CorrectionRetry,
+                                    GenerationRoundCause::AnswerPhaseToolCallRejected,
+                                ),
+                                AnswerPhaseKind::InvestigationEvidenceReady => (
+                                    GenerationRoundLabel::PostEvidenceRetry,
+                                    GenerationRoundCause::PostEvidenceToolCallRejected,
+                                ),
+                            };
+                            next_round_label = label;
+                            next_round_cause = cause;
+                            continue;
+                        }
+
+                        let (answer, reason) = match phase {
+                            AnswerPhaseKind::PostRead => (
+                                repeated_tool_after_answer_phase_final_answer(),
+                                RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
+                            ),
+                            AnswerPhaseKind::InvestigationEvidenceReady => (
+                                repeated_tool_after_evidence_ready_final_answer(),
+                                RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
+                            ),
+                        };
+                        self.finish_with_runtime_answer(
+                            answer,
+                            AnswerSource::RuntimeTerminal {
+                                reason,
+                                rounds: tool_rounds,
+                            },
+                            on_event,
+                        );
+                        finish_turn!();
+                    }
+                }
+
                 // If the previous tool round ended in an edit_file error and the model's repair
                 // attempt contains edit_file tag syntax but produced no parseable tool calls,
                 // inject a targeted correction rather than silently accepting as Direct.
@@ -1600,7 +1654,10 @@ impl Runtime {
                     if answer_phase.is_none() {
                         if investigation_required && investigation.evidence_ready() {
                             answer_phase = Some(AnswerPhaseKind::InvestigationEvidenceReady);
-                        } else if !investigation_required && !reads_this_turn.is_empty() {
+                        } else if !investigation_required
+                            && !mutation_allowed
+                            && !reads_this_turn.is_empty()
+                        {
                             answer_phase = Some(AnswerPhaseKind::PostRead);
                         }
                     }

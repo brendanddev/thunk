@@ -19,7 +19,9 @@ pub(super) fn run_generate_turn(
     let mut messages = conversation.snapshot();
     messages.push(Message::system(prompt::render_tool_surface_hint(
         tool_surface.as_str(),
-        tool_surface.allowed_tool_names(),
+        tool_surface
+            .allowed_tool_names()
+            .chain(tool_surface.mutation_tool_names().iter().copied()),
     )));
     let request = GenerateRequest::new(messages);
     let mut response = String::new();

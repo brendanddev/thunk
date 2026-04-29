@@ -15,6 +15,11 @@ pub(super) enum ToolSurface {
     /// Used for answer-phase generations after evidence is accepted or a read completes,
     /// to prevent the model from attempting tool calls and triggering a correction round.
     AnswerOnly,
+    /// Read tools plus mutation tools (edit_file, write_file) visible in the per-turn hint.
+    /// Selected when the prompt requests a mutation so the model knows those tools are
+    /// available this turn. Enforcement for mutation calls remains the same as RetrievalFirst:
+    /// they bypass surface checks via the approval path.
+    MutationEnabled,
 }
 
 /// Canonical registry entry for a tool surface.
@@ -52,6 +57,14 @@ const GIT_READ_ONLY_TOOLS: &[SurfaceTool] = &[
     SurfaceTool::GitLog,
 ];
 const ANSWER_ONLY_TOOLS: &[SurfaceTool] = &[];
+// MutationEnabled has the same read tools as RetrievalFirst. Mutation tools (edit_file,
+// write_file) are not SurfaceTool variants — they bypass surface enforcement and are
+// exposed to the model only via the mutation_tool_names() hint extension.
+const MUTATION_ENABLED_TOOLS: &[SurfaceTool] = &[
+    SurfaceTool::SearchCode,
+    SurfaceTool::ReadFile,
+    SurfaceTool::ListDir,
+];
 const TOOL_SURFACE_DEFINITIONS: &[ToolSurfaceDefinition] = &[
     ToolSurfaceDefinition {
         surface: ToolSurface::RetrievalFirst,
@@ -67,6 +80,11 @@ const TOOL_SURFACE_DEFINITIONS: &[ToolSurfaceDefinition] = &[
         surface: ToolSurface::AnswerOnly,
         name: "AnswerOnly",
         tools: ANSWER_ONLY_TOOLS,
+    },
+    ToolSurfaceDefinition {
+        surface: ToolSurface::MutationEnabled,
+        name: "MutationEnabled",
+        tools: MUTATION_ENABLED_TOOLS,
     },
 ];
 
@@ -114,6 +132,15 @@ impl ToolSurface {
     pub(super) fn allowed_tool_names(self) -> impl Iterator<Item = &'static str> {
         self.tools().iter().copied().map(SurfaceTool::name)
     }
+
+    /// Returns the mutation tool names that should be appended to the per-turn hint
+    /// when this surface is active. Empty for all surfaces except MutationEnabled.
+    pub(super) fn mutation_tool_names(self) -> &'static [&'static str] {
+        match self {
+            Self::MutationEnabled => &["edit_file", "write_file"],
+            _ => &[],
+        }
+    }
 }
 
 pub(super) fn select_tool_surface(
@@ -124,8 +151,9 @@ pub(super) fn select_tool_surface(
 ) -> ToolSurface {
     if is_explicit_git_tooling_prompt(prompt) {
         ToolSurface::GitReadOnly
+    } else if mutation_allowed {
+        ToolSurface::MutationEnabled
     } else if investigation_required
-        || mutation_allowed
         || has_direct_read
         || prompt_requests_directory_navigation(prompt)
     {
@@ -198,7 +226,10 @@ fn starts_with_token_phrase(tokens: &[String], phrase: &[&str]) -> bool {
 /// approval/mutation policy, not by read-only surface enforcement.
 pub(super) fn tool_allowed_for_surface(input: &ToolInput, surface: ToolSurface) -> bool {
     if let Some(tool) = SurfaceTool::from_input(input) {
-        tool_surface_for_tool(tool) == Some(surface)
+        // Direct membership check: is this read-only tool in the surface's canonical set?
+        // Using direct lookup avoids ambiguity when multiple surfaces share the same tools
+        // (e.g., MutationEnabled and RetrievalFirst both carry search/read/list).
+        surface.tools().contains(&tool)
     } else {
         // Mutation permission remains separate from tool-surface policy.
         true

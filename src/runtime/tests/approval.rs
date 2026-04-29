@@ -280,3 +280,59 @@ fn approve_produces_runtime_owned_answer_after_successful_mutation() {
         "last assistant message must be the runtime-owned mutation answer: {last_assistant:?}"
     );
 }
+
+#[test]
+fn mutation_turn_with_preparatory_read_still_reaches_edit_file_approval() {
+    // Regression test for Fix 2: answer_phase must not fire on mutation-allowed turns
+    // after a preparatory read, or the model can never proceed to call edit_file.
+    //
+    // Sequence: model reads target file first (confirming content), then calls edit_file.
+    // Both calls must be allowed — the PostRead answer_phase gate must not intercept.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let target = tmp.path().join("hello.txt");
+    fs::write(&target, "hello root\n").unwrap();
+
+    let read_then_edit = vec![
+        "[read_file: hello.txt]",
+        "[edit_file]\npath: hello.txt\n---search---\nhello root\n---replace---\nhello runtime\n[/edit_file]",
+        "Done.",
+    ];
+    let mut rt = make_runtime_in(read_then_edit, tmp.path());
+
+    let submit_events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Edit hello.txt and change hello root to hello runtime".into(),
+        },
+    );
+
+    assert!(
+        !has_failed(&submit_events),
+        "mutation turn with prior read must not fail: {submit_events:?}"
+    );
+    assert!(
+        submit_events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ApprovalRequired(p) if p.tool_name == "edit_file")),
+        "edit_file must reach approval even after a preparatory read: {submit_events:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "hello root\n",
+        "file must not be modified before approval"
+    );
+
+    let approve_events = collect_events(&mut rt, RuntimeRequest::Approve);
+    assert!(
+        !has_failed(&approve_events),
+        "approve must succeed: {approve_events:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "hello runtime\n",
+        "file must be updated after approval"
+    );
+}

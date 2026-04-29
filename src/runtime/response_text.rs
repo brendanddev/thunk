@@ -197,6 +197,9 @@ pub(super) fn surface_policy_correction(surface: ToolSurface) -> &'static str {
         ToolSurface::AnswerOnly => {
             "[runtime:correction] No tools are available. Provide your final answer now."
         }
+        ToolSurface::MutationEnabled => {
+            "[runtime:correction] This turn allows retrieval tools and mutation tools: search_code, read_file, list_dir, edit_file, write_file. Git tools are not available."
+        }
     }
 }
 
@@ -207,6 +210,9 @@ pub(super) fn repeated_disallowed_tool_error(surface: ToolSurface) -> &'static s
         }
         ToolSurface::GitReadOnly => "repeated unavailable tool use for this Git read-only turn.",
         ToolSurface::AnswerOnly => "no tools are available during answer synthesis.",
+        ToolSurface::MutationEnabled => {
+            "repeated unavailable tool use for this mutation-enabled turn."
+        }
     }
 }
 

@@ -455,3 +455,123 @@ fn repeated_tool_after_answer_phase_terminates_before_search_budget_failure() {
         "last assistant must be the repeated-answer-phase terminal: {last_assistant:?}"
     );
 }
+
+#[test]
+fn direct_read_discards_runtime_correction_echo_before_final_synthesis() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/main.py"),
+        "def main():\n    return 'ok'\n",
+    )
+    .unwrap();
+
+    let correction = "[runtime:correction] The file was already read this turn. Do not call more tools. Provide your final answer now based on what was read.";
+    let final_answer = "sandbox/main.py defines main(), which returns 'ok'.";
+    let mut rt = make_runtime_in(
+        vec!["[read_file: sandbox/main.py]", correction, final_answer],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Read sandbox/main.py".into(),
+        },
+    );
+
+    assert!(
+        !has_failed(&events),
+        "runtime must recover from a correction echo after a successful read: {events:?}"
+    );
+
+    let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: read_file ===").count(),
+        1,
+        "the duplicate post-read tool attempt must still be blocked"
+    );
+    assert!(
+        all_user.contains("[runtime:correction]") && all_user.contains("already read this turn"),
+        "the answer-phase correction must still be injected for the blocked duplicate read"
+    );
+
+    let assistant_messages: Vec<&str> = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        !assistant_messages
+            .iter()
+            .any(|m| m.trim_start().starts_with("[runtime:correction]")),
+        "runtime corrections must remain internal and never become assistant-visible: {assistant_messages:?}"
+    );
+    assert_eq!(assistant_messages.last().copied(), Some(final_answer));
+}
+
+#[test]
+fn correction_echo_without_sentinel_prefix_is_not_emitted_as_final_answer() {
+    // Regression test for Fix 3: model echoes the correction text without the
+    // "[runtime:correction]" prefix. The runtime must still detect this as an
+    // echo and discard it, then accept the real final answer on the next round.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/main.py"),
+        "def main():\n    return 'ok'\n",
+    )
+    .unwrap();
+
+    // Model's first synthesis response after the seeded read echoes correction text
+    // without the "[runtime:correction]" sentinel prefix.
+    let partial_echo =
+        "The file was already read this turn. Based on the contents, main returns 'ok'.";
+    let final_answer = "sandbox/main.py defines main(), which returns 'ok'.";
+    let mut rt = make_runtime_in(vec![partial_echo, final_answer], tmp.path());
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Read sandbox/main.py".into(),
+        },
+    );
+
+    assert!(
+        !has_failed(&events),
+        "runtime must recover from prefix-less correction echo: {events:?}"
+    );
+
+    // The partial echo must not be emitted to the user.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            RuntimeEvent::AssistantMessageChunk(text) if text.contains("The file was already read this turn")
+        )),
+        "correction echo must not be emitted as an AssistantMessageChunk"
+    );
+
+    let snapshot = rt.messages_snapshot();
+    let last_assistant = snapshot
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str());
+    assert_eq!(
+        last_assistant,
+        Some(final_answer),
+        "last assistant message must be the real final answer, not the echo"
+    );
+}

@@ -567,7 +567,7 @@ fn tool_surface_hint_does_not_replace_original_user_prompt() {
 }
 
 #[test]
-fn mutation_turn_still_receives_surface_hint() {
+fn mutation_turn_receives_mutation_enabled_surface_hint() {
     let (mut rt, requests) = make_runtime_with_recorded_requests(vec!["Done."]);
     collect_events(
         &mut rt,
@@ -582,10 +582,62 @@ fn mutation_turn_still_receives_surface_hint() {
         first.messages.iter().any(|m| {
             m.role == Role::System
                 && m.content
-                    == "Active tool surface: RetrievalFirst. Available this turn: search_code, read_file, list_dir."
+                    == "Active tool surface: MutationEnabled. Available this turn: search_code, read_file, list_dir, edit_file, write_file."
         }),
-        "mutation-intent turns still expose active surface hint: {:?}",
+        "mutation-intent turns must expose MutationEnabled hint with all tool names: {:?}",
         first.messages
+    );
+}
+
+#[test]
+fn select_tool_surface_returns_mutation_enabled_for_mutation_prompts() {
+    use crate::runtime::tool_surface::select_tool_surface;
+    for prompt_text in [
+        "Edit src/main.rs and change hello to hi",
+        "Write a new file called output.txt",
+        "Create a file named demo.txt",
+        "Update the config file",
+        "Delete the old log file",
+        "Modify the README",
+    ] {
+        assert_eq!(
+            select_tool_surface(prompt_text, false, true, false),
+            ToolSurface::MutationEnabled,
+            "mutation prompt should select MutationEnabled: {prompt_text}"
+        );
+    }
+}
+
+#[test]
+fn mutation_enabled_hint_includes_edit_and_write_file() {
+    let hint = prompt::render_tool_surface_hint(
+        ToolSurface::MutationEnabled.as_str(),
+        ToolSurface::MutationEnabled.allowed_tool_names().chain(
+            ToolSurface::MutationEnabled
+                .mutation_tool_names()
+                .iter()
+                .copied(),
+        ),
+    );
+    assert!(
+        hint.contains("MutationEnabled"),
+        "hint must name the MutationEnabled surface: {hint}"
+    );
+    assert!(
+        hint.contains("edit_file"),
+        "MutationEnabled hint must list edit_file: {hint}"
+    );
+    assert!(
+        hint.contains("write_file"),
+        "MutationEnabled hint must list write_file: {hint}"
+    );
+    assert!(
+        hint.contains("search_code"),
+        "MutationEnabled hint must still list search_code: {hint}"
+    );
+    assert!(
+        hint.contains("read_file"),
+        "MutationEnabled hint must still list read_file: {hint}"
     );
 }
 
