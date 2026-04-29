@@ -21,14 +21,15 @@ impl SessionStore {
     }
 
     /// Creates a new empty session and returns its metadata.
-    pub fn create(&self) -> Result<SessionMeta> {
+    pub fn create(&self, project_root: &Path) -> Result<SessionMeta> {
         let id = generate_session_id();
         let now = now_ms();
+        let project_root = project_root.to_string_lossy().into_owned();
         self.conn
             .execute(
-                "INSERT INTO sessions (id, created_at, updated_at, msg_count)
-                 VALUES (?1, ?2, ?2, 0)",
-                params![id, now as i64],
+                "INSERT INTO sessions (id, project_root, created_at, updated_at, msg_count)
+                 VALUES (?1, ?2, ?3, ?3, 0)",
+                params![id, project_root, now as i64],
             )
             .map_err(|e| AppError::Storage(e.to_string()))?;
         self.require_meta(&id)
@@ -121,7 +122,7 @@ impl SessionStore {
     pub fn list(&self) -> Result<Vec<SessionMeta>> {
         self.conn
             .prepare(
-                "SELECT id, created_at, updated_at, msg_count
+                "SELECT id, project_root, created_at, updated_at, msg_count
                  FROM sessions
                  ORDER BY updated_at DESC",
             )
@@ -129,9 +130,10 @@ impl SessionStore {
             .query_map([], |row| {
                 Ok(SessionMeta {
                     id: row.get(0)?,
-                    created_at: row.get::<_, i64>(1)? as u64,
-                    updated_at: row.get::<_, i64>(2)? as u64,
-                    message_count: row.get::<_, i64>(3)? as usize,
+                    project_root: row.get(1)?,
+                    created_at: row.get::<_, i64>(2)? as u64,
+                    updated_at: row.get::<_, i64>(3)? as u64,
+                    message_count: row.get::<_, i64>(4)? as usize,
                 })
             })
             .map_err(|e| AppError::Storage(e.to_string()))?
@@ -161,15 +163,16 @@ impl SessionStore {
     fn load_meta(&self, id: &str) -> Result<Option<SessionMeta>> {
         self.conn
             .query_row(
-                "SELECT id, created_at, updated_at, msg_count
+                "SELECT id, project_root, created_at, updated_at, msg_count
                  FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(SessionMeta {
                         id: row.get(0)?,
-                        created_at: row.get::<_, i64>(1)? as u64,
-                        updated_at: row.get::<_, i64>(2)? as u64,
-                        message_count: row.get::<_, i64>(3)? as usize,
+                        project_root: row.get(1)?,
+                        created_at: row.get::<_, i64>(2)? as u64,
+                        updated_at: row.get::<_, i64>(3)? as u64,
+                        message_count: row.get::<_, i64>(4)? as usize,
                     })
                 },
             )
@@ -196,18 +199,20 @@ mod tests {
     #[test]
     fn create_and_list() {
         let store = in_memory();
-        let a = store.create().unwrap();
-        let b = store.create().unwrap();
+        let a = store.create(Path::new("/tmp/project-a")).unwrap();
+        let b = store.create(Path::new("/tmp/project-b")).unwrap();
         let sessions = store.list().unwrap();
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().any(|s| s.id == a.id));
         assert!(sessions.iter().any(|s| s.id == b.id));
+        assert_eq!(a.project_root.as_deref(), Some("/tmp/project-a"));
+        assert_eq!(b.project_root.as_deref(), Some("/tmp/project-b"));
     }
 
     #[test]
     fn save_and_load_roundtrip() {
         let store = in_memory();
-        let meta = store.create().unwrap();
+        let meta = store.create(Path::new("/tmp/project")).unwrap();
 
         let messages = vec![
             StoredMessage {
@@ -221,17 +226,19 @@ mod tests {
         ];
         let saved = store.save(&meta.id, &messages).unwrap();
         assert_eq!(saved.message_count, 2);
+        assert_eq!(saved.project_root.as_deref(), Some("/tmp/project"));
 
         let loaded = store.load(&meta.id).unwrap().unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].role, "user");
         assert_eq!(loaded.messages[1].content, "hi there");
+        assert_eq!(loaded.meta.project_root.as_deref(), Some("/tmp/project"));
     }
 
     #[test]
     fn save_replaces_existing_messages() {
         let store = in_memory();
-        let meta = store.create().unwrap();
+        let meta = store.create(Path::new("/tmp/project")).unwrap();
 
         store
             .save(
@@ -261,8 +268,8 @@ mod tests {
     #[test]
     fn load_most_recent_returns_latest() {
         let store = in_memory();
-        let a = store.create().unwrap();
-        let b = store.create().unwrap();
+        let a = store.create(Path::new("/tmp/project-a")).unwrap();
+        let b = store.create(Path::new("/tmp/project-b")).unwrap();
 
         // Save to b last so it is most recent
         store
@@ -286,12 +293,13 @@ mod tests {
 
         let recent = store.load_most_recent().unwrap().unwrap();
         assert_eq!(recent.meta.id, b.id);
+        assert_eq!(recent.meta.project_root.as_deref(), Some("/tmp/project-b"));
     }
 
     #[test]
     fn delete_removes_session_and_messages() {
         let store = in_memory();
-        let meta = store.create().unwrap();
+        let meta = store.create(Path::new("/tmp/project")).unwrap();
         store
             .save(
                 &meta.id,

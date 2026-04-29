@@ -8,7 +8,7 @@ Defines the high-level architecture and design decisions of the app, including t
 
 `thunk` is a local-first Rust TUI coding assistant. It runs a conversation loop against a selected model backend, lets the model request a small set of typed project-local tools through a constrained text protocol, and requires explicit user approval before mutating files.
 
-At startup, `src/main.rs` calls `app::run()`. The app layer discovers the project root from `config.toml`, loads config, builds the model backend and tool registry, opens optional session logging, restores the most recent session from SQLite, and launches the TUI. After that, the TUI talks only to `AppContext`; `AppContext` forwards requests into the runtime and persists the runtime transcript.
+At startup, `src/main.rs` calls `app::run()`. The app layer discovers the project root from `config.toml`, loads config, builds the model backend and tool registry, opens optional session logging, restores the most recent same-root session from SQLite, and launches the TUI. After that, the TUI talks only to `AppContext`; `AppContext` forwards requests into the runtime and persists the runtime transcript.
 
 The core problem the project solves is running an AI coding assistant locally without collapsing the system into one text-driven loop. The current implementation keeps model generation, tool execution, approval, persistence, and UI rendering in separate layers with explicit boundaries.
 
@@ -192,8 +192,9 @@ Sessions are stored in `data/sessions.db` through `storage/session`.
 
 - `sessions` stores session metadata.
 - `session_messages` stores ordered messages for each session.
-- `SessionStore::load_most_recent()` restores the most recently updated session at startup.
+- `SessionStore::load_most_recent()` loads the most recently updated session candidate at startup.
 - `ActiveSession::save()` rewrites the stored messages for the current session instead of appending deltas.
+- `ActiveSession::open_or_restore()` restores that session only when its stored `project_root` exactly matches the current canonical project root; otherwise it creates a new session.
 
 The stored transcript is derived from the runtime conversation:
 

@@ -27,7 +27,7 @@ On startup the app:
 - finds the project root by walking up to `config.toml`
 - creates `data/` and `logs/` if needed
 - builds the configured backend and the default tool registry
-- opens or restores the most recent session from `data/sessions.db`
+- opens or restores the most recent same-root session from `data/sessions.db`
 
 ---
 

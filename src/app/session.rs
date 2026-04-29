@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::llm::backend::{Message, Role};
+use crate::runtime::ProjectRoot;
 use crate::storage::session::{SavedSession, SessionId, SessionStore, StoredMessage};
 
 use super::Result;
@@ -12,27 +13,43 @@ use super::Result;
 pub struct ActiveSession {
     store: SessionStore,
     session_id: SessionId,
+    project_root: PathBuf,
 }
 
 impl ActiveSession {
     /// Opens the session database and returns the active session plus any
     /// previously stored messages to restore into the runtime. Returns an
     /// empty vec if no prior session exists.
-    pub fn open_or_restore(db_path: &Path) -> Result<(Self, Vec<Message>)> {
+    pub fn open_or_restore(
+        db_path: &Path,
+        project_root: &ProjectRoot,
+    ) -> Result<(Self, Vec<Message>)> {
         let store = SessionStore::open(db_path)?;
+        let current_root = project_root.path();
+        let current_root_str = current_root.to_string_lossy();
 
         match store.load_most_recent()? {
-            Some(saved) => {
+            Some(saved)
+                if saved.meta.project_root.as_deref() == Some(current_root_str.as_ref()) =>
+            {
                 let messages = from_stored(&saved);
                 let session_id = saved.meta.id;
-                Ok((Self { store, session_id }, messages))
+                Ok((
+                    Self {
+                        store,
+                        session_id,
+                        project_root: current_root.to_path_buf(),
+                    },
+                    messages,
+                ))
             }
-            None => {
-                let meta = store.create()?;
+            Some(_) | None => {
+                let meta = store.create(current_root)?;
                 Ok((
                     Self {
                         store,
                         session_id: meta.id,
+                        project_root: current_root.to_path_buf(),
                     },
                     vec![],
                 ))
@@ -51,7 +68,7 @@ impl ActiveSession {
     /// Creates a new session and makes it the active one.
     /// Called when the user explicitly starts a fresh conversation.
     pub fn begin_new(&mut self) -> Result<()> {
-        let meta = self.store.create()?;
+        let meta = self.store.create(&self.project_root)?;
         self.session_id = meta.id;
         Ok(())
     }
@@ -174,6 +191,7 @@ mod tests {
         let saved = SavedSession {
             meta: SessionMeta {
                 id: "test".into(),
+                project_root: Some("/tmp/project".into()),
                 created_at: 0,
                 updated_at: 0,
                 message_count: stored.len(),
@@ -204,6 +222,7 @@ mod tests {
         let saved = SavedSession {
             meta: SessionMeta {
                 id: "t".into(),
+                project_root: Some("/tmp/project".into()),
                 created_at: 0,
                 updated_at: 0,
                 message_count: 14,
@@ -229,6 +248,7 @@ mod tests {
         let saved = SavedSession {
             meta: SessionMeta {
                 id: "t".into(),
+                project_root: Some("/tmp/project".into()),
                 created_at: 0,
                 updated_at: 0,
                 message_count: 1,
@@ -254,6 +274,7 @@ mod tests {
         let saved = SavedSession {
             meta: SessionMeta {
                 id: "t".into(),
+                project_root: Some("/tmp/project".into()),
                 created_at: 0,
                 updated_at: 0,
                 message_count: 3,
@@ -289,6 +310,7 @@ mod tests {
         let saved = SavedSession {
             meta: SessionMeta {
                 id: "t".into(),
+                project_root: Some("/tmp/project".into()),
                 created_at: 0,
                 updated_at: 0,
                 message_count: 2,
@@ -321,6 +343,7 @@ mod tests {
         let saved = SavedSession {
             meta: SessionMeta {
                 id: "t".into(),
+                project_root: Some("/tmp/project".into()),
                 created_at: 0,
                 updated_at: 0,
                 message_count: 3,
@@ -354,6 +377,7 @@ mod tests {
         let saved = SavedSession {
             meta: SessionMeta {
                 id: "test".into(),
+                project_root: Some("/tmp/project".into()),
                 created_at: 0,
                 updated_at: 0,
                 message_count: 1,
@@ -366,5 +390,156 @@ mod tests {
 
         let restored = from_stored(&saved);
         assert!(restored.is_empty());
+    }
+
+    fn temp_project_root() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    fn canonical_project_root(dir: &tempfile::TempDir) -> ProjectRoot {
+        ProjectRoot::new(dir.path().to_path_buf()).unwrap()
+    }
+
+    fn session_db_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("sessions.db")
+    }
+
+    #[test]
+    fn open_or_restore_restores_session_when_project_root_matches() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let root_dir = temp_project_root();
+        let root = canonical_project_root(&root_dir);
+        let db_path = session_db_path(&db_dir);
+
+        let store = SessionStore::open(&db_path).unwrap();
+        let meta = store.create(root.path()).unwrap();
+        store
+            .save(
+                &meta.id,
+                &[
+                    StoredMessage {
+                        role: "user".into(),
+                        content: "hello".into(),
+                    },
+                    StoredMessage {
+                        role: "assistant".into(),
+                        content: "hi there".into(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let (_session, history) = ActiveSession::open_or_restore(&db_path, &root).unwrap();
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "hello");
+        assert_eq!(history[1].content, "hi there");
+        assert_eq!(
+            SessionStore::open(&db_path).unwrap().list().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn open_or_restore_creates_new_session_when_project_root_differs() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let original_root_dir = temp_project_root();
+        let current_root_dir = temp_project_root();
+        let original_root = canonical_project_root(&original_root_dir);
+        let current_root = canonical_project_root(&current_root_dir);
+        let db_path = session_db_path(&db_dir);
+
+        let store = SessionStore::open(&db_path).unwrap();
+        let original = store.create(original_root.path()).unwrap();
+        store
+            .save(
+                &original.id,
+                &[StoredMessage {
+                    role: "user".into(),
+                    content: "stale history".into(),
+                }],
+            )
+            .unwrap();
+
+        let (_session, history) = ActiveSession::open_or_restore(&db_path, &current_root).unwrap();
+
+        assert!(history.is_empty());
+
+        let store = SessionStore::open(&db_path).unwrap();
+        let sessions = store.list().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_ne!(sessions[0].id, original.id);
+        assert_eq!(
+            sessions[0].project_root.as_deref(),
+            Some(current_root.path().to_string_lossy().as_ref())
+        );
+        assert_eq!(sessions[0].message_count, 0);
+    }
+
+    #[test]
+    fn open_or_restore_creates_new_session_when_project_root_is_missing() {
+        use rusqlite::Connection;
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let root_dir = temp_project_root();
+        let root = canonical_project_root(&root_dir);
+        let db_path = session_db_path(&db_dir);
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id          TEXT PRIMARY KEY,
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                msg_count   INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE session_messages (
+                session_id  TEXT NOT NULL,
+                seq         INTEGER NOT NULL,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                PRIMARY KEY (session_id, seq)
+            );
+
+            CREATE INDEX idx_sessions_updated
+                ON sessions(updated_at DESC);
+
+            CREATE INDEX idx_session_messages_lookup
+                ON session_messages(session_id, seq);
+
+            PRAGMA user_version = 1;
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, created_at, updated_at, msg_count)
+             VALUES (?1, ?2, ?2, 1)",
+            ("legacy", 1_i64),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_messages (session_id, seq, role, content)
+             VALUES (?1, 0, ?2, ?3)",
+            ("legacy", "user", "legacy history"),
+        )
+        .unwrap();
+        drop(conn);
+
+        let (_session, history) = ActiveSession::open_or_restore(&db_path, &root).unwrap();
+        assert!(history.is_empty());
+
+        let store = SessionStore::open(&db_path).unwrap();
+        let legacy = store.load("legacy").unwrap().unwrap();
+        assert_eq!(legacy.meta.project_root, None);
+
+        let sessions = store.list().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions[0].project_root.as_deref(),
+            Some(root.path().to_string_lossy().as_ref())
+        );
+        assert_eq!(sessions[0].message_count, 0);
     }
 }

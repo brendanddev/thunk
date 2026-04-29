@@ -13,7 +13,7 @@ The current design splits that work across two layers:
 - `app/session.rs` owns the bridge between runtime messages and stored messages
 - `storage/session/` owns SQLite schema and CRUD
 
-`AppContext` uses those pieces to restore the most recent session at startup and save conversation state after completed submit, approve, and reject requests.
+`AppContext` uses those pieces to restore the most recent same-root session at startup and save conversation state after completed submit, approve, and reject requests.
 
 ---
 
@@ -95,9 +95,10 @@ At startup:
 
 1. `app::run()` opens the session DB
 2. `ActiveSession::open_or_restore()` asks `SessionStore` for the most recently updated session
-3. if one exists, stored messages are converted back into runtime messages
-4. if none exists, a new empty session is created
-5. `AppContext::build()` loads the restored history into the runtime after creating a fresh system prompt
+3. if that session's stored `project_root` exactly matches the current canonical project root, stored messages are converted back into runtime messages
+4. if the stored `project_root` is missing or different, a new empty session is created instead
+5. if no prior session exists, a new empty session is created
+6. `AppContext::build()` loads the restored history into the runtime after creating a fresh system prompt
 
 Restore is intentionally narrower than storage.
 
@@ -156,7 +157,7 @@ The old session remains in SQLite; reset does not delete prior sessions.
 
 Session IDs are generated as 16-character lowercase hex strings.
 
-Sessions are restored by `updated_at` descending, so the app always resumes the most recently updated saved session.
+Sessions are considered for restore by `updated_at` descending, and the app only resumes the most recently updated saved session when its stored `project_root` exactly matches the current canonical project root.
 The docs intentionally treat those timestamp fields as opaque stored ordering values rather than promising a specific unit.
 
 Messages within a session are stored and loaded in ascending `seq` order.
@@ -165,7 +166,7 @@ Messages within a session are stored and loaded in ascending `seq` order.
 
 ## Current Limitations
 
-- Only the most recent session is restored automatically.
+- Only the most recent same-root session is restored automatically.
 - Pending approvals are not persisted.
 - Restore uses a fixed message window rather than token-aware budgeting.
 - The full stored transcript can be larger than the context reloaded into the runtime.

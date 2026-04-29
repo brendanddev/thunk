@@ -2,7 +2,7 @@
 
 Local-first, personal AI coding assistant CLI focused on local-first workflows, modular architecture, privacy, and real coding actions.
 
-> Version 0.8.28
+> Version 0.8.29
 
 ---
 
@@ -43,7 +43,7 @@ The project is structured to keep model generation, tool execution, persistence,
 - Re-enters model generation after tool results so the assistant can synthesize a grounded same-turn answer.
 - Uses runtime-owned terminal answers when the runtime already knows the outcome, such as rejected mutations or failed file reads.
 - Enforces bounded per-turn `search_code` behavior at runtime instead of relying only on prompt wording.
-- Persists sessions in `data/sessions.db` and restores the most recent session on startup.
+- Persists sessions in `data/sessions.db` and restores the most recent same-root session on startup.
 - Writes best-effort per-session logs under `logs/`.
 
 Current built-in tools:
