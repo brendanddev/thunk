@@ -6,6 +6,7 @@ mod investigation;
 mod paths;
 mod project_path;
 mod project_root;
+mod project_snapshot;
 mod prompt;
 mod prompt_analysis;
 mod resolved_input;
