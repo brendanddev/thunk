@@ -1,7 +1,7 @@
-use super::super::protocol::prompt;
-use super::super::tool_surface::{
+use super::super::investigation::tool_surface::{
     select_tool_surface, tool_allowed_for_surface, SurfaceTool, ToolSurface,
 };
+use super::super::protocol::prompt;
 use super::*;
 use crate::llm::backend::Role;
 use crate::tools::ToolInput;
@@ -613,7 +613,7 @@ fn mutation_turn_receives_mutation_enabled_surface_hint() {
 
 #[test]
 fn select_tool_surface_returns_mutation_enabled_for_mutation_prompts() {
-    use crate::runtime::tool_surface::select_tool_surface;
+    use crate::runtime::investigation::tool_surface::select_tool_surface;
     for prompt_text in [
         "Edit src/main.rs and change hello to hi",
         "Write a new file called output.txt",

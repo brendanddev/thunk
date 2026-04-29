@@ -1,11 +1,11 @@
-use super::paths::normalize_evidence_path;
+use super::super::paths::normalize_evidence_path;
 
 /// Determines whether a prompt should enter investigation mode.
 ///
 /// Uses structural signals first (identifier-like tokens), then falls back to
 /// constrained natural-language lookup detection. This must remain conservative
 /// to avoid over-triggering investigation on general questions.
-pub(super) fn prompt_requires_investigation(text: &str) -> bool {
+pub(crate) fn prompt_requires_investigation(text: &str) -> bool {
     for raw in text.split(|c: char| {
         c.is_whitespace()
             || matches!(
@@ -159,7 +159,7 @@ fn contains_word(text: &str, needle: &str) -> bool {
 ///
 /// Lowercases and splits on non-identifier characters. Shared by multiple
 /// classification helpers to ensure consistent tokenization.
-pub(super) fn normalized_prompt_tokens(text: &str) -> Vec<String> {
+pub(crate) fn normalized_prompt_tokens(text: &str) -> Vec<String> {
     text.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|token| !token.is_empty())
@@ -171,7 +171,7 @@ pub(super) fn normalized_prompt_tokens(text: &str) -> Vec<String> {
 ///
 /// Uses a strict keyword list to avoid accidental triggering from
 /// conversational language.
-pub(super) fn user_requested_mutation(text: &str) -> bool {
+pub(crate) fn user_requested_mutation(text: &str) -> bool {
     text.split(|c: char| {
         c.is_whitespace()
             || matches!(
@@ -212,7 +212,7 @@ pub(super) fn user_requested_mutation(text: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SimpleEditRequest {
+pub(crate) struct SimpleEditRequest {
     pub path: String,
     pub search: String,
     pub replace: String,
@@ -223,7 +223,7 @@ pub(super) struct SimpleEditRequest {
 /// Accepted forms only:
 /// - "Edit the file <path> replace the content <old> with <new>"
 /// - "Edit <path> replace <old> with <new>"
-pub(super) fn requested_simple_edit(text: &str) -> Option<SimpleEditRequest> {
+pub(crate) fn requested_simple_edit(text: &str) -> Option<SimpleEditRequest> {
     const LONG_PREFIX: &str = "edit the file ";
     const SHORT_PREFIX: &str = "edit ";
     const LONG_REPLACE_MARKER: &str = " replace the content ";
@@ -287,7 +287,7 @@ pub(super) fn requested_simple_edit(text: &str) -> Option<SimpleEditRequest> {
 ///   "Find X in the application"  → None  (no `/` in token)
 ///   "Find X in context"          → None  (no `/`)
 ///   "Find X in https://…"        → None  (URL rejected)
-pub(super) fn extract_investigation_path_scope(text: &str) -> Option<String> {
+pub(crate) fn extract_investigation_path_scope(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     let words: Vec<&str> = text.split_whitespace().collect();
     let lower_words: Vec<&str> = lower.split_whitespace().collect();
@@ -340,7 +340,7 @@ pub(super) fn extract_investigation_path_scope(text: &str) -> Option<String> {
 ///
 /// Accepts "read <path>" and "read file <path>" forms. Returns None if the
 /// structure does not match or the candidate does not resemble a file path.
-pub(super) fn requested_read_path(text: &str) -> Option<String> {
+pub(crate) fn requested_read_path(text: &str) -> Option<String> {
     path_from_read_verb(text).or_else(|| path_from_what_is_in_query(text))
 }
 
@@ -406,7 +406,7 @@ fn path_from_what_is_in_query(text: &str) -> Option<String> {
 ///
 /// Allows common patterns (directories, extensions, README) without resolving
 /// or validating against the filesystem.
-pub(super) fn looks_like_file_path(path: &str) -> bool {
+pub(crate) fn looks_like_file_path(path: &str) -> bool {
     !path.is_empty()
         && (path.contains('/')
             || path.contains('\\')
@@ -419,7 +419,7 @@ pub(super) fn looks_like_file_path(path: &str) -> bool {
 /// Computed once from the original user prompt before the generation loop starts.
 /// When non-None, the engine seeds `pending_runtime_call` directly — the model
 /// never generates before the first tool executes.
-pub(super) enum RetrievalIntent {
+pub(crate) enum RetrievalIntent {
     None,
     DirectRead { path: String },
     DirectoryListing { path: String },
@@ -430,7 +430,7 @@ pub(super) enum RetrievalIntent {
 /// Checks direct-read first (path-qualified "what is in" or "read" forms),
 /// then directory navigation (nav verb + path token or structural cue).
 /// Returns None when neither applies, including all investigation-required turns.
-pub(super) fn classify_retrieval_intent(text: &str) -> RetrievalIntent {
+pub(crate) fn classify_retrieval_intent(text: &str) -> RetrievalIntent {
     if let Some(path) = requested_read_path(text) {
         return RetrievalIntent::DirectRead { path };
     }
@@ -501,7 +501,7 @@ fn extract_directory_target(text: &str) -> Option<String> {
 }
 
 /// snake_case: contains underscore, ≥2 segments, each segment ≥2 alphanumeric chars.
-pub(super) fn is_snake_case_identifier(token: &str) -> bool {
+pub(crate) fn is_snake_case_identifier(token: &str) -> bool {
     if !token.contains('_') {
         return false;
     }
@@ -515,7 +515,7 @@ pub(super) fn is_snake_case_identifier(token: &str) -> bool {
 /// Matches PascalCase/camelCase identifiers.
 /// Note: also intentionally matches ALLCAPS tokens of sufficient length (e.g., DEBUG, README)
 /// for Phase 8.4 structural detection.
-pub(super) fn is_pascal_case_identifier(token: &str) -> bool {
+pub(crate) fn is_pascal_case_identifier(token: &str) -> bool {
     if token.len() < 5 {
         return false;
     }

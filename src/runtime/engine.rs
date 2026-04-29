@@ -7,13 +7,15 @@ use crate::tools::{
     ExecutionKind, PendingAction, ToolError, ToolInput, ToolOutput, ToolRegistry, ToolRunResult,
 };
 
-use super::anchors::{
+use super::conversation::Conversation;
+use super::generation::{emit_visible_assistant_message, run_generate_turn};
+use super::investigation::anchors::{
     has_same_scope_reference, is_last_read_file_anchor_prompt, is_last_search_anchor_prompt,
     AnchorState,
 };
-use super::conversation::Conversation;
-use super::generation::{emit_visible_assistant_message, run_generate_turn};
-use super::investigation::{detect_investigation_mode, InvestigationMode, InvestigationState};
+use super::investigation::investigation::{
+    detect_investigation_mode, InvestigationMode, InvestigationState,
+};
 use super::project::ProjectRoot;
 use super::project::ProjectStructureSnapshot;
 use super::project::ProjectStructureSnapshotCache;
@@ -386,11 +388,11 @@ fn infer_post_tool_round_cause(results: &str) -> GenerationRoundCause {
     }
 }
 
-use super::tool_surface::{select_tool_surface, ToolSurface};
+use super::investigation::tool_surface::{select_tool_surface, ToolSurface};
 
 /// Returns true if the prompt contains a token that looks like a code identifier.
 /// Only two structural patterns are checked — no NLP, no heuristics.
-use super::prompt_analysis::{
+use super::investigation::prompt_analysis::{
     classify_retrieval_intent, extract_investigation_path_scope, prompt_requires_investigation,
     requested_simple_edit, user_requested_mutation, RetrievalIntent,
 };

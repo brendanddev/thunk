@@ -2,8 +2,8 @@ use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, Message, ModelBackend};
 
 use super::conversation::Conversation;
+use super::investigation::tool_surface::ToolSurface;
 use super::protocol::prompt;
-use super::tool_surface::ToolSurface;
 use super::types::{Activity, RuntimeEvent};
 
 /// Runs a single generation turn: sends the current conversation to the backend,

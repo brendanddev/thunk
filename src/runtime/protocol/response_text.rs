@@ -1,4 +1,4 @@
-use super::super::tool_surface::ToolSurface;
+use super::super::investigation::tool_surface::ToolSurface;
 
 /// Injected into the conversation when a fabricated tool-result block is detected.
 /// Shown to the model only; not displayed in the TUI.

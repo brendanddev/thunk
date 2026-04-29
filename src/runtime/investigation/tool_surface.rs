@@ -8,7 +8,7 @@ use super::prompt_analysis::normalized_prompt_tokens;
 /// turn. This is policy enforced by the runtime before dispatch; tools and
 /// tool_codec must not own or interpret surface rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ToolSurface {
+pub(crate) enum ToolSurface {
     RetrievalFirst,
     GitReadOnly,
     /// Synthesis-only surface: no tools offered.
@@ -37,7 +37,7 @@ struct ToolSurfaceDefinition {
 /// Mutation tools are intentionally excluded from surfaces because approval and
 /// mutation permission are governed by a separate lifecycle path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SurfaceTool {
+pub(crate) enum SurfaceTool {
     SearchCode,
     ReadFile,
     ListDir,
@@ -89,7 +89,7 @@ const TOOL_SURFACE_DEFINITIONS: &[ToolSurfaceDefinition] = &[
 ];
 
 impl SurfaceTool {
-    pub(super) fn from_input(input: &ToolInput) -> Option<Self> {
+    pub(crate) fn from_input(input: &ToolInput) -> Option<Self> {
         match input {
             ToolInput::SearchCode { .. } => Some(Self::SearchCode),
             ToolInput::ReadFile { .. } => Some(Self::ReadFile),
@@ -101,7 +101,7 @@ impl SurfaceTool {
         }
     }
 
-    pub(super) fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::SearchCode => "search_code",
             Self::ReadFile => "read_file",
@@ -121,33 +121,33 @@ impl ToolSurface {
             .expect("tool surface definition must exist")
     }
 
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         self.definition().name
     }
 
-    pub(super) fn tools(self) -> &'static [SurfaceTool] {
+    pub(crate) fn tools(self) -> &'static [SurfaceTool] {
         self.definition().tools
     }
 
-    pub(super) fn allowed_tool_names(self) -> impl Iterator<Item = &'static str> {
+    pub(crate) fn allowed_tool_names(self) -> impl Iterator<Item = &'static str> {
         self.tools().iter().copied().map(SurfaceTool::name)
     }
 
     /// Returns the mutation tool names that should be appended to the per-turn hint
     /// when this surface is active. Empty for all surfaces except MutationEnabled.
-    pub(super) fn mutation_tool_names(self) -> &'static [&'static str] {
+    pub(crate) fn mutation_tool_names(self) -> &'static [&'static str] {
         match self {
             Self::MutationEnabled => &["edit_file", "write_file"],
             _ => &[],
         }
     }
 
-    pub(super) fn includes_project_snapshot_hint(self) -> bool {
+    pub(crate) fn includes_project_snapshot_hint(self) -> bool {
         matches!(self, Self::RetrievalFirst | Self::MutationEnabled)
     }
 }
 
-pub(super) fn select_tool_surface(
+pub(crate) fn select_tool_surface(
     prompt: &str,
     investigation_required: bool,
     mutation_allowed: bool,
@@ -228,7 +228,7 @@ fn starts_with_token_phrase(tokens: &[String], phrase: &[&str]) -> bool {
 ///
 /// Mutation calls return true here because they are checked by the separate
 /// approval/mutation policy, not by read-only surface enforcement.
-pub(super) fn tool_allowed_for_surface(input: &ToolInput, surface: ToolSurface) -> bool {
+pub(crate) fn tool_allowed_for_surface(input: &ToolInput, surface: ToolSurface) -> bool {
     if let Some(tool) = SurfaceTool::from_input(input) {
         // Direct membership check: is this read-only tool in the surface's canonical set?
         // Using direct lookup avoids ambiguity when multiple surfaces share the same tools
@@ -241,7 +241,7 @@ pub(super) fn tool_allowed_for_surface(input: &ToolInput, surface: ToolSurface) 
 }
 
 /// Identifies Git read-only tool calls for Git acquisition/finalization logic.
-pub(super) fn is_git_read_only_tool_input(input: &ToolInput) -> bool {
+pub(crate) fn is_git_read_only_tool_input(input: &ToolInput) -> bool {
     matches!(
         SurfaceTool::from_input(input).and_then(tool_surface_for_tool),
         Some(ToolSurface::GitReadOnly)

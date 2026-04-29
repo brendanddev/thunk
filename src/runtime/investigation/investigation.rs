@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::tools::ToolOutput;
 
-use super::paths::normalize_evidence_path;
-use super::types::RuntimeEvent;
+use super::super::paths::normalize_evidence_path;
+use super::super::types::RuntimeEvent;
 
 const RUNTIME_TRACE_ENV: &str = "THUNK_TRACE_RUNTIME";
 
@@ -68,27 +68,27 @@ fn push_unique_path(paths: &mut Vec<String>, path: &str) {
     }
 }
 
-pub(super) fn contains_initialization_term(text: &str) -> bool {
+pub(crate) fn contains_initialization_term(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     INITIALIZATION_TERMS.iter().any(|term| lower.contains(term))
 }
 
-pub(super) fn contains_create_term(text: &str) -> bool {
+pub(crate) fn contains_create_term(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     CREATE_TERMS.iter().any(|term| lower.contains(term))
 }
 
-pub(super) fn contains_register_term(text: &str) -> bool {
+pub(crate) fn contains_register_term(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     REGISTER_TERMS.iter().any(|term| lower.contains(term))
 }
 
-pub(super) fn contains_load_term(text: &str) -> bool {
+pub(crate) fn contains_load_term(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     LOAD_TERMS.iter().any(|term| lower.contains(term))
 }
 
-pub(super) fn contains_save_term(text: &str) -> bool {
+pub(crate) fn contains_save_term(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     SAVE_TERMS.iter().any(|term| lower.contains(term))
 }
@@ -101,7 +101,7 @@ fn contains_word(text: &str, needle: &str) -> bool {
 /// Returns true if the path's file extension identifies it as a config file.
 /// Classification is purely extension-based — no content analysis or filename heuristics.
 /// Handles the exact `.env` dotfile explicitly since `Path::extension()` returns None for it.
-pub(super) fn is_config_file(path: &str) -> bool {
+pub(crate) fn is_config_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let p = Path::new(&lower);
     if matches!(
@@ -140,7 +140,7 @@ fn is_source_candidate_path(path: &str) -> bool {
 /// Rust `use` statements and C `#include` are intentionally excluded — too many false positives
 /// from identifiers like `use` appearing in natural language or in assertion-style code.
 /// No regex, no scoring — prefix matching only, same style as looks_like_definition.
-pub(super) fn looks_like_import(line: &str) -> bool {
+pub(crate) fn looks_like_import(line: &str) -> bool {
     let t = line.trim_start();
     // `import X` — Python, Java, Go, TypeScript, JavaScript
     t.starts_with("import ")
@@ -152,7 +152,7 @@ pub(super) fn looks_like_import(line: &str) -> bool {
 /// Strips each known definition prefix, extracts the first alphanumeric+underscore token,
 /// and requires exact equality — so "class TaskStatus:" does not match symbol "Task".
 /// Coverage mirrors `looks_like_definition`.
-pub(super) fn looks_like_definition_of_symbol(line: &str, symbol: &str) -> bool {
+pub(crate) fn looks_like_definition_of_symbol(line: &str, symbol: &str) -> bool {
     let t = line.trim_start();
     const PREFIXES: &[&str] = &[
         "pub enum ",
@@ -225,7 +225,7 @@ fn looks_like_definition(line: &str) -> bool {
 /// Computed once from the user prompt before the tool loop starts.
 /// Controls which evidence-acceptance gates are active for this turn.
 #[derive(Copy, Clone)]
-pub(super) enum InvestigationMode {
+pub(crate) enum InvestigationMode {
     /// No mode-specific gating. Any search-candidate read satisfies evidence.
     General,
     /// Prompt signals a usage lookup (where X is used/referenced/appears).
@@ -255,7 +255,7 @@ pub(super) enum InvestigationMode {
 }
 
 impl InvestigationMode {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             InvestigationMode::General => "General",
             InvestigationMode::UsageLookup => "UsageLookup",
@@ -273,7 +273,7 @@ impl InvestigationMode {
 /// Detects the structural investigation mode from the prompt text.
 /// Evaluated in priority order so each prompt maps to exactly one mode.
 /// Priority: UsageLookup > ConfigLookup > InitializationLookup > CreateLookup > RegisterLookup > LoadLookup > SaveLookup > DefinitionLookup > General.
-pub(super) fn detect_investigation_mode(text: &str) -> InvestigationMode {
+pub(crate) fn detect_investigation_mode(text: &str) -> InvestigationMode {
     let lower = text.to_ascii_lowercase();
     if [
         "use",
@@ -333,7 +333,7 @@ pub(super) fn detect_investigation_mode(text: &str) -> InvestigationMode {
 
 /// Distinguishes which structural insufficiency caused a candidate read to be rejected.
 /// Used by the caller in run_tool_round to select the appropriate correction message.
-pub(super) enum RecoveryKind {
+pub(crate) enum RecoveryKind {
     /// The file was definition-only on a usage lookup with usage candidates available.
     DefinitionOnly,
     /// The file was not a definition-site candidate on a definition lookup when definition
@@ -358,7 +358,7 @@ pub(super) enum RecoveryKind {
 }
 
 impl RecoveryKind {
-    pub(super) fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             RecoveryKind::DefinitionOnly => "DefinitionOnly",
             RecoveryKind::NonDefinitionSite => "NonDefinitionSite",
@@ -376,7 +376,7 @@ impl RecoveryKind {
 
 /// Tracks per-turn search → read investigation state.
 /// Resets at the start of each call to run_turns, exactly like SearchBudget.
-pub(super) struct InvestigationState {
+pub(crate) struct InvestigationState {
     /// True once any search_code call this turn returned at least one match.
     search_produced_results: bool,
     /// Count of read_file calls that completed successfully this turn.
@@ -488,7 +488,7 @@ pub(super) struct InvestigationState {
 }
 
 impl InvestigationState {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             search_produced_results: false,
             files_read_count: 0,
@@ -530,36 +530,36 @@ impl InvestigationState {
         }
     }
 
-    pub(super) fn configure_usage_evidence_policy(&mut self, broad_usage_lookup: bool) {
+    pub(crate) fn configure_usage_evidence_policy(&mut self, broad_usage_lookup: bool) {
         self.broad_usage_lookup = broad_usage_lookup;
     }
 
-    pub(super) fn evidence_ready(&self) -> bool {
+    pub(crate) fn evidence_ready(&self) -> bool {
         self.search_produced_results
             && self.useful_accepted_candidate_reads >= self.useful_candidate_reads_target
     }
 
-    pub(super) fn search_produced_results(&self) -> bool {
+    pub(crate) fn search_produced_results(&self) -> bool {
         self.search_produced_results
     }
 
-    pub(super) fn files_read_count(&self) -> usize {
+    pub(crate) fn files_read_count(&self) -> usize {
         self.files_read_count
     }
 
-    pub(super) fn candidate_reads_count(&self) -> usize {
+    pub(crate) fn candidate_reads_count(&self) -> usize {
         self.candidate_reads_count
     }
 
-    pub(super) fn useful_candidate_reads_count(&self) -> usize {
+    pub(crate) fn useful_candidate_reads_count(&self) -> usize {
         self.useful_accepted_candidate_reads
     }
 
-    pub(super) fn search_attempted(&self) -> bool {
+    pub(crate) fn search_attempted(&self) -> bool {
         self.search_attempted
     }
 
-    pub(super) fn issue_direct_answer_correction(&mut self) -> bool {
+    pub(crate) fn issue_direct_answer_correction(&mut self) -> bool {
         if self.direct_answer_correction_issued {
             return false;
         }
@@ -567,7 +567,7 @@ impl InvestigationState {
         true
     }
 
-    pub(super) fn issue_premature_synthesis_correction(&mut self) -> bool {
+    pub(crate) fn issue_premature_synthesis_correction(&mut self) -> bool {
         if self.premature_synthesis_correction_issued {
             return false;
         }
@@ -575,7 +575,7 @@ impl InvestigationState {
         true
     }
 
-    pub(super) fn is_search_candidate_path(&self, path: &str) -> bool {
+    pub(crate) fn is_search_candidate_path(&self, path: &str) -> bool {
         let read_path = normalize_evidence_path(path);
         let relative_suffix = read_path.contains('/').then(|| format!("/{read_path}"));
         self.search_candidate_paths.iter().any(|candidate| {
@@ -587,7 +587,7 @@ impl InvestigationState {
         })
     }
 
-    pub(super) fn record_search_results(
+    pub(crate) fn record_search_results(
         &mut self,
         output: &ToolOutput,
         query: Option<&str>,
@@ -791,7 +791,7 @@ impl InvestigationState {
         was_empty
     }
 
-    pub(super) fn record_read_result(
+    pub(crate) fn record_read_result(
         &mut self,
         output: &ToolOutput,
         mode: InvestigationMode,
@@ -1266,11 +1266,11 @@ impl InvestigationState {
             .map(String::as_str)
     }
 
-    pub(super) fn preferred_usage_candidate(&self) -> Option<&str> {
+    pub(crate) fn preferred_usage_candidate(&self) -> Option<&str> {
         self.preferred_usage_candidate_with_filters(&HashSet::new(), false)
     }
 
-    pub(super) fn next_usage_evidence_candidate(&self) -> Option<&str> {
+    pub(crate) fn next_usage_evidence_candidate(&self) -> Option<&str> {
         if self.useful_accepted_candidate_reads == 0
             || self.useful_accepted_candidate_reads >= self.useful_candidate_reads_target
         {
@@ -1415,7 +1415,7 @@ impl InvestigationState {
     ///
     /// DefinitionLookup is intentionally excluded: the definition_site_file preamble in
     /// tool_codec already handles that case directly in the rendered search output.
-    pub(super) fn candidate_preference_hint(&self, mode: InvestigationMode) -> Option<String> {
+    pub(crate) fn candidate_preference_hint(&self, mode: InvestigationMode) -> Option<String> {
         if self.search_candidate_paths.is_empty() {
             return None;
         }

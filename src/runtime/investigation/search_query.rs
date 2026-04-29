@@ -4,7 +4,7 @@ use crate::tools::ToolInput;
 ///
 /// Drops common stopwords and returns the first meaningful identifier-like
 /// token. Falls back to the original query when no better token is found.
-pub(super) fn simplify_search_query(query: &str) -> String {
+pub(crate) fn simplify_search_query(query: &str) -> String {
     const STOPWORDS: &[&str] = &[
         "a",
         "an",
@@ -52,7 +52,7 @@ pub(super) fn simplify_search_query(query: &str) -> String {
 /// Applies query simplification in-place for SearchCode inputs.
 ///
 /// Ensures the runtime always sends a minimally useful query to the tool.
-pub(super) fn simplify_search_input(input: &mut ToolInput) {
+pub(crate) fn simplify_search_input(input: &mut ToolInput) {
     if let ToolInput::SearchCode { query, .. } = input {
         let simplified = simplify_search_query(query);
         if !simplified.is_empty() && simplified != *query {
@@ -65,7 +65,7 @@ pub(super) fn simplify_search_input(input: &mut ToolInput) {
 ///
 /// Returns a reason when the query is too weak to be useful, allowing
 /// deterministic correction/termination behavior.
-pub(super) fn weak_search_query_reason(query: &str) -> Option<&'static str> {
+pub(crate) fn weak_search_query_reason(query: &str) -> Option<&'static str> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Some("empty");

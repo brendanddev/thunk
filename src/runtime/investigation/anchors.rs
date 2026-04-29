@@ -15,7 +15,7 @@ use crate::tools::ToolOutput;
 /// - in-memory only (cleared on reset)
 /// - not coupled to tool dispatch or conversation mutation
 #[derive(Debug, Clone, Default)]
-pub(super) struct AnchorState {
+pub(crate) struct AnchorState {
     last_read_file: Option<String>,
     last_search_query: Option<String>,
     last_search_scope: Option<String>,
@@ -23,7 +23,7 @@ pub(super) struct AnchorState {
 
 impl AnchorState {
     /// Clears all anchor state (called on runtime reset).
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.last_read_file = None;
         self.last_search_query = None;
         self.last_search_scope = None;
@@ -33,7 +33,7 @@ impl AnchorState {
     /// Returns the resolved path if updated.
     ///
     /// Does not update on failed reads or non-file outputs.
-    pub(super) fn record_successful_read(&mut self, output: &ToolOutput) -> Option<String> {
+    pub(crate) fn record_successful_read(&mut self, output: &ToolOutput) -> Option<String> {
         if let ToolOutput::FileContents(file) = output {
             let path = file.path.clone();
             self.last_read_file = Some(path.clone());
@@ -48,7 +48,7 @@ impl AnchorState {
     /// and path-scope clamp).
     ///
     /// Does not update on failed searches.
-    pub(super) fn record_successful_search(
+    pub(crate) fn record_successful_search(
         &mut self,
         output: &ToolOutput,
         query: String,
@@ -70,31 +70,31 @@ impl AnchorState {
     }
 
     /// Returns the last successfully read file path, if any.
-    pub(super) fn last_read_file(&self) -> Option<&str> {
+    pub(crate) fn last_read_file(&self) -> Option<&str> {
         self.last_read_file.as_deref()
     }
 
     /// Returns the last successful search (query + scope), if any.
-    pub(super) fn last_search(&self) -> Option<(String, Option<String>)> {
+    pub(crate) fn last_search(&self) -> Option<(String, Option<String>)> {
         self.last_search_query
             .clone()
             .map(|query| (query, self.last_search_scope.clone()))
     }
 
     /// Returns the scope from the last successful scoped search, if any.
-    pub(super) fn last_scoped_search_scope(&self) -> Option<&str> {
+    pub(crate) fn last_scoped_search_scope(&self) -> Option<&str> {
         self.last_search_scope
             .as_deref()
             .filter(|scope| !scope.trim().is_empty())
     }
 
     #[cfg(test)]
-    pub(super) fn last_search_query(&self) -> Option<&str> {
+    pub(crate) fn last_search_query(&self) -> Option<&str> {
         self.last_search_query.as_deref()
     }
 
     #[cfg(test)]
-    pub(super) fn last_search_scope(&self) -> Option<&str> {
+    pub(crate) fn last_search_scope(&self) -> Option<&str> {
         self.last_search_scope.as_deref()
     }
 }
@@ -105,7 +105,7 @@ impl AnchorState {
 /// - no semantic interpretation
 /// - no pronoun resolution
 /// - no fuzzy matching
-pub(super) fn is_last_read_file_anchor_prompt(text: &str) -> bool {
+pub(crate) fn is_last_read_file_anchor_prompt(text: &str) -> bool {
     let normalized = normalize_anchor_prompt(text);
     matches!(
         normalized.as_str(),
@@ -121,7 +121,7 @@ pub(super) fn is_last_read_file_anchor_prompt(text: &str) -> bool {
 /// Returns true if the input matches a supported last-search anchor prompt.
 ///
 /// Only exact replay phrases are supported; does not interpret query intent.
-pub(super) fn is_last_search_anchor_prompt(text: &str) -> bool {
+pub(crate) fn is_last_search_anchor_prompt(text: &str) -> bool {
     let normalized = normalize_anchor_prompt(text);
     matches!(
         normalized.as_str(),
@@ -139,7 +139,7 @@ pub(super) fn is_last_search_anchor_prompt(text: &str) -> bool {
 ///
 /// Matching is structural only. These phrases reuse the last successful scoped
 /// search's effective scope; they do not resolve pronouns or infer paths.
-pub(super) fn has_same_scope_reference(text: &str) -> bool {
+pub(crate) fn has_same_scope_reference(text: &str) -> bool {
     let normalized = normalize_anchor_prompt(text);
     [
         "in the same folder",

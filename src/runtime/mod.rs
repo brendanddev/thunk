@@ -1,19 +1,15 @@
-mod anchors;
 mod conversation;
 mod engine;
 mod generation;
 mod investigation;
 mod paths;
 pub(crate) mod project;
-mod prompt_analysis;
 mod protocol;
 #[cfg(test)]
 mod scenarios;
-mod search_query;
 #[cfg(test)]
 mod tests;
 mod tool_round;
-mod tool_surface;
 mod trace;
 mod types;
 
