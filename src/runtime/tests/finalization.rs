@@ -450,9 +450,11 @@ fn repeated_tool_after_answer_phase_terminates_before_search_budget_failure() {
         .rev()
         .find(|m| m.role == crate::llm::backend::Role::Assistant)
         .map(|m| m.content.as_str());
+    // Fix 1: for a direct read, the runtime now falls back to the read content
+    // rather than emitting the synthesis-failure message.
     assert!(
-        matches!(last_assistant, Some(s) if s.contains("model kept calling tools after the file was already read")),
-        "last assistant must be the repeated-answer-phase terminal: {last_assistant:?}"
+        matches!(last_assistant, Some(s) if s.contains("fn bar()")),
+        "last assistant must contain the file content fallback, not a terminal error: {last_assistant:?}"
     );
 }
 
@@ -573,5 +575,193 @@ fn correction_echo_without_sentinel_prefix_is_not_emitted_as_final_answer() {
         last_assistant,
         Some(final_answer),
         "last assistant message must be the real final answer, not the echo"
+    );
+}
+
+// ── Regression: Fix 1 ─────────────────────────────────────────────────────────
+// When a seeded direct read succeeds but model synthesis repeatedly fails
+// (keeps calling tools in answer phase), the runtime must serve the file content
+// as a deterministic fallback rather than emitting a synthesis-failure message.
+#[test]
+fn direct_read_fallback_serves_file_content_when_model_loops() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/main.py"),
+        "def main():\n    return 'ok'\n",
+    )
+    .unwrap();
+
+    // Model produces tool calls both times it is asked to synthesize — simulating
+    // the local-model loop observed in QA.
+    let mut rt = make_runtime_in(
+        vec![
+            "[read_file: sandbox/main.py]",
+            "[search_code: main]",
+            "This must not be consumed.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Read sandbox/main.py".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
+                ..
+            })
+        ),
+        "terminal reason must be RepeatedToolAfterAnswerPhase: {answer_source:?}"
+    );
+
+    let snapshot = rt.messages_snapshot();
+    let last_assistant = snapshot
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str());
+
+    // The fallback must contain the actual file content, not a failure message.
+    assert!(
+        matches!(last_assistant, Some(s) if s.contains("def main()")),
+        "fallback answer must contain file contents: {last_assistant:?}"
+    );
+    assert!(
+        !matches!(last_assistant, Some(s) if s.contains("model kept calling tools")),
+        "failure message must not be emitted when direct_read_result is available: {last_assistant:?}"
+    );
+}
+
+// ── Regression: Fix 2 ─────────────────────────────────────────────────────────
+// When the model emits a block opening tag without the matching close tag
+// (e.g. `[write_file] path: foo ---content--- bar`), the runtime must detect it
+// as malformed and inject a correction rather than accepting it as a direct answer.
+#[test]
+fn malformed_write_open_without_close_triggers_correction() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("test.txt"), "hello world\n").unwrap();
+
+    // First response: malformed block (open tag, inline content, no close tag).
+    // Second response: proper tool call after correction.
+    let malformed = "[write_file] path: test.txt\n---content---\nhello thunk";
+    let proper_call = "[write_file]\npath: test.txt\n---content---\nhello thunk\n[/write_file]";
+    let mut rt = make_runtime_in(vec![malformed, proper_call], tmp.path());
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Edit test.txt replace hello world with hello thunk".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "must not fail: {events:?}");
+
+    let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The malformed block must trigger the specialized write_file correction, not the generic one.
+    assert!(
+        all_user.contains("[runtime:correction]")
+            && all_user.contains("write_file block is malformed"),
+        "runtime must inject specialized write_file correction for open-without-close: {all_user}"
+    );
+
+    // The malformed string must NOT appear verbatim as an assistant message.
+    let assistant_messages: Vec<&str> = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        !assistant_messages
+            .iter()
+            .any(|m| m.contains("[write_file] path: test.txt")),
+        "malformed tool syntax must never surface as a final answer: {assistant_messages:?}"
+    );
+}
+
+// ── Regression: Fix 3 ─────────────────────────────────────────────────────────
+// When the resolver rejects a mutation tool call (path escapes project root),
+// the runtime must terminate immediately with MutationFailed rather than
+// continuing into more tool rounds (e.g. falling back to search_code).
+#[test]
+fn mutation_resolver_failure_terminates_immediately() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+
+    // Model tries to write outside the project root, then would search if allowed to continue.
+    let outside_write = format!(
+        "[write_file]\npath: {}/outside.txt\n---content---\nhello\n[/write_file]",
+        tmp.path().parent().unwrap().display()
+    );
+    let would_search = "[search_code: hello]".to_string();
+    let mut rt = make_runtime_in(vec![outside_write, would_search], tmp.path());
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Write /tmp/outside.txt with content hello".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::MutationFailed,
+                ..
+            })
+        ),
+        "resolver-rejected mutation must terminate with MutationFailed: {answer_source:?}"
+    );
+
+    let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: search_code ===").count(),
+        0,
+        "runtime must not fall back into retrieval after a mutation resolver failure"
     );
 }

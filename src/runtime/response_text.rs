@@ -40,6 +40,36 @@ pub(super) const MALFORMED_BLOCK_CORRECTION: &str =
      Tag names are exact — you must use [write_file], [edit_file], etc. exactly as shown. \
      Do not rename or abbreviate them. Emit the correct tool call now with no other text.";
 
+/// Injected when an edit_file block is missing its closing [/edit_file] tag.
+/// Shows the exact canonical block format so weak models know how to repair it.
+pub(super) fn malformed_edit_file_correction() -> String {
+    "[runtime:correction] Your edit_file block is malformed — it is missing the closing [/edit_file] tag. \
+     The exact format is:\n\
+     [edit_file]\n\
+     path: <file path>\n\
+     ---search---\n\
+     <exact text to find>\n\
+     ---replace---\n\
+     <replacement text>\n\
+     [/edit_file]\n\
+     Emit the corrected block now with no other text."
+        .to_string()
+}
+
+/// Injected when a write_file block is missing its closing [/write_file] tag.
+/// Shows the exact canonical block format so weak models know how to repair it.
+pub(super) fn malformed_write_file_correction() -> String {
+    "[runtime:correction] Your write_file block is malformed — it is missing the closing [/write_file] tag. \
+     The exact format is:\n\
+     [write_file]\n\
+     path: <file path>\n\
+     ---content---\n\
+     <file content>\n\
+     [/write_file]\n\
+     Emit the corrected block now with no other text."
+        .to_string()
+}
+
 /// Injected when search returned matches but the model attempts synthesis without reading any file.
 /// One correction is allowed per turn; after that, the runtime terminates with insufficient evidence.
 pub(super) const READ_BEFORE_ANSWERING: &str =
@@ -264,6 +294,21 @@ pub(super) fn unread_requested_file_final_answer(path: &str) -> String {
     format!(
         "I couldn't read `{path}` because no matching read_file result was produced. No file contents were read."
     )
+}
+
+/// Fallback answer for a direct-read turn where the model repeatedly called tools instead of
+/// synthesizing. Strips the tool_result wrapper so the user sees clean file content rather
+/// than the model-facing protocol block.
+pub(super) fn direct_read_fallback_answer(results: &str) -> String {
+    const HDR: &str = "=== tool_result: read_file ===\n";
+    const FTR: &str = "=== /tool_result ===\n";
+    let inner = results.strip_prefix(HDR).unwrap_or(results);
+    let inner = inner.strip_suffix(FTR).unwrap_or(inner);
+    inner.trim_end().to_string()
+}
+
+pub(super) fn mutation_input_rejected_final_answer(tool_name: &str, error: &str) -> String {
+    format!("I couldn't complete {tool_name}: {error}. No changes were made.")
 }
 
 pub(super) fn insufficient_evidence_final_answer() -> &'static str {

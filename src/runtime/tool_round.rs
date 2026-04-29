@@ -503,6 +503,13 @@ pub(super) fn run_tool_round(
                         reason: RuntimeTerminalReason::ReadFileFailed,
                     };
                 }
+                if is_mutating_tool(&input) {
+                    return ToolRoundOutcome::TerminalAnswer {
+                        results: accumulated,
+                        answer: mutation_input_rejected_final_answer(&name, &error),
+                        reason: RuntimeTerminalReason::MutationFailed,
+                    };
+                }
                 continue;
             }
         };

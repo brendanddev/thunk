@@ -978,15 +978,36 @@ pub fn contains_edit_attempt(text: &str) -> bool {
     text.contains("[edit_file]") && text.contains("[/edit_file]")
 }
 
-/// Returns true if the text contains a known tool CLOSE tag without a matching open tag.
-/// This fingerprints the common drift case where the model uses a wrong opening tag
-/// (e.g. `[test_file]...[/write_file]`) — the open fails to match, the close is present.
-/// Used by the engine to trigger a correction instead of silently accepting the response
-/// as a direct text answer.
+/// Returns true if the text contains an unmatched block tool tag — either a known CLOSE tag
+/// without a matching open, or a known OPEN tag without a matching close.
+///
+/// Two drift patterns are detected:
+/// - Close-without-open: model used a wrong opening tag name (e.g. `[test_file]...[/write_file]`).
+/// - Open-without-close: model emitted the opening tag inline without a body/close
+///   (e.g. `[write_file] path: foo ---content--- bar` with no `[/write_file]`).
+///
+/// Both patterns produce zero parsed tool calls and must be corrected rather than silently
+/// accepted as a direct text answer.
+/// Returns the name of the mutation tool detected in an open-without-close pattern,
+/// used to specialize the correction message with the tool's exact required syntax.
+/// Returns None when the pattern is close-without-open (wrong tag name drift) or
+/// when neither edit_file nor write_file is involved.
+pub fn detected_malformed_mutation_tool(text: &str) -> Option<&'static str> {
+    if text.contains("[edit_file]") && !text.contains("[/edit_file]") {
+        Some("edit_file")
+    } else if text.contains("[write_file]") && !text.contains("[/write_file]") {
+        Some("write_file")
+    } else {
+        None
+    }
+}
+
 pub fn contains_malformed_block(text: &str) -> bool {
     (text.contains("[/write_file]") && !text.contains("[write_file]"))
         || (text.contains("[/edit_file]") && !text.contains("[edit_file]"))
         || (text.contains("[/search_code]") && !text.contains("[search_code]"))
+        || (text.contains("[write_file]") && !text.contains("[/write_file]"))
+        || (text.contains("[edit_file]") && !text.contains("[/edit_file]"))
 }
 
 // Protocol description

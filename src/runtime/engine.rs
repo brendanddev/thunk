@@ -1010,6 +1010,9 @@ impl Runtime {
         let mut post_answer_phase_tool_attempts = 0usize;
         let mut post_answer_phase_correction_echo_retries = 0usize;
         let mut seeded_tool_executed = false;
+        // Holds the raw tool_result block from a seeded direct read so the runtime can serve
+        // it as a deterministic fallback when model synthesis repeatedly fails in answer phase.
+        let mut direct_read_result: Option<String> = None;
 
         macro_rules! finish_turn {
             () => {{
@@ -1254,18 +1257,26 @@ impl Runtime {
                         );
                         continue;
                     }
-                    let (answer, reason) = match phase {
+                    let (answer, reason): (String, RuntimeTerminalReason) = match phase {
                         AnswerPhaseKind::PostRead => (
-                            repeated_tool_after_answer_phase_final_answer(),
+                            // Invariant: direct_read_result is set iff requested_read_path was
+                            // set (DirectRead) and the seeded read completed. When present, serve
+                            // the read content directly rather than the synthesis-failure message.
+                            direct_read_result
+                                .as_deref()
+                                .map(direct_read_fallback_answer)
+                                .unwrap_or_else(|| {
+                                    repeated_tool_after_answer_phase_final_answer().to_string()
+                                }),
                             RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
                         ),
                         AnswerPhaseKind::InvestigationEvidenceReady => (
-                            repeated_tool_after_evidence_ready_final_answer(),
+                            repeated_tool_after_evidence_ready_final_answer().to_string(),
                             RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
                         ),
                     };
                     self.finish_with_runtime_answer(
-                        answer,
+                        &answer,
                         AnswerSource::RuntimeTerminal {
                             reason,
                             rounds: tool_rounds,
@@ -1349,18 +1360,23 @@ impl Runtime {
                             continue;
                         }
 
-                        let (answer, reason) = match phase {
+                        let (answer, reason): (String, RuntimeTerminalReason) = match phase {
                             AnswerPhaseKind::PostRead => (
-                                repeated_tool_after_answer_phase_final_answer(),
+                                direct_read_result
+                                    .as_deref()
+                                    .map(direct_read_fallback_answer)
+                                    .unwrap_or_else(|| {
+                                        repeated_tool_after_answer_phase_final_answer().to_string()
+                                    }),
                                 RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
                             ),
                             AnswerPhaseKind::InvestigationEvidenceReady => (
-                                repeated_tool_after_evidence_ready_final_answer(),
+                                repeated_tool_after_evidence_ready_final_answer().to_string(),
                                 RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
                             ),
                         };
                         self.finish_with_runtime_answer(
-                            answer,
+                            &answer,
                             AnswerSource::RuntimeTerminal {
                                 reason,
                                 rounds: tool_rounds,
@@ -1412,8 +1428,13 @@ impl Runtime {
                     if corrections < MAX_CORRECTIONS {
                         corrections += 1;
                         self.conversation.discard_last_if_assistant();
-                        self.conversation
-                            .push_user(MALFORMED_BLOCK_CORRECTION.to_string());
+                        let correction =
+                            match tool_codec::detected_malformed_mutation_tool(&response) {
+                                Some("edit_file") => malformed_edit_file_correction(),
+                                Some("write_file") => malformed_write_file_correction(),
+                                _ => MALFORMED_BLOCK_CORRECTION.to_string(),
+                            };
+                        self.conversation.push_user(correction);
                         next_round_label = GenerationRoundLabel::CorrectionRetry;
                         next_round_cause = GenerationRoundCause::MalformedBlockCorrection;
                         continue;
@@ -1625,6 +1646,12 @@ impl Runtime {
                         last_call_key = None;
                         if matches!(retrieval_intent, RetrievalIntent::DirectoryListing { .. }) {
                             answer_phase = Some(AnswerPhaseKind::PostRead);
+                        }
+                        // Invariant: requested_read_path.is_some() identifies a DirectRead turn.
+                        // Capture the result now (before commit moves it) so the runtime can
+                        // serve it as a deterministic fallback if model synthesis loops.
+                        if requested_read_path.is_some() {
+                            direct_read_result = Some(results.clone());
                         }
                     }
                     if let Some(t) = t_tool_start {

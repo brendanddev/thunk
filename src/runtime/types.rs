@@ -44,6 +44,9 @@ pub enum AnswerSource {
 pub enum RuntimeTerminalReason {
     RejectedMutation,
     ReadFileFailed,
+    /// A mutation tool call was rejected at resolver level (e.g. path escapes project root).
+    /// Distinct from RejectedMutation, which is a user-initiated cancellation of an approved action.
+    MutationFailed,
     RepeatedDisallowedTool,
     RepeatedToolAfterEvidenceReady,
     RepeatedWeakSearchQuery,
