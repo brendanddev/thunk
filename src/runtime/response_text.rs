@@ -301,10 +301,15 @@ pub(super) fn unread_requested_file_final_answer(path: &str) -> String {
 /// than the model-facing protocol block.
 pub(super) fn direct_read_fallback_answer(results: &str) -> String {
     const HDR: &str = "=== tool_result: read_file ===\n";
-    const FTR: &str = "=== /tool_result ===\n";
-    let inner = results.strip_prefix(HDR).unwrap_or(results);
-    let inner = inner.strip_suffix(FTR).unwrap_or(inner);
-    inner.trim_end().to_string()
+    const FTR: &str = "=== /tool_result ===";
+    let mut inner = results.trim_end_matches('\n');
+    if let Some(after_header) = inner.strip_prefix(HDR) {
+        inner = after_header;
+    }
+    if let Some(before_footer) = inner.strip_suffix(FTR) {
+        inner = before_footer;
+    }
+    inner.trim_end_matches('\n').to_string()
 }
 
 pub(super) fn mutation_input_rejected_final_answer(tool_name: &str, error: &str) -> String {

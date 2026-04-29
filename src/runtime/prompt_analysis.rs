@@ -211,6 +211,65 @@ pub(super) fn user_requested_mutation(text: &str) -> bool {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SimpleEditRequest {
+    pub path: String,
+    pub search: String,
+    pub replace: String,
+}
+
+/// Extracts a narrow natural-language edit request for weak-model stabilization.
+///
+/// Accepted forms only:
+/// - "Edit the file <path> replace the content <old> with <new>"
+/// - "Edit <path> replace <old> with <new>"
+pub(super) fn requested_simple_edit(text: &str) -> Option<SimpleEditRequest> {
+    const LONG_PREFIX: &str = "edit the file ";
+    const SHORT_PREFIX: &str = "edit ";
+    const LONG_REPLACE_MARKER: &str = " replace the content ";
+    const SHORT_REPLACE_MARKER: &str = " replace ";
+    const WITH_MARKER: &str = " with ";
+
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    let (prefix_len, replace_marker) = if lower.starts_with(LONG_PREFIX) {
+        (LONG_PREFIX.len(), LONG_REPLACE_MARKER)
+    } else if lower.starts_with(SHORT_PREFIX) {
+        (SHORT_PREFIX.len(), SHORT_REPLACE_MARKER)
+    } else {
+        return None;
+    };
+
+    let rest = &trimmed[prefix_len..];
+    let lower_rest = &lower[prefix_len..];
+    let replace_index = lower_rest.find(replace_marker)?;
+    let path = rest[..replace_index].trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if path.is_empty() || path.chars().any(char::is_whitespace) || !looks_like_file_path(path) {
+        return None;
+    }
+
+    let remainder = &rest[replace_index + replace_marker.len()..];
+    let lower_remainder = &lower_rest[replace_index + replace_marker.len()..];
+    let with_index = lower_remainder.find(WITH_MARKER)?;
+    let search = remainder[..with_index].trim();
+    let replace = remainder[with_index + WITH_MARKER.len()..].trim();
+    if search.is_empty() || replace.is_empty() {
+        return None;
+    }
+
+    Some(SimpleEditRequest {
+        path: path.to_string(),
+        search: search.to_string(),
+        replace: replace.to_string(),
+    })
+}
+
 /// Extracts a single relative path scope from an investigation prompt.
 ///
 /// Fires only on the conservative pattern `in <token>` / `within <token>`, with
@@ -643,6 +702,26 @@ mod tests {
             requested_read_path("What is in this project?").as_deref(),
             None
         );
+    }
+
+    #[test]
+    fn requested_simple_edit_detects_long_form() {
+        let edit = requested_simple_edit(
+            "Edit the file test.txt replace the content hello world with hello thunk",
+        )
+        .expect("expected simple edit");
+        assert_eq!(edit.path, "test.txt");
+        assert_eq!(edit.search, "hello world");
+        assert_eq!(edit.replace, "hello thunk");
+    }
+
+    #[test]
+    fn requested_simple_edit_detects_short_form() {
+        let edit = requested_simple_edit("Edit hello.txt replace hello root with hello runtime")
+            .expect("expected simple edit");
+        assert_eq!(edit.path, "hello.txt");
+        assert_eq!(edit.search, "hello root");
+        assert_eq!(edit.replace, "hello runtime");
     }
 
     #[test]

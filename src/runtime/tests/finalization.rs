@@ -1,5 +1,24 @@
 use super::*;
+use crate::app::config::Config;
+use crate::llm::backend::GenerateRequest;
 use crate::runtime::types::RuntimeTerminalReason;
+use crate::tools::default_registry;
+use std::sync::{Arc, Mutex};
+
+fn make_runtime_in_with_recorded_requests(
+    responses: Vec<impl Into<String>>,
+    root: &std::path::Path,
+) -> (Runtime, Arc<Mutex<Vec<GenerateRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(root.to_path_buf()).unwrap();
+    let runtime = Runtime::new(
+        &Config::default(),
+        project_root.clone(),
+        Box::new(RecordingBackend::new(responses, Arc::clone(&requests))),
+        default_registry().with_project_root(project_root.as_path_buf()),
+    );
+    (runtime, requests)
+}
 
 #[test]
 fn definition_lookup_extra_tool_after_evidence_ready_enters_answer_only_mode() {
@@ -261,59 +280,6 @@ fn repeated_post_evidence_tool_use_terminates_before_search_budget_failure() {
 // Phase 11.2.1 — Runtime Turn Finalization (Stage 1)
 
 #[test]
-fn direct_read_blocks_post_read_tool_call_with_answer_phase_correction() {
-    // Non-investigation direct read: after read_file succeeds, answer_phase = true.
-    // A subsequent tool call must be blocked. The model then produces the final answer.
-    use std::fs;
-    use tempfile::TempDir;
-
-    let tmp = TempDir::new().unwrap();
-    fs::write(tmp.path().join("foo.rs"), "fn foo() {}\n").unwrap();
-
-    let final_answer = "foo.rs defines a single function.";
-    let mut rt = make_runtime_in(vec!["[search_code: foo]", final_answer], tmp.path());
-
-    let events = collect_events(
-        &mut rt,
-        RuntimeRequest::Submit {
-            text: "read foo.rs".into(),
-        },
-    );
-
-    assert!(!has_failed(&events), "must not fail: {events:?}");
-
-    let snapshot = rt.messages_snapshot();
-    let all_user: String = snapshot
-        .iter()
-        .filter(|m| m.role == crate::llm::backend::Role::User)
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert_eq!(
-        all_user.matches("=== tool_result: read_file ===").count(),
-        1,
-        "read_file must have executed exactly once"
-    );
-    assert_eq!(
-        all_user.matches("=== tool_result: search_code ===").count(),
-        0,
-        "search_code after read must be blocked by answer_phase gate"
-    );
-    assert!(
-        all_user.contains("[runtime:correction]") && all_user.contains("already read this turn"),
-        "answer_phase correction must be injected after blocked search"
-    );
-
-    let last_assistant = snapshot
-        .iter()
-        .rev()
-        .find(|m| m.role == crate::llm::backend::Role::Assistant)
-        .map(|m| m.content.as_str());
-    assert_eq!(last_assistant, Some(final_answer));
-}
-
-#[test]
 fn general_retrieval_blocks_post_read_search_with_answer_phase_correction() {
     // Non-investigation search + read: after read succeeds, answer_phase = true.
     // A further search attempt must be blocked. The model then answers.
@@ -379,211 +345,11 @@ fn general_retrieval_blocks_post_read_search_with_answer_phase_correction() {
     assert_eq!(last_assistant, Some(final_answer));
 }
 
-#[test]
-fn repeated_tool_after_answer_phase_terminates_before_search_budget_failure() {
-    // Non-investigation: after read, answer_phase = true.
-    // First post-read tool call → answer_phase correction.
-    // Second post-read tool call → RepeatedToolAfterAnswerPhase terminal.
-    use std::fs;
-    use tempfile::TempDir;
-
-    let tmp = TempDir::new().unwrap();
-    fs::write(tmp.path().join("bar.rs"), "fn bar() {}\n").unwrap();
-
-    let mut rt = make_runtime_in(
-        vec![
-            "[read_file: bar.rs]",
-            "[search_code: bar]",
-            "[search_code: bar]",
-            "This response must not be consumed.",
-        ],
-        tmp.path(),
-    );
-
-    let events = collect_events(
-        &mut rt,
-        RuntimeRequest::Submit {
-            text: "read bar.rs".into(),
-        },
-    );
-
-    assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
-
-    let answer_source = events.iter().find_map(|e| {
-        if let RuntimeEvent::AnswerReady(src) = e {
-            Some(src.clone())
-        } else {
-            None
-        }
-    });
-    assert!(
-        matches!(
-            answer_source,
-            Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
-                ..
-            })
-        ),
-        "second post-read tool attempt must use RepeatedToolAfterAnswerPhase: {answer_source:?}"
-    );
-
-    let snapshot = rt.messages_snapshot();
-    let all_user: String = snapshot
-        .iter()
-        .filter(|m| m.role == crate::llm::backend::Role::User)
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert_eq!(
-        all_user.matches("=== tool_result: search_code ===").count(),
-        0,
-        "post-read search_code attempts must not dispatch"
-    );
-    assert!(
-        all_user.contains("[runtime:correction]") && all_user.contains("already read this turn"),
-        "first post-read tool attempt must receive answer_phase correction"
-    );
-
-    let last_assistant = snapshot
-        .iter()
-        .rev()
-        .find(|m| m.role == crate::llm::backend::Role::Assistant)
-        .map(|m| m.content.as_str());
-    // Fix 1: for a direct read, the runtime now falls back to the read content
-    // rather than emitting the synthesis-failure message.
-    assert!(
-        matches!(last_assistant, Some(s) if s.contains("fn bar()")),
-        "last assistant must contain the file content fallback, not a terminal error: {last_assistant:?}"
-    );
-}
-
-#[test]
-fn direct_read_discards_runtime_correction_echo_before_final_synthesis() {
-    use std::fs;
-    use tempfile::TempDir;
-
-    let tmp = TempDir::new().unwrap();
-    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
-    fs::write(
-        tmp.path().join("sandbox/main.py"),
-        "def main():\n    return 'ok'\n",
-    )
-    .unwrap();
-
-    let correction = "[runtime:correction] The file was already read this turn. Do not call more tools. Provide your final answer now based on what was read.";
-    let final_answer = "sandbox/main.py defines main(), which returns 'ok'.";
-    let mut rt = make_runtime_in(
-        vec!["[read_file: sandbox/main.py]", correction, final_answer],
-        tmp.path(),
-    );
-
-    let events = collect_events(
-        &mut rt,
-        RuntimeRequest::Submit {
-            text: "Read sandbox/main.py".into(),
-        },
-    );
-
-    assert!(
-        !has_failed(&events),
-        "runtime must recover from a correction echo after a successful read: {events:?}"
-    );
-
-    let snapshot = rt.messages_snapshot();
-    let all_user: String = snapshot
-        .iter()
-        .filter(|m| m.role == crate::llm::backend::Role::User)
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        all_user.matches("=== tool_result: read_file ===").count(),
-        1,
-        "the duplicate post-read tool attempt must still be blocked"
-    );
-    assert!(
-        all_user.contains("[runtime:correction]") && all_user.contains("already read this turn"),
-        "the answer-phase correction must still be injected for the blocked duplicate read"
-    );
-
-    let assistant_messages: Vec<&str> = snapshot
-        .iter()
-        .filter(|m| m.role == crate::llm::backend::Role::Assistant)
-        .map(|m| m.content.as_str())
-        .collect();
-    assert!(
-        !assistant_messages
-            .iter()
-            .any(|m| m.trim_start().starts_with("[runtime:correction]")),
-        "runtime corrections must remain internal and never become assistant-visible: {assistant_messages:?}"
-    );
-    assert_eq!(assistant_messages.last().copied(), Some(final_answer));
-}
-
-#[test]
-fn correction_echo_without_sentinel_prefix_is_not_emitted_as_final_answer() {
-    // Regression test for Fix 3: model echoes the correction text without the
-    // "[runtime:correction]" prefix. The runtime must still detect this as an
-    // echo and discard it, then accept the real final answer on the next round.
-    use std::fs;
-    use tempfile::TempDir;
-
-    let tmp = TempDir::new().unwrap();
-    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
-    fs::write(
-        tmp.path().join("sandbox/main.py"),
-        "def main():\n    return 'ok'\n",
-    )
-    .unwrap();
-
-    // Model's first synthesis response after the seeded read echoes correction text
-    // without the "[runtime:correction]" sentinel prefix.
-    let partial_echo =
-        "The file was already read this turn. Based on the contents, main returns 'ok'.";
-    let final_answer = "sandbox/main.py defines main(), which returns 'ok'.";
-    let mut rt = make_runtime_in(vec![partial_echo, final_answer], tmp.path());
-
-    let events = collect_events(
-        &mut rt,
-        RuntimeRequest::Submit {
-            text: "Read sandbox/main.py".into(),
-        },
-    );
-
-    assert!(
-        !has_failed(&events),
-        "runtime must recover from prefix-less correction echo: {events:?}"
-    );
-
-    // The partial echo must not be emitted to the user.
-    assert!(
-        !events.iter().any(|e| matches!(
-            e,
-            RuntimeEvent::AssistantMessageChunk(text) if text.contains("The file was already read this turn")
-        )),
-        "correction echo must not be emitted as an AssistantMessageChunk"
-    );
-
-    let snapshot = rt.messages_snapshot();
-    let last_assistant = snapshot
-        .iter()
-        .rev()
-        .find(|m| m.role == crate::llm::backend::Role::Assistant)
-        .map(|m| m.content.as_str());
-    assert_eq!(
-        last_assistant,
-        Some(final_answer),
-        "last assistant message must be the real final answer, not the echo"
-    );
-}
-
 // ── Regression: Fix 1 ─────────────────────────────────────────────────────────
-// When a seeded direct read succeeds but model synthesis repeatedly fails
-// (keeps calling tools in answer phase), the runtime must serve the file content
-// as a deterministic fallback rather than emitting a synthesis-failure message.
+// When a seeded direct read succeeds, the runtime must finalize immediately with
+// the file contents rather than entering post-read answer-phase synthesis.
 #[test]
-fn direct_read_fallback_serves_file_content_when_model_loops() {
+fn direct_read_finalizes_immediately_with_file_contents() {
     use std::fs;
     use tempfile::TempDir;
 
@@ -595,9 +361,7 @@ fn direct_read_fallback_serves_file_content_when_model_loops() {
     )
     .unwrap();
 
-    // Model produces tool calls both times it is asked to synthesize — simulating
-    // the local-model loop observed in QA.
-    let mut rt = make_runtime_in(
+    let (mut rt, requests) = make_runtime_in_with_recorded_requests(
         vec![
             "[read_file: sandbox/main.py]",
             "[search_code: main]",
@@ -625,12 +389,9 @@ fn direct_read_fallback_serves_file_content_when_model_loops() {
     assert!(
         matches!(
             answer_source,
-            Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
-                ..
-            })
+            Some(AnswerSource::ToolAssisted { rounds: 1 })
         ),
-        "terminal reason must be RepeatedToolAfterAnswerPhase: {answer_source:?}"
+        "direct read must finalize as a single tool-assisted turn: {answer_source:?}"
     );
 
     let snapshot = rt.messages_snapshot();
@@ -645,9 +406,31 @@ fn direct_read_fallback_serves_file_content_when_model_loops() {
         matches!(last_assistant, Some(s) if s.contains("def main()")),
         "fallback answer must contain file contents: {last_assistant:?}"
     );
+    for forbidden in [
+        "=== tool_result",
+        "=== /tool_result",
+        "=== end_tool_result",
+        "[tool_result:",
+        "[/tool_result]",
+    ] {
+        assert!(
+            !matches!(last_assistant, Some(s) if s.contains(forbidden)),
+            "fallback answer must not contain protocol wrapper `{forbidden}`: {last_assistant:?}"
+        );
+    }
     assert!(
-        !matches!(last_assistant, Some(s) if s.contains("model kept calling tools")),
-        "failure message must not be emitted when direct_read_result is available: {last_assistant:?}"
+        !matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
+                ..
+            })
+        ),
+        "direct read must not end as RepeatedToolAfterAnswerPhase: {answer_source:?}"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "direct read must not perform any model generation"
     );
 }
 
@@ -672,7 +455,7 @@ fn malformed_write_open_without_close_triggers_correction() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "Edit test.txt replace hello world with hello thunk".into(),
+            text: "Update test.txt by replacing hello world with hello thunk".into(),
         },
     );
 

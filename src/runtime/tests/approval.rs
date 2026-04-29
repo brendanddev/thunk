@@ -1,4 +1,24 @@
 use super::*;
+use crate::app::config::Config;
+use crate::llm::backend::GenerateRequest;
+use crate::runtime::types::RuntimeTerminalReason;
+use crate::tools::default_registry;
+use std::sync::{Arc, Mutex};
+
+fn make_runtime_in_with_recorded_requests(
+    responses: Vec<impl Into<String>>,
+    root: &std::path::Path,
+) -> (Runtime, Arc<Mutex<Vec<GenerateRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(root.to_path_buf()).unwrap();
+    let runtime = Runtime::new(
+        &Config::default(),
+        project_root.clone(),
+        Box::new(RecordingBackend::new(responses, Arc::clone(&requests))),
+        default_registry().with_project_root(project_root.as_path_buf()),
+    );
+    (runtime, requests)
+}
 
 #[test]
 fn approve_with_no_pending_fires_failed() {
@@ -208,6 +228,144 @@ fn edit_old_new_content_format_requests_approval_and_executes() {
             .iter()
             .any(|m| m.content.contains("=== tool_result: edit_file ===")),
         "approved edit result must be injected: {snapshot:?}"
+    );
+}
+
+#[test]
+fn simple_edit_prompt_seeds_edit_file_and_requests_approval() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("test.txt");
+    fs::write(&file, "hello world").unwrap();
+
+    let (mut rt, requests) =
+        make_runtime_in_with_recorded_requests(vec!["should not be used"], tmp.path());
+    let submit_events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Edit the file test.txt replace the content hello world with hello thunk".into(),
+        },
+    );
+
+    assert!(
+        !has_failed(&submit_events),
+        "submit failed: {submit_events:?}"
+    );
+    assert!(
+        submit_events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ApprovalRequired(p) if p.tool_name == "edit_file")),
+        "simple edit prompt must request edit_file approval: {submit_events:?}"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "seeded simple edit must reach approval before any model generation"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "hello world",
+        "file must not change before approval"
+    );
+}
+
+#[test]
+fn seeded_simple_edit_executes_only_after_approval() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("hello.txt");
+    fs::write(&file, "hello root").unwrap();
+
+    let (mut rt, requests) =
+        make_runtime_in_with_recorded_requests(vec!["still unused"], tmp.path());
+    let submit_events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Edit hello.txt replace hello root with hello runtime".into(),
+        },
+    );
+
+    assert!(
+        !has_failed(&submit_events),
+        "submit failed: {submit_events:?}"
+    );
+    assert!(
+        submit_events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ApprovalRequired(p) if p.tool_name == "edit_file")),
+        "seeded simple edit must enter the normal approval path: {submit_events:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "hello root",
+        "file must not change before approval"
+    );
+
+    let approve_events = collect_events(&mut rt, RuntimeRequest::Approve);
+    assert!(
+        !has_failed(&approve_events),
+        "approve failed: {approve_events:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "hello runtime",
+        "seeded simple edit must execute only after approval"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "seeded simple edit must stay on the runtime-owned resolver/approval path"
+    );
+}
+
+#[test]
+fn simple_edit_prompt_outside_root_is_rejected_before_approval() {
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().parent().unwrap().join("outside.txt");
+
+    let (mut rt, requests) =
+        make_runtime_in_with_recorded_requests(vec!["must not be used"], tmp.path());
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: format!(
+                "Edit {} replace hello world with hello thunk",
+                outside.display()
+            ),
+        },
+    );
+
+    assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ApprovalRequired(_))),
+        "outside-root seeded simple edit must terminate before approval: {events:?}"
+    );
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::MutationFailed,
+                ..
+            })
+        ),
+        "outside-root seeded simple edit must end as MutationFailed: {answer_source:?}"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "outside-root seeded simple edit must terminate before any model generation"
     );
 }
 

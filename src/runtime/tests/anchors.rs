@@ -17,14 +17,7 @@ fn successful_read_file_updates_last_read_file_anchor() {
     .unwrap();
 
     let expected_path = "src/runtime/engine.rs";
-    let mut rt = make_runtime_in(
-        vec![
-            "[read_file: src/runtime/engine.rs]",
-            "Read engine.rs.",
-            "Re-read engine.rs.",
-        ],
-        tmp.path(),
-    );
+    let mut rt = make_runtime_in(vec!["Re-read engine.rs."], tmp.path());
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
@@ -62,14 +55,7 @@ fn read_that_file_again_dispatches_one_read_to_anchor() {
     fs::create_dir_all(tmp.path().join("src")).unwrap();
     fs::write(tmp.path().join("src/anchor.rs"), "fn anchor() {}\n").unwrap();
 
-    let mut rt = make_runtime_in(
-        vec![
-            "[read_file: src/anchor.rs]",
-            "First read complete.",
-            "Anchored read complete.",
-        ],
-        tmp.path(),
-    );
+    let mut rt = make_runtime_in(vec!["Anchored read complete."], tmp.path());
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
@@ -121,14 +107,7 @@ fn open_the_last_file_resolves_to_last_read_file_anchor() {
     fs::create_dir_all(tmp.path().join("src")).unwrap();
     fs::write(tmp.path().join("src/last.rs"), "fn last() {}\n").unwrap();
 
-    let mut rt = make_runtime_in(
-        vec![
-            "[read_file: src/last.rs]",
-            "First read complete.",
-            "Opened last file.",
-        ],
-        tmp.path(),
-    );
+    let mut rt = make_runtime_in(vec!["Opened last file."], tmp.path());
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
@@ -204,16 +183,7 @@ fn failed_read_file_does_not_update_last_read_file_anchor() {
     fs::write(tmp.path().join("src/good.rs"), "fn good() {}\n").unwrap();
 
     let good_path = "src/good.rs";
-    let mut rt = make_runtime_in(
-        vec![
-            "[read_file: src/good.rs]",
-            "First read complete.",
-            "[read_file: src/missing.rs]",
-            "",
-            "Read good.rs again.",
-        ],
-        tmp.path(),
-    );
+    let mut rt = make_runtime_in(vec!["Read good.rs again."], tmp.path());
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
@@ -303,8 +273,6 @@ fn unsupported_anchor_phrases_do_not_resolve_last_read_file() {
 
     let mut rt = make_runtime_in(
         vec![
-            "[read_file: src/anchor.rs]",
-            "First read complete.",
             "Not an anchor.",
             "Still not an anchor.",
             "Also not an anchor.",
@@ -352,8 +320,6 @@ fn anchored_read_seeds_reads_this_turn_and_answer_phase_fires_after_model_initia
     let final_answer = "Read both files.";
     let mut rt = make_runtime_in(
         vec![
-            "[read_file: src/anchor.rs]",
-            "First read complete.",
             "[read_file: src/b.rs]",
             "[search_code: anchor]",
             final_answer,

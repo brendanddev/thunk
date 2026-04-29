@@ -388,7 +388,7 @@ use super::tool_surface::{select_tool_surface, ToolSurface};
 /// Only two structural patterns are checked — no NLP, no heuristics.
 use super::prompt_analysis::{
     classify_retrieval_intent, extract_investigation_path_scope, prompt_requires_investigation,
-    user_requested_mutation, RetrievalIntent,
+    requested_simple_edit, user_requested_mutation, RetrievalIntent,
 };
 
 pub struct Runtime {
@@ -1044,6 +1044,7 @@ impl Runtime {
         let mutation_allowed = original_user_prompt
             .map(user_requested_mutation)
             .unwrap_or(false);
+        let simple_edit_request = original_user_prompt.and_then(requested_simple_edit);
         let tool_surface = original_user_prompt
             .map(|p| {
                 select_tool_surface(
@@ -1137,20 +1138,31 @@ impl Runtime {
             &[("surface", tool_surface.as_str().into())],
         );
         if !investigation_required {
-            match &retrieval_intent {
-                RetrievalIntent::DirectRead { path } => {
-                    pending_runtime_call = Some(PendingRuntimeCall {
-                        input: ToolInput::ReadFile { path: path.clone() },
-                        seeded_pre_generation: true,
-                    });
+            if let Some(edit) = simple_edit_request.as_ref() {
+                pending_runtime_call = Some(PendingRuntimeCall {
+                    input: ToolInput::EditFile {
+                        path: edit.path.clone(),
+                        search: edit.search.clone(),
+                        replace: edit.replace.clone(),
+                    },
+                    seeded_pre_generation: true,
+                });
+            } else {
+                match &retrieval_intent {
+                    RetrievalIntent::DirectRead { path } => {
+                        pending_runtime_call = Some(PendingRuntimeCall {
+                            input: ToolInput::ReadFile { path: path.clone() },
+                            seeded_pre_generation: true,
+                        });
+                    }
+                    RetrievalIntent::DirectoryListing { path } => {
+                        pending_runtime_call = Some(PendingRuntimeCall {
+                            input: ToolInput::ListDir { path: path.clone() },
+                            seeded_pre_generation: true,
+                        });
+                    }
+                    RetrievalIntent::None => {}
                 }
-                RetrievalIntent::DirectoryListing { path } => {
-                    pending_runtime_call = Some(PendingRuntimeCall {
-                        input: ToolInput::ListDir { path: path.clone() },
-                        seeded_pre_generation: true,
-                    });
-                }
-                RetrievalIntent::None => {}
             }
         }
         loop {
@@ -1656,6 +1668,18 @@ impl Runtime {
                     }
                     if let Some(t) = t_tool_start {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
+                    }
+                    if seeded_pre_generation && requested_read_path.is_some() {
+                        let answer = direct_read_fallback_answer(&results);
+                        self.commit_tool_results(results);
+                        self.conversation
+                            .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
+                        self.finish_with_runtime_answer(
+                            &answer,
+                            AnswerSource::ToolAssisted { rounds: 1 },
+                            on_event,
+                        );
+                        finish_turn!();
                     }
                     let post_tool_cause = infer_post_tool_round_cause(&results);
                     self.commit_tool_results(results);

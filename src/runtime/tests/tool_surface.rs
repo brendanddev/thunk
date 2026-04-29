@@ -267,16 +267,8 @@ fn path_qualified_file_prompt_reads_before_first_model_generation() {
     let requests = requests.lock().unwrap();
     assert_eq!(
         requests.len(),
-        1,
-        "model must not generate before read_file"
-    );
-    let first = requests.first().expect("backend request must be recorded");
-    assert!(
-        first
-            .messages
-            .iter()
-            .any(|m| m.content.contains("=== tool_result: read_file ===")),
-        "first backend request must occur after read_file"
+        0,
+        "direct-read prompt must finalize without any model generation"
     );
 }
 
@@ -669,9 +661,9 @@ fn answer_only_surface_hint_declares_no_tools() {
 
 #[test]
 fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
-    // Phase 12.0.1: after a successful read the runtime sets answer_phase = PostRead.
-    // The synthesis generation must receive the AnswerOnly surface hint so the model
-    // is not offered any tools — eliminating the post_evidence_tool_call_rejected round.
+    // Phase 12.0.1: after a successful model-initiated read on a non-direct-read turn,
+    // the synthesis generation must receive the AnswerOnly surface hint so the model
+    // is not offered any tools.
     use std::fs;
     use tempfile::TempDir;
 
@@ -686,7 +678,7 @@ fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
         project_root.clone(),
         Box::new(RecordingBackend::new(
             vec![
-                "[read_file: sandbox/main.py]", // round 1: model reads the requested file
+                "[read_file: sandbox/main.py]", // round 1: model reads a file
                 "Here is what I found.",        // round 2: synthesis — must get AnswerOnly hint
             ],
             Arc::clone(&requests),
@@ -697,7 +689,7 @@ fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "Read sandbox/main.py".into(),
+            text: "display the structure".into(),
         },
     );
 

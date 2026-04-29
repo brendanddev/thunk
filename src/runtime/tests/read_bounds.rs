@@ -2,9 +2,9 @@ use super::*;
 
 #[test]
 fn read_cap_blocks_reads_beyond_limit() {
-    // On non-investigation turns, answer_phase fires after the first read.
-    // The second read attempt is blocked by the answer_phase gate, not the cap.
-    // This verifies that post-read tool drift is prevented for non-investigation turns.
+    // On non-investigation turns that are not explicit direct reads, answer_phase
+    // fires after the first read. The second read attempt is blocked by the
+    // answer_phase gate, not the cap.
     use std::fs;
     use tempfile::TempDir;
 
@@ -21,7 +21,7 @@ fn read_cap_blocks_reads_beyond_limit() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "read a.rs".into(),
+            text: "display the structure".into(),
         },
     );
 
@@ -57,9 +57,9 @@ fn read_cap_blocks_reads_beyond_limit() {
 
 #[test]
 fn duplicate_read_is_blocked_within_same_turn() {
-    // On non-investigation turns, answer_phase fires after the first read.
-    // The duplicate read attempt is blocked by the answer_phase gate (not the dedup
-    // guard) — both mechanisms prevent the read, but answer_phase fires first.
+    // On non-investigation turns that are not explicit direct reads, answer_phase
+    // fires after the first read. The duplicate read attempt is blocked by the
+    // answer_phase gate (not the dedup guard).
     use std::fs;
     use tempfile::TempDir;
 
@@ -78,7 +78,7 @@ fn duplicate_read_is_blocked_within_same_turn() {
     let events = collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "read engine.rs".into(),
+            text: "display the structure".into(),
         },
     );
 
