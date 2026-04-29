@@ -2,7 +2,7 @@ use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, Message, ModelBackend};
 
 use super::conversation::Conversation;
-use super::prompt;
+use super::protocol::prompt;
 use super::tool_surface::ToolSurface;
 use super::types::{Activity, RuntimeEvent};
 

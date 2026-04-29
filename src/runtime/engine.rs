@@ -17,9 +17,9 @@ use super::investigation::{detect_investigation_mode, InvestigationMode, Investi
 use super::project::ProjectRoot;
 use super::project::ProjectStructureSnapshot;
 use super::project::ProjectStructureSnapshotCache;
-use super::prompt;
+use super::protocol::prompt;
+use super::protocol::tool_codec;
 use super::resolve;
-use super::tool_codec;
 use super::tool_round::{
     run_tool_round, SearchBudget, ToolRoundOutcome, MAX_CANDIDATE_READS_PER_INVESTIGATION,
 };
@@ -100,7 +100,7 @@ impl CommandTool {
     }
 }
 
-use super::response_text::*;
+use super::protocol::response_text::*;
 use super::trace::{trace_runtime_decision, RUNTIME_TRACE_ENV};
 
 fn trace_insufficient_evidence_terminal(

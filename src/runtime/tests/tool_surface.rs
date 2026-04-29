@@ -1,4 +1,4 @@
-use super::super::prompt;
+use super::super::protocol::prompt;
 use super::super::tool_surface::{
     select_tool_surface, tool_allowed_for_surface, SurfaceTool, ToolSurface,
 };

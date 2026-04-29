@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::tools::ToolSpec;
 
-use super::project::{ProjectStructureEntryKind, ProjectStructureSnapshot};
+use super::super::project::{ProjectStructureEntryKind, ProjectStructureSnapshot};
 use super::tool_codec;
 
 /// Builds the ephemeral per-turn tool-surface hint injected before generation.
@@ -130,7 +130,7 @@ When you show code, keep it focused on the user's request.",
 
 #[cfg(test)]
 mod tests {
-    use super::super::project::{
+    use super::super::super::project::{
         ProjectStructureEntry, ProjectStructureEntryKind, ProjectStructureSnapshot,
     };
     use super::*;

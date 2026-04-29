@@ -7,9 +7,9 @@ use crate::tools::{
 use super::anchors::AnchorState;
 use super::investigation::{InvestigationMode, InvestigationState, RecoveryKind};
 use super::paths::{normalize_evidence_path, path_is_within_scope, path_matches_requested};
-use super::response_text::*;
+use super::protocol::response_text::*;
+use super::protocol::tool_codec;
 use super::search_query::{simplify_search_input, weak_search_query_reason};
-use super::tool_codec;
 use super::tool_surface::{is_git_read_only_tool_input, tool_allowed_for_surface, ToolSurface};
 use super::trace::trace_runtime_decision;
 use super::types::{RuntimeEvent, RuntimeTerminalReason};

@@ -5,15 +5,13 @@ mod generation;
 mod investigation;
 mod paths;
 pub(crate) mod project;
-mod prompt;
 mod prompt_analysis;
-mod response_text;
+mod protocol;
 #[cfg(test)]
 mod scenarios;
 mod search_query;
 #[cfg(test)]
 mod tests;
-mod tool_codec;
 mod tool_round;
 mod tool_surface;
 mod trace;
