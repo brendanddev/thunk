@@ -1,10 +1,10 @@
 use crate::app::Result;
 use crate::llm::backend::{BackendEvent, BackendStatus, GenerateRequest, Message, ModelBackend};
 
-use super::conversation::Conversation;
-use super::investigation::tool_surface::ToolSurface;
-use super::protocol::prompt;
-use super::types::{Activity, RuntimeEvent};
+use super::super::conversation::Conversation;
+use super::super::investigation::tool_surface::ToolSurface;
+use super::super::protocol::prompt;
+use super::super::types::{Activity, RuntimeEvent};
 
 /// Runs a single generation turn: sends the current conversation to the backend,
 /// buffers the assistant response into conversation history, then returns the

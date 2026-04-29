@@ -7,25 +7,27 @@ use crate::tools::{
     ExecutionKind, PendingAction, ToolError, ToolInput, ToolOutput, ToolRegistry, ToolRunResult,
 };
 
-use super::conversation::Conversation;
-use super::generation::{emit_visible_assistant_message, run_generate_turn};
-use super::investigation::anchors::{
+use super::super::conversation::Conversation;
+use super::super::investigation::anchors::{
     has_same_scope_reference, is_last_read_file_anchor_prompt, is_last_search_anchor_prompt,
     AnchorState,
 };
-use super::investigation::investigation::{
+use super::super::investigation::investigation::{
     detect_investigation_mode, InvestigationMode, InvestigationState,
 };
-use super::project::ProjectRoot;
-use super::project::ProjectStructureSnapshot;
-use super::project::ProjectStructureSnapshotCache;
-use super::protocol::prompt;
-use super::protocol::tool_codec;
-use super::resolve;
+use super::super::project::ProjectRoot;
+use super::super::project::ProjectStructureSnapshot;
+use super::super::project::ProjectStructureSnapshotCache;
+use super::super::protocol::prompt;
+use super::super::protocol::tool_codec;
+use super::super::resolve;
+use super::super::types::{
+    Activity, AnswerSource, RuntimeEvent, RuntimeRequest, RuntimeTerminalReason,
+};
+use super::generation::{emit_visible_assistant_message, run_generate_turn};
 use super::tool_round::{
     run_tool_round, SearchBudget, ToolRoundOutcome, MAX_CANDIDATE_READS_PER_INVESTIGATION,
 };
-use super::types::{Activity, AnswerSource, RuntimeEvent, RuntimeRequest, RuntimeTerminalReason};
 
 /// Maximum tool rounds per turn. Prevents runaway loops when the model keeps
 /// producing tool calls without reaching a final answer.
@@ -102,8 +104,8 @@ impl CommandTool {
     }
 }
 
-use super::protocol::response_text::*;
-use super::trace::{trace_runtime_decision, RUNTIME_TRACE_ENV};
+use super::super::protocol::response_text::*;
+use super::super::trace::{trace_runtime_decision, RUNTIME_TRACE_ENV};
 
 fn trace_insufficient_evidence_terminal(
     reason: &str,
@@ -388,11 +390,11 @@ fn infer_post_tool_round_cause(results: &str) -> GenerationRoundCause {
     }
 }
 
-use super::investigation::tool_surface::{select_tool_surface, ToolSurface};
+use super::super::investigation::tool_surface::{select_tool_surface, ToolSurface};
 
 /// Returns true if the prompt contains a token that looks like a code identifier.
 /// Only two structural patterns are checked — no NLP, no heuristics.
-use super::investigation::prompt_analysis::{
+use super::super::investigation::prompt_analysis::{
     classify_retrieval_intent, extract_investigation_path_scope, prompt_requires_investigation,
     requested_simple_edit, user_requested_mutation, RetrievalIntent,
 };

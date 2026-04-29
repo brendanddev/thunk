@@ -1,7 +1,6 @@
 mod conversation;
-mod engine;
-mod generation;
 mod investigation;
+mod orchestration;
 mod paths;
 pub(crate) mod project;
 mod protocol;
@@ -9,12 +8,11 @@ mod protocol;
 mod scenarios;
 #[cfg(test)]
 mod tests;
-mod tool_round;
 mod trace;
 mod types;
 
 pub use crate::tools::{PendingAction, RiskLevel};
-pub use engine::Runtime;
+pub use orchestration::Runtime;
 pub use project::ResolvedToolInput;
 #[allow(unused_imports)]
 pub use project::{resolve, PathResolutionError};

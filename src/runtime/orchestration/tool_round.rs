@@ -4,18 +4,20 @@ use crate::tools::{
     ExecutionKind, PendingAction, ToolError, ToolInput, ToolRegistry, ToolRunResult,
 };
 
-use super::investigation::anchors::AnchorState;
-use super::investigation::investigation::{InvestigationMode, InvestigationState, RecoveryKind};
-use super::investigation::search_query::{simplify_search_input, weak_search_query_reason};
-use super::investigation::tool_surface::{
+use super::super::investigation::anchors::AnchorState;
+use super::super::investigation::investigation::{
+    InvestigationMode, InvestigationState, RecoveryKind,
+};
+use super::super::investigation::search_query::{simplify_search_input, weak_search_query_reason};
+use super::super::investigation::tool_surface::{
     is_git_read_only_tool_input, tool_allowed_for_surface, ToolSurface,
 };
-use super::paths::{normalize_evidence_path, path_is_within_scope, path_matches_requested};
-use super::protocol::response_text::*;
-use super::protocol::tool_codec;
-use super::trace::trace_runtime_decision;
-use super::types::{RuntimeEvent, RuntimeTerminalReason};
-use super::{resolve, ProjectRoot};
+use super::super::paths::{normalize_evidence_path, path_is_within_scope, path_matches_requested};
+use super::super::protocol::response_text::*;
+use super::super::protocol::tool_codec;
+use super::super::trace::trace_runtime_decision;
+use super::super::types::{RuntimeEvent, RuntimeTerminalReason};
+use super::super::{resolve, ProjectRoot};
 
 /// Maximum number of successful read_file calls allowed in a single turn.
 /// Each read injects up to MAX_LINES lines into the prompt; this cap bounds worst-case
