@@ -14,9 +14,9 @@ use super::anchors::{
 use super::conversation::Conversation;
 use super::generation::{emit_visible_assistant_message, run_generate_turn};
 use super::investigation::{detect_investigation_mode, InvestigationMode, InvestigationState};
-use super::project_root::ProjectRoot;
-use super::project_snapshot::ProjectStructureSnapshot;
-use super::project_snapshot::ProjectStructureSnapshotCache;
+use super::project::ProjectRoot;
+use super::project::ProjectStructureSnapshot;
+use super::project::ProjectStructureSnapshotCache;
 use super::prompt;
 use super::resolve;
 use super::tool_codec;

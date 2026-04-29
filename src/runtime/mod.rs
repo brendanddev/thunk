@@ -4,13 +4,9 @@ mod engine;
 mod generation;
 mod investigation;
 mod paths;
-mod project_path;
-mod project_root;
-mod project_snapshot;
+pub(crate) mod project;
 mod prompt;
 mod prompt_analysis;
-mod resolved_input;
-mod resolver;
 mod response_text;
 #[cfg(test)]
 mod scenarios;
@@ -25,9 +21,9 @@ mod types;
 
 pub use crate::tools::{PendingAction, RiskLevel};
 pub use engine::Runtime;
-pub use project_path::{ProjectPath, ProjectScope};
-pub use project_root::{ProjectRoot, ProjectRootError};
-pub use resolved_input::ResolvedToolInput;
+pub use project::ResolvedToolInput;
 #[allow(unused_imports)]
-pub use resolver::{resolve, PathResolutionError};
+pub use project::{resolve, PathResolutionError};
+pub use project::{ProjectPath, ProjectScope};
+pub use project::{ProjectRoot, ProjectRootError};
 pub use types::{AnswerSource, RuntimeEvent, RuntimeRequest};

@@ -41,12 +41,12 @@ impl ProjectStructureSnapshot {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct ProjectStructureSnapshotCache {
+pub(crate) struct ProjectStructureSnapshotCache {
     snapshot: Option<ProjectStructureSnapshot>,
 }
 
 impl ProjectStructureSnapshotCache {
-    pub(super) fn get_or_build(
+    pub(crate) fn get_or_build(
         &mut self,
         root: &ProjectRoot,
     ) -> io::Result<&ProjectStructureSnapshot> {
@@ -59,7 +59,7 @@ impl ProjectStructureSnapshotCache {
             .expect("snapshot cache must be populated after build"))
     }
 
-    pub(super) fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         self.snapshot = None;
     }
 }
