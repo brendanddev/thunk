@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use crate::runtime::{ProjectPath, ResolvedToolInput};
 
-use super::context::ToolContext;
 use super::pending::{PendingAction, RiskLevel};
 use super::types::{EditFileOutput, ExecutionKind, ToolError, ToolOutput, ToolRunResult, ToolSpec};
 use super::Tool;
@@ -13,8 +12,8 @@ pub struct EditFileTool {
 }
 
 impl EditFileTool {
-    pub fn new(context: ToolContext) -> Self {
-        let root = context.root.canonicalize().unwrap_or(context.root);
+    pub fn new(root: PathBuf) -> Self {
+        let root = root.canonicalize().unwrap_or(root);
         Self { root }
     }
 }
@@ -224,7 +223,7 @@ mod tests {
     }
 
     fn tool_in(dir: &TempDir) -> EditFileTool {
-        EditFileTool::new(ToolContext::new(dir.path().to_path_buf()))
+        EditFileTool::new(dir.path().to_path_buf())
     }
 
     fn resolved_path(root: &TempDir, relative: &str) -> ProjectPath {

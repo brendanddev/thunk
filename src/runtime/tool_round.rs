@@ -768,7 +768,7 @@ mod tests {
     fn temp_root() -> (TempDir, ProjectRoot, ToolRegistry) {
         let dir = TempDir::new().unwrap();
         let root = ProjectRoot::new(dir.path().to_path_buf()).unwrap();
-        let registry = default_registry(root.as_path_buf());
+        let registry = default_registry().with_project_root(root.as_path_buf());
         (dir, root, registry)
     }
 

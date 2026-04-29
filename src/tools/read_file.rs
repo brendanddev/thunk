@@ -2,7 +2,6 @@ use std::fs;
 
 use crate::runtime::ResolvedToolInput;
 
-use super::context::ToolContext;
 use super::types::{
     ExecutionKind, FileContentsOutput, ToolError, ToolOutput, ToolRunResult, ToolSpec,
 };
@@ -15,7 +14,7 @@ const MAX_LINES: usize = 200;
 pub struct ReadFileTool;
 
 impl ReadFileTool {
-    pub fn new(_context: ToolContext) -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -73,11 +72,9 @@ mod tests {
     }
 
     fn read(root: &TempDir, relative: &str) -> Result<ToolRunResult, ToolError> {
-        ReadFileTool::new(ToolContext::new(root.path().to_path_buf())).run(
-            &ResolvedToolInput::ReadFile {
-                path: resolved_path(root, relative),
-            },
-        )
+        ReadFileTool::new().run(&ResolvedToolInput::ReadFile {
+            path: resolved_path(root, relative),
+        })
     }
 
     #[test]

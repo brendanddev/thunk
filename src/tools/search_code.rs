@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use crate::runtime::{ProjectScope, ResolvedToolInput};
 
-use super::context::ToolContext;
 use super::types::{
     ExecutionKind, SearchMatch, SearchResultsOutput, ToolError, ToolOutput, ToolRunResult, ToolSpec,
 };
@@ -65,8 +64,8 @@ pub struct SearchCodeTool {
 }
 
 impl SearchCodeTool {
-    pub fn new(context: ToolContext) -> Self {
-        let root = context.root.canonicalize().unwrap_or(context.root);
+    pub fn new(root: PathBuf) -> Self {
+        let root = root.canonicalize().unwrap_or(root);
         Self { root }
     }
 }
@@ -340,12 +339,10 @@ mod tests {
         query: &str,
         scope: Option<&str>,
     ) -> Result<ToolRunResult, ToolError> {
-        SearchCodeTool::new(ToolContext::new(root.path().to_path_buf())).run(
-            &ResolvedToolInput::SearchCode {
-                query: query.to_string(),
-                scope: scope.map(|relative| resolved_scope(root, relative)),
-            },
-        )
+        SearchCodeTool::new(root.path().to_path_buf()).run(&ResolvedToolInput::SearchCode {
+            query: query.to_string(),
+            scope: scope.map(|relative| resolved_scope(root, relative)),
+        })
     }
 
     #[test]
@@ -382,7 +379,7 @@ mod tests {
     #[test]
     fn returns_error_on_empty_query() {
         let root = TempDir::new().unwrap();
-        let err = SearchCodeTool::new(ToolContext::new(root.path().to_path_buf()))
+        let err = SearchCodeTool::new(root.path().to_path_buf())
             .run(&ResolvedToolInput::SearchCode {
                 query: "".into(),
                 scope: None,

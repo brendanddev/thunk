@@ -1826,7 +1826,7 @@ mod tests {
             &Config::default(),
             project_root.clone(),
             Box::new(TestBackend::new(responses)),
-            default_registry(project_root.as_path_buf()),
+            default_registry().with_project_root(project_root.as_path_buf()),
         )
     }
 
@@ -1992,7 +1992,7 @@ mod tests {
         fs::write(tmp.path().join("src/outside.py"), "needle = False\n").unwrap();
 
         let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
-        let registry = default_registry(project_root.as_path_buf());
+        let registry = default_registry().with_project_root(project_root.as_path_buf());
         let mut last_call_key = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
@@ -2051,7 +2051,7 @@ mod tests {
         fs::write(tmp.path().join("a.rs"), "fn needle() {}\n").unwrap();
         fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
         let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
-        let registry = default_registry(project_root.as_path_buf());
+        let registry = default_registry().with_project_root(project_root.as_path_buf());
         let mut last_call_key = None;
         let mut search_budget = SearchBudget::new();
         let mut investigation = InvestigationState::new();
@@ -2222,7 +2222,7 @@ mod tests {
         .unwrap();
 
         let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
-        let registry = default_registry(project_root.as_path_buf());
+        let registry = default_registry().with_project_root(project_root.as_path_buf());
         let mut anchors = AnchorState::default();
         let mut events = Vec::new();
 

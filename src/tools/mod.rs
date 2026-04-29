@@ -1,4 +1,3 @@
-pub mod context;
 mod edit_file;
 mod git_diff;
 mod git_log;
@@ -11,20 +10,11 @@ mod search_code;
 pub mod types;
 mod write_file;
 
-use std::path::PathBuf;
-
 use crate::runtime::ResolvedToolInput;
 
-use edit_file::EditFileTool;
-use git_diff::GitDiffTool;
-use git_log::GitLogTool;
-use git_status::GitStatusTool;
 use list_dir::ListDirTool;
 use read_file::ReadFileTool;
-use search_code::SearchCodeTool;
-use write_file::WriteFileTool;
 
-pub use context::ToolContext;
 pub use pending::{PendingAction, RiskLevel};
 pub use registry::ToolRegistry;
 pub use types::{
@@ -54,18 +44,13 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// Builds a ToolRegistry pre-loaded with all tools.
-/// Each tool still receives a ToolContext for compatibility during the staged
-/// migration to runtime-owned path resolution.
-pub fn default_registry(root: PathBuf) -> ToolRegistry {
+/// Builds a ToolRegistry with the tools that do not require a project root.
+///
+/// Call `ToolRegistry::with_project_root()` to add the root-aware tools that
+/// need the runtime-owned project root for execution or approval validation.
+pub fn default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(ReadFileTool::new(ToolContext::new(root.clone())));
-    registry.register(ListDirTool::new(ToolContext::new(root.clone())));
-    registry.register(SearchCodeTool::new(ToolContext::new(root.clone())));
-    registry.register(GitStatusTool::new(ToolContext::new(root.clone())));
-    registry.register(GitDiffTool::new(ToolContext::new(root.clone())));
-    registry.register(GitLogTool::new(ToolContext::new(root.clone())));
-    registry.register(EditFileTool::new(ToolContext::new(root.clone())));
-    registry.register(WriteFileTool::new(ToolContext::new(root)));
+    registry.register(ReadFileTool::new());
+    registry.register(ListDirTool::new());
     registry
 }

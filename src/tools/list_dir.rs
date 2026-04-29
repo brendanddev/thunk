@@ -2,7 +2,6 @@ use std::fs;
 
 use crate::runtime::ResolvedToolInput;
 
-use super::context::ToolContext;
 use super::types::{
     DirEntry, DirectoryListingOutput, EntryKind, ExecutionKind, ToolError, ToolOutput,
     ToolRunResult, ToolSpec,
@@ -12,7 +11,7 @@ use super::Tool;
 pub struct ListDirTool;
 
 impl ListDirTool {
-    pub fn new(_context: ToolContext) -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -96,11 +95,9 @@ mod tests {
     }
 
     fn list(root: &TempDir, relative: &str) -> Result<ToolRunResult, ToolError> {
-        ListDirTool::new(ToolContext::new(root.path().to_path_buf())).run(
-            &ResolvedToolInput::ListDir {
-                path: resolved_scope(root, relative),
-            },
-        )
+        ListDirTool::new().run(&ResolvedToolInput::ListDir {
+            path: resolved_scope(root, relative),
+        })
     }
 
     #[test]

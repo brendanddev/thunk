@@ -25,7 +25,7 @@ pub fn run(cli: cli::Cli) -> Result<()> {
     let backend = build_backend(&config)?;
     let project_root = crate::runtime::ProjectRoot::new(paths.root_dir.clone())
         .map_err(|e| AppError::Config(e.to_string()))?;
-    let registry = default_registry(project_root.as_path_buf());
+    let registry = default_registry().with_project_root(project_root.as_path_buf());
     let log = crate::logging::SessionLog::open(&paths.logs_dir);
 
     let (active_session, history) = session::ActiveSession::open_or_restore(&paths.session_db)?;

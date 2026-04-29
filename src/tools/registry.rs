@@ -1,9 +1,16 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::runtime::ResolvedToolInput;
 
+use super::edit_file::EditFileTool;
+use super::git_diff::GitDiffTool;
+use super::git_log::GitLogTool;
+use super::git_status::GitStatusTool;
 use super::pending::PendingAction;
+use super::search_code::SearchCodeTool;
 use super::types::{ExecutionKind, ToolError, ToolOutput, ToolRunResult, ToolSpec};
+use super::write_file::WriteFileTool;
 use super::Tool;
 
 /// Owns all registered tools. Responsibilities: registration, spec enumeration, dispatch.
@@ -27,6 +34,17 @@ impl ToolRegistry {
         self.tools.insert(name, Box::new(tool));
     }
 
+    /// Registers the tools that need the runtime-owned project root.
+    pub fn with_project_root(mut self, root: PathBuf) -> Self {
+        self.register(SearchCodeTool::new(root.clone()));
+        self.register(GitStatusTool::new(root.clone()));
+        self.register(GitDiffTool::new(root.clone()));
+        self.register(GitLogTool::new(root.clone()));
+        self.register(EditFileTool::new(root.clone()));
+        self.register(WriteFileTool::new(root));
+        self
+    }
+
     /// Dispatches a typed input to the correct tool and returns the run result.
     /// Returns ToolError::NotFound if no tool is registered for the input's tool_name.
     pub fn dispatch(&self, input: ResolvedToolInput) -> Result<ToolRunResult, ToolError> {
@@ -34,13 +52,7 @@ impl ToolRegistry {
         let tool = self.tools.get(name).ok_or_else(|| ToolError::NotFound {
             name: name.to_string(),
         })?;
-        match name {
-            "read_file" | "list_dir" | "search_code" => tool.run(&input),
-            // Temporary Slice 15.3.3 split: the remaining tools still perform
-            // their own local legacy-input adaptation until 15.3.4 / 15.3.5.
-            "write_file" | "edit_file" | "git_status" | "git_diff" | "git_log" => tool.run(&input),
-            _ => tool.run(&input),
-        }
+        tool.run(&input)
     }
 
     /// Applies a previously approved mutation by delegating to the correct tool's
@@ -88,14 +100,9 @@ mod tests {
 
     use super::*;
     use crate::runtime::{ProjectPath, ProjectRoot, ProjectScope};
-    use crate::tools::context::ToolContext;
     use crate::tools::list_dir::ListDirTool;
     use crate::tools::read_file::ReadFileTool;
     use crate::tools::types::{ToolOutput, ToolRunResult};
-
-    fn ctx() -> ToolContext {
-        ToolContext::new(PathBuf::from("."))
-    }
 
     fn resolved_root_path() -> ProjectPath {
         let root = ProjectRoot::new(PathBuf::from(".")).unwrap();
@@ -109,8 +116,8 @@ mod tests {
     #[test]
     fn specs_are_sorted_by_name() {
         let mut registry = ToolRegistry::new();
-        registry.register(ReadFileTool::new(ctx()));
-        registry.register(ListDirTool::new(ctx()));
+        registry.register(ReadFileTool::new());
+        registry.register(ListDirTool::new());
 
         let specs = registry.specs();
         let names: Vec<_> = specs.iter().map(|s| s.name).collect();
@@ -133,7 +140,7 @@ mod tests {
     #[test]
     fn dispatch_routes_to_correct_tool() {
         let mut registry = ToolRegistry::new();
-        registry.register(ListDirTool::new(ctx()));
+        registry.register(ListDirTool::new());
 
         let result = registry.dispatch(ResolvedToolInput::ListDir {
             path: resolved_root_scope(),
@@ -147,7 +154,7 @@ mod tests {
     #[test]
     fn spec_for_returns_spec_for_registered_tool() {
         let mut registry = ToolRegistry::new();
-        registry.register(ReadFileTool::new(ctx()));
+        registry.register(ReadFileTool::new());
 
         let spec = registry.spec_for("read_file");
         assert!(spec.is_some());
@@ -162,12 +169,9 @@ mod tests {
 
     #[test]
     fn is_approval_required_true_for_mutating_tools() {
-        use crate::tools::{
-            context::ToolContext, edit_file::EditFileTool, write_file::WriteFileTool,
-        };
         let mut registry = ToolRegistry::new();
-        registry.register(EditFileTool::new(ToolContext::new(PathBuf::from("."))));
-        registry.register(WriteFileTool::new(ToolContext::new(PathBuf::from("."))));
+        registry.register(EditFileTool::new(PathBuf::from(".")));
+        registry.register(WriteFileTool::new(PathBuf::from(".")));
 
         assert!(registry.is_approval_required("edit_file"));
         assert!(registry.is_approval_required("write_file"));
@@ -176,8 +180,8 @@ mod tests {
     #[test]
     fn is_approval_required_false_for_read_only_tools() {
         let mut registry = ToolRegistry::new();
-        registry.register(ReadFileTool::new(ctx()));
-        registry.register(ListDirTool::new(ctx()));
+        registry.register(ReadFileTool::new());
+        registry.register(ListDirTool::new());
 
         assert!(!registry.is_approval_required("read_file"));
         assert!(!registry.is_approval_required("list_dir"));

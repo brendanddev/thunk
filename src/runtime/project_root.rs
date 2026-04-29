@@ -60,7 +60,8 @@ impl ProjectRoot {
 
     /// Returns an owned clone of the canonical path.
     ///
-    /// Use only where ownership is required (e.g., constructing `ToolContext`).
+    /// Use only where ownership is required (e.g., constructing a tool registry
+    /// that needs to retain the project root path).
     pub fn as_path_buf(&self) -> PathBuf {
         self.path.clone()
     }
