@@ -1207,7 +1207,10 @@ fn candidate_read_after_search_passes_guard() {
         },
     );
 
-    assert!(!has_failed(&events), "candidate read must not fail: {events:?}");
+    assert!(
+        !has_failed(&events),
+        "candidate read must not fail: {events:?}"
+    );
 
     let snapshot = rt.messages_snapshot();
     assert!(
@@ -1279,4 +1282,139 @@ fn non_candidate_read_before_search_is_not_blocked() {
         "guard must not fire when no search has been performed"
     );
     let _ = events; // turn ends at InsufficientEvidence since no search was done — acceptable
+}
+
+#[test]
+fn repeated_non_candidate_read_across_rounds_goes_terminal() {
+    // First round: search succeeds, model reads a non-candidate → correction (attempts=1).
+    // Second round: model reads another non-candidate → persistent counter reaches 2 → terminal.
+    // Verifies that InvestigationState.non_candidate_read_attempts persists across
+    // separate run_tool_round calls within the same user turn.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/init.rs"),
+        "fn initialize_logging() {}\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("unrelated.rs"), "fn other() {}\n").unwrap();
+    fs::write(tmp.path().join("also_unrelated.rs"), "fn another() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: initialize_logging]",
+            "[read_file: unrelated.rs]",
+            "[read_file: also_unrelated.rs]",
+            "Done.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Find where logging is initialized in sandbox/".into(),
+        },
+    );
+
+    let snapshot = rt.messages_snapshot();
+
+    // First offense: correction injected (attempts=1 from round 2).
+    assert!(
+        snapshot.iter().any(|m| {
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
+        }),
+        "first non-candidate read must produce a correction: {snapshot:?}"
+    );
+
+    // Second offense: terminal (attempts=2 from round 3, counter persisted from round 2).
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::ReadFileFailed,
+                ..
+            })
+        ),
+        "second non-candidate read must terminate with ReadFileFailed: {answer_source:?}"
+    );
+}
+
+#[test]
+fn repeated_non_candidate_read_does_not_become_search_budget_closed() {
+    // Regression guard: when a non-candidate read causes a terminal, the reason must be
+    // ReadFileFailed, not InsufficientEvidence or a search-budget-related terminal.
+    // Before the fix the counter reset each round, causing the model to retry the bad read,
+    // then attempt an extra search, and terminal with a misleading search-budget message.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/init.rs"),
+        "fn initialize_logging() {}\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("unrelated.rs"), "fn other() {}\n").unwrap();
+    fs::write(tmp.path().join("also_unrelated.rs"), "fn another() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: initialize_logging]",
+            "[read_file: unrelated.rs]",
+            "[read_file: also_unrelated.rs]",
+            "[search_code: initialize_logging]",
+            "Done.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Find where logging is initialized in sandbox/".into(),
+        },
+    );
+
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+
+    // Must terminate as ReadFileFailed on the second non-candidate read (round 3),
+    // before the model ever reaches the redundant search in round 4.
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::ReadFileFailed,
+                ..
+            })
+        ),
+        "terminal must be ReadFileFailed, not a search-budget-closed terminal: {answer_source:?}"
+    );
+
+    // The snapshot must NOT contain any search-budget-exceeded messages.
+    let snapshot = rt.messages_snapshot();
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("search budget exceeded")),
+        "search-budget message must not appear — turn must terminal before reaching the extra search"
+    );
 }

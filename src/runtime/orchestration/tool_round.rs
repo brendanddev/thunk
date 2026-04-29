@@ -170,7 +170,6 @@ pub(super) fn run_tool_round(
 ) -> ToolRoundOutcome {
     let mut accumulated = String::new();
     let mut git_answer_sections = Vec::new();
-    let mut non_candidate_read_attempts = 0usize;
 
     for mut input in calls {
         simplify_search_input(&mut input);
@@ -404,20 +403,20 @@ pub(super) fn run_tool_round(
         {
             if let Some(rp) = read_path.as_deref() {
                 if !investigation.is_search_candidate_path(rp) {
-                    non_candidate_read_attempts += 1;
+                    let attempts = investigation.increment_non_candidate_read_attempts();
                     trace_runtime_decision(
                         on_event,
                         "non_candidate_read_rejected",
                         &[
                             ("path", normalize_evidence_path(rp)),
-                            ("attempts", non_candidate_read_attempts.to_string()),
+                            ("attempts", attempts.to_string()),
                         ],
                     );
                     on_event(RuntimeEvent::ToolCallFinished {
                         name: name.clone(),
                         summary: None,
                     });
-                    if non_candidate_read_attempts == 1 {
+                    if attempts == 1 {
                         accumulated.push_str(&tool_codec::format_tool_error(
                             &name,
                             &non_candidate_read_correction(rp),
@@ -426,7 +425,9 @@ pub(super) fn run_tool_round(
                     }
                     accumulated.push_str(&tool_codec::format_tool_error(
                         &name,
-                        &format!("`{rp}` is not in the search results — repeated non-candidate read."),
+                        &format!(
+                            "`{rp}` is not in the search results — repeated non-candidate read."
+                        ),
                     ));
                     return ToolRoundOutcome::TerminalAnswer {
                         results: accumulated,

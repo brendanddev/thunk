@@ -485,6 +485,10 @@ pub(crate) struct InvestigationState {
     lockfile_candidates: HashSet<String>,
     /// True after the lockfile recovery correction has been issued once this turn.
     lockfile_correction_issued: bool,
+    /// Number of times a non-candidate read_file was attempted this turn.
+    /// Persists across run_tool_round calls so the repeated-offense terminal fires
+    /// even when the first offense and second offense are in separate model responses.
+    non_candidate_read_attempts: usize,
 }
 
 impl InvestigationState {
@@ -527,6 +531,7 @@ impl InvestigationState {
             save_correction_issued: false,
             lockfile_candidates: HashSet::new(),
             lockfile_correction_issued: false,
+            non_candidate_read_attempts: 0,
         }
     }
 
@@ -557,6 +562,13 @@ impl InvestigationState {
 
     pub(crate) fn search_attempted(&self) -> bool {
         self.search_attempted
+    }
+
+    /// Increments the non-candidate read attempt counter and returns the new count.
+    /// Called in run_tool_round before dispatch; persists across rounds within a turn.
+    pub(crate) fn increment_non_candidate_read_attempts(&mut self) -> usize {
+        self.non_candidate_read_attempts += 1;
+        self.non_candidate_read_attempts
     }
 
     pub(crate) fn issue_direct_answer_correction(&mut self) -> bool {
