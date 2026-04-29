@@ -434,6 +434,32 @@ mod tests {
     }
 
     #[test]
+    fn nested_match_paths_are_exact_project_relative_strings() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("src").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("worker.rs"),
+            "pub fn worker() {}\nconst NEEDLE: &str = \"needle\";\n",
+        )
+        .unwrap();
+
+        let out = search(&tmp, "needle", Some(".")).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        let root_display = tmp.path().canonicalize().unwrap().display().to_string();
+        assert_eq!(sr.matches.len(), 1);
+        assert_eq!(sr.matches[0].file, "src/nested/worker.rs");
+        assert!(
+            !sr.matches[0].file.contains(&root_display),
+            "search match path must not contain absolute root: {}",
+            sr.matches[0].file
+        );
+    }
+
+    #[test]
     fn source_files_ranked_before_docs() {
         // README.md and lib.rs both match — source file must appear first.
         let tmp = TempDir::new().unwrap();

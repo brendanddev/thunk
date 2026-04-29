@@ -283,8 +283,14 @@ mod tests {
         .unwrap() else {
             panic!("expected Approval");
         };
+        let root_display = dir.path().canonicalize().unwrap().display().to_string();
         assert!(pa.summary.contains("lib.rs"));
         assert!(pa.summary.contains("2 line(s)"));
+        assert!(
+            !pa.summary.contains(&root_display),
+            "approval summary must not contain absolute root: {}",
+            pa.summary
+        );
     }
 
     #[test]
@@ -376,7 +382,13 @@ mod tests {
         let ToolOutput::EditFile(ef) = out else {
             panic!("expected EditFile output");
         };
+        let root_display = dir.path().canonicalize().unwrap().display().to_string();
         assert_eq!(ef.path, "f.rs");
+        assert!(
+            !ef.path.contains(&root_display),
+            "normal edit output path must not contain absolute root: {}",
+            ef.path
+        );
         assert_eq!(ef.lines_replaced, 1);
 
         let written = fs::read_to_string(&path).unwrap();

@@ -277,8 +277,14 @@ mod tests {
         else {
             panic!("expected Approval");
         };
+        let root_display = dir.path().canonicalize().unwrap().display().to_string();
         assert!(pa.summary.contains("out.rs"));
         assert!(pa.summary.contains("3 lines"));
+        assert!(
+            !pa.summary.contains(&root_display),
+            "approval summary must not contain absolute root: {}",
+            pa.summary
+        );
     }
 
     #[test]
@@ -367,7 +373,13 @@ mod tests {
         let ToolOutput::WriteFile(wf) = tool.execute_approved(&pa.payload).unwrap() else {
             panic!("expected WriteFile output");
         };
+        let root_display = dir.path().canonicalize().unwrap().display().to_string();
         assert_eq!(wf.path, "new.rs");
+        assert!(
+            !wf.path.contains(&root_display),
+            "normal write output path must not contain absolute root: {}",
+            wf.path
+        );
         assert!(wf.created);
         assert_eq!(wf.bytes_written, "pub fn hello() {}".len());
         assert!(path.exists());
@@ -390,7 +402,13 @@ mod tests {
         let ToolOutput::WriteFile(wf) = tool.execute_approved(&pa.payload).unwrap() else {
             panic!("expected WriteFile output");
         };
+        let root_display = dir.path().canonicalize().unwrap().display().to_string();
         assert_eq!(wf.path, "f.rs");
+        assert!(
+            !wf.path.contains(&root_display),
+            "normal write output path must not contain absolute root: {}",
+            wf.path
+        );
         assert!(!wf.created);
         assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
     }
