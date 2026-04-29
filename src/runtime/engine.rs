@@ -15,7 +15,6 @@ use super::conversation::Conversation;
 use super::generation::{emit_visible_assistant_message, run_generate_turn};
 use super::investigation::{detect_investigation_mode, InvestigationMode, InvestigationState};
 use super::project_root::ProjectRoot;
-#[cfg(test)]
 use super::project_snapshot::ProjectStructureSnapshot;
 use super::project_snapshot::ProjectStructureSnapshotCache;
 use super::prompt;
@@ -350,6 +349,7 @@ impl TurnPerformance {
 fn estimate_generation_prompt_chars(
     conversation: &Conversation,
     tool_surface: ToolSurface,
+    project_snapshot_hint: Option<&str>,
 ) -> usize {
     let hint = prompt::render_tool_surface_hint(
         tool_surface.as_str(),
@@ -363,6 +363,7 @@ fn estimate_generation_prompt_chars(
         .map(|message| message.content.len())
         .sum::<usize>()
         + hint.len()
+        + project_snapshot_hint.map_or(0, str::len)
 }
 
 fn infer_post_tool_round_cause(results: &str) -> GenerationRoundCause {
@@ -536,9 +537,17 @@ impl Runtime {
         self.conversation.push_user(capped);
     }
 
-    #[cfg(test)]
     fn get_or_build_project_snapshot(&mut self) -> std::io::Result<&ProjectStructureSnapshot> {
         self.project_snapshot_cache.get_or_build(&self.project_root)
+    }
+
+    fn maybe_render_project_snapshot_hint(&mut self, tool_surface: ToolSurface) -> Option<String> {
+        if !tool_surface.includes_project_snapshot_hint() {
+            return None;
+        }
+
+        let snapshot = self.get_or_build_project_snapshot().ok()?;
+        Some(prompt::render_project_snapshot_hint(snapshot))
     }
 
     fn invalidate_project_snapshot(&mut self) {
@@ -1203,8 +1212,17 @@ impl Runtime {
                     &[("surface", "AnswerOnly".into())],
                 );
             }
+            let project_snapshot_hint = if pending_runtime_call.is_none() {
+                self.maybe_render_project_snapshot_hint(effective_surface)
+            } else {
+                None
+            };
             let prompt_chars = if turn_perf.enabled {
-                estimate_generation_prompt_chars(&self.conversation, effective_surface)
+                estimate_generation_prompt_chars(
+                    &self.conversation,
+                    effective_surface,
+                    project_snapshot_hint.as_deref(),
+                )
             } else {
                 0
             };
@@ -1228,6 +1246,7 @@ impl Runtime {
                             self.backend.as_mut(),
                             &mut self.conversation,
                             effective_surface,
+                            project_snapshot_hint.as_deref(),
                             &mut perf_on_event,
                         ) {
                             Ok(Some(r)) => r,

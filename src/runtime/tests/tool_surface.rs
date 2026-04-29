@@ -7,6 +7,20 @@ use crate::llm::backend::Role;
 use crate::tools::ToolInput;
 use std::sync::{Arc, Mutex};
 
+fn project_snapshot_hint<'a>(request: &'a crate::llm::backend::GenerateRequest) -> Option<&'a str> {
+    request
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == Role::System && message.content.starts_with("[project snapshot]")
+        })
+        .map(|message| message.content.as_str())
+}
+
+fn has_project_snapshot_hint(request: &crate::llm::backend::GenerateRequest) -> bool {
+    project_snapshot_hint(request).is_some()
+}
+
 #[test]
 fn tool_surface_defaults_to_retrieval_first_for_code_investigation_prompts() {
     assert_eq!(
@@ -505,6 +519,11 @@ fn git_read_only_surface_hint_is_sent_to_model() {
         "GitReadOnly surface hint must be injected into backend request: {:?}",
         first.messages
     );
+    assert!(
+        !has_project_snapshot_hint(first),
+        "GitReadOnly turns must not receive project snapshot hint: {:?}",
+        first.messages
+    );
 }
 
 #[test]
@@ -513,7 +532,7 @@ fn tool_surface_hint_is_ephemeral_not_persisted() {
     collect_events(
         &mut rt,
         RuntimeRequest::Submit {
-            text: "hello".into(),
+            text: "where is serde used".into(),
         },
     );
 
@@ -523,8 +542,9 @@ fn tool_surface_hint_is_ephemeral_not_persisted() {
                 .starts_with("Active tool surface: RetrievalFirst. Available this turn:")
                 || m.content
                     .starts_with("Active tool surface: GitReadOnly. Available this turn:")
+                || m.content.starts_with("[project snapshot]")
         }),
-        "surface hint must not be persisted in conversation history"
+        "ephemeral hints must not be persisted in conversation history"
     );
 }
 
@@ -556,6 +576,11 @@ fn tool_surface_hint_does_not_replace_original_user_prompt() {
         }),
         "surface hint must be additional system context"
     );
+    assert!(
+        has_project_snapshot_hint(first),
+        "RetrievalFirst generation must include project snapshot hint: {:?}",
+        first.messages
+    );
 }
 
 #[test]
@@ -577,6 +602,11 @@ fn mutation_turn_receives_mutation_enabled_surface_hint() {
                     == "Active tool surface: MutationEnabled. Available this turn: search_code, read_file, list_dir, edit_file, write_file."
         }),
         "mutation-intent turns must expose MutationEnabled hint with all tool names: {:?}",
+        first.messages
+    );
+    assert!(
+        has_project_snapshot_hint(first),
+        "MutationEnabled generation must include project snapshot hint: {:?}",
         first.messages
     );
 }
@@ -723,6 +753,61 @@ fn answer_only_surface_hint_sent_to_model_during_post_read_synthesis() {
         "AnswerOnly surface hint must not offer read_file: {}",
         surface_hint.content
     );
+    assert!(
+        !has_project_snapshot_hint(synthesis),
+        "AnswerOnly synthesis must not receive project snapshot hint: {:?}",
+        synthesis.messages
+    );
+}
+
+#[test]
+fn retrieval_first_project_snapshot_hint_is_compact_and_deterministic() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("src")).unwrap();
+    fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    fs::create_dir_all(tmp.path().join("target")).unwrap();
+    fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("README.md"), "# Demo\n").unwrap();
+    fs::write(tmp.path().join("config.toml"), "mode = \"dev\"\n").unwrap();
+    fs::write(tmp.path().join("src").join("lib.rs"), "pub fn demo() {}\n").unwrap();
+    fs::write(tmp.path().join("docs").join("guide.md"), "# Guide\n").unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let project_root = ProjectRoot::new(tmp.path().to_path_buf()).unwrap();
+    let mut rt = Runtime::new(
+        &Config::default(),
+        project_root.clone(),
+        Box::new(RecordingBackend::new(vec!["Done."], Arc::clone(&requests))),
+        default_registry().with_project_root(project_root.as_path_buf()),
+    );
+
+    collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "where is demo used".into(),
+        },
+    );
+
+    let requests = requests.lock().unwrap();
+    let first = requests.first().expect("backend request must be recorded");
+    let hint =
+        project_snapshot_hint(first).expect("RetrievalFirst turn must include snapshot hint");
+
+    assert!(hint.contains("Important files: Cargo.toml, README.md, config.toml"));
+    assert!(hint.contains("Top-level dirs: docs, src"));
+    assert!(hint.contains("Top-level files: Cargo.toml, README.md, config.toml"));
+    assert!(hint.contains("Truncated: false"));
+    assert_eq!(hint.lines().count(), 6, "hint must stay short: {hint}");
+    assert!(hint.len() <= 260, "hint must stay compact: {}", hint.len());
 }
 
 #[test]

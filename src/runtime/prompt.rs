@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::tools::ToolSpec;
 
+use super::project_snapshot::{ProjectStructureEntryKind, ProjectStructureSnapshot};
 use super::tool_codec;
 
 /// Builds the ephemeral per-turn tool-surface hint injected before generation.
@@ -21,6 +22,74 @@ where
         format!("Active tool surface: {surface_name}. No tools are available. Provide your final answer now.")
     } else {
         format!("Active tool surface: {surface_name}. Available this turn: {tools}.")
+    }
+}
+
+pub(crate) fn render_project_snapshot_hint(snapshot: &ProjectStructureSnapshot) -> String {
+    const IMPORTANT_FILE_CAP: usize = 4;
+    const TOP_LEVEL_DIR_CAP: usize = 6;
+    const TOP_LEVEL_FILE_CAP: usize = 6;
+    const MAX_ITEM_CHARS: usize = 32;
+
+    let top_level_dirs = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.depth == 1 && entry.kind == ProjectStructureEntryKind::Dir)
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>();
+    let top_level_files = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.depth == 1 && entry.kind == ProjectStructureEntryKind::File)
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>();
+
+    let (important_files, important_truncated) = render_capped_list(
+        &snapshot.important_files,
+        IMPORTANT_FILE_CAP,
+        MAX_ITEM_CHARS,
+    );
+    let (dirs, dirs_truncated) =
+        render_capped_list(&top_level_dirs, TOP_LEVEL_DIR_CAP, MAX_ITEM_CHARS);
+    let (files, files_truncated) =
+        render_capped_list(&top_level_files, TOP_LEVEL_FILE_CAP, MAX_ITEM_CHARS);
+    let truncated = snapshot.truncated || important_truncated || dirs_truncated || files_truncated;
+
+    format!(
+        "[project snapshot]\nImportant files: {important_files}\nTop-level dirs: {dirs}\nTop-level files: {files}\nTruncated: {truncated}\n[/project snapshot]"
+    )
+}
+
+fn render_capped_list<T>(items: &[T], cap: usize, max_item_chars: usize) -> (String, bool)
+where
+    T: AsRef<str>,
+{
+    if items.is_empty() {
+        return ("none".to_string(), false);
+    }
+
+    let truncated = items.len() > cap;
+    let rendered = items
+        .iter()
+        .take(cap)
+        .map(|item| truncate_item(item.as_ref(), max_item_chars))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if truncated {
+        (format!("{rendered}, ..."), true)
+    } else {
+        (rendered, false)
+    }
+}
+
+fn truncate_item(item: &str, max_chars: usize) -> String {
+    let mut chars = item.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 
@@ -57,4 +126,90 @@ When you show code, keep it focused on the user's request.",
     }
 
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::project_snapshot::{
+        ProjectStructureEntry, ProjectStructureEntryKind, ProjectStructureSnapshot,
+    };
+    use super::*;
+
+    #[test]
+    fn project_snapshot_hint_is_compact_and_bounded() {
+        let snapshot = ProjectStructureSnapshot {
+            entries: vec![
+                ProjectStructureEntry {
+                    path: "docs".into(),
+                    depth: 1,
+                    kind: ProjectStructureEntryKind::Dir,
+                    important: false,
+                },
+                ProjectStructureEntry {
+                    path: "src".into(),
+                    depth: 1,
+                    kind: ProjectStructureEntryKind::Dir,
+                    important: false,
+                },
+                ProjectStructureEntry {
+                    path: "tests".into(),
+                    depth: 1,
+                    kind: ProjectStructureEntryKind::Dir,
+                    important: false,
+                },
+                ProjectStructureEntry {
+                    path: "Cargo.toml".into(),
+                    depth: 1,
+                    kind: ProjectStructureEntryKind::File,
+                    important: true,
+                },
+                ProjectStructureEntry {
+                    path: "README.md".into(),
+                    depth: 1,
+                    kind: ProjectStructureEntryKind::File,
+                    important: true,
+                },
+                ProjectStructureEntry {
+                    path: "config.toml".into(),
+                    depth: 1,
+                    kind: ProjectStructureEntryKind::File,
+                    important: true,
+                },
+                ProjectStructureEntry {
+                    path: "very-long-top-level-file-name-that-should-be-truncated.txt".into(),
+                    depth: 1,
+                    kind: ProjectStructureEntryKind::File,
+                    important: false,
+                },
+            ],
+            important_files: vec![
+                "Cargo.toml".into(),
+                "README.md".into(),
+                "config.toml".into(),
+                "package.json".into(),
+                "pyproject.toml".into(),
+            ],
+            max_depth: 2,
+            max_nodes: 40,
+            truncated: false,
+        };
+
+        let hint = render_project_snapshot_hint(&snapshot);
+
+        assert!(hint.starts_with("[project snapshot]\n"));
+        assert!(hint.ends_with("\n[/project snapshot]"));
+        assert!(
+            hint.contains("Important files: Cargo.toml, README.md, config.toml, package.json, ...")
+        );
+        assert!(hint.contains("Top-level dirs: docs, src, tests"));
+        assert!(hint.contains("Top-level files: Cargo.toml, README.md, config.toml"));
+        assert!(hint.contains("very-long-top-level-file-name-th..."));
+        assert!(hint.contains("Truncated: true"));
+        assert_eq!(
+            hint.lines().count(),
+            6,
+            "hint format must stay short: {hint}"
+        );
+        assert!(hint.len() <= 320, "hint must stay compact: {}", hint.len());
+    }
 }

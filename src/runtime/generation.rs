@@ -14,6 +14,7 @@ pub(super) fn run_generate_turn(
     backend: &mut dyn ModelBackend,
     conversation: &mut Conversation,
     tool_surface: ToolSurface,
+    project_snapshot_hint: Option<&str>,
     on_event: &mut dyn FnMut(RuntimeEvent),
 ) -> Result<Option<String>> {
     let mut messages = conversation.snapshot();
@@ -23,6 +24,9 @@ pub(super) fn run_generate_turn(
             .allowed_tool_names()
             .chain(tool_surface.mutation_tool_names().iter().copied()),
     )));
+    if let Some(hint) = project_snapshot_hint {
+        messages.push(Message::system(hint.to_string()));
+    }
     let request = GenerateRequest::new(messages);
     let mut response = String::new();
 

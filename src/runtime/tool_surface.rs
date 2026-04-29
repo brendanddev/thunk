@@ -141,6 +141,10 @@ impl ToolSurface {
             _ => &[],
         }
     }
+
+    pub(super) fn includes_project_snapshot_hint(self) -> bool {
+        matches!(self, Self::RetrievalFirst | Self::MutationEnabled)
+    }
 }
 
 pub(super) fn select_tool_surface(
