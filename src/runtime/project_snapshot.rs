@@ -40,6 +40,30 @@ impl ProjectStructureSnapshot {
     }
 }
 
+#[derive(Debug, Default)]
+pub(super) struct ProjectStructureSnapshotCache {
+    snapshot: Option<ProjectStructureSnapshot>,
+}
+
+impl ProjectStructureSnapshotCache {
+    pub(super) fn get_or_build(
+        &mut self,
+        root: &ProjectRoot,
+    ) -> io::Result<&ProjectStructureSnapshot> {
+        if self.snapshot.is_none() {
+            self.snapshot = Some(ProjectStructureSnapshot::build(root)?);
+        }
+        Ok(self
+            .snapshot
+            .as_ref()
+            .expect("snapshot cache must be populated after build"))
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.snapshot = None;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectStructureEntry {
     pub path: String,

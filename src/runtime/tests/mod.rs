@@ -17,6 +17,7 @@ mod integration_misc;
 mod investigation;
 mod investigation_modes;
 mod path_scope;
+mod project_snapshot;
 mod read_bounds;
 mod search_budget;
 mod search_guardrails;

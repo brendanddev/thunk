@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::app::config::Config;
 use crate::llm::backend::{BackendCapabilities, ModelBackend, Role};
 use crate::tools::{
-    ExecutionKind, PendingAction, ToolError, ToolInput, ToolRegistry, ToolRunResult,
+    ExecutionKind, PendingAction, ToolError, ToolInput, ToolOutput, ToolRegistry, ToolRunResult,
 };
 
 use super::anchors::{
@@ -15,6 +15,9 @@ use super::conversation::Conversation;
 use super::generation::{emit_visible_assistant_message, run_generate_turn};
 use super::investigation::{detect_investigation_mode, InvestigationMode, InvestigationState};
 use super::project_root::ProjectRoot;
+#[cfg(test)]
+use super::project_snapshot::ProjectStructureSnapshot;
+use super::project_snapshot::ProjectStructureSnapshotCache;
 use super::prompt;
 use super::resolve;
 use super::tool_codec;
@@ -400,6 +403,7 @@ pub struct Runtime {
     system_prompt: String,
     anchors: AnchorState,
     context_policy: ContextPolicy,
+    project_snapshot_cache: ProjectStructureSnapshotCache,
     /// Holds a mutating tool action that is waiting for user approval.
     /// Set when a tool round suspends; cleared by Approve or Reject.
     /// At most one pending action exists at any time.
@@ -425,6 +429,7 @@ impl Runtime {
             system_prompt,
             anchors: AnchorState::default(),
             context_policy,
+            project_snapshot_cache: ProjectStructureSnapshotCache::default(),
             pending_action: None,
         }
     }
@@ -529,6 +534,21 @@ impl Runtime {
     fn commit_tool_results(&mut self, results: String) {
         let capped = cap_tool_result_blocks(&results, self.context_policy.tool_result_max_lines);
         self.conversation.push_user(capped);
+    }
+
+    #[cfg(test)]
+    fn get_or_build_project_snapshot(&mut self) -> std::io::Result<&ProjectStructureSnapshot> {
+        self.project_snapshot_cache.get_or_build(&self.project_root)
+    }
+
+    fn invalidate_project_snapshot(&mut self) {
+        self.project_snapshot_cache.invalidate();
+    }
+
+    fn invalidate_project_snapshot_if_needed(&mut self, output: &ToolOutput) {
+        if matches!(output, ToolOutput::WriteFile(_) | ToolOutput::EditFile(_)) {
+            self.invalidate_project_snapshot();
+        }
     }
 
     fn dispatch_command_tool(&mut self, tool: CommandTool, on_event: &mut dyn FnMut(RuntimeEvent)) {
@@ -909,6 +929,7 @@ impl Runtime {
 
         match self.registry.execute_approved(&pending) {
             Ok(output) => {
+                self.invalidate_project_snapshot_if_needed(&output);
                 let summary = tool_codec::render_compact_summary(&output);
                 let final_answer = mutation_complete_final_answer(&tool_name, &summary);
                 on_event(RuntimeEvent::ToolCallFinished {
@@ -1796,6 +1817,13 @@ impl Runtime {
     #[cfg(test)]
     pub(crate) fn set_pending_for_test(&mut self, action: PendingAction) {
         self.pending_action = Some(action);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_snapshot_for_test(
+        &mut self,
+    ) -> std::io::Result<ProjectStructureSnapshot> {
+        self.get_or_build_project_snapshot().cloned()
     }
 }
 
