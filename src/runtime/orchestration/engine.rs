@@ -20,6 +20,7 @@ use super::super::project::ProjectStructureSnapshot;
 use super::super::project::ProjectStructureSnapshotCache;
 use super::super::protocol::prompt;
 use super::super::protocol::tool_codec;
+use super::super::paths::normalize_evidence_path;
 use super::super::resolve;
 use super::super::types::{
     Activity, AnswerSource, RuntimeEvent, RuntimeRequest, RuntimeTerminalReason,
@@ -391,6 +392,48 @@ fn infer_post_tool_round_cause(results: &str) -> GenerationRoundCause {
 }
 
 use super::super::investigation::tool_surface::{select_tool_surface, ToolSurface};
+
+/// Extracts relative file-path tokens cited in a model answer.
+/// Returns only tokens that look like project source paths: relative,
+/// slash-separated, with a recognized file extension, no URL scheme, no `..`.
+/// Used by the read-set answer guard to detect unread paths cited as evidence.
+fn extract_claimed_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for raw in text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'')) {
+        // Strip surrounding punctuation that is never part of a file path.
+        let token = raw.trim_matches(|c: char| matches!(c, '`' | ':' | '!' | '?' | '*' | '_' | ',' | ';'));
+        let token = token.trim_end_matches('.');
+        if token.is_empty() {
+            continue;
+        }
+        // Must start with alphanumeric (excludes CLI flags like --path/to/x).
+        if !token.chars().next().is_some_and(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        // Must contain a path separator and must be relative.
+        if !token.contains('/') || token.starts_with('/') {
+            continue;
+        }
+        // Exclude URLs.
+        if token.contains("://") {
+            continue;
+        }
+        // Exclude parent-directory traversal.
+        if token.split('/').any(|seg| seg == "..") {
+            continue;
+        }
+        // Must have a file extension on the last segment: .ext where ext is 1–5 alpha chars.
+        let last_seg = token.split('/').next_back().unwrap_or("");
+        let has_ext = last_seg.rfind('.').is_some_and(|i| {
+            let ext = &last_seg[i + 1..];
+            !ext.is_empty() && ext.len() <= 5 && ext.bytes().all(|b| b.is_ascii_alphabetic())
+        });
+        if has_ext {
+            paths.push(token.to_string());
+        }
+    }
+    paths
+}
 
 /// Returns true if the prompt contains a token that looks like a code identifier.
 /// Only two structural patterns are checked — no NLP, no heuristics.
@@ -1629,6 +1672,58 @@ impl Runtime {
                         );
                         self.finish_with_runtime_answer(
                             ungrounded_investigation_final_answer(),
+                            AnswerSource::RuntimeTerminal {
+                                reason: RuntimeTerminalReason::InsufficientEvidence,
+                                rounds: tool_rounds,
+                            },
+                            on_event,
+                        );
+                        finish_turn!();
+                    }
+                }
+
+                // 16.3.2: UsageLookup with definition-only reads.
+                if matches!(investigation_mode, InvestigationMode::UsageLookup)
+                    && investigation_required
+                    && investigation.all_useful_accepted_reads_are_definition_only()
+                {
+                    trace_runtime_decision(
+                        on_event,
+                        "terminal_insufficient_evidence",
+                        &[("reason", "usage_lookup_all_reads_definition_only".into())],
+                    );
+                    self.finish_with_runtime_answer(
+                        insufficient_evidence_final_answer(),
+                        AnswerSource::RuntimeTerminal {
+                            reason: RuntimeTerminalReason::InsufficientEvidence,
+                            rounds: tool_rounds,
+                        },
+                        on_event,
+                    );
+                    finish_turn!();
+                }
+
+                // Read-set answer guard (16.3.1): if the answer text cites a
+                // project-looking path that was never successfully read this turn,
+                // reject it deterministically rather than surfacing hallucinated evidence.
+                // Only fires on investigation turns; harmless for direct-read / mutation.
+                if investigation_required && investigation.search_produced_results() {
+                    let claimed = extract_claimed_paths(&response);
+                    if let Some(bad_path) = claimed
+                        .iter()
+                        .find(|p| !reads_this_turn.contains(&normalize_evidence_path(p)))
+                    {
+                        trace_runtime_decision(
+                            on_event,
+                            "answer_guard_rejected",
+                            &[("path", bad_path.clone())],
+                        );
+                        self.finish_with_runtime_answer(
+                            &format!(
+                                "The investigation did not successfully read `{bad_path}` — \
+                                 this path cannot be cited as evidence. No answer can be given \
+                                 without reading the relevant file first."
+                            ),
                             AnswerSource::RuntimeTerminal {
                                 reason: RuntimeTerminalReason::InsufficientEvidence,
                                 rounds: tool_rounds,

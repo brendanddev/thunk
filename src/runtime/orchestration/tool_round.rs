@@ -417,10 +417,26 @@ pub(super) fn run_tool_round(
                         summary: None,
                     });
                     if attempts == 1 {
-                        let best = investigation.best_candidate_for_mode(investigation_mode);
+                        let best = investigation
+                            .best_candidate_for_mode(investigation_mode)
+                            .map(|s| s.to_string());
+                        if let Some(candidate) = best {
+                            trace_runtime_decision(
+                                on_event,
+                                "forced_candidate_read_after_non_candidate",
+                                &[
+                                    ("rejected_path", normalize_evidence_path(rp)),
+                                    ("candidate_path", normalize_evidence_path(&candidate)),
+                                ],
+                            );
+                            return ToolRoundOutcome::RuntimeDispatch {
+                                accumulated,
+                                call: ToolInput::ReadFile { path: candidate },
+                            };
+                        }
                         accumulated.push_str(&tool_codec::format_tool_error(
                             &name,
-                            &non_candidate_read_correction(rp, best),
+                            &non_candidate_read_correction(rp, None),
                         ));
                         continue;
                     }
@@ -1059,5 +1075,86 @@ mod tests {
         assert!(results.contains("=== tool_error: read_file ==="));
         assert!(results.contains(surface_policy_correction(ToolSurface::AnswerOnly)));
         assert!(!results.contains("invalid tool input:"));
+    }
+
+    #[test]
+    fn non_candidate_read_forces_runtime_dispatch_to_best_candidate() {
+        let (_dir, root, registry) = temp_root();
+        fs::write(root.path().join("candidate.rs"), "fn needle() {}\n").unwrap();
+        fs::write(root.path().join("other.rs"), "fn unrelated() {}\n").unwrap();
+
+        let mut last_call_key = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn = HashSet::new();
+        let mut anchors = AnchorState::default();
+        let mut requested_read_completed = false;
+        let mut disallowed = 0usize;
+        let mut weak_query = 0usize;
+
+        // Round 1: search to populate candidate list with candidate.rs
+        run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "needle".into(),
+                path: None,
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        );
+
+        assert!(
+            investigation.search_produced_results(),
+            "search must have found candidate.rs"
+        );
+
+        // Round 2: model attempts to read other.rs (not a search candidate)
+        let outcome = run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: "other.rs".into(),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        );
+
+        let ToolRoundOutcome::RuntimeDispatch { call, .. } = outcome else {
+            panic!("non-candidate read must produce RuntimeDispatch to the search candidate");
+        };
+        let ToolInput::ReadFile { path } = call else {
+            panic!("dispatched call must be read_file");
+        };
+        assert!(
+            path.contains("candidate.rs"),
+            "forced dispatch must target the search candidate, got: {path}"
+        );
     }
 }

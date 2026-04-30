@@ -277,6 +277,67 @@ fn repeated_post_evidence_tool_use_terminates_before_search_budget_failure() {
     );
 }
 
+// Slice 16.3.1 — Read-Set Answer Guard
+#[test]
+fn answer_citing_unread_path_triggers_insufficient_evidence() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("src")).unwrap();
+    fs::write(tmp.path().join("src/router.rs"), "pub fn route_request() {}\n").unwrap();
+    fs::write(tmp.path().join("src/handlers.rs"), "pub fn handle_auth() {}\n").unwrap();
+
+    // Model: search → read the candidate → final answer that cites the unread file.
+    let hallucinated = "route_request is defined in src/handlers.rs.";
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: route_request]",
+            "[read_file: src/router.rs]",
+            hallucinated,
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Where is route_request defined in src/".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "guard must terminate cleanly: {events:?}");
+
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::InsufficientEvidence,
+                ..
+            })
+        ),
+        "answer citing unread path must terminate with InsufficientEvidence: {answer_source:?}"
+    );
+
+    let snapshot = rt.messages_snapshot();
+    let last_assistant = snapshot
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str());
+    assert!(
+        !matches!(last_assistant, Some(s) if s.contains("route_request is defined in src/handlers.rs")),
+        "hallucinated sentence must not be emitted as final answer: {last_assistant:?}"
+    );
+}
+
 // Phase 11.2.1 — Runtime Turn Finalization (Stage 1)
 
 #[test]
@@ -546,5 +607,49 @@ fn mutation_resolver_failure_terminates_immediately() {
         all_user.matches("=== tool_result: search_code ===").count(),
         0,
         "runtime must not fall back into retrieval after a mutation resolver failure"
+    );
+}
+
+#[test]
+fn usage_lookup_definition_only_reads_produce_insufficient_evidence() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("widget.rs"), "fn target_fn() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: target_fn]",
+            "[read_file: widget.rs]",
+            "target_fn is defined in widget.rs.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Where is target_fn used?".into(),
+        },
+    );
+
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::InsufficientEvidence,
+                ..
+            })
+        ),
+        "UsageLookup with definition-only reads must produce InsufficientEvidence, got: {answer_source:?}"
     );
 }

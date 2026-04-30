@@ -544,6 +544,15 @@ impl InvestigationState {
             && self.useful_accepted_candidate_reads >= self.useful_candidate_reads_target
     }
 
+    pub(crate) fn all_useful_accepted_reads_are_definition_only(&self) -> bool {
+        self.useful_accepted_candidate_reads > 0
+            && self.useful_accepted_candidate_paths.iter().all(|p| {
+                self.definition_only_candidates
+                    .iter()
+                    .any(|d| normalize_evidence_path(d) == *p)
+            })
+    }
+
     pub(crate) fn search_produced_results(&self) -> bool {
         self.search_produced_results
     }
