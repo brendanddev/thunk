@@ -395,17 +395,7 @@ fn single_explicit_relative_file_path(text: &str) -> Option<String> {
             .trim_matches(|c: char| {
                 matches!(
                     c,
-                    '`' | '"'
-                        | '\''
-                        | ','
-                        | ';'
-                        | ':'
-                        | '('
-                        | ')'
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
+                    '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
                 )
             })
             .trim_end_matches(|c: char| matches!(c, '.' | '?' | '!'));
@@ -493,9 +483,15 @@ pub(crate) fn looks_like_file_path(path: &str) -> bool {
 /// Computed once from the original user prompt before the generation loop starts.
 /// When non-None, the engine seeds `pending_runtime_call` directly — the model
 /// never generates before the first tool executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectReadMode {
+    Raw,
+    Explain,
+}
+
 pub(crate) enum RetrievalIntent {
     None,
-    DirectRead { path: String },
+    DirectRead { path: String, mode: DirectReadMode },
     DirectoryListing { path: String },
 }
 
@@ -505,13 +501,63 @@ pub(crate) enum RetrievalIntent {
 /// then directory navigation (nav verb + path token or structural cue).
 /// Returns None when neither applies, including all investigation-required turns.
 pub(crate) fn classify_retrieval_intent(text: &str) -> RetrievalIntent {
-    if let Some(path) = requested_read_path(text) {
-        return RetrievalIntent::DirectRead { path };
+    if let Some((path, mode)) = classify_direct_read(text) {
+        return RetrievalIntent::DirectRead { path, mode };
     }
     if let Some(path) = extract_directory_target(text) {
         return RetrievalIntent::DirectoryListing { path };
     }
     RetrievalIntent::None
+}
+
+fn classify_direct_read(text: &str) -> Option<(String, DirectReadMode)> {
+    let mode = classify_direct_read_mode(text)?;
+    if let Some(path) = requested_read_path(text) {
+        return Some((path, mode));
+    }
+    if matches!(mode, DirectReadMode::Raw) {
+        if let Some(path) = path_from_show_verb(text) {
+            return Some((path, mode));
+        }
+    }
+    None
+}
+
+fn classify_direct_read_mode(text: &str) -> Option<DirectReadMode> {
+    let lower = text.trim_start().to_ascii_lowercase();
+    if lower.starts_with("read ") || lower.starts_with("show ") || lower.starts_with("what is in ")
+    {
+        return Some(DirectReadMode::Raw);
+    }
+    if lower.starts_with("explain ") || lower.starts_with("what does ") {
+        return Some(DirectReadMode::Explain);
+    }
+    None
+}
+
+fn path_from_show_verb(text: &str) -> Option<String> {
+    let mut tokens = text.split_whitespace();
+    let first = tokens.next()?;
+    if !first.eq_ignore_ascii_case("show") {
+        return None;
+    }
+
+    let mut candidate = tokens.next()?;
+    if candidate.eq_ignore_ascii_case("file") {
+        candidate = tokens.next()?;
+    }
+
+    let path = candidate.trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if looks_like_explicit_relative_file_path(path) {
+        Some(path.to_string())
+    } else {
+        None
+    }
 }
 
 /// Extracts a directory target from navigation prompts.
@@ -779,15 +825,30 @@ mod tests {
     }
 
     #[test]
-    fn classify_retrieval_intent_treats_question_style_explicit_file_paths_as_direct_read() {
+    fn classify_retrieval_intent_distinguishes_raw_and_explain_direct_reads() {
         assert!(matches!(
             classify_retrieval_intent("What does sandbox/services/task_service.py do?"),
-            RetrievalIntent::DirectRead { path }
+            RetrievalIntent::DirectRead { path, mode: DirectReadMode::Explain }
                 if path == "sandbox/services/task_service.py"
         ));
         assert!(matches!(
             classify_retrieval_intent("Explain sandbox/services/task_service.py"),
-            RetrievalIntent::DirectRead { path }
+            RetrievalIntent::DirectRead { path, mode: DirectReadMode::Explain }
+                if path == "sandbox/services/task_service.py"
+        ));
+        assert!(matches!(
+            classify_retrieval_intent("Read sandbox/services/task_service.py"),
+            RetrievalIntent::DirectRead { path, mode: DirectReadMode::Raw }
+                if path == "sandbox/services/task_service.py"
+        ));
+        assert!(matches!(
+            classify_retrieval_intent("Show sandbox/services/task_service.py"),
+            RetrievalIntent::DirectRead { path, mode: DirectReadMode::Raw }
+                if path == "sandbox/services/task_service.py"
+        ));
+        assert!(matches!(
+            classify_retrieval_intent("What is in sandbox/services/task_service.py?"),
+            RetrievalIntent::DirectRead { path, mode: DirectReadMode::Raw }
                 if path == "sandbox/services/task_service.py"
         ));
         assert!(!matches!(

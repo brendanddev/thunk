@@ -250,6 +250,22 @@ pub(crate) fn repeated_disallowed_tool_final_answer() -> &'static str {
     "I could not continue because the model repeatedly tried to use tools that are unavailable for this request."
 }
 
+pub(crate) fn repeated_search_budget_violation_final_answer() -> &'static str {
+    "I could not continue because the model kept calling search_code after search was already closed for this turn."
+}
+
+pub(crate) fn repeated_fabricated_tool_result_final_answer() -> &'static str {
+    "I could not continue because the model repeatedly produced fabricated tool result or error blocks."
+}
+
+pub(crate) fn repeated_malformed_tool_syntax_final_answer() -> &'static str {
+    "I could not continue because the model repeatedly produced malformed tool block syntax."
+}
+
+pub(crate) fn repeated_garbled_edit_repair_final_answer() -> &'static str {
+    "I could not continue because the model repeatedly produced an invalid edit_file repair block."
+}
+
 pub(crate) fn repeated_tool_after_evidence_ready_final_answer() -> &'static str {
     "I could not continue because the model kept calling tools after sufficient file evidence was already read."
 }

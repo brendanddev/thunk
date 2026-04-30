@@ -48,6 +48,10 @@ pub enum RuntimeTerminalReason {
     /// Distinct from RejectedMutation, which is a user-initiated cancellation of an approved action.
     MutationFailed,
     RepeatedDisallowedTool,
+    RepeatedSearchBudgetViolation,
+    RepeatedFabricatedToolResult,
+    RepeatedMalformedToolSyntax,
+    RepeatedGarbledEditRepair,
     RepeatedToolAfterEvidenceReady,
     RepeatedWeakSearchQuery,
     /// Model attempted further tool use after the turn's artifact was already acquired.

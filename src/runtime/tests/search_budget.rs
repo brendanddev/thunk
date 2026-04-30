@@ -84,6 +84,80 @@ fn search_budget_closes_after_first_search_with_results_across_rounds() {
 }
 
 #[test]
+fn repeated_closed_search_budget_violation_terminals_deterministically() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("logging.rs"), "fn logging() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: logging]",
+            "[search_code: logging]",
+            "[search_code: logging]",
+            "This response should not be consumed.",
+        ],
+        tmp.path(),
+    );
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "display the structure".into(),
+        },
+    );
+
+    assert!(
+        !has_failed(&events),
+        "repeated closed-search violations must terminate cleanly: {events:?}"
+    );
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::RepeatedSearchBudgetViolation,
+                ..
+            })
+        ),
+        "second closed-search violation must use a deterministic runtime terminal: {answer_source:?}"
+    );
+
+    let snapshot = rt.messages_snapshot();
+    let all_user: String = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        all_user.matches("=== tool_result: search_code ===").count(),
+        1,
+        "repeated closed-search violations must not dispatch extra searches"
+    );
+    assert_eq!(
+        all_user.matches("Search returned matches").count(),
+        2,
+        "the runtime should emit the initial closed-search guidance plus one explicit correction"
+    );
+    let last_assistant = snapshot
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str());
+    assert!(
+        matches!(last_assistant, Some(s) if s.contains("search_code after search was already closed")),
+        "last assistant message must be the runtime-owned closed-search terminal: {last_assistant:?}"
+    );
+}
+
+#[test]
 fn search_budget_closes_after_empty_retry_across_rounds() {
     // Phase 8.3: after two empty searches and the third attempt discarded, the runtime
     // now emits the insufficient-evidence terminal answer rather than letting the model

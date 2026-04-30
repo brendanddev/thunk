@@ -303,27 +303,18 @@ fn unsupported_anchor_phrases_do_not_resolve_last_read_file() {
 }
 
 #[test]
-fn anchored_read_seeds_reads_this_turn_and_answer_phase_fires_after_model_initiated_read() {
+fn anchored_read_replay_starts_in_answer_only_and_blocks_follow_up_retrieval() {
     use std::fs;
     use tempfile::TempDir;
 
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join("src")).unwrap();
-    for file in ["anchor.rs", "b.rs"] {
-        fs::write(
-            tmp.path().join("src").join(file),
-            format!("fn {}() {{}}\n", file.replace(".rs", "")),
-        )
-        .unwrap();
-    }
+    fs::write(tmp.path().join("src/anchor.rs"), "fn anchor() {}\n").unwrap();
+    fs::write(tmp.path().join("src/b.rs"), "fn b() {}\n").unwrap();
 
     let final_answer = "Read both files.";
     let mut rt = make_runtime_in(
-        vec![
-            "[read_file: src/b.rs]",
-            "[search_code: anchor]",
-            final_answer,
-        ],
+        vec!["[search_code: anchor][read_file: src/b.rs]", final_answer],
         tmp.path(),
     );
     collect_events(
@@ -354,17 +345,24 @@ fn anchored_read_seeds_reads_this_turn_and_answer_phase_fires_after_model_initia
 
     assert_eq!(
         all_user.matches("=== tool_result: read_file ===").count(),
-        3,
-        "turn 1 anchor + anchor re-read + one model-initiated read must succeed"
+        2,
+        "turn 1 anchor plus anchor replay should be the only executed reads"
     );
     assert!(
         all_user.contains("The file was already read this turn"),
-        "answer_phase correction must fire after model-initiated read in anchor turn"
+        "anchor replay must start in answer-only mode and correct the first retrieval attempt"
     );
     assert_eq!(
         all_user.matches("=== tool_result: search_code ===").count(),
         0,
-        "post-read search_code must be blocked by answer_phase gate"
+        "follow-up search must be blocked before dispatch during anchor replay"
+    );
+    assert_eq!(
+        all_user
+            .matches("=== tool_result: read_file ===\n[1 lines]\nfn b() {}\n")
+            .count(),
+        0,
+        "follow-up read_file must also be blocked before dispatch during anchor replay"
     );
 
     let last_assistant = snapshot

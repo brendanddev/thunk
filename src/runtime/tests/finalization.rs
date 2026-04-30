@@ -285,8 +285,16 @@ fn answer_citing_unread_path_triggers_insufficient_evidence() {
 
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join("src")).unwrap();
-    fs::write(tmp.path().join("src/router.rs"), "pub fn route_request() {}\n").unwrap();
-    fs::write(tmp.path().join("src/handlers.rs"), "pub fn handle_auth() {}\n").unwrap();
+    fs::write(
+        tmp.path().join("src/router.rs"),
+        "pub fn route_request() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("src/handlers.rs"),
+        "pub fn handle_auth() {}\n",
+    )
+    .unwrap();
 
     // Model: search → read the candidate → final answer that cites the unread file.
     let hallucinated = "route_request is defined in src/handlers.rs.";
@@ -306,7 +314,10 @@ fn answer_citing_unread_path_triggers_insufficient_evidence() {
         },
     );
 
-    assert!(!has_failed(&events), "guard must terminate cleanly: {events:?}");
+    assert!(
+        !has_failed(&events),
+        "guard must terminate cleanly: {events:?}"
+    );
 
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
@@ -548,6 +559,72 @@ fn malformed_write_open_without_close_triggers_correction() {
             .iter()
             .any(|m| m.contains("[write_file] path: test.txt")),
         "malformed tool syntax must never surface as a final answer: {assistant_messages:?}"
+    );
+}
+
+#[test]
+fn repeated_malformed_write_syntax_terminals_deterministically() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("test.txt"), "hello world\n").unwrap();
+
+    let malformed = "[write_file] path: test.txt\n---content---\nhello thunk";
+    let mut rt = make_runtime_in(
+        vec![
+            malformed,
+            malformed,
+            "This response should not be consumed.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Update test.txt by replacing hello world with hello thunk".into(),
+        },
+    );
+
+    assert!(
+        !has_failed(&events),
+        "repeated malformed tool syntax must terminate cleanly: {events:?}"
+    );
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::RepeatedMalformedToolSyntax,
+                ..
+            })
+        ),
+        "second malformed block must use a deterministic runtime terminal: {answer_source:?}"
+    );
+
+    let snapshot = rt.messages_snapshot();
+    let assistant_messages: Vec<&str> = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        !assistant_messages
+            .iter()
+            .any(|m| m.contains("[write_file] path: test.txt")),
+        "malformed write syntax must not surface as a final assistant answer: {assistant_messages:?}"
+    );
+    let last_assistant = assistant_messages.last().copied();
+    assert!(
+        matches!(last_assistant, Some(s) if s.contains("malformed tool block syntax")),
+        "last assistant message must be the runtime malformed-syntax terminal: {last_assistant:?}"
     );
 }
 

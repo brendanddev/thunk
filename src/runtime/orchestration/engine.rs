@@ -15,12 +15,12 @@ use super::super::investigation::anchors::{
 use super::super::investigation::investigation::{
     detect_investigation_mode, InvestigationMode, InvestigationState,
 };
+use super::super::paths::{normalize_evidence_path, path_is_within_scope};
 use super::super::project::ProjectRoot;
 use super::super::project::ProjectStructureSnapshot;
 use super::super::project::ProjectStructureSnapshotCache;
 use super::super::protocol::prompt;
 use super::super::protocol::tool_codec;
-use super::super::paths::{normalize_evidence_path, path_is_within_scope};
 use super::super::resolve;
 use super::super::types::{
     Activity, AnswerSource, RuntimeEvent, RuntimeRequest, RuntimeTerminalReason,
@@ -399,9 +399,12 @@ use super::super::investigation::tool_surface::{select_tool_surface, ToolSurface
 /// Used by the read-set answer guard to detect unread paths cited as evidence.
 fn extract_claimed_paths(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
-    for raw in text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'')) {
+    for raw in text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'')
+    }) {
         // Strip surrounding punctuation that is never part of a file path.
-        let token = raw.trim_matches(|c: char| matches!(c, '`' | ':' | '!' | '?' | '*' | '_' | ',' | ';'));
+        let token =
+            raw.trim_matches(|c: char| matches!(c, '`' | ':' | '!' | '?' | '*' | '_' | ',' | ';'));
         let token = token.trim_end_matches('.');
         if token.is_empty() {
             continue;
@@ -439,7 +442,7 @@ fn extract_claimed_paths(text: &str) -> Vec<String> {
 /// Only two structural patterns are checked — no NLP, no heuristics.
 use super::super::investigation::prompt_analysis::{
     classify_retrieval_intent, extract_investigation_path_scope, prompt_requires_investigation,
-    requested_simple_edit, user_requested_mutation, RetrievalIntent,
+    requested_simple_edit, user_requested_mutation, DirectReadMode, RetrievalIntent,
 };
 
 pub struct Runtime {
@@ -816,7 +819,7 @@ impl Runtime {
                 self.conversation
                     .trim_tool_exchanges_if_needed(self.context_policy.trim_threshold);
                 on_event(RuntimeEvent::ActivityChanged(Activity::Processing));
-                self.run_turns_with_initial_reads(1, reads_this_turn, on_event);
+                self.run_turns_with_initial_reads(1, reads_this_turn, true, on_event);
             }
             ToolRoundOutcome::TerminalAnswer {
                 results,
@@ -1051,13 +1054,14 @@ impl Runtime {
     /// the tool round limit is reached, or a tool action requires approval.
     /// `tool_rounds` is the count already consumed before this call (0 for a fresh turn).
     fn run_turns(&mut self, tool_rounds: usize, on_event: &mut dyn FnMut(RuntimeEvent)) {
-        self.run_turns_with_initial_reads(tool_rounds, HashSet::new(), on_event);
+        self.run_turns_with_initial_reads(tool_rounds, HashSet::new(), false, on_event);
     }
 
     fn run_turns_with_initial_reads(
         &mut self,
         mut tool_rounds: usize,
         mut reads_this_turn: HashSet<String>,
+        start_in_post_read_answer_phase: bool,
         on_event: &mut dyn FnMut(RuntimeEvent),
     ) {
         struct PendingRuntimeCall {
@@ -1071,7 +1075,16 @@ impl Runtime {
             InvestigationEvidenceReady,
         }
 
+        #[derive(Default)]
+        struct EngineLocalEscalation {
+            closed_search_budget_violations: usize,
+            fabricated_tool_result_violations: usize,
+            malformed_tool_syntax_violations: usize,
+            garbled_edit_repair_violations: usize,
+        }
+
         let mut corrections = 0usize;
+        let mut engine_local_escalation = EngineLocalEscalation::default();
         let mut last_call_key: Option<String> = None;
         let mut pending_runtime_call: Option<PendingRuntimeCall> = None;
         let mut search_budget = SearchBudget::new();
@@ -1083,7 +1096,8 @@ impl Runtime {
         let mut read_request_correction_issued = false;
         let mut disallowed_tool_attempts = 0usize;
         let mut weak_search_query_attempts = 0usize;
-        let mut answer_phase: Option<AnswerPhaseKind> = None;
+        let mut answer_phase: Option<AnswerPhaseKind> =
+            start_in_post_read_answer_phase.then_some(AnswerPhaseKind::PostRead);
         let mut post_answer_phase_tool_attempts = 0usize;
         let mut post_answer_phase_correction_echo_retries = 0usize;
         let mut seeded_tool_executed = false;
@@ -1108,7 +1122,11 @@ impl Runtime {
             .map(classify_retrieval_intent)
             .unwrap_or(RetrievalIntent::None);
         let requested_read_path: Option<String> = match &retrieval_intent {
-            RetrievalIntent::DirectRead { path } => Some(path.clone()),
+            RetrievalIntent::DirectRead { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        let direct_read_mode = match &retrieval_intent {
+            RetrievalIntent::DirectRead { mode, .. } => Some(*mode),
             _ => None,
         };
         let investigation_required = original_user_prompt
@@ -1226,7 +1244,7 @@ impl Runtime {
                 });
             } else {
                 match &retrieval_intent {
-                    RetrievalIntent::DirectRead { path } => {
+                    RetrievalIntent::DirectRead { path, .. } => {
                         pending_runtime_call = Some(PendingRuntimeCall {
                             input: ToolInput::ReadFile { path: path.clone() },
                             seeded_pre_generation: true,
@@ -1357,18 +1375,19 @@ impl Runtime {
                         continue;
                     }
                     let (answer, reason): (String, RuntimeTerminalReason) = match phase {
-                        AnswerPhaseKind::PostRead => (
-                            // Invariant: direct_read_result is set iff requested_read_path was
-                            // set (DirectRead) and the seeded read completed. When present, serve
-                            // the read content directly rather than the synthesis-failure message.
-                            direct_read_result
-                                .as_deref()
-                                .map(direct_read_fallback_answer)
-                                .unwrap_or_else(|| {
-                                    repeated_tool_after_answer_phase_final_answer().to_string()
-                                }),
-                            RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
-                        ),
+                        AnswerPhaseKind::PostRead => {
+                            let answer = if matches!(direct_read_mode, Some(DirectReadMode::Raw)) {
+                                direct_read_result
+                                    .as_deref()
+                                    .map(direct_read_fallback_answer)
+                                    .unwrap_or_else(|| {
+                                        repeated_tool_after_answer_phase_final_answer().to_string()
+                                    })
+                            } else {
+                                repeated_tool_after_answer_phase_final_answer().to_string()
+                            };
+                            (answer, RuntimeTerminalReason::RepeatedToolAfterAnswerPhase)
+                        }
                         AnswerPhaseKind::InvestigationEvidenceReady => (
                             repeated_tool_after_evidence_ready_final_answer().to_string(),
                             RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
@@ -1413,19 +1432,23 @@ impl Runtime {
                     );
                     finish_turn!();
                 }
-                if corrections < MAX_CORRECTIONS {
-                    corrections += 1;
-                    self.conversation.discard_last_if_assistant();
+                engine_local_escalation.closed_search_budget_violations += 1;
+                self.conversation.discard_last_if_assistant();
+                if engine_local_escalation.closed_search_budget_violations == 1 {
                     self.conversation
                         .push_user(search_budget.closed_message().to_string());
                     next_round_label = GenerationRoundLabel::CorrectionRetry;
                     next_round_cause = GenerationRoundCause::SearchBudgetClosedCorrection;
                     continue;
                 }
-                on_event(RuntimeEvent::Failed {
-                    message: "Model kept searching after the search budget was closed.".to_string(),
-                });
-                on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                self.finish_with_runtime_answer(
+                    repeated_search_budget_violation_final_answer(),
+                    AnswerSource::RuntimeTerminal {
+                        reason: RuntimeTerminalReason::RepeatedSearchBudgetViolation,
+                        rounds: tool_rounds,
+                    },
+                    on_event,
+                );
                 finish_turn!();
             }
 
@@ -1460,15 +1483,21 @@ impl Runtime {
                         }
 
                         let (answer, reason): (String, RuntimeTerminalReason) = match phase {
-                            AnswerPhaseKind::PostRead => (
-                                direct_read_result
-                                    .as_deref()
-                                    .map(direct_read_fallback_answer)
-                                    .unwrap_or_else(|| {
+                            AnswerPhaseKind::PostRead => {
+                                let answer =
+                                    if matches!(direct_read_mode, Some(DirectReadMode::Raw)) {
+                                        direct_read_result
+                                            .as_deref()
+                                            .map(direct_read_fallback_answer)
+                                            .unwrap_or_else(|| {
+                                                repeated_tool_after_answer_phase_final_answer()
+                                                    .to_string()
+                                            })
+                                    } else {
                                         repeated_tool_after_answer_phase_final_answer().to_string()
-                                    }),
-                                RuntimeTerminalReason::RepeatedToolAfterAnswerPhase,
-                            ),
+                                    };
+                                (answer, RuntimeTerminalReason::RepeatedToolAfterAnswerPhase)
+                            }
                             AnswerPhaseKind::InvestigationEvidenceReady => (
                                 repeated_tool_after_evidence_ready_final_answer().to_string(),
                                 RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
@@ -1490,43 +1519,58 @@ impl Runtime {
                 // attempt contains edit_file tag syntax but produced no parseable tool calls,
                 // inject a targeted correction rather than silently accepting as Direct.
                 if tool_codec::contains_edit_attempt(&response)
-                    && last_injected_was_edit_error(&self.conversation)
-                    && corrections < MAX_CORRECTIONS
+                    && (last_injected_was_edit_error(&self.conversation)
+                        || engine_local_escalation.garbled_edit_repair_violations > 0)
                 {
-                    corrections += 1;
+                    engine_local_escalation.garbled_edit_repair_violations += 1;
                     self.conversation.discard_last_if_assistant();
-                    self.conversation
-                        .push_user(EDIT_REPAIR_CORRECTION.to_string());
-                    next_round_label = GenerationRoundLabel::CorrectionRetry;
-                    next_round_cause = GenerationRoundCause::EditRepairCorrection;
-                    continue;
+                    if engine_local_escalation.garbled_edit_repair_violations == 1 {
+                        self.conversation
+                            .push_user(EDIT_REPAIR_CORRECTION.to_string());
+                        next_round_label = GenerationRoundLabel::CorrectionRetry;
+                        next_round_cause = GenerationRoundCause::EditRepairCorrection;
+                        continue;
+                    }
+                    self.finish_with_runtime_answer(
+                        repeated_garbled_edit_repair_final_answer(),
+                        AnswerSource::RuntimeTerminal {
+                            reason: RuntimeTerminalReason::RepeatedGarbledEditRepair,
+                            rounds: tool_rounds,
+                        },
+                        on_event,
+                    );
+                    finish_turn!();
                 }
 
                 // Fabricated [tool_result:] / [tool_error:] blocks mean the model bypassed the
                 // protocol. Attempt one automatic correction before surfacing the error.
                 if tool_codec::contains_fabricated_exchange(&response) {
-                    if corrections < MAX_CORRECTIONS {
-                        corrections += 1;
-                        self.conversation.discard_last_if_assistant();
+                    engine_local_escalation.fabricated_tool_result_violations += 1;
+                    self.conversation.discard_last_if_assistant();
+                    if engine_local_escalation.fabricated_tool_result_violations == 1 {
                         self.conversation
                             .push_user(FABRICATION_CORRECTION.to_string());
                         next_round_label = GenerationRoundLabel::CorrectionRetry;
                         next_round_cause = GenerationRoundCause::FabricationCorrection;
                         continue;
                     }
-                    on_event(RuntimeEvent::Failed {
-                        message: "Model repeatedly produced fabricated tool results. Try rephrasing your request.".to_string(),
-                    });
-                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    self.finish_with_runtime_answer(
+                        repeated_fabricated_tool_result_final_answer(),
+                        AnswerSource::RuntimeTerminal {
+                            reason: RuntimeTerminalReason::RepeatedFabricatedToolResult,
+                            rounds: tool_rounds,
+                        },
+                        on_event,
+                    );
                     finish_turn!();
                 }
                 // Malformed block: a known closing tag ([/write_file], [/edit_file], etc.)
                 // is present without the matching opening tag. The model used a wrong tag name.
                 // Attempt one correction before giving up.
                 if tool_codec::contains_malformed_block(&response) {
-                    if corrections < MAX_CORRECTIONS {
-                        corrections += 1;
-                        self.conversation.discard_last_if_assistant();
+                    engine_local_escalation.malformed_tool_syntax_violations += 1;
+                    self.conversation.discard_last_if_assistant();
+                    if engine_local_escalation.malformed_tool_syntax_violations == 1 {
                         let correction =
                             match tool_codec::detected_malformed_mutation_tool(&response) {
                                 Some("edit_file") => malformed_edit_file_correction(),
@@ -1538,12 +1582,14 @@ impl Runtime {
                         next_round_cause = GenerationRoundCause::MalformedBlockCorrection;
                         continue;
                     }
-                    on_event(RuntimeEvent::Failed {
-                        message:
-                            "Model used incorrect tool tag names. Try rephrasing your request."
-                                .to_string(),
-                    });
-                    on_event(RuntimeEvent::ActivityChanged(Activity::Idle));
+                    self.finish_with_runtime_answer(
+                        repeated_malformed_tool_syntax_final_answer(),
+                        AnswerSource::RuntimeTerminal {
+                            reason: RuntimeTerminalReason::RepeatedMalformedToolSyntax,
+                            rounds: tool_rounds,
+                        },
+                        on_event,
+                    );
                     finish_turn!();
                 }
 
@@ -1829,12 +1875,17 @@ impl Runtime {
                         // serve it as a deterministic fallback if model synthesis loops.
                         if requested_read_path.is_some() {
                             direct_read_result = Some(results.clone());
+                            if matches!(direct_read_mode, Some(DirectReadMode::Explain)) {
+                                answer_phase = Some(AnswerPhaseKind::PostRead);
+                            }
                         }
                     }
                     if let Some(t) = t_tool_start {
                         turn_perf.record_tool_elapsed(t.elapsed().as_millis() as u64);
                     }
-                    if seeded_pre_generation && requested_read_path.is_some() {
+                    if seeded_pre_generation
+                        && matches!(direct_read_mode, Some(DirectReadMode::Raw))
+                    {
                         let answer = direct_read_fallback_answer(&results);
                         self.commit_tool_results(results);
                         self.conversation
@@ -2120,6 +2171,182 @@ mod tests {
         events
             .iter()
             .any(|e| matches!(e, RuntimeEvent::Failed { .. }))
+    }
+
+    #[test]
+    fn raw_direct_read_returns_file_contents_without_synthesis_round() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/task_service.py"),
+            "def filtered_tasks(tasks):\n    return [task for task in tasks if task.completed]\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(vec!["THIS SHOULD NOT APPEAR"], tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Read sandbox/services/task_service.py".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        let assistant_messages: Vec<&str> = snapshot
+            .iter()
+            .filter(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(assistant_messages.len(), 1);
+        assert!(
+            assistant_messages[0].contains("def filtered_tasks(tasks):")
+                && assistant_messages[0]
+                    .contains("return [task for task in tasks if task.completed]"),
+            "raw direct read must finalize with file contents only: {assistant_messages:?}"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|m| !m.content.contains("THIS SHOULD NOT APPEAR")),
+            "raw direct read must not consume a synthesis response"
+        );
+    }
+
+    #[test]
+    fn explain_direct_read_reads_then_synthesizes() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/task_service.py"),
+            "def filtered_tasks(tasks):\n    return [task for task in tasks if task.completed]\n",
+        )
+        .unwrap();
+
+        let final_answer = "This file filters completed tasks from the input list.";
+        let mut rt = make_runtime_in(vec![final_answer], tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Explain sandbox/services/task_service.py".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "explain direct read must commit the seeded read result"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(final_answer));
+        assert_ne!(
+            last_assistant,
+            Some(
+                "def filtered_tasks(tasks):\n    return [task for task in tasks if task.completed]"
+            ),
+            "explain direct read must not fall back to raw file contents"
+        );
+    }
+
+    #[test]
+    fn what_does_direct_read_behaves_like_explain() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/task_service.py"),
+            "def filtered_tasks(tasks):\n    return [task for task in tasks if task.completed]\n",
+        )
+        .unwrap();
+
+        let final_answer = "This file defines logic for filtering completed tasks.";
+        let mut rt = make_runtime_in(vec![final_answer], tmp.path());
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "What does sandbox/services/task_service.py do?".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must not fail: {events:?}");
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| m.content.contains("=== tool_result: read_file ===")),
+            "what-does direct read must commit the seeded read result"
+        );
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(last_assistant, Some(final_answer));
+    }
+
+    #[test]
+    fn explain_direct_read_repeated_tool_fallback_does_not_dump_file_contents() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services/task_service.py"),
+            "def filtered_tasks(tasks):\n    return [task for task in tasks if task.completed]\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[read_file: sandbox/services/task_service.py]",
+                "[read_file: sandbox/services/task_service.py]",
+            ],
+            tmp.path(),
+        );
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Explain sandbox/services/task_service.py".into(),
+            },
+        );
+
+        assert!(
+            !has_failed(&events),
+            "turn must terminate cleanly: {events:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(repeated_tool_after_answer_phase_final_answer())
+        );
+        assert_ne!(
+            last_assistant,
+            Some(
+                "def filtered_tasks(tasks):\n    return [task for task in tasks if task.completed]"
+            ),
+            "explain-mode repeated-tool fallback must not dump raw file contents"
+        );
     }
 
     // ── ContextPolicy tests ──────────────────────────────────────────────────
@@ -2971,7 +3198,10 @@ mod tests {
             },
         );
 
-        assert!(!has_failed(&events), "turn must terminate cleanly: {events:?}");
+        assert!(
+            !has_failed(&events),
+            "turn must terminate cleanly: {events:?}"
+        );
         let answer_source = events.iter().find_map(|e| {
             if let RuntimeEvent::AnswerReady(src) = e {
                 Some(src.clone())

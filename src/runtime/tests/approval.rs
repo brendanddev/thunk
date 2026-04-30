@@ -185,6 +185,66 @@ fn edit_repair_correction_injected_on_garbled_repair_after_failure() {
 }
 
 #[test]
+fn repeated_garbled_edit_repair_terminals_without_surfacing_malformed_block() {
+    let bad_edit = "[edit_file]\npath: foo.rs\n---replace---\nnew text\n[/edit_file]";
+    let garbled_repair =
+        "[edit_file]\npath: foo.rs\nFind: old text\nReplace: new text\n[/edit_file]";
+
+    let mut rt = make_runtime(vec![
+        bad_edit,
+        garbled_repair,
+        garbled_repair,
+        "This response should not be consumed.",
+    ]);
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "edit foo.rs".into(),
+        },
+    );
+
+    assert!(
+        !has_failed(&events),
+        "repeated garbled edit repair must terminate cleanly: {events:?}"
+    );
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(
+            answer_source,
+            Some(AnswerSource::RuntimeTerminal {
+                reason: RuntimeTerminalReason::RepeatedGarbledEditRepair,
+                ..
+            })
+        ),
+        "second garbled edit repair must use deterministic runtime terminal: {answer_source:?}"
+    );
+
+    let snapshot = rt.messages_snapshot();
+    let assistant_messages: Vec<&str> = snapshot
+        .iter()
+        .filter(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        !assistant_messages
+            .iter()
+            .any(|m| m.contains("Find: old text") || m.contains("Replace: new text")),
+        "garbled edit repair must not surface as a final assistant answer: {assistant_messages:?}"
+    );
+    let last_assistant = assistant_messages.last().copied();
+    assert!(
+        matches!(last_assistant, Some(s) if s.contains("invalid edit_file repair block")),
+        "last assistant message must be the runtime garbled-repair terminal: {last_assistant:?}"
+    );
+}
+
+#[test]
 fn edit_old_new_content_format_requests_approval_and_executes() {
     use std::fs;
     use tempfile::TempDir;

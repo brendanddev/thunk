@@ -1,5 +1,6 @@
-use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::runtime::{ProjectScope, ResolvedToolInput};
 
@@ -99,8 +100,7 @@ impl Tool for SearchCodeTool {
             .map(ProjectScope::absolute)
             .unwrap_or(self.root.as_path());
 
-        let mut matches = Vec::new();
-        walk_and_search(self.root.as_path(), scope_root, query, &mut matches)?;
+        let matches = search_with_rg(self.root.as_path(), scope_root, query)?;
         let mut matches = sort_by_file_group_priority(matches, query);
 
         let total_matches = matches.len();
@@ -118,68 +118,90 @@ impl Tool for SearchCodeTool {
     }
 }
 
-fn walk_and_search(
+fn search_with_rg(
     project_root: &Path,
-    dir: &Path,
+    scope_root: &Path,
     query: &str,
-    matches: &mut Vec<SearchMatch>,
-) -> Result<(), ToolError> {
-    if matches.len() >= MAX_COLLECT {
-        return Ok(());
+) -> Result<Vec<SearchMatch>, ToolError> {
+    let scope_prefix = project_relative_display(scope_root, project_root);
+    let mut command = Command::new("rg");
+    command
+        .current_dir(scope_root)
+        .arg("--fixed-strings")
+        .arg("--line-number")
+        .arg("--with-filename")
+        .arg("--no-heading")
+        .arg("--color")
+        .arg("never")
+        .arg("--hidden")
+        .arg("--no-ignore")
+        .arg("--max-count")
+        .arg(MAX_LINES_COLLECTED_PER_FILE.to_string())
+        .arg("--sort")
+        .arg("path");
+
+    for pattern in ripgrep_globs() {
+        command.arg("--glob").arg(pattern);
     }
 
-    let read = match fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return Ok(()), // skip unreadable dirs silently
-    };
+    command
+        .arg("-e")
+        .arg(query)
+        .arg(".")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    let mut entries: Vec<_> = read.filter_map(|e| e.ok()).collect();
-    // Sort for deterministic ordering across platforms.
-    entries.sort_by_key(|e| e.file_name());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ToolError::Io(std::io::Error::other("failed to capture ripgrep stdout")))?;
 
-    for entry in entries {
-        if matches.len() >= MAX_COLLECT {
+    let mut reader = BufReader::new(stdout);
+    let mut matches = Vec::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
             break;
         }
-
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if path.is_dir() {
-            if !name_str.starts_with('.') && !SKIP_DIRS.contains(&name_str.as_ref()) {
-                walk_and_search(project_root, &path, query, matches)?;
+        if let Some(search_match) = parse_rg_match_line(&line, scope_prefix.as_deref()) {
+            matches.push(search_match);
+            if matches.len() >= MAX_COLLECT {
+                let _ = child.kill();
+                break;
             }
-        } else if is_text_file(&path) {
-            search_in_file(project_root, &path, query, matches);
         }
     }
 
-    Ok(())
-}
+    drop(reader);
+    let hit_collect_cap = matches.len() >= MAX_COLLECT;
+    let output = child.wait_with_output()?;
 
-fn search_in_file(project_root: &Path, path: &Path, query: &str, matches: &mut Vec<SearchMatch>) {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return; // skip binary or unreadable files silently
-    };
-    let Some(display_path) = project_relative_display(path, project_root) else {
-        return;
-    };
-
-    let mut from_this_file = 0;
-    for (idx, line) in contents.lines().enumerate() {
-        if matches.len() >= MAX_COLLECT || from_this_file >= MAX_LINES_COLLECTED_PER_FILE {
-            break;
-        }
-        if line.contains(query) {
-            matches.push(SearchMatch {
-                file: display_path.clone(),
-                line_number: idx + 1,
-                line: line.to_string(),
-            });
-            from_this_file += 1;
+    if !hit_collect_cap {
+        match output.status.code() {
+            Some(0) => {}
+            Some(1) => return Ok(Vec::new()),
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let message = if stderr.is_empty() {
+                    format!("ripgrep search failed with status {}", output.status)
+                } else {
+                    format!("ripgrep search failed: {stderr}")
+                };
+                return Err(ToolError::Io(std::io::Error::other(message)));
+            }
         }
     }
+
+    matches.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then_with(|| a.line_number.cmp(&b.line_number))
+    });
+    Ok(matches)
 }
 
 fn project_relative_display(path: &Path, root: &Path) -> Option<String> {
@@ -193,11 +215,51 @@ fn project_relative_display(path: &Path, root: &Path) -> Option<String> {
     )
 }
 
-fn is_text_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| TEXT_EXTENSIONS.contains(&ext))
-        .unwrap_or(false)
+fn ripgrep_globs() -> Vec<String> {
+    let mut globs = vec!["!**/.*/**".to_string()];
+
+    for dir in SKIP_DIRS {
+        globs.push(format!("!**/{dir}/**"));
+    }
+
+    for ext in TEXT_EXTENSIONS {
+        globs.push(match *ext {
+            "gitignore" => "*.gitignore".to_string(),
+            _ => format!("*.{ext}"),
+        });
+    }
+
+    globs
+}
+
+fn parse_rg_match_line(raw: &str, scope_prefix: Option<&str>) -> Option<SearchMatch> {
+    let raw = raw.trim_end_matches(['\r', '\n']);
+    for (path_end, _) in raw.match_indices(':') {
+        let rest = &raw[path_end + 1..];
+        let Some(line_sep) = rest.find(':') else {
+            return None;
+        };
+        let line_number = &rest[..line_sep];
+        if !line_number.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let relative_path = raw[..path_end].trim_start_matches("./");
+        let file = match scope_prefix {
+            Some(prefix) if !prefix.is_empty() && prefix != "." => {
+                format!("{prefix}/{relative_path}")
+            }
+            _ => relative_path.to_string(),
+        };
+        let line = rest[line_sep + 1..].to_string();
+        return Some(SearchMatch {
+            file,
+            line_number: line_number.parse().ok()?,
+            line,
+        });
+    }
+
+    None
 }
 
 /// Groups matches by file and stable-sorts the groups so definition-containing source files
@@ -359,6 +421,26 @@ mod tests {
         assert_eq!(sr.matches[0].file, "lib.rs");
         assert_eq!(sr.matches[0].line_number, 1);
         assert!(sr.matches[0].line.contains("fn foo"));
+    }
+
+    #[test]
+    fn fixed_string_search_matches_literal_text_not_regex_like_variants() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("task_service.py"),
+            "task.status = 'done'\ntaskXstatus = 'wrong'\n",
+        )
+        .unwrap();
+
+        let out = search(&tmp, "task.status", Some(".")).unwrap();
+        let ToolRunResult::Immediate(ToolOutput::SearchResults(sr)) = out else {
+            panic!("expected Immediate(SearchResults)")
+        };
+
+        assert_eq!(sr.matches.len(), 1);
+        assert_eq!(sr.matches[0].file, "task_service.py");
+        assert_eq!(sr.matches[0].line_number, 1);
+        assert_eq!(sr.matches[0].line, "task.status = 'done'");
     }
 
     #[test]
