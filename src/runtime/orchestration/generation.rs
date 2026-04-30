@@ -64,6 +64,9 @@ pub(super) fn emit_visible_assistant_message(text: &str, on_event: &mut dyn FnMu
 fn map_backend_status(status: BackendStatus) -> Activity {
     match status {
         BackendStatus::LoadingModel => Activity::LoadingModel,
+        BackendStatus::CreatingContext => Activity::CreatingContext,
+        BackendStatus::Tokenizing => Activity::Tokenizing,
+        BackendStatus::Prefilling => Activity::Prefilling,
         BackendStatus::Generating => Activity::Generating,
     }
 }

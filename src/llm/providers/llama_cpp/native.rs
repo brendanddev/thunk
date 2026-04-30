@@ -12,7 +12,7 @@ use llama_cpp_2::{
 
 use crate::app::config::LlamaCppConfig;
 use crate::app::{AppError, Result};
-use crate::llm::backend::BackendEvent;
+use crate::llm::backend::{BackendEvent, BackendStatus};
 
 pub(super) struct LoadedLlama {
     pub(super) model: LlamaModel,
@@ -119,6 +119,7 @@ pub(super) fn run_generation(
         .with_type_v(KvCacheType::F16)
         .with_offload_kqv(false);
 
+    on_event(BackendEvent::StatusChanged(BackendStatus::CreatingContext));
     let t_ctx_start = Instant::now();
     let mut ctx = {
         // Context creation prints sched_reserve / kv_cache / graph_reserve lines directly to
@@ -143,6 +144,7 @@ pub(super) fn run_generation(
         elapsed_ms: t_ctx_start.elapsed().as_millis() as u64,
     });
 
+    on_event(BackendEvent::StatusChanged(BackendStatus::Tokenizing));
     let t_tok_start = Instant::now();
     let tokens = loaded
         .model
@@ -171,6 +173,7 @@ pub(super) fn run_generation(
         stage: "prefill_start",
         elapsed_ms: t_ctx_start.elapsed().as_millis() as u64,
     });
+    on_event(BackendEvent::StatusChanged(BackendStatus::Prefilling));
     let t_prefill_start = Instant::now();
 
     let mut batch = LlamaBatch::new(batch_tokens as usize, 1);
@@ -199,6 +202,7 @@ pub(super) fn run_generation(
     let mut sampler =
         LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(0)]);
 
+    on_event(BackendEvent::StatusChanged(BackendStatus::Generating));
     let mut generated = 0usize;
     let mut current_pos = tokens.len() as i32;
     let t_gen_start = Instant::now();

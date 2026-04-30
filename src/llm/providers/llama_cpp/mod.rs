@@ -102,7 +102,6 @@ impl ModelBackend for LlamaCppBackend {
                 elapsed_ms: t.elapsed().as_millis() as u64,
             });
         }
-        on_event(BackendEvent::StatusChanged(BackendStatus::Generating));
         run_generation(loaded, &config, &prompt, on_event)
     }
 }

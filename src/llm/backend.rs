@@ -65,6 +65,9 @@ impl GenerateRequest {
 #[derive(Debug, Clone)]
 pub enum BackendStatus {
     LoadingModel,
+    CreatingContext,
+    Tokenizing,
+    Prefilling,
     Generating,
 }
 
