@@ -111,7 +111,7 @@ fn draw_input(stdout: &mut io::Stdout, state: &AppState, width: u16, height: u16
 fn draw_status(stdout: &mut io::Stdout, state: &AppState, width: u16, height: u16) -> Result<()> {
     let row = height.saturating_sub(1);
     let text = if state.show_activity {
-        format!(" status: {} ", state.status)
+        format!("  {}  ", state.status)
     } else {
         " ".to_string()
     };

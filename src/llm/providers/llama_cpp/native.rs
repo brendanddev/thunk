@@ -12,7 +12,7 @@ use llama_cpp_2::{
 
 use crate::app::config::LlamaCppConfig;
 use crate::app::{AppError, Result};
-use crate::llm::backend::{BackendEvent, BackendStatus};
+use crate::llm::backend::{BackendEvent, BackendStatus, BackendTimingStage};
 
 pub(super) struct LoadedLlama {
     pub(super) model: LlamaModel,
@@ -140,7 +140,7 @@ pub(super) fn run_generation(
             })?
     };
     on_event(BackendEvent::Timing {
-        stage: "ctx_create",
+        stage: BackendTimingStage::CtxCreate,
         elapsed_ms: t_ctx_start.elapsed().as_millis() as u64,
     });
 
@@ -151,7 +151,7 @@ pub(super) fn run_generation(
         .str_to_token(prompt, AddBos::Always)
         .map_err(map_llama_error)?;
     on_event(BackendEvent::Timing {
-        stage: "tokenize",
+        stage: BackendTimingStage::Tokenize,
         elapsed_ms: t_tok_start.elapsed().as_millis() as u64,
     });
 
@@ -170,7 +170,7 @@ pub(super) fn run_generation(
     }
 
     on_event(BackendEvent::Timing {
-        stage: "prefill_start",
+        stage: BackendTimingStage::PrefillStart,
         elapsed_ms: t_ctx_start.elapsed().as_millis() as u64,
     });
     on_event(BackendEvent::StatusChanged(BackendStatus::Prefilling));
@@ -195,7 +195,7 @@ pub(super) fn run_generation(
     }
 
     on_event(BackendEvent::Timing {
-        stage: "prefill_done",
+        stage: BackendTimingStage::PrefillDone,
         elapsed_ms: t_prefill_start.elapsed().as_millis() as u64,
     });
 
@@ -239,7 +239,7 @@ pub(super) fn run_generation(
     }
 
     on_event(BackendEvent::Timing {
-        stage: "generation_done",
+        stage: BackendTimingStage::GenerationDone,
         elapsed_ms: t_gen_start.elapsed().as_millis() as u64,
     });
     on_event(BackendEvent::Finished);

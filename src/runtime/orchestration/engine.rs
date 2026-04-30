@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::app::config::Config;
-use crate::llm::backend::{BackendCapabilities, ModelBackend, Role};
+use crate::llm::backend::{BackendCapabilities, BackendTimingStage, ModelBackend, Role};
 use crate::tools::{
     ExecutionKind, PendingAction, ToolError, ToolInput, ToolOutput, ToolRegistry, ToolRunResult,
 };
@@ -272,18 +272,18 @@ impl TurnPerformance {
         )));
     }
 
-    fn record_backend_timing(&mut self, stage: &str, elapsed_ms: u64) {
+    fn record_backend_timing(&mut self, stage: BackendTimingStage, elapsed_ms: u64) {
         if !self.enabled {
             return;
         }
 
         match stage {
-            "ctx_create" => self.ctx_ms += elapsed_ms,
-            "tokenize" => self.tokenize_ms += elapsed_ms,
-            "prefill_done" => self.prefill_ms += elapsed_ms,
-            "generation_done" => self.generation_ms += elapsed_ms,
-            "model_load" => self.model_load_ms += elapsed_ms,
-            _ => {}
+            BackendTimingStage::CtxCreate => self.ctx_ms += elapsed_ms,
+            BackendTimingStage::Tokenize => self.tokenize_ms += elapsed_ms,
+            BackendTimingStage::PrefillDone => self.prefill_ms += elapsed_ms,
+            BackendTimingStage::GenerationDone => self.generation_ms += elapsed_ms,
+            BackendTimingStage::ModelLoad => self.model_load_ms += elapsed_ms,
+            BackendTimingStage::PrefillStart => {}
         }
     }
 
@@ -1310,7 +1310,7 @@ impl Runtime {
                         let turn_perf = &mut turn_perf;
                         let mut perf_on_event = |event| {
                             if let RuntimeEvent::BackendTiming { stage, elapsed_ms } = &event {
-                                turn_perf.record_backend_timing(stage, *elapsed_ms);
+                                turn_perf.record_backend_timing(*stage, *elapsed_ms);
                             }
                             on_event(event);
                         };
@@ -2112,7 +2112,9 @@ fn last_injected_was_edit_error(conversation: &Conversation) -> bool {
 mod tests {
     use super::*;
     use crate::app::config::Config;
-    use crate::llm::backend::{BackendCapabilities, BackendEvent, GenerateRequest};
+    use crate::llm::backend::{
+        BackendCapabilities, BackendEvent, BackendTimingStage, GenerateRequest,
+    };
     use crate::runtime::ProjectRoot;
     use crate::tools::default_registry;
 
@@ -2460,11 +2462,11 @@ mod tests {
         let mut perf = TurnPerformance::new();
         std::env::remove_var(RUNTIME_TRACE_ENV);
 
-        perf.record_backend_timing("model_load", 4200);
-        perf.record_backend_timing("ctx_create", 50);
-        perf.record_backend_timing("tokenize", 20);
-        perf.record_backend_timing("prefill_done", 1000);
-        perf.record_backend_timing("generation_done", 800);
+        perf.record_backend_timing(BackendTimingStage::ModelLoad, 4200);
+        perf.record_backend_timing(BackendTimingStage::CtxCreate, 50);
+        perf.record_backend_timing(BackendTimingStage::Tokenize, 20);
+        perf.record_backend_timing(BackendTimingStage::PrefillDone, 1000);
+        perf.record_backend_timing(BackendTimingStage::GenerationDone, 800);
         perf.record_tool_elapsed(300);
         perf.record_tool_elapsed(150);
 

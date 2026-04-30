@@ -1,3 +1,4 @@
+use crate::llm::backend::BackendTimingStage;
 use crate::tools::PendingAction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +130,7 @@ pub enum RuntimeEvent {
     /// Advisory timing event routed from the backend. Consumed by the logging layer only;
     /// must not be forwarded to the TUI or drive any control flow.
     BackendTiming {
-        stage: &'static str,
+        stage: BackendTimingStage,
         elapsed_ms: u64,
     },
     /// Advisory runtime decision trace. Consumed by the application logging layer only;

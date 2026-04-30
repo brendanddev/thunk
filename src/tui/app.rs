@@ -310,6 +310,7 @@ fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::AssistantMessageChunk(chunk) => state.append_assistant_chunk(&chunk),
         RuntimeEvent::AssistantMessageFinished => {}
         RuntimeEvent::ToolCallStarted { name } => {
+            state.set_status(&format!("tool: {name}"));
             state.add_tool_message(format!("tool: {name}"));
         }
         RuntimeEvent::ToolCallFinished { name, summary } => match summary {
@@ -317,6 +318,7 @@ fn apply_runtime_event(state: &mut AppState, event: RuntimeEvent) {
             None => state.add_tool_message(format!("tool failed: {name}")),
         },
         RuntimeEvent::AnswerReady(source) => {
+            state.set_status("ready");
             if let AnswerSource::ToolLimitReached = source {
                 state.add_system_message("Tool limit reached. Response may be incomplete.");
             }

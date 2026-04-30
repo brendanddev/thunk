@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use crate::app::config::LlamaCppConfig;
 use crate::app::{AppError, Result};
 use crate::llm::backend::{
-    BackendCapabilities, BackendEvent, BackendStatus, GenerateRequest, ModelBackend,
+    BackendCapabilities, BackendEvent, BackendStatus, BackendTimingStage, GenerateRequest,
+    ModelBackend,
 };
 
 use native::{load_model, run_generation, LoadedLlama};
@@ -98,7 +99,7 @@ impl ModelBackend for LlamaCppBackend {
         let loaded = self.ensure_loaded()?;
         if let Some(t) = t_load_start {
             on_event(BackendEvent::Timing {
-                stage: "model_load",
+                stage: BackendTimingStage::ModelLoad,
                 elapsed_ms: t.elapsed().as_millis() as u64,
             });
         }
