@@ -438,6 +438,14 @@ fn extract_claimed_paths(text: &str) -> Vec<String> {
     paths
 }
 
+fn is_definition_only_usage_answer(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains(" is defined in ")
+        || lower.contains(" are defined in ")
+        || lower.contains(" is declared in ")
+        || lower.contains(" are declared in ")
+}
+
 /// Returns true if the prompt contains a token that looks like a code identifier.
 /// Only two structural patterns are checked — no NLP, no heuristics.
 use super::super::investigation::prompt_analysis::{
@@ -1732,6 +1740,8 @@ impl Runtime {
                 if matches!(investigation_mode, InvestigationMode::UsageLookup)
                     && investigation_required
                     && investigation.all_useful_accepted_reads_are_definition_only()
+                    && (investigation.has_non_definition_candidates()
+                        || is_definition_only_usage_answer(&response))
                 {
                     trace_runtime_decision(
                         on_event,

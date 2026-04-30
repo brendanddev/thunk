@@ -553,6 +553,10 @@ impl InvestigationState {
             })
     }
 
+    pub(crate) fn has_non_definition_candidates(&self) -> bool {
+        self.has_non_definition_candidates
+    }
+
     pub(crate) fn search_produced_results(&self) -> bool {
         self.search_produced_results
     }

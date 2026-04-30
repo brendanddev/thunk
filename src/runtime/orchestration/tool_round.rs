@@ -462,23 +462,9 @@ pub(super) fn run_tool_round(
                         let best = investigation
                             .best_candidate_for_mode(investigation_mode)
                             .map(|s| s.to_string());
-                        if let Some(candidate) = best {
-                            trace_runtime_decision(
-                                on_event,
-                                "forced_candidate_read_after_non_candidate",
-                                &[
-                                    ("rejected_path", normalize_evidence_path(rp)),
-                                    ("candidate_path", normalize_evidence_path(&candidate)),
-                                ],
-                            );
-                            return ToolRoundOutcome::RuntimeDispatch {
-                                accumulated,
-                                call: ToolInput::ReadFile { path: candidate },
-                            };
-                        }
                         accumulated.push_str(&tool_codec::format_tool_error(
                             &name,
-                            &non_candidate_read_correction(rp, None),
+                            &non_candidate_read_correction(rp, best.as_deref()),
                         ));
                         continue;
                     }
@@ -1120,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn non_candidate_read_forces_runtime_dispatch_to_best_candidate() {
+    fn non_candidate_read_produces_correction_naming_best_candidate() {
         let (_dir, root, registry) = temp_root();
         fs::write(root.path().join("candidate.rs"), "fn needle() {}\n").unwrap();
         fs::write(root.path().join("other.rs"), "fn unrelated() {}\n").unwrap();
@@ -1188,15 +1174,20 @@ mod tests {
             &mut |_| {},
         );
 
-        let ToolRoundOutcome::RuntimeDispatch { call, .. } = outcome else {
-            panic!("non-candidate read must produce RuntimeDispatch to the search candidate");
-        };
-        let ToolInput::ReadFile { path } = call else {
-            panic!("dispatched call must be read_file");
+        let ToolRoundOutcome::Completed {
+            results: accumulated,
+            git_acquisition_answer: None,
+        } = outcome
+        else {
+            panic!("non-candidate read must produce a correction, not a dispatch");
         };
         assert!(
-            path.contains("candidate.rs"),
-            "forced dispatch must target the search candidate, got: {path}"
+            accumulated.contains("`other.rs` was not returned by the search"),
+            "correction must explain why the read was rejected: {accumulated}"
+        );
+        assert!(
+            accumulated.contains("[read_file: candidate.rs]"),
+            "correction must name the best candidate to read next: {accumulated}"
         );
     }
 
@@ -1206,7 +1197,7 @@ mod tests {
         fs::create_dir_all(root.path().join("sandbox/services")).unwrap();
         fs::write(
             root.path().join("sandbox/README.md"),
-            "Completed tasks are documented here.\n",
+            "completed tasks are documented here.\n",
         )
         .unwrap();
         fs::write(

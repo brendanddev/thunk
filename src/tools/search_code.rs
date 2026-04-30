@@ -216,17 +216,19 @@ fn project_relative_display(path: &Path, root: &Path) -> Option<String> {
 }
 
 fn ripgrep_globs() -> Vec<String> {
-    let mut globs = vec!["!**/.*/**".to_string()];
-
-    for dir in SKIP_DIRS {
-        globs.push(format!("!**/{dir}/**"));
-    }
+    let mut globs = Vec::new();
 
     for ext in TEXT_EXTENSIONS {
         globs.push(match *ext {
             "gitignore" => "*.gitignore".to_string(),
             _ => format!("*.{ext}"),
         });
+    }
+
+    globs.push("!**/.*/**".to_string());
+
+    for dir in SKIP_DIRS {
+        globs.push(format!("!**/{dir}/**"));
     }
 
     globs
