@@ -593,7 +593,7 @@ impl InvestigationState {
             InvestigationMode::SaveLookup => self.first_save_candidate(),
             InvestigationMode::DefinitionLookup => self.first_definition_candidate(),
             InvestigationMode::UsageLookup => self.preferred_usage_candidate(),
-            InvestigationMode::General => None,
+            InvestigationMode::General => self.first_source_candidate(),
         };
         mode_specific.or_else(|| self.search_candidate_paths.first().map(String::as_str))
     }
@@ -2255,6 +2255,29 @@ mod tests {
             state.preferred_usage_candidate(),
             Some("sandbox/services/runner.py"),
             "normal source files should outrank initialization candidates for UsageLookup"
+        );
+    }
+
+    #[test]
+    fn best_candidate_for_mode_general_prefers_source_over_docs_and_benchmarks() {
+        let mut state = InvestigationState::new();
+        let output = make_search_output_for_hint(vec![
+            ("sandbox/README.md", "Completed tasks are documented here."),
+            (
+                "docs/benchmarks/runs/2026-04-29-phase16-baseline.md",
+                "completed tasks benchmark notes",
+            ),
+            (
+                "sandbox/services/task_service.py",
+                "if task.completed:\n    filtered.append(task)",
+            ),
+        ]);
+        state.record_search_results(&output, Some("completed"), &mut |_| {});
+
+        assert_eq!(
+            state.best_candidate_for_mode(InvestigationMode::General),
+            Some("sandbox/services/task_service.py"),
+            "General candidate preference should pick source over README/docs/benchmarks"
         );
     }
 

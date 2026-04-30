@@ -20,7 +20,7 @@ use super::super::project::ProjectStructureSnapshot;
 use super::super::project::ProjectStructureSnapshotCache;
 use super::super::protocol::prompt;
 use super::super::protocol::tool_codec;
-use super::super::paths::normalize_evidence_path;
+use super::super::paths::{normalize_evidence_path, path_is_within_scope};
 use super::super::resolve;
 use super::super::types::{
     Activity, AnswerSource, RuntimeEvent, RuntimeRequest, RuntimeTerminalReason,
@@ -1709,6 +1709,32 @@ impl Runtime {
                 // Only fires on investigation turns; harmless for direct-read / mutation.
                 if investigation_required && investigation.search_produced_results() {
                     let claimed = extract_claimed_paths(&response);
+                    if let Some(scope) = investigation_path_scope.as_deref() {
+                        if let Some(bad_path) = claimed
+                            .iter()
+                            .map(|p| normalize_evidence_path(p))
+                            .find(|p| !path_is_within_scope(p, scope))
+                        {
+                            trace_runtime_decision(
+                                on_event,
+                                "answer_scope_guard_rejected",
+                                &[("path", bad_path.clone()), ("scope", scope.to_string())],
+                            );
+                            self.finish_with_runtime_answer(
+                                &format!(
+                                    "The investigation is scoped to `{scope}`, but the answer cited \
+                                     `{bad_path}`. No answer can be given using files outside the \
+                                     active search scope."
+                                ),
+                                AnswerSource::RuntimeTerminal {
+                                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                                    rounds: tool_rounds,
+                                },
+                                on_event,
+                            );
+                            finish_turn!();
+                        }
+                    }
                     if let Some(bad_path) = claimed
                         .iter()
                         .find(|p| !reads_this_turn.contains(&normalize_evidence_path(p)))
@@ -2899,6 +2925,85 @@ mod tests {
         assert_eq!(
             last_assistant,
             Some("Logging is initialized in sandbox/services/logging_setup.py.")
+        );
+    }
+
+    #[test]
+    fn scoped_final_answer_rejects_out_of_scope_path_before_unread_guard() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/services")).unwrap();
+        fs::create_dir_all(tmp.path().join("sandbox/other")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("sandbox/services")
+                .join("logging_factory.py"),
+            "logger = logging.getLogger(__name__)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/services").join("logging_setup.py"),
+            "def initialize_logging():\n    logging.basicConfig(level=logging.INFO)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("sandbox/other").join("logging_setup.py"),
+            "def initialize_logging():\n    logging.basicConfig(level=logging.DEBUG)\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: logging]",
+                "[read_file: sandbox/services/logging_factory.py]",
+                "[read_file: sandbox/services/logging_setup.py]",
+                "Logging is initialized in sandbox/other/logging_setup.py.",
+            ],
+            tmp.path(),
+        );
+
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Find where logging is initialized in sandbox/services/".into(),
+            },
+        );
+
+        assert!(!has_failed(&events), "turn must terminate cleanly: {events:?}");
+        let answer_source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(src) = e {
+                Some(src.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                answer_source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "out-of-scope final answer must produce InsufficientEvidence: {answer_source:?}"
+        );
+
+        let snapshot = rt.messages_snapshot();
+        let last_assistant = snapshot
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::llm::backend::Role::Assistant)
+            .map(|m| m.content.as_str());
+        assert_eq!(
+            last_assistant,
+            Some(
+                "The investigation is scoped to `sandbox/services/`, but the answer cited \
+                 `sandbox/other/logging_setup.py`. No answer can be given using files outside \
+                 the active search scope."
+            ),
+            "scope guard must fire before the unread-path guard"
         );
     }
 

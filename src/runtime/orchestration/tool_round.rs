@@ -109,6 +109,18 @@ fn is_mutating_tool(input: &ToolInput) -> bool {
     )
 }
 
+fn is_general_doc_like_candidate_path(path: &str) -> bool {
+    let normalized = normalize_evidence_path(path);
+    let lower = normalized.to_ascii_lowercase();
+    let file_name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+
+    file_name == "readme"
+        || file_name.starts_with("readme.")
+        || lower
+            .split('/')
+            .any(|segment| matches!(segment, "doc" | "docs" | "benchmark" | "benchmarks"))
+}
+
 /// Outcome of dispatching one round of tool calls.
 pub(super) enum ToolRoundOutcome {
     /// All tools in this round completed immediately; results are ready to push.
@@ -402,6 +414,36 @@ pub(super) fn run_tool_round(
             && requested_read_path.is_none()
         {
             if let Some(rp) = read_path.as_deref() {
+                if matches!(investigation_mode, InvestigationMode::General)
+                    && investigation.candidate_reads_count() == 0
+                    && investigation.is_search_candidate_path(rp)
+                {
+                    let best = investigation
+                        .best_candidate_for_mode(InvestigationMode::General)
+                        .map(|s| s.to_string());
+                    if let Some(candidate) = best {
+                        if is_general_doc_like_candidate_path(rp)
+                            && normalize_evidence_path(&candidate) != normalize_evidence_path(rp)
+                        {
+                            trace_runtime_decision(
+                                on_event,
+                                "general_doc_candidate_redirected",
+                                &[
+                                    ("rejected_path", normalize_evidence_path(rp)),
+                                    ("candidate_path", normalize_evidence_path(&candidate)),
+                                ],
+                            );
+                            on_event(RuntimeEvent::ToolCallFinished {
+                                name: name.clone(),
+                                summary: None,
+                            });
+                            return ToolRoundOutcome::RuntimeDispatch {
+                                accumulated,
+                                call: ToolInput::ReadFile { path: candidate },
+                            };
+                        }
+                    }
+                }
                 if !investigation.is_search_candidate_path(rp) {
                     let attempts = investigation.increment_non_candidate_read_attempts();
                     trace_runtime_decision(
@@ -1155,6 +1197,94 @@ mod tests {
         assert!(
             path.contains("candidate.rs"),
             "forced dispatch must target the search candidate, got: {path}"
+        );
+    }
+
+    #[test]
+    fn general_readme_candidate_first_read_redirects_to_source_candidate() {
+        let (_dir, root, registry) = temp_root();
+        fs::create_dir_all(root.path().join("sandbox/services")).unwrap();
+        fs::write(
+            root.path().join("sandbox/README.md"),
+            "Completed tasks are documented here.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("sandbox/services/task_service.py"),
+            "def filtered_tasks(tasks):\n    return [task for task in tasks if task.completed]\n",
+        )
+        .unwrap();
+
+        let mut last_call_key = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn = HashSet::new();
+        let mut anchors = AnchorState::default();
+        let mut requested_read_completed = false;
+        let mut disallowed = 0usize;
+        let mut weak_query = 0usize;
+
+        run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "completed".into(),
+                path: Some("sandbox/".into()),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            Some("sandbox/"),
+            &mut |_| {},
+        );
+
+        assert!(
+            investigation.search_produced_results(),
+            "search must have found README and source candidates"
+        );
+
+        let outcome = run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: "sandbox/README.md".into(),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            Some("sandbox/"),
+            &mut |_| {},
+        );
+
+        let ToolRoundOutcome::RuntimeDispatch { call, .. } = outcome else {
+            panic!("README first-read should be redirected to the source candidate");
+        };
+        let ToolInput::ReadFile { path } = call else {
+            panic!("redirected call must be read_file");
+        };
+        assert!(
+            path.contains("sandbox/services/task_service.py"),
+            "redirect must target the source candidate, got: {path}"
         );
     }
 }

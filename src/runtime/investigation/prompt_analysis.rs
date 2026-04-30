@@ -338,10 +338,19 @@ pub(crate) fn extract_investigation_path_scope(text: &str) -> Option<String> {
 
 /// Extracts a direct-read file path from a prompt starting with "read".
 ///
-/// Accepts "read <path>" and "read file <path>" forms. Returns None if the
-/// structure does not match or the candidate does not resemble a file path.
+/// Accepts:
+/// - "read <path>"
+/// - "read file <path>"
+/// - question/explanation-style prompts with exactly one explicit relative file path
+///   such as "What does sandbox/services/task_service.py do?" or
+///   "Explain sandbox/services/task_service.py"
+///
+/// Returns None if the structure does not match or the candidate does not
+/// resemble a relative file path.
 pub(crate) fn requested_read_path(text: &str) -> Option<String> {
-    path_from_read_verb(text).or_else(|| path_from_what_is_in_query(text))
+    path_from_read_verb(text)
+        .or_else(|| path_from_what_is_in_query(text))
+        .or_else(|| path_from_explicit_file_prompt(text))
 }
 
 fn path_from_read_verb(text: &str) -> Option<String> {
@@ -367,6 +376,71 @@ fn path_from_read_verb(text: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn path_from_explicit_file_prompt(text: &str) -> Option<String> {
+    let lower = text.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("what does ") || lower.starts_with("explain ")) {
+        return None;
+    }
+
+    single_explicit_relative_file_path(text)
+}
+
+fn single_explicit_relative_file_path(text: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+
+    for raw in text.split_whitespace() {
+        let path = raw
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '`' | '"'
+                        | '\''
+                        | ','
+                        | ';'
+                        | ':'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                )
+            })
+            .trim_end_matches(|c: char| matches!(c, '.' | '?' | '!'));
+
+        if !looks_like_explicit_relative_file_path(path) {
+            continue;
+        }
+
+        let normalized = normalize_evidence_path(path);
+        if found.is_some() {
+            return None;
+        }
+        found = Some(normalized);
+    }
+
+    found
+}
+
+fn looks_like_explicit_relative_file_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with("http://")
+        || path.starts_with("https://")
+        || path.contains(|c: char| c.is_whitespace())
+        || path.ends_with('/')
+        || !path.contains('/')
+        || !looks_like_file_path(path)
+    {
+        return false;
+    }
+
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains('.') || name.eq_ignore_ascii_case("README"))
 }
 
 /// Extracts a path-qualified direct-read target from "what is in <path>" queries.
@@ -702,6 +776,24 @@ mod tests {
             requested_read_path("What is in this project?").as_deref(),
             None
         );
+    }
+
+    #[test]
+    fn classify_retrieval_intent_treats_question_style_explicit_file_paths_as_direct_read() {
+        assert!(matches!(
+            classify_retrieval_intent("What does sandbox/services/task_service.py do?"),
+            RetrievalIntent::DirectRead { path }
+                if path == "sandbox/services/task_service.py"
+        ));
+        assert!(matches!(
+            classify_retrieval_intent("Explain sandbox/services/task_service.py"),
+            RetrievalIntent::DirectRead { path }
+                if path == "sandbox/services/task_service.py"
+        ));
+        assert!(!matches!(
+            classify_retrieval_intent("Where are completed tasks filtered in sandbox/"),
+            RetrievalIntent::DirectRead { .. }
+        ));
     }
 
     #[test]
