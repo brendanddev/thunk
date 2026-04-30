@@ -417,9 +417,10 @@ pub(super) fn run_tool_round(
                         summary: None,
                     });
                     if attempts == 1 {
+                        let best = investigation.best_candidate_for_mode(investigation_mode);
                         accumulated.push_str(&tool_codec::format_tool_error(
                             &name,
-                            &non_candidate_read_correction(rp),
+                            &non_candidate_read_correction(rp, best),
                         ));
                         continue;
                     }

@@ -571,6 +571,24 @@ impl InvestigationState {
         self.non_candidate_read_attempts
     }
 
+    /// Returns the best candidate path for the given investigation mode.
+    /// Routes to the mode-specific classifier first; falls back to the first search
+    /// candidate if the mode has no dedicated set or that set is empty.
+    pub(crate) fn best_candidate_for_mode(&self, mode: InvestigationMode) -> Option<&str> {
+        let mode_specific = match mode {
+            InvestigationMode::InitializationLookup => self.first_initialization_candidate(),
+            InvestigationMode::ConfigLookup => self.first_config_candidate(),
+            InvestigationMode::CreateLookup => self.first_create_candidate(),
+            InvestigationMode::RegisterLookup => self.first_register_candidate(),
+            InvestigationMode::LoadLookup => self.first_load_candidate(),
+            InvestigationMode::SaveLookup => self.first_save_candidate(),
+            InvestigationMode::DefinitionLookup => self.first_definition_candidate(),
+            InvestigationMode::UsageLookup => self.preferred_usage_candidate(),
+            InvestigationMode::General => None,
+        };
+        mode_specific.or_else(|| self.search_candidate_paths.first().map(String::as_str))
+    }
+
     pub(crate) fn issue_direct_answer_correction(&mut self) -> bool {
         if self.direct_answer_correction_issued {
             return false;

@@ -1418,3 +1418,173 @@ fn repeated_non_candidate_read_does_not_become_search_budget_closed() {
         "search-budget message must not appear — turn must terminal before reaching the extra search"
     );
 }
+
+#[test]
+fn initialization_lookup_non_candidate_correction_names_initialization_candidate() {
+    // Phase 16.2: non-candidate correction on an InitializationLookup turn must name the
+    // best initialization candidate so the model can act on it immediately.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    fs::write(
+        tmp.path().join("sandbox/init.rs"),
+        "fn initialize_logging() {}\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("unrelated.rs"), "fn other() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: initialize_logging]",
+            "[read_file: unrelated.rs]",
+            "Logging is initialized in sandbox/init.rs.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Find where logging is initialized in sandbox/".into(),
+        },
+    );
+
+    let snapshot = rt.messages_snapshot();
+    assert!(
+        snapshot.iter().any(|m| {
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
+                && m.content.contains("[read_file: sandbox/init.rs]")
+        }),
+        "correction for InitializationLookup must name the initialization candidate: {snapshot:?}"
+    );
+    let _ = events;
+}
+
+#[test]
+fn config_lookup_non_candidate_correction_names_config_candidate() {
+    // Phase 16.2: non-candidate correction on a ConfigLookup turn must name the best
+    // config-file candidate so the model reads the right file on the next attempt.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("config")).unwrap();
+    fs::write(
+        tmp.path().join("config/database.yaml"),
+        "database: postgres\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("unrelated.rs"), "fn other() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: database]",
+            "[read_file: unrelated.rs]",
+            "The database is configured in config/database.yaml.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Find where the database is configured".into(),
+        },
+    );
+
+    let snapshot = rt.messages_snapshot();
+    assert!(
+        snapshot.iter().any(|m| {
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
+                && m.content.contains("[read_file: config/database.yaml]")
+        }),
+        "correction for ConfigLookup must name the config candidate: {snapshot:?}"
+    );
+    let _ = events;
+}
+
+#[test]
+fn general_mode_non_candidate_correction_names_first_search_candidate() {
+    // Phase 16.2: on a General-mode turn the mode-specific selector returns None, so the
+    // correction must fall back to naming the first search result.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("engine.rs"), "fn run_turns() {}\n").unwrap();
+    fs::write(tmp.path().join("unrelated.rs"), "fn other() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: run_turns]",
+            "[read_file: unrelated.rs]",
+            "run_turns drives the loop.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "What does run_turns do?".into(),
+        },
+    );
+
+    let snapshot = rt.messages_snapshot();
+    assert!(
+        snapshot.iter().any(|m| {
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
+                && m.content.contains("[read_file: engine.rs]")
+        }),
+        "correction for General mode must name the first search candidate: {snapshot:?}"
+    );
+    let _ = events;
+}
+
+#[test]
+fn non_candidate_correction_with_no_mode_specific_candidate_names_first_result() {
+    // Phase 16.2: when the mode is InitializationLookup but no matched line contains an
+    // initialization term, the mode-specific selector returns None and the correction must
+    // fall back to naming the first search result.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+    // Content does NOT contain "initialize"/"initialization" → won't be an initialization candidate.
+    fs::write(tmp.path().join("sandbox/other.rs"), "fn setup() {}\n").unwrap();
+    fs::write(tmp.path().join("unrelated.rs"), "fn other() {}\n").unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: setup]",
+            "[read_file: unrelated.rs]",
+            "The setup function is in sandbox/other.rs.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            // "initialized" triggers InitializationLookup; "setup" is the identifier to find.
+            text: "Find where the application is initialized using setup".into(),
+        },
+    );
+
+    let snapshot = rt.messages_snapshot();
+    assert!(
+        snapshot.iter().any(|m| {
+            m.content.contains("=== tool_error: read_file ===")
+                && m.content.contains("was not returned by the search")
+                && m.content.contains("[read_file: sandbox/other.rs]")
+        }),
+        "correction must fall back to first search result when mode-specific set is empty: {snapshot:?}"
+    );
+    let _ = events;
+}

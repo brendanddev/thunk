@@ -327,11 +327,18 @@ pub(crate) fn ungrounded_investigation_final_answer() -> &'static str {
 /// Injected when a read_file call targets a file that was not returned by the most recent
 /// search.  Fires only on investigation turns after search results exist.
 /// First offense: model is corrected and may retry with a matched file.
-pub(crate) fn non_candidate_read_correction(path: &str) -> String {
-    format!(
-        "[runtime:correction] `{path}` was not returned by the search — \
-         read one of the matched files from the search results instead."
-    )
+/// When a best candidate is available it is named explicitly so the model can act immediately.
+pub(crate) fn non_candidate_read_correction(path: &str, candidate: Option<&str>) -> String {
+    match candidate {
+        Some(c) => format!(
+            "[runtime:correction] `{path}` was not returned by the search — \
+             read this exact matched file instead: [read_file: {c}]"
+        ),
+        None => format!(
+            "[runtime:correction] `{path}` was not returned by the search — \
+             read one of the matched files from the search results instead."
+        ),
+    }
 }
 
 pub(crate) fn non_candidate_read_terminal_answer() -> &'static str {
