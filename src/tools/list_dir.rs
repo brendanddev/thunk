@@ -8,6 +8,8 @@ use super::types::{
 };
 use super::Tool;
 
+const MAX_ENTRIES: usize = 200;
+
 pub struct ListDirTool;
 
 impl ListDirTool {
@@ -67,10 +69,18 @@ impl Tool for ListDirTool {
             b_is_dir.cmp(&a_is_dir).then_with(|| a.name.cmp(&b.name))
         });
 
+        let total_entries = entries.len();
+        let truncated = total_entries > MAX_ENTRIES;
+        if truncated {
+            entries.truncate(MAX_ENTRIES);
+        }
+
         Ok(ToolRunResult::Immediate(ToolOutput::DirectoryListing(
             DirectoryListingOutput {
                 path: path.display().to_string(),
                 entries,
+                truncated,
+                total_entries,
             },
         )))
     }
@@ -125,5 +135,61 @@ mod tests {
         let root = TempDir::new().unwrap();
         let err = list(&root, "missing").unwrap_err();
         assert!(matches!(err, ToolError::Io(_)));
+    }
+
+    #[test]
+    fn small_directory_returns_full_output() {
+        let root = TempDir::new().unwrap();
+        for i in 0..10 {
+            fs::write(root.path().join(format!("file{i}.txt")), "").unwrap();
+        }
+
+        let result = list(&root, ".").unwrap();
+        let ToolRunResult::Immediate(ToolOutput::DirectoryListing(dl)) = result else {
+            panic!("expected Immediate(DirectoryListing)")
+        };
+
+        assert_eq!(dl.entries.len(), 10);
+        assert_eq!(dl.total_entries, 10);
+        assert!(!dl.truncated);
+    }
+
+    #[test]
+    fn large_directory_is_capped_at_max_entries() {
+        let root = TempDir::new().unwrap();
+        for i in 0..=MAX_ENTRIES {
+            fs::write(root.path().join(format!("file{i:04}.txt")), "").unwrap();
+        }
+
+        let result = list(&root, ".").unwrap();
+        let ToolRunResult::Immediate(ToolOutput::DirectoryListing(dl)) = result else {
+            panic!("expected Immediate(DirectoryListing)")
+        };
+
+        assert!(dl.truncated);
+        assert_eq!(dl.entries.len(), MAX_ENTRIES);
+        assert_eq!(dl.total_entries, MAX_ENTRIES + 1);
+    }
+
+    #[test]
+    fn capped_output_is_deterministic() {
+        let root = TempDir::new().unwrap();
+        for i in 0..=MAX_ENTRIES {
+            fs::write(root.path().join(format!("file{i:04}.txt")), "").unwrap();
+        }
+
+        let r1 = list(&root, ".").unwrap();
+        let r2 = list(&root, ".").unwrap();
+
+        let ToolRunResult::Immediate(ToolOutput::DirectoryListing(dl1)) = r1 else {
+            panic!()
+        };
+        let ToolRunResult::Immediate(ToolOutput::DirectoryListing(dl2)) = r2 else {
+            panic!()
+        };
+
+        let names1: Vec<&str> = dl1.entries.iter().map(|e| e.name.as_str()).collect();
+        let names2: Vec<&str> = dl2.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names1, names2);
     }
 }

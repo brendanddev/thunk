@@ -501,7 +501,16 @@ pub fn render_compact_summary(output: &ToolOutput) -> String {
             }
         }
         ToolOutput::DirectoryListing(d) => {
-            format!("listed {} ({} entries)", d.path, d.entries.len())
+            if d.truncated {
+                format!(
+                    "listed {} (showing {} of {} entries)",
+                    d.path,
+                    d.entries.len(),
+                    d.total_entries
+                )
+            } else {
+                format!("listed {} ({} entries)", d.path, d.entries.len())
+            }
         }
         ToolOutput::SearchResults(s) => {
             if s.total_matches == 0 {
@@ -925,7 +934,8 @@ pub(crate) fn render_output(output: &ToolOutput) -> String {
             if d.entries.is_empty() {
                 "(empty directory)".to_string()
             } else {
-                d.entries
+                let mut lines: Vec<String> = d
+                    .entries
                     .iter()
                     .map(|e| {
                         let kind = match e.kind {
@@ -935,8 +945,15 @@ pub(crate) fn render_output(output: &ToolOutput) -> String {
                         };
                         format!("{kind}  {}", e.name)
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .collect();
+                if d.truncated {
+                    let remaining = d.total_entries - d.entries.len();
+                    lines.push(format!(
+                        "[... {remaining} more entries not shown — {total} total]",
+                        total = d.total_entries,
+                    ));
+                }
+                lines.join("\n")
             }
         }
         ToolOutput::SearchResults(s) => {

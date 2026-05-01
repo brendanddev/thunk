@@ -90,6 +90,8 @@ pub struct FileContentsOutput {
 pub struct DirectoryListingOutput {
     pub path: String,
     pub entries: Vec<DirEntry>,
+    pub truncated: bool,
+    pub total_entries: usize,
 }
 
 #[derive(Debug, Clone)]
