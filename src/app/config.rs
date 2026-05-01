@@ -249,13 +249,10 @@ impl LlamaCppConfig {
     }
 }
 
-/// Loads the config from a TOML file at the specified path
+/// Loads the config from a TOML file at the specified path, or returns defaults if absent.
 pub fn load(path: &Path) -> Result<Config> {
     if !path.exists() {
-        return Err(AppError::Config(format!(
-            "Config file not found: {}",
-            path.display()
-        )));
+        return Ok(Config::default());
     }
 
     let raw = fs::read_to_string(path)?;

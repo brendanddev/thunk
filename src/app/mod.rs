@@ -23,7 +23,7 @@ pub fn run(cli: cli::Cli) -> Result<()> {
         config.llm.provider = model;
     }
     let backend = build_backend(&config)?;
-    let project_root = crate::runtime::ProjectRoot::new(paths.root_dir.clone())
+    let project_root = crate::runtime::ProjectRoot::new(paths.project_root.clone())
         .map_err(|e| AppError::Config(e.to_string()))?;
     let registry = default_registry().with_project_root(project_root.as_path_buf());
     let log = crate::logging::SessionLog::open(&paths.logs_dir);
