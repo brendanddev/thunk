@@ -44,6 +44,7 @@ Known limitations at this stage:
 ---
 
 ## Results
+
 | Version | Date | Backend | Scenario | Prompt / action | Expected behavior | Observed behavior | Tool rounds | Answer mode | Pass | Notes | Source |
 |--------|------|---------|----------|-----------------|------------------|------------------|-------------|-------------|------|------|--------|
 | 0.8.30 | 2026-04-29 | qwen2.5-coder-1.5b-instruct q4_k_m | initialization lookup | Find where logging is initialized in sandbox/ | search → read candidate in sandbox/ → grounded answer | search scoped correctly, but model attempted read on `.github/ISSUE_TEMPLATE.md`; read failed; runtime terminated | 2 | RuntimeTerminal | FAIL | Non-candidate read after scoped search; breaks retrieval discipline | manual/log |

@@ -11,6 +11,7 @@ pub use super::{
 
 mod anchors;
 mod approval;
+mod external_repo_fixtures;
 mod finalization;
 mod git_acquisition;
 mod integration_misc;
