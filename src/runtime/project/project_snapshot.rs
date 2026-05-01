@@ -7,11 +7,10 @@ use std::path::{Path, PathBuf};
 
 use super::project_path::relative_display;
 use super::ProjectRoot;
+use crate::dirs::DEFAULT_SKIP_DIRS;
 
 pub(crate) const MAX_SNAPSHOT_DEPTH: u8 = 2;
 pub(crate) const MAX_SNAPSHOT_NODES: usize = 40;
-
-const NOISY_DIRS: &[&str] = &[".git", "target", "node_modules"];
 const IMPORTANT_TOP_LEVEL_FILES: &[&str] = &[
     "Cargo.toml",
     "README",
@@ -167,7 +166,9 @@ fn read_entries(dir: &Path, root: &Path, depth: u8) -> io::Result<Vec<CandidateE
         };
 
         let name = item.file_name().to_string_lossy().into_owned();
-        if matches!(kind, ProjectStructureEntryKind::Dir) && is_noisy_dir(&name) {
+        if matches!(kind, ProjectStructureEntryKind::Dir)
+            && DEFAULT_SKIP_DIRS.contains(&name.as_str())
+        {
             continue;
         }
 
@@ -201,10 +202,6 @@ fn entry_kind_rank(kind: ProjectStructureEntryKind) -> u8 {
         ProjectStructureEntryKind::File => 1,
         ProjectStructureEntryKind::Symlink => 2,
     }
-}
-
-fn is_noisy_dir(name: &str) -> bool {
-    NOISY_DIRS.contains(&name)
 }
 
 fn is_important_top_level_file(name: &str) -> bool {

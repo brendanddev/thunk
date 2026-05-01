@@ -24,8 +24,7 @@ const MAX_RESULTS_SHOWN: usize = 15;
 /// alphabetically late in the walk are then reached and promoted by the sort step.
 const MAX_LINES_COLLECTED_PER_FILE: usize = 3;
 
-/// Directory names that are always skipped during the recursive walk.
-const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", ".hg", "dist", "build"];
+use crate::dirs::DEFAULT_SKIP_DIRS;
 
 /// File extensions treated as text. Everything else is skipped as likely binary.
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -227,7 +226,7 @@ fn ripgrep_globs() -> Vec<String> {
 
     globs.push("!**/.*/**".to_string());
 
-    for dir in SKIP_DIRS {
+    for dir in DEFAULT_SKIP_DIRS {
         globs.push(format!("!**/{dir}/**"));
     }
 

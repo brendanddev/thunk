@@ -1,5 +1,6 @@
 use std::fs;
 
+use crate::dirs::DEFAULT_SKIP_DIRS;
 use crate::runtime::ResolvedToolInput;
 
 use super::types::{
@@ -60,6 +61,7 @@ impl Tool for ListDirTool {
                     size_bytes,
                 }
             })
+            .filter(|e| !(e.kind == EntryKind::Dir && DEFAULT_SKIP_DIRS.contains(&e.name.as_str())))
             .collect();
 
         // Directories first, then files; alphabetical within each group.
@@ -169,6 +171,26 @@ mod tests {
         assert!(dl.truncated);
         assert_eq!(dl.entries.len(), MAX_ENTRIES);
         assert_eq!(dl.total_entries, MAX_ENTRIES + 1);
+    }
+
+    #[test]
+    fn skips_noisy_directories() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir(root.path().join("node_modules")).unwrap();
+        fs::create_dir(root.path().join("target")).unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("Cargo.toml"), "").unwrap();
+
+        let result = list(&root, ".").unwrap();
+        let ToolRunResult::Immediate(ToolOutput::DirectoryListing(dl)) = result else {
+            panic!("expected Immediate(DirectoryListing)")
+        };
+
+        let names: Vec<&str> = dl.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"src"));
+        assert!(names.contains(&"Cargo.toml"));
+        assert!(!names.contains(&"node_modules"));
+        assert!(!names.contains(&"target"));
     }
 
     #[test]
