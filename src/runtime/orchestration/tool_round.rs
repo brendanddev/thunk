@@ -449,6 +449,18 @@ pub(super) fn run_tool_round(
                     let best = investigation
                         .best_candidate_for_mode(investigation_mode)
                         .map(|s| s.to_string());
+                    // Dispatch is possible when: first offense, candidate is in the valid
+                    // candidate set, not already read this turn, and neither the per-turn
+                    // read cap nor the per-investigation candidate-read cap is exhausted.
+                    let dispatch_possible = attempts == 1
+                        && best.as_ref().map_or(false, |c| {
+                            let normalized = normalize_evidence_path(c);
+                            investigation.is_search_candidate_path(c)
+                                && !reads_this_turn.contains(&normalized)
+                                && reads_this_turn.len() < MAX_READS_PER_TURN
+                                && investigation.candidate_reads_count()
+                                    < MAX_CANDIDATE_READS_PER_INVESTIGATION
+                        });
                     trace_runtime_decision(
                         on_event,
                         "non_candidate_read_rejected",
@@ -465,7 +477,9 @@ pub(super) fn run_tool_round(
                             ),
                             (
                                 "recovery_action",
-                                if attempts == 1 {
+                                if dispatch_possible {
+                                    "dispatch"
+                                } else if attempts == 1 {
                                     "correction"
                                 } else {
                                     "terminal"
@@ -487,10 +501,24 @@ pub(super) fn run_tool_round(
                                 &[
                                     ("path", normalize_evidence_path(c)),
                                     ("mode", investigation_mode.as_str().to_string()),
-                                    ("selection_reason", "correction_hint".to_string()),
-                                    ("dispatch_possible", "false".to_string()),
+                                    (
+                                        "selection_reason",
+                                        if dispatch_possible {
+                                            "non_candidate_redirect"
+                                        } else {
+                                            "correction_hint"
+                                        }
+                                        .to_string(),
+                                    ),
+                                    ("dispatch_possible", dispatch_possible.to_string()),
                                 ],
                             );
+                            if dispatch_possible {
+                                return ToolRoundOutcome::RuntimeDispatch {
+                                    accumulated,
+                                    call: ToolInput::ReadFile { path: c.clone() },
+                                };
+                            }
                         }
                         accumulated.push_str(&tool_codec::format_tool_error(
                             &name,
@@ -1143,7 +1171,10 @@ mod tests {
     }
 
     #[test]
-    fn non_candidate_read_produces_correction_naming_best_candidate() {
+    fn non_candidate_read_dispatches_to_preferred_candidate() {
+        // When the model reads a file not in the search results and a valid candidate
+        // is available, the runtime dispatches the candidate directly instead of
+        // injecting a correction and waiting for the model to retry.
         let (_dir, root, registry) = temp_root();
         fs::write(root.path().join("candidate.rs"), "fn needle() {}\n").unwrap();
         fs::write(root.path().join("other.rs"), "fn unrelated() {}\n").unwrap();
@@ -1157,7 +1188,7 @@ mod tests {
         let mut disallowed = 0usize;
         let mut weak_query = 0usize;
 
-        // Round 1: search to populate candidate list with candidate.rs
+        // Round 1: search populates candidate list with candidate.rs
         run_tool_round(
             &root,
             &registry,
@@ -1187,7 +1218,117 @@ mod tests {
             "search must have found candidate.rs"
         );
 
-        // Round 2: model attempts to read other.rs (not a search candidate)
+        // Round 2: model attempts to read other.rs (not a search candidate).
+        // Runtime must dispatch candidate.rs directly — no correction, no search reopen.
+        let outcome = run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: "other.rs".into(),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        );
+
+        let ToolRoundOutcome::RuntimeDispatch { call, .. } = outcome else {
+            panic!("non-candidate read must dispatch the preferred candidate");
+        };
+        let ToolInput::ReadFile { path } = call else {
+            panic!("dispatched call must be read_file, not search_code");
+        };
+        assert_eq!(
+            path, "candidate.rs",
+            "dispatch must target the preferred candidate"
+        );
+    }
+
+    #[test]
+    fn non_candidate_read_correction_fallback_when_candidate_already_read() {
+        // When the preferred candidate was already read this turn, dispatch is unsafe
+        // (read would be a dedup-blocked duplicate). The runtime must fall back to
+        // the correction path rather than dispatch.
+        let (_dir, root, registry) = temp_root();
+        fs::write(root.path().join("candidate.rs"), "fn needle() {}\n").unwrap();
+        fs::write(root.path().join("other.rs"), "fn unrelated() {}\n").unwrap();
+
+        let mut last_call_key = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn = HashSet::new();
+        let mut anchors = AnchorState::default();
+        let mut requested_read_completed = false;
+        let mut disallowed = 0usize;
+        let mut weak_query = 0usize;
+
+        // Round 1: search populates candidate list with candidate.rs
+        run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "needle".into(),
+                path: None,
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        );
+
+        // Round 2: model reads the candidate (valid — puts it in reads_this_turn)
+        run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: "candidate.rs".into(),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        );
+
+        assert!(
+            reads_this_turn.contains("candidate.rs"),
+            "candidate.rs must be recorded as read this turn"
+        );
+
+        // Round 3: model reads other.rs (non-candidate). Dispatch is blocked because
+        // candidate.rs is already in reads_this_turn. Must fall back to correction.
         let outcome = run_tool_round(
             &root,
             &registry,
@@ -1213,10 +1354,10 @@ mod tests {
 
         let ToolRoundOutcome::Completed {
             results: accumulated,
-            git_acquisition_answer: None,
+            ..
         } = outcome
         else {
-            panic!("non-candidate read must produce a correction, not a dispatch");
+            panic!("must fall back to correction, not dispatch or terminal");
         };
         assert!(
             accumulated.contains("`other.rs` was not returned by the search"),
@@ -1224,7 +1365,112 @@ mod tests {
         );
         assert!(
             accumulated.contains("[read_file: candidate.rs]"),
-            "correction must name the best candidate to read next: {accumulated}"
+            "correction must still name the best candidate: {accumulated}"
+        );
+    }
+
+    #[test]
+    fn non_candidate_read_repeated_offense_still_terminates() {
+        // Even with Phase 18.1, a second non-candidate read after dispatch must terminate.
+        // Candidate enforcement is not weakened — the runtime does not allow infinite
+        // non-candidate reads to be silently redirected.
+        let (_dir, root, registry) = temp_root();
+        fs::write(root.path().join("candidate.rs"), "fn needle() {}\n").unwrap();
+        fs::write(root.path().join("other.rs"), "fn unrelated() {}\n").unwrap();
+
+        let mut last_call_key = None;
+        let mut search_budget = SearchBudget::new();
+        let mut investigation = InvestigationState::new();
+        let mut reads_this_turn = HashSet::new();
+        let mut anchors = AnchorState::default();
+        let mut requested_read_completed = false;
+        let mut disallowed = 0usize;
+        let mut weak_query = 0usize;
+
+        run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::SearchCode {
+                query: "needle".into(),
+                path: None,
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        );
+
+        // First offense: runtime dispatches candidate.rs
+        let first = run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: "other.rs".into(),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        );
+        assert!(
+            matches!(first, ToolRoundOutcome::RuntimeDispatch { .. }),
+            "first offense must dispatch"
+        );
+
+        // Second offense: attempts == 2 → terminal, regardless of candidates
+        let second = run_tool_round(
+            &root,
+            &registry,
+            vec![ToolInput::ReadFile {
+                path: "other.rs".into(),
+            }],
+            &mut last_call_key,
+            &mut search_budget,
+            &mut investigation,
+            &mut reads_this_turn,
+            &mut anchors,
+            ToolSurface::RetrievalFirst,
+            &mut disallowed,
+            &mut weak_query,
+            false,
+            true,
+            InvestigationMode::General,
+            None,
+            &mut requested_read_completed,
+            None,
+            &mut |_| {},
+        );
+        assert!(
+            matches!(
+                second,
+                ToolRoundOutcome::TerminalAnswer {
+                    reason: RuntimeTerminalReason::ReadFileFailed,
+                    ..
+                }
+            ),
+            "second non-candidate read offense must terminate"
         );
     }
 

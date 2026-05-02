@@ -174,6 +174,10 @@ fn read_before_answering_correction_discards_premature_synthesis() {
 
 #[test]
 fn read_must_come_from_current_search_results() {
+    // Phase 18.1: when the model reads a non-candidate file after search, the runtime
+    // dispatches the preferred candidate (engine.rs) directly — no correction injected.
+    // The model's answer "notes.rs explains it." claims a file not in reads_this_turn,
+    // so the answer guard fires and the turn ends as InsufficientEvidence.
     use std::fs;
     use tempfile::TempDir;
 
@@ -199,21 +203,24 @@ fn read_must_come_from_current_search_results() {
     );
 
     let snapshot = rt.messages_snapshot();
-    // Phase 16.1: non-candidate reads are now blocked before dispatch.
-    // The read produces tool_error (not tool_result) with a correction message.
+    // Dispatch produced a tool_result (engine.rs was read). No tool_error correction.
     assert!(
-        snapshot.iter().any(|m| {
+        snapshot
+            .iter()
+            .any(|m| m.content.contains("=== tool_result: read_file ===")),
+        "dispatch must produce a tool_result for the preferred candidate: {snapshot:?}"
+    );
+    assert!(
+        !snapshot.iter().any(|m| {
             m.content.contains("=== tool_error: read_file ===")
                 && m.content.contains("was not returned by the search")
         }),
-        "non-candidate read must be blocked before dispatch with a correction: {snapshot:?}"
+        "dispatch must not inject a correction: {snapshot:?}"
     );
-    assert!(
-        !snapshot
-            .iter()
-            .any(|m| m.content.contains("=== tool_result: read_file ===")),
-        "blocked non-candidate read must not produce a tool_result"
-    );
+    // The dispatch reads engine.rs (evidence ready). "notes.rs explains it." does not
+    // contain a claimed path that the answer guard extracts, so the turn completes as
+    // ToolAssisted — evidence was acquired via dispatch even though the model asked for
+    // the wrong file.
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -222,14 +229,8 @@ fn read_must_come_from_current_search_results() {
         }
     });
     assert!(
-        matches!(
-            answer_source,
-            Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::InsufficientEvidence,
-                ..
-            })
-        ),
-        "blocked non-candidate read must not admit synthesis: {answer_source:?}"
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "dispatch makes evidence ready — turn completes as ToolAssisted: {answer_source:?}"
     );
 }
 
@@ -1126,10 +1127,11 @@ fn import_only_fallback_accepts_when_all_candidates_are_import_only() {
 // Phase 16.1: Retrieval Candidate Discipline
 
 #[test]
-fn non_candidate_read_after_search_produces_correction() {
-    // After search returns a candidate, the model reads a file that was NOT in the
-    // search results.  The guard must block the read before dispatch and inject a
-    // [runtime:correction] message naming the path that was not a candidate.
+fn non_candidate_read_after_search_dispatches_preferred_candidate() {
+    // Phase 18.1: when the model reads a non-candidate file after search, the runtime
+    // dispatches the preferred candidate (sandbox/init.rs) directly.
+    // The model's subsequent answer cites sandbox/init.rs, which was read via dispatch,
+    // so the answer guard passes and the turn completes as ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -1160,20 +1162,33 @@ fn non_candidate_read_after_search_produces_correction() {
 
     let snapshot = rt.messages_snapshot();
 
+    // Dispatch produced a tool_result for sandbox/init.rs. No tool_error correction.
     assert!(
         snapshot.iter().any(|m| {
+            m.content.contains("=== tool_result: read_file ===")
+                && m.content.contains("initialize_logging")
+        }),
+        "dispatch must produce a tool_result containing the candidate's content: {snapshot:?}"
+    );
+    assert!(
+        !snapshot.iter().any(|m| {
             m.content.contains("=== tool_error: read_file ===")
                 && m.content.contains("was not returned by the search")
         }),
-        "non-candidate read must produce a tool_error correction before dispatch: {snapshot:?}"
+        "dispatch must not inject a correction: {snapshot:?}"
     );
+    // Answer cites sandbox/init.rs (which was read via dispatch) — admitted as ToolAssisted.
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
     assert!(
-        !snapshot
-            .iter()
-            .any(|m| m.content.contains("=== tool_result: read_file ===")),
-        "non-candidate read must not reach dispatch"
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "answer grounded in the dispatched candidate must be admitted as ToolAssisted: {answer_source:?}"
     );
-    let _ = events; // turn may end at InsufficientEvidence — that is acceptable
 }
 
 #[test]
@@ -1285,11 +1300,11 @@ fn non_candidate_read_before_search_is_not_blocked() {
 }
 
 #[test]
-fn repeated_non_candidate_read_across_rounds_goes_terminal() {
-    // First round: search succeeds, model reads a non-candidate → correction (attempts=1).
-    // Second round: model reads another non-candidate → persistent counter reaches 2 → terminal.
-    // Verifies that InvestigationState.non_candidate_read_attempts persists across
-    // separate run_tool_round calls within the same user turn.
+fn repeated_non_candidate_read_after_dispatch_is_bounded() {
+    // Phase 18.1: first offense dispatches sandbox/init.rs (evidence ready).
+    // The second tool call is caught by the evidence-ready guard (not the non-candidate
+    // guard), which issues a correction telling the model to answer. The model answers
+    // "Done." which has no file-path claims and is admitted as ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -1322,16 +1337,22 @@ fn repeated_non_candidate_read_across_rounds_goes_terminal() {
 
     let snapshot = rt.messages_snapshot();
 
-    // First offense: correction injected (attempts=1 from round 2).
+    // Dispatch produced a tool_result (sandbox/init.rs). No correction for first offense.
     assert!(
         snapshot.iter().any(|m| {
+            m.content.contains("=== tool_result: read_file ===")
+                && m.content.contains("initialize_logging")
+        }),
+        "dispatch must produce a tool_result for the preferred candidate: {snapshot:?}"
+    );
+    assert!(
+        !snapshot.iter().any(|m| {
             m.content.contains("=== tool_error: read_file ===")
                 && m.content.contains("was not returned by the search")
         }),
-        "first non-candidate read must produce a correction: {snapshot:?}"
+        "dispatch must not inject a correction for the first offense: {snapshot:?}"
     );
-
-    // Second offense: terminal (attempts=2 from round 3, counter persisted from round 2).
+    // Turn completes — model answers "Done." after the evidence-ready correction.
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -1340,23 +1361,17 @@ fn repeated_non_candidate_read_across_rounds_goes_terminal() {
         }
     });
     assert!(
-        matches!(
-            answer_source,
-            Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::ReadFileFailed,
-                ..
-            })
-        ),
-        "second non-candidate read must terminate with ReadFileFailed: {answer_source:?}"
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "turn must complete as ToolAssisted after dispatch + evidence-ready guard: {answer_source:?}"
     );
 }
 
 #[test]
 fn repeated_non_candidate_read_does_not_become_search_budget_closed() {
-    // Regression guard: when a non-candidate read causes a terminal, the reason must be
-    // ReadFileFailed, not InsufficientEvidence or a search-budget-related terminal.
-    // Before the fix the counter reset each round, causing the model to retry the bad read,
-    // then attempt an extra search, and terminal with a misleading search-budget message.
+    // Regression guard (Phase 18.1 update): first offense dispatches sandbox/init.rs
+    // (evidence ready). The second tool call and repeated search are both caught by the
+    // evidence-ready guard and terminate the turn as RepeatedToolAfterEvidenceReady —
+    // before the redundant search fires. No search-budget-exceeded message appears.
     use std::fs;
     use tempfile::TempDir;
 
@@ -1396,33 +1411,34 @@ fn repeated_non_candidate_read_does_not_become_search_budget_closed() {
         }
     });
 
-    // Must terminate as ReadFileFailed on the second non-candidate read (round 3),
-    // before the model ever reaches the redundant search in round 4.
+    // Terminal is RepeatedToolAfterEvidenceReady — not search-budget-closed.
     assert!(
         matches!(
             answer_source,
             Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::ReadFileFailed,
+                reason: RuntimeTerminalReason::RepeatedToolAfterEvidenceReady,
                 ..
             })
         ),
-        "terminal must be ReadFileFailed, not a search-budget-closed terminal: {answer_source:?}"
+        "terminal must be RepeatedToolAfterEvidenceReady after dispatch makes evidence ready: {answer_source:?}"
     );
 
-    // The snapshot must NOT contain any search-budget-exceeded messages.
     let snapshot = rt.messages_snapshot();
     assert!(
         !snapshot
             .iter()
             .any(|m| m.content.contains("search budget exceeded")),
-        "search-budget message must not appear — turn must terminal before reaching the extra search"
+        "search-budget message must not appear — turn terminates before reaching the extra search"
     );
 }
 
 #[test]
-fn initialization_lookup_non_candidate_correction_names_initialization_candidate() {
-    // Phase 16.2: non-candidate correction on an InitializationLookup turn must name the
-    // best initialization candidate so the model can act on it immediately.
+fn initialization_lookup_non_candidate_dispatches_initialization_candidate() {
+    // Phase 18.1: on an InitializationLookup turn, when the model reads a non-candidate
+    // file (unrelated.rs), the runtime dispatches the preferred initialization candidate
+    // (sandbox/init.rs) directly. The dispatched read produces a tool_result containing
+    // init.rs content. No correction is injected, no search is reopened.
+    // The model's answer cites sandbox/init.rs (which was read via dispatch) → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -1452,21 +1468,50 @@ fn initialization_lookup_non_candidate_correction_names_initialization_candidate
     );
 
     let snapshot = rt.messages_snapshot();
+    // Dispatched read must have produced a tool_result showing sandbox/init.rs content.
     assert!(
         snapshot.iter().any(|m| {
+            m.content.contains("=== tool_result: read_file ===")
+                && m.content.contains("initialize_logging")
+        }),
+        "dispatch must produce a tool_result containing the initialization candidate content: {snapshot:?}"
+    );
+    // No non-candidate correction must have been injected.
+    assert!(
+        !snapshot.iter().any(|m| {
             m.content.contains("=== tool_error: read_file ===")
                 && m.content.contains("was not returned by the search")
-                && m.content.contains("[read_file: sandbox/init.rs]")
         }),
-        "correction for InitializationLookup must name the initialization candidate: {snapshot:?}"
+        "dispatch must not inject a non-candidate correction: {snapshot:?}"
     );
-    let _ = events;
+    // Search must not have been reopened.
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("search budget exceeded")),
+        "dispatch must not trigger a second search: {snapshot:?}"
+    );
+    // Answer cites sandbox/init.rs which was read via dispatch → admitted as ToolAssisted.
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "answer grounded in the dispatched initialization candidate must be ToolAssisted: {answer_source:?}"
+    );
 }
 
 #[test]
-fn config_lookup_non_candidate_correction_names_config_candidate() {
-    // Phase 16.2: non-candidate correction on a ConfigLookup turn must name the best
-    // config-file candidate so the model reads the right file on the next attempt.
+fn config_lookup_non_candidate_dispatches_config_candidate() {
+    // Phase 18.1: on a ConfigLookup turn, when the model reads a non-candidate file
+    // (unrelated.rs), the runtime dispatches the preferred config candidate
+    // (config/database.yaml) directly. The dispatched read produces a tool_result
+    // containing the YAML content. No correction is injected, no search is reopened.
+    // The model's answer cites config/database.yaml (read via dispatch) → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -1496,21 +1541,50 @@ fn config_lookup_non_candidate_correction_names_config_candidate() {
     );
 
     let snapshot = rt.messages_snapshot();
+    // Dispatched read must have produced a tool_result showing config/database.yaml content.
     assert!(
         snapshot.iter().any(|m| {
+            m.content.contains("=== tool_result: read_file ===")
+                && m.content.contains("database: postgres")
+        }),
+        "dispatch must produce a tool_result containing the config candidate content: {snapshot:?}"
+    );
+    // No non-candidate correction must have been injected.
+    assert!(
+        !snapshot.iter().any(|m| {
             m.content.contains("=== tool_error: read_file ===")
                 && m.content.contains("was not returned by the search")
-                && m.content.contains("[read_file: config/database.yaml]")
         }),
-        "correction for ConfigLookup must name the config candidate: {snapshot:?}"
+        "dispatch must not inject a non-candidate correction: {snapshot:?}"
     );
-    let _ = events;
+    // Search must not have been reopened.
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("search budget exceeded")),
+        "dispatch must not trigger a second search: {snapshot:?}"
+    );
+    // Answer cites config/database.yaml (read via dispatch) → admitted as ToolAssisted.
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "answer grounded in the dispatched config candidate must be ToolAssisted: {answer_source:?}"
+    );
 }
 
 #[test]
-fn general_mode_non_candidate_correction_names_first_search_candidate() {
-    // Phase 16.2: on a General-mode turn the mode-specific selector returns None, so the
-    // correction must fall back to naming the first search result.
+fn general_mode_non_candidate_dispatches_first_search_candidate() {
+    // Phase 18.1: on a General-mode turn, when the model reads a non-candidate file
+    // (unrelated.rs), the runtime dispatches the first search candidate (engine.rs)
+    // directly. The dispatched read produces a tool_result with engine.rs content.
+    // No correction is injected. The model's answer has no claimed file paths →
+    // the answer guard does not fire → admitted as ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -1535,28 +1609,57 @@ fn general_mode_non_candidate_correction_names_first_search_candidate() {
     );
 
     let snapshot = rt.messages_snapshot();
+    // Dispatched read must have produced a tool_result showing engine.rs content.
     assert!(
         snapshot.iter().any(|m| {
+            m.content.contains("=== tool_result: read_file ===")
+                && m.content.contains("run_turns")
+        }),
+        "dispatch must produce a tool_result containing the first search candidate content: {snapshot:?}"
+    );
+    // No non-candidate correction must have been injected.
+    assert!(
+        !snapshot.iter().any(|m| {
             m.content.contains("=== tool_error: read_file ===")
                 && m.content.contains("was not returned by the search")
-                && m.content.contains("[read_file: engine.rs]")
         }),
-        "correction for General mode must name the first search candidate: {snapshot:?}"
+        "dispatch must not inject a non-candidate correction: {snapshot:?}"
     );
-    let _ = events;
+    // Search must not have been reopened.
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("search budget exceeded")),
+        "dispatch must not trigger a second search: {snapshot:?}"
+    );
+    // Answer has no claimed file paths → answer guard does not fire → ToolAssisted.
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "answer after dispatch of first search candidate must be ToolAssisted: {answer_source:?}"
+    );
 }
 
 #[test]
-fn non_candidate_correction_with_no_mode_specific_candidate_names_first_result() {
-    // Phase 16.2: when the mode is InitializationLookup but no matched line contains an
-    // initialization term, the mode-specific selector returns None and the correction must
-    // fall back to naming the first search result.
+fn non_candidate_dispatch_falls_back_to_first_result_when_no_mode_specific_candidate() {
+    // Phase 18.1: when the mode is InitializationLookup but no matched line contains an
+    // initialization term, best_candidate_for_mode falls back to the first search result
+    // (sandbox/other.rs). The runtime dispatches that file directly when the model reads
+    // a non-candidate. No correction is injected, no search is reopened.
+    // The model's answer cites sandbox/other.rs (read via dispatch) → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
-    // Content does NOT contain "initialize"/"initialization" → won't be an initialization candidate.
+    // Content does NOT contain "initialize"/"initialization" → no initialization candidate;
+    // fallback dispatches the first search result (sandbox/other.rs).
     fs::write(tmp.path().join("sandbox/other.rs"), "fn setup() {}\n").unwrap();
     fs::write(tmp.path().join("unrelated.rs"), "fn other() {}\n").unwrap();
 
@@ -1578,13 +1681,39 @@ fn non_candidate_correction_with_no_mode_specific_candidate_names_first_result()
     );
 
     let snapshot = rt.messages_snapshot();
+    // Dispatched read must have produced a tool_result showing sandbox/other.rs content.
     assert!(
         snapshot.iter().any(|m| {
+            m.content.contains("=== tool_result: read_file ===")
+                && m.content.contains("fn setup")
+        }),
+        "dispatch must produce a tool_result containing the fallback first-result content: {snapshot:?}"
+    );
+    // No non-candidate correction must have been injected.
+    assert!(
+        !snapshot.iter().any(|m| {
             m.content.contains("=== tool_error: read_file ===")
                 && m.content.contains("was not returned by the search")
-                && m.content.contains("[read_file: sandbox/other.rs]")
         }),
-        "correction must fall back to first search result when mode-specific set is empty: {snapshot:?}"
+        "dispatch must not inject a non-candidate correction: {snapshot:?}"
     );
-    let _ = events;
+    // Search must not have been reopened.
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("search budget exceeded")),
+        "dispatch must not trigger a second search: {snapshot:?}"
+    );
+    // Answer cites sandbox/other.rs (read via dispatch) → admitted as ToolAssisted.
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "answer grounded in the dispatched fallback candidate must be ToolAssisted: {answer_source:?}"
+    );
 }

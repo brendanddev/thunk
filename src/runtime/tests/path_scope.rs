@@ -80,8 +80,9 @@ fn path_scope_narrows_search_to_specified_directory() {
 fn path_scope_after_list_dir_failure_keeps_search_candidates_inside_scope() {
     // Manual regression: "in the sandbox/ folder" must still produce sandbox/
     // as the prompt-derived upper bound after an initial list_dir failure.
-    // The model later reads an out-of-scope matched-looking file; that read must
-    // not satisfy evidence because it was never a scoped search candidate.
+    // Phase 18.1: when the model reads the out-of-scope src/app/session.rs (which is not
+    // a scoped search candidate), the runtime dispatches sandbox/database.yaml directly.
+    // The model's next answer cites the in-scope dispatched candidate → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -104,8 +105,7 @@ fn path_scope_after_list_dir_failure_keeps_search_candidates_inside_scope() {
             "[list_dir: .]",
             "[search_code: database]",
             "[read_file: src/app/session.rs]",
-            "The database is configured in src/app/session.rs.",
-            "[read_file: sandbox/database.yaml]",
+            // Phase 18.1: runtime dispatched sandbox/database.yaml; model answers correctly.
             "The database is configured in sandbox/database.yaml.",
         ],
         tmp.path(),
@@ -140,6 +140,15 @@ fn path_scope_after_list_dir_failure_keeps_search_candidates_inside_scope() {
     assert!(
         !search_result.contains("src/app/session.rs"),
         "scoped search must not include out-of-scope candidates: {search_result}"
+    );
+
+    // Dispatch produced a tool_result for sandbox/database.yaml (the in-scope candidate).
+    assert!(
+        snapshot.iter().any(|m| {
+            m.content.contains("=== tool_result: read_file ===")
+                && m.content.contains("sandbox.db")
+        }),
+        "dispatch must have read the in-scope candidate sandbox/database.yaml: {snapshot:?}"
     );
 
     let last_assistant = snapshot
