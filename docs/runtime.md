@@ -35,7 +35,7 @@ Those responsibilities stay in `tui/`, `app/` + `storage/`, and `tools/`.
 
 ### `Runtime`
 
-`Runtime` in `src/runtime/engine.rs` owns the active conversation, the selected `ModelBackend`, the `ToolRegistry`, and the single optional `pending_action`.
+`Runtime` in `src/runtime/orchestration/engine.rs` owns the active conversation, the selected `ModelBackend`, the `ToolRegistry`, and the single optional `pending_action`.
 
 ### `Conversation`
 
@@ -48,12 +48,17 @@ Those responsibilities stay in `tui/`, `app/` + `storage/`, and `tools/`.
 
 ### `RuntimeRequest`
 
-The runtime handles four requests:
+The runtime handles these requests:
 
 - `Submit { text }`
 - `Reset`
 - `Approve`
 - `Reject`
+- `QueryLast`
+- `QueryAnchors`
+- `QueryHistory`
+- `ReadFile { path }`
+- `SearchCode { query }`
 
 ### `RuntimeEvent`
 
@@ -65,6 +70,9 @@ The runtime communicates outward only through events, including:
 - approval required
 - answer ready
 - failure
+- informational query/command output via `InfoMessage`
+- advisory backend timing via `BackendTiming`
+- advisory runtime decision traces via `RuntimeTrace`
 
 The TUI renders these events but does not control runtime internals.
 
@@ -83,7 +91,9 @@ The TUI renders these events but does not control runtime internals.
 
 The runtime always starts from a fresh system prompt, even when conversation history is restored from storage.
 
-Before each normal model generation, the runtime also injects an additional system message describing the active tool surface for that turn. That hint is part of the backend request only; it is not persisted in `Conversation` history. It narrows the current retrieval-vs-Git read-only family; mutation permission is enforced separately by the runtime.
+Before each normal model generation, the runtime also injects an additional system message describing the active tool surface for that generation. That hint is part of the backend request only; it is not persisted in `Conversation` history. Current surfaces are `RetrievalFirst`, `GitReadOnly`, `AnswerOnly`, and `MutationEnabled`.
+
+For `RetrievalFirst` and `MutationEnabled` generations, the runtime can also inject a compact project snapshot hint built from the current project root. That snapshot hint is also request-only and is invalidated after successful `edit_file` and `write_file` execution.
 
 ---
 
@@ -91,7 +101,7 @@ Before each normal model generation, the runtime also injects an additional syst
 
 Before tool dispatch, the runtime derives bounded per-turn policy state from the current user prompt:
 
-- the active tool surface for the surface-owned read-only tools: `RetrievalFirst` or `GitReadOnly`
+- the active tool surface for the current generation: `RetrievalFirst`, `GitReadOnly`, `AnswerOnly`, or `MutationEnabled`
 - whether mutating tools are allowed, based on conservative mutation-intent detection
 - whether the prompt requires a bounded investigation flow
 - the structural investigation mode and optional path scope
@@ -117,7 +127,7 @@ On `Submit`:
 
 ### 2. Generate
 
-`run_generate_turn()` sends a full snapshot of the current conversation to the active backend as `GenerateRequest`.
+`run_generate_turn()` sends the current in-memory snapshot of the conversation to the active backend as `GenerateRequest`. That snapshot may already have had older assistant-tool-call + runtime-result pairs live-trimmed by the runtime.
 
 Backend output is streamed back as `BackendEvent`s:
 
@@ -157,7 +167,7 @@ results are grouped by file in that rendered text, with per-file match counts an
 `MAX_LINES_PER_FILE = 3` representative lines per file. This is presentation-only: the runtime still
 receives typed `SearchResultsOutput` data and does not parse grouped text for decisions.
 
-Some tool outcomes end with a runtime-owned assistant answer instead of another model generation. Current examples include failed `read_file` calls, rejected mutations, insufficient-evidence terminals, and completed Git read-only rounds.
+Some tool outcomes end with a runtime-owned assistant answer instead of another model generation. Current examples include successful approved mutations, failed `read_file` calls, rejected mutations, insufficient-evidence terminals, and completed Git read-only rounds.
 
 `search_code` has extra runtime enforcement because prompt-only rules were not reliable enough with small local models:
 
@@ -179,6 +189,8 @@ Investigation-required turns also have a post-evidence boundary:
 - a repeated violation ends the turn with `RuntimeTerminalReason::RepeatedToolAfterEvidenceReady`
 
 This keeps the search -> read -> answer lifecycle runtime-owned instead of model-owned.
+
+When the runtime does want one more synthesis pass after a completed read or accepted evidence, that generation runs under `AnswerOnly`, so no further tools are offered.
 
 ### Initialization Lookup
 
@@ -222,10 +234,12 @@ The current runtime behavior keeps tool evidence inside the same user turn:
 
 - successful immediate retrieval rounds append results and usually re-enter generation for synthesis
 - successful Git read-only acquisition rounds append results and end immediately with a runtime-produced visible answer
-- approved mutations append the approved result and re-enter generation for a follow-up model response
+- approved mutations append the approved result and end immediately with a runtime-produced visible answer
 - rejected mutations append a terminal tool error and a runtime-owned cancellation answer without re-entering model generation
 - failed `read_file` calls append a tool error and a runtime-owned failure answer without re-entering model generation
 - approval execution failures append a tool error and re-enter generation so the model can recover
+
+When retrieval or investigation turns do re-enter generation for synthesis, that answer-phase generation runs under `AnswerOnly`.
 
 The runtime has a hard cap of `10` tool rounds per turn, plus narrower runtime guards for repeated tool cycles and repeated searches.
 
@@ -246,8 +260,9 @@ When that happens:
 
 - calls `ToolRegistry::execute_approved()`
 - appends a runtime-owned tool result block on success
+- ends immediately with a runtime-owned final answer on success
 - appends a runtime-owned tool error block on failure
-- re-enters model generation after either approved execution outcome
+- re-enters model generation only after approved execution failure
 
 `Reject`:
 
@@ -262,7 +277,7 @@ Only one pending action can exist at a time.
 
 ## Tool Protocol Boundary
 
-The runtime does not parse tool syntax itself. `src/runtime/tool_codec.rs` owns the wire protocol between assistant text and the tool layer.
+The runtime does not parse tool syntax itself. `src/runtime/protocol/tool_codec.rs` owns the wire protocol between assistant text and the tool layer.
 
 That module is responsible for:
 
@@ -288,6 +303,8 @@ It contains:
 - internal correction messages when the model violates the tool protocol
 - runtime-owned terminal assistant answers for outcomes the runtime can state authoritatively
 
+Once the conversation exceeds the live-trim threshold, the runtime can also remove older complete assistant-tool-call + runtime-result pairs from the oldest eligible window. Conversational messages and the most recent tail are preserved.
+
 Notable correction paths today:
 
 - if the assistant fabricates a `tool_result` or `tool_error` block instead of making a real tool call, the runtime removes that assistant message, injects a correction message, and retries once
@@ -295,7 +312,7 @@ Notable correction paths today:
 - if an `edit_file` repair attempt follows an edit tool error but is still malformed, the runtime injects an edit-specific correction instead of silently accepting the malformed retry as a direct answer
 - if `search_code` exceeds the per-turn search budget, the runtime discards that retry from conversation context and injects a search-closed correction
 
-Runtime-owned final answers are streamed through the same assistant-message events as model text. Deterministic failure / rejection paths report `AnswerSource::RuntimeTerminal`. Completed Git read-only turns currently report `AnswerSource::ToolAssisted { rounds }` even though the visible answer text is runtime-produced, because `AnswerSource` still groups successful tool-completed paths together.
+Runtime-owned final answers are streamed through the same assistant-message events as model text. Deterministic failure / rejection paths report `AnswerSource::RuntimeTerminal`. Completed Git read-only turns and successful approved mutations currently report `AnswerSource::ToolAssisted { rounds }` even though the visible answer text is runtime-produced, because `AnswerSource` still groups successful tool-completed paths together.
 
 ---
 
@@ -317,7 +334,7 @@ When `PARAMS_TRACE_RUNTIME` is set, the runtime also emits advisory `RuntimeTrac
 
 ### With `llm/`
 
-The runtime depends only on the `ModelBackend` trait and backend stream events. It does not know whether the active backend is `mock` or `llama_cpp`.
+The runtime depends only on the `ModelBackend` trait and backend stream events. It does not know whether the active backend is `mock`, `llama_cpp`, or `openai`.
 
 ### With `tools/`
 
@@ -335,10 +352,8 @@ The runtime emits `RuntimeEvent`s. The TUI renders them and routes slash command
 
 ## Current Limitations
 
-- The runtime always sends the full in-memory conversation snapshot to the backend.
-- Live context trimming is not implemented before generation.
-- `AnswerSource::ToolAssisted` still covers both model-authored synthesis and runtime-authored successful Git answers.
-- Successful mutation turns still rely on a post-approval model response. There is no runtime-owned completion invariant for `edit_file` / `write_file` yet.
+- The runtime still sends the current in-memory conversation snapshot to the backend. Context control is structural rather than token-aware: old tool exchanges can be live-trimmed, but there is still no proactive token budgeting before generation.
+- `AnswerSource::ToolAssisted` still covers both model-authored synthesis and runtime-authored successful completions such as Git read-only answers and approved mutations.
 - `edit_file` may still require multiple model attempts before producing a valid exact edit; that is a model-output quality issue, not a tool-execution correctness issue.
 - Pending approval state is in memory only and is lost on restart.
 - The visible TUI transcript is not rebuilt from restored runtime history on startup.

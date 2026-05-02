@@ -19,7 +19,7 @@ Today that built-in tool set is intentionally small:
 - `edit_file`
 - `write_file`
 
-The layer is built around explicit types rather than text parsing. Raw assistant text is parsed in `runtime/tool_codec.rs` before any tool is called, and the runtime may expose only a subset of registered tools on a given turn. Current tool-surface policy applies only to the read-only retrieval/Git families; `edit_file` and `write_file` are gated separately by mutation intent and approval.
+The layer is built around explicit types rather than text parsing. Raw assistant text is parsed in `src/runtime/protocol/tool_codec.rs` before any tool is called, and the runtime may expose only a subset of registered tools on a given turn. Current tool-surface policy applies only to the read-only retrieval/Git families; `edit_file` and `write_file` are gated separately by mutation intent and approval.
 
 ---
 
@@ -96,7 +96,16 @@ It is responsible for:
 - delegating approved mutations back to the correct tool
 - exposing sorted tool specs for the system prompt
 
-The default registry is built in `src/tools/mod.rs` and is rooted at the discovered project root.
+The default registry is built in `src/tools/mod.rs` and initially registers only `read_file` and `list_dir`.
+
+The remaining root-aware tools are added by `ToolRegistry::with_project_root(...)`:
+
+- `search_code`
+- `git_status`
+- `git_diff`
+- `git_log`
+- `edit_file`
+- `write_file`
 
 ---
 
@@ -110,8 +119,8 @@ Relative paths:
 
 Absolute paths:
 
-- pass through unchanged for read-only tools
-- are allowed for mutating tools only if they stay within the project root
+- are canonicalized for read-only tools and must still resolve within the project root
+- are allowed for mutating tools only if they normalize within the project root
 
 Mutating tools also reject `..` path traversal.
 
@@ -140,8 +149,10 @@ Current behavior:
 
 - does not recurse
 - returns entry name, kind, and file size when available
+- skips directories in `DEFAULT_SKIP_DIRS`
 - sorts directories before files
 - sorts alphabetically within each group
+- caps the returned listing at `200` entries and reports truncation metadata when the directory is larger
 
 Runtime investigation behavior can block `list_dir` before `search_code` on code-location questions. Directory listings are still useful as a read-only tool, but they are not accepted as the first evidence step for investigation-required prompts.
 

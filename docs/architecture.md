@@ -8,7 +8,7 @@ Defines the high-level architecture and design decisions of the app, including t
 
 `thunk` is a local-first Rust TUI coding assistant. It runs a conversation loop against a selected model backend, lets the model request a small set of typed project-local tools through a constrained text protocol, and requires explicit user approval before mutating files.
 
-At startup, `src/main.rs` calls `app::run()`. The app layer discovers the project root from `config.toml`, loads config, builds the model backend and tool registry, opens optional session logging, restores the most recent same-root session from SQLite, and launches the TUI. After that, the TUI talks only to `AppContext`; `AppContext` forwards requests into the runtime and persists the runtime transcript.
+At startup, `src/main.rs` calls `app::run()`. The app layer discovers two roots: a config/storage root from the nearest `config.toml` (or the launch directory when absent), and a separate runtime project root from the nearest `.git` ancestor (or the launch directory as fallback). It then loads config, builds the model backend and tool registry, opens optional session logging, restores the most recent session only when its stored `project_root` exactly matches the current runtime project root, and launches the TUI. After that, the TUI talks only to `AppContext`; `AppContext` forwards requests into the runtime and persists the runtime transcript.
 
 The core problem the project solves is running an AI coding assistant locally without collapsing the system into one text-driven loop. The current implementation keeps model generation, tool execution, approval, persistence, and UI rendering in separate layers with explicit boundaries.
 
@@ -43,7 +43,7 @@ The core problem the project solves is running an AI coding assistant locally wi
 ### `llm/`
 
 - Responsibilities: model backend abstraction, provider selection, provider-specific prompt formatting, streaming backend events, and llama.cpp execution details.
-- Owns: `ModelBackend`, `GenerateRequest`, `BackendEvent`, `BackendStatus`, `mock`, and `llama_cpp`.
+- Owns: `ModelBackend`, `GenerateRequest`, `BackendEvent`, `BackendStatus`, `mock`, `llama_cpp`, and `openai`.
 - Must not: know about tools, persistence, slash commands, or terminal rendering.
 
 ### `tui/`
@@ -71,11 +71,11 @@ The core problem the project solves is running an AI coding assistant locally wi
 7. `ToolRegistry` dispatches each `ToolInput` to its tool implementation.
 8. Immediate tool results are rendered two ways by the runtime: a compact one-line summary for the TUI, and a `=== tool_result: name ===` block appended back into the conversation as a user message.
 9. If a tool returns `Approval(PendingAction)`, the runtime stores that single pending action, emits `ApprovalRequired`, and stops the turn until the user chooses `/approve` or `/reject`.
-10. If no approval is pending, the runtime either re-enters generation with the injected tool results or finishes immediately with a runtime-produced answer, depending on the turn lifecycle. Retrieval turns usually re-enter generation; completed Git read-only turns do not.
+10. If no approval is pending, the runtime either re-enters generation with the injected tool results or finishes immediately with a runtime-produced answer, depending on the turn lifecycle. Retrieval turns usually re-enter generation; completed Git read-only turns and successful approved mutations do not.
 11. If the runtime already knows the terminal outcome, such as a rejected mutation, failed `read_file`, exhausted investigation, or completed Git read-only acquisition, it can emit a runtime-owned assistant answer instead of asking the model to synthesize.
 12. The TUI renders events only. It never sees typed tool payloads and never calls tool implementations directly.
 
-One important current behavior: successful tool rounds do not all end the same way. Retrieval and approved-mutation turns usually call the model again with tool results in context so the final answer can synthesize what was actually found or changed. Git read-only turns are different: after one completed Git acquisition round, the runtime produces the visible answer directly and ends the turn without a post-tool synthesis round.
+One important current behavior: successful tool rounds do not all end the same way. Retrieval turns usually call the model again with tool results in context so the final answer can synthesize what was found. Approved-mutation turns and completed Git read-only turns are different: after the tool result is committed, the runtime produces the visible answer directly and ends the turn without a post-tool synthesis round.
 
 ---
 
@@ -107,7 +107,7 @@ The runtime owns the pending action lifecycle, but it does not interpret `payloa
 4. `/approve` calls `ToolRegistry::execute_approved()`.
 5. `/reject` appends a `=== tool_error: name ===` block and emits a runtime-owned cancellation answer.
 
-On approval success, the runtime appends a `=== tool_result: name ===` block and re-enters generation for a follow-up response. On approval failure, it appends a `=== tool_error: name ===` block and resumes generation so the model can recover. On rejection, the runtime does not re-enter model generation because it already knows no mutation occurred.
+On approval success, the runtime appends a `=== tool_result: name ===` block and finishes immediately with a runtime-owned final answer summarizing the completed mutation. On approval failure, it appends a `=== tool_error: name ===` block and resumes generation so the model can recover. On rejection, the runtime does not re-enter model generation because it already knows no mutation occurred.
 
 ### Two-Phase Execution
 
@@ -127,7 +127,7 @@ Current mutating tools:
 
 ## Tool Protocol
 
-`runtime/tool_codec.rs` owns the wire protocol between model text and tool execution. It has three jobs:
+`src/runtime/protocol/tool_codec.rs` owns the wire protocol between model text and tool execution. It has three jobs:
 
 - parse assistant text into typed `ToolInput` values
 - format `ToolOutput` / tool errors back into runtime-owned conversation text
@@ -212,8 +212,9 @@ Restore behavior is intentionally narrower than storage:
 
 Live trimming is limited today:
 
-- there is no token-aware budgeting or message trimming before generation
-- every generation request sends the full in-memory conversation snapshot
+- there is no token-aware budgeting before generation
+- the runtime live-trims oldest assistant-tool-call + user-tool-result pairs once the conversation exceeds the configured threshold, while preserving the system prompt, recent messages, and conversational turns
+- every generation request still sends the current in-memory conversation snapshot after any such trimming
 - `read_file` truncates file reads to the first `200` lines
 - `search_code` truncates at `50` matches
 - if the live prompt still exceeds the configured llama.cpp context window, generation fails instead of auto-trimming
@@ -232,8 +233,8 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 - At most one `pending_action` exists at a time.
 - New user submissions are rejected while an approval is pending.
 - The runtime owns conversation mutation, tool result injection, and approval state.
-- Each turn uses exactly one runtime-selected tool surface for the surface-owned read-only families. Current surfaces are `RetrievalFirst` (`search_code`, `read_file`, `list_dir`) and `GitReadOnly` (`git_status`, `git_diff`, `git_log`).
-- Mutation permission is separate from tool-surface policy. `edit_file` and `write_file` are gated by a conservative mutation-intent check plus the approval flow, not by the `RetrievalFirst` / `GitReadOnly` surface definitions.
+- Each generation uses exactly one runtime-selected tool surface. Current surfaces are `RetrievalFirst` (`search_code`, `read_file`, `list_dir`), `GitReadOnly` (`git_status`, `git_diff`, `git_log`), `AnswerOnly` (no tools), and `MutationEnabled` (the retrieval tools plus a per-turn hint that `edit_file` and `write_file` are available).
+- Mutation permission is still separate from read-only surface membership. `edit_file` and `write_file` are gated by a conservative mutation-intent check plus the approval flow; `MutationEnabled` affects the per-turn hinting and no-tool-vs-read-tool policy for that generation.
 - Tool-surface enforcement is pre-dispatch and runtime-owned. The same canonical surface definitions are also used to render the ephemeral backend hint for the active turn.
 - Raw assistant tool syntax is parsed only in `tool_codec`.
 - Tools return typed data; tools do not append conversation text themselves.
@@ -244,7 +245,7 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 - investigation candidate reads remain capped at 2, recovery is single-shot, and action lookup modes use matched-line structural classification only, without semantic reasoning or tool / `tool_codec` changes.
 - A completed Git read-only acquisition round can contain multiple Git tools in the same assistant response, but after that round the runtime ends the turn with a visible answer and does not ask the model to synthesize.
 - Explicit follow-up anchors are runtime-owned and structural only: last-read file, last-search replay, and same-scope reuse. They are updated from successful tool outputs, kept in memory only, and cleared on reset.
-- Explicit file-read prompts such as `read src/runtime/engine.rs` are tracked by the runtime. If the model reads a different file or never produces the requested read, the turn ends with a runtime-owned failure answer.
+- Explicit file-read prompts such as `read src/runtime/orchestration/engine.rs` are tracked by the runtime. If the model reads a different file or never produces the requested read, the turn ends with a runtime-owned failure answer.
 - rejected mutations are answered by the runtime without model synthesis, so the assistant cannot claim a rejected write/edit happened
 - failed `read_file` calls can terminate with a runtime-owned answer, so missing-file reads do not loop
 - Malformed `edit_file` repair attempts after edit errors are surfaced back to the model through runtime correction rather than silently ending the turn.
@@ -257,9 +258,8 @@ One current UI/runtime mismatch also matters: restored history is loaded into th
 
 ## Known Limitations / Deferred Work
 
-- Live context management is incomplete. Restore trimming exists, but there is no proactive token-based budgeting or live conversation trimming before generation.
+- Live context management is incomplete. Restore trimming and structural live trimming of old tool exchanges exist, but there is still no proactive token-based budgeting before generation.
 - Tool-loop safety still includes a hard limit of `10` tool rounds per turn; search has narrower per-turn runtime enforcement, but broader planning quality is still model-dependent.
-- Approved mutation turns still rely on a post-approval model response. There is not yet a runtime-owned completion invariant after a successful `edit_file` or `write_file`.
 - `edit_file` can still be noisy before a valid exact edit block appears; this is a model-output quality issue, not a correctness issue once a valid tool call is parsed.
 - Advanced memory is not implemented. There is no embeddings layer, structured memory, or long-term recall.
 - LSP integration is not implemented.

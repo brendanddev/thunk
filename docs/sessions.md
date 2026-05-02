@@ -13,7 +13,7 @@ The current design splits that work across two layers:
 - `app/session.rs` owns the bridge between runtime messages and stored messages
 - `storage/session/` owns SQLite schema and CRUD
 
-`AppContext` uses those pieces to restore the most recent same-root session at startup and save conversation state after completed submit, approve, and reject requests.
+`AppContext` uses those pieces to inspect the single most recently updated saved session at startup, restore it only when its stored `project_root` matches the current runtime project root, and save conversation state after completed submit, approve, and reject requests.
 
 ---
 
@@ -54,6 +54,7 @@ Current schema:
 
 - `sessions`
   - `id`
+  - `project_root`
   - `created_at`
   - `updated_at`
   - `msg_count`
@@ -94,9 +95,9 @@ The system prompt is intentionally not persisted. It is rebuilt from current con
 At startup:
 
 1. `app::run()` opens the session DB
-2. `ActiveSession::open_or_restore()` asks `SessionStore` for the most recently updated session
+2. `ActiveSession::open_or_restore()` asks `SessionStore` for the single most recently updated session overall
 3. if that session's stored `project_root` exactly matches the current canonical project root, stored messages are converted back into runtime messages
-4. if the stored `project_root` is missing or different, a new empty session is created instead
+4. if that single most recent session has a missing or different `project_root`, restore does not continue scanning older sessions; a new empty session is created instead
 5. if no prior session exists, a new empty session is created
 6. `AppContext::build()` loads the restored history into the runtime after creating a fresh system prompt
 
@@ -166,7 +167,7 @@ Messages within a session are stored and loaded in ascending `seq` order.
 
 ## Current Limitations
 
-- Only the most recent same-root session is restored automatically.
+- Only the single most recently updated session is considered for automatic restore, and it is restored only when its stored `project_root` matches the current runtime project root.
 - Pending approvals are not persisted.
 - Restore uses a fixed message window rather than token-aware budgeting.
 - The full stored transcript can be larger than the context reloaded into the runtime.
