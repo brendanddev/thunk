@@ -1795,10 +1795,23 @@ impl Runtime {
                         .iter()
                         .find(|p| !reads_this_turn.contains(&normalize_evidence_path(p)))
                     {
+                        let reads_list = {
+                            let mut sorted: Vec<&str> =
+                                reads_this_turn.iter().map(String::as_str).collect();
+                            sorted.sort_unstable();
+                            sorted.join(",")
+                        };
                         trace_runtime_decision(
                             on_event,
                             "answer_guard_rejected",
-                            &[("path", bad_path.clone())],
+                            &[
+                                ("path", bad_path.clone()),
+                                ("reads_count", reads_this_turn.len().to_string()),
+                                ("reads", reads_list),
+                                ("evidence_ready", investigation.evidence_ready().to_string()),
+                                ("retry_available", "false".to_string()),
+                                ("action", "terminal".to_string()),
+                            ],
                         );
                         self.finish_with_runtime_answer(
                             &format!(

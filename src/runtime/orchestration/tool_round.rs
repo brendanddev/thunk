@@ -446,12 +446,33 @@ pub(super) fn run_tool_round(
                 }
                 if !investigation.is_search_candidate_path(rp) {
                     let attempts = investigation.increment_non_candidate_read_attempts();
+                    let best = investigation
+                        .best_candidate_for_mode(investigation_mode)
+                        .map(|s| s.to_string());
                     trace_runtime_decision(
                         on_event,
                         "non_candidate_read_rejected",
                         &[
                             ("path", normalize_evidence_path(rp)),
-                            ("attempts", attempts.to_string()),
+                            ("mode", investigation_mode.as_str().to_string()),
+                            (
+                                "candidate_count",
+                                investigation.search_candidate_count().to_string(),
+                            ),
+                            (
+                                "preferred_candidate",
+                                best.as_deref().unwrap_or("none").to_string(),
+                            ),
+                            (
+                                "recovery_action",
+                                if attempts == 1 {
+                                    "correction"
+                                } else {
+                                    "terminal"
+                                }
+                                .to_string(),
+                            ),
+                            ("search_closed", search_budget.is_closed().to_string()),
                         ],
                     );
                     on_event(RuntimeEvent::ToolCallFinished {
@@ -459,9 +480,18 @@ pub(super) fn run_tool_round(
                         summary: None,
                     });
                     if attempts == 1 {
-                        let best = investigation
-                            .best_candidate_for_mode(investigation_mode)
-                            .map(|s| s.to_string());
+                        if let Some(ref c) = best {
+                            trace_runtime_decision(
+                                on_event,
+                                "candidate_selected",
+                                &[
+                                    ("path", normalize_evidence_path(c)),
+                                    ("mode", investigation_mode.as_str().to_string()),
+                                    ("selection_reason", "correction_hint".to_string()),
+                                    ("dispatch_possible", "false".to_string()),
+                                ],
+                            );
+                        }
                         accumulated.push_str(&tool_codec::format_tool_error(
                             &name,
                             &non_candidate_read_correction(rp, best.as_deref()),
@@ -711,7 +741,12 @@ pub(super) fn run_tool_round(
                             trace_runtime_decision(
                                 on_event,
                                 "usage_candidate_selected",
-                                &[("path", path.to_string())],
+                                &[
+                                    ("path", path.to_string()),
+                                    ("mode", investigation_mode.as_str().to_string()),
+                                    ("selection_reason", "initial_after_search".to_string()),
+                                    ("dispatch_possible", "true".to_string()),
+                                ],
                             );
                             return ToolRoundOutcome::RuntimeDispatch {
                                 accumulated,
@@ -760,7 +795,9 @@ pub(super) fn run_tool_round(
                             "usage_candidate_selected",
                             &[
                                 ("path", path.to_string()),
-                                ("reason", "additional_usage_evidence".into()),
+                                ("mode", investigation_mode.as_str().to_string()),
+                                ("selection_reason", "additional_usage_evidence".to_string()),
+                                ("dispatch_possible", "true".to_string()),
                                 (
                                     "useful_candidate_reads",
                                     investigation.useful_candidate_reads_count().to_string(),

@@ -584,6 +584,10 @@ impl InvestigationState {
         self.non_candidate_read_attempts
     }
 
+    pub(crate) fn search_candidate_count(&self) -> usize {
+        self.search_candidate_paths.len()
+    }
+
     /// Returns the best candidate path for the given investigation mode.
     /// Routes to the mode-specific classifier first; falls back to the first search
     /// candidate if the mode has no dedicated set or that set is empty.
