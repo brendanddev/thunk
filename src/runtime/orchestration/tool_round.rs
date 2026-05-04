@@ -230,6 +230,68 @@ pub(super) fn run_tool_round(
             ToolInput::ReadFile { path } => Some(path.clone()),
             _ => None,
         };
+        // Pre-intercept: if a non-candidate read_file can be deterministically dispatched
+        // to the preferred candidate, intercept now — before emitting ToolCallStarted —
+        // so no invalid tool events ever appear in the stream.
+        if investigation_required
+            && investigation.search_produced_results()
+            && requested_read_path.is_none()
+        {
+            if let Some(rp) = read_path.as_deref() {
+                if !investigation.is_search_candidate_path(rp)
+                    && investigation.non_candidate_read_attempts() == 0
+                {
+                    let best = investigation
+                        .best_candidate_for_mode(investigation_mode)
+                        .map(|s| s.to_string());
+                    let dispatch_possible = best.as_ref().map_or(false, |c| {
+                        let normalized = normalize_evidence_path(c);
+                        investigation.is_search_candidate_path(c)
+                            && !reads_this_turn.contains(&normalized)
+                            && reads_this_turn.len() < MAX_READS_PER_TURN
+                            && investigation.candidate_reads_count()
+                                < MAX_CANDIDATE_READS_PER_INVESTIGATION
+                    });
+                    if dispatch_possible {
+                        investigation.increment_non_candidate_read_attempts();
+                        trace_runtime_decision(
+                            on_event,
+                            "non_candidate_read_rejected",
+                            &[
+                                ("path", normalize_evidence_path(rp)),
+                                ("mode", investigation_mode.as_str().to_string()),
+                                (
+                                    "candidate_count",
+                                    investigation.search_candidate_count().to_string(),
+                                ),
+                                (
+                                    "preferred_candidate",
+                                    best.as_deref().unwrap_or("none").to_string(),
+                                ),
+                                ("recovery_action", "dispatch".to_string()),
+                                ("search_closed", search_budget.is_closed().to_string()),
+                            ],
+                        );
+                        let c = best.unwrap();
+                        trace_runtime_decision(
+                            on_event,
+                            "candidate_selected",
+                            &[
+                                ("path", normalize_evidence_path(&c)),
+                                ("mode", investigation_mode.as_str().to_string()),
+                                ("selection_reason", "non_candidate_redirect".to_string()),
+                                ("dispatch_possible", "true".to_string()),
+                            ],
+                        );
+                        return ToolRoundOutcome::RuntimeDispatch {
+                            accumulated,
+                            call: ToolInput::ReadFile { path: c },
+                        };
+                    }
+                }
+            }
+        }
+
         let name = input.tool_name().to_string();
         let key = call_fingerprint(&input);
         let is_git_read_only_tool = is_git_read_only_tool_input(&input);

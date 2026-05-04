@@ -577,6 +577,10 @@ impl InvestigationState {
         self.search_attempted
     }
 
+    pub(crate) fn non_candidate_read_attempts(&self) -> usize {
+        self.non_candidate_read_attempts
+    }
+
     /// Increments the non-candidate read attempt counter and returns the new count.
     /// Called in run_tool_round before dispatch; persists across rounds within a turn.
     pub(crate) fn increment_non_candidate_read_attempts(&mut self) -> usize {

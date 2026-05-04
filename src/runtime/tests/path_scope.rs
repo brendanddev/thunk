@@ -145,8 +145,7 @@ fn path_scope_after_list_dir_failure_keeps_search_candidates_inside_scope() {
     // Dispatch produced a tool_result for sandbox/database.yaml (the in-scope candidate).
     assert!(
         snapshot.iter().any(|m| {
-            m.content.contains("=== tool_result: read_file ===")
-                && m.content.contains("sandbox.db")
+            m.content.contains("=== tool_result: read_file ===") && m.content.contains("sandbox.db")
         }),
         "dispatch must have read the in-scope candidate sandbox/database.yaml: {snapshot:?}"
     );
