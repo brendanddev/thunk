@@ -192,6 +192,7 @@ enum GenerationRoundCause {
     ReadRequestToolRequired,
     SearchBeforeAnsweringCorrection,
     ReadBeforeAnsweringCorrection,
+    AnswerGuardRetry,
 }
 
 impl GenerationRoundCause {
@@ -210,6 +211,7 @@ impl GenerationRoundCause {
             Self::ReadRequestToolRequired => "read_request_tool_required",
             Self::SearchBeforeAnsweringCorrection => "search_before_answering",
             Self::ReadBeforeAnsweringCorrection => "read_before_answering",
+            Self::AnswerGuardRetry => "answer_guard_retry",
         }
     }
 }
@@ -1112,6 +1114,9 @@ impl Runtime {
         // Holds the raw tool_result block from a seeded direct read so the runtime can serve
         // it as a deterministic fallback when model synthesis repeatedly fails in answer phase.
         let mut direct_read_result: Option<String> = None;
+        // Counts how many times answer_guard_retry has been entered this turn.
+        // Bounded to 1: a second guard rejection is always terminal.
+        let mut answer_guard_retry_count = 0u8;
 
         macro_rules! finish_turn {
             () => {{
@@ -1801,6 +1806,32 @@ impl Runtime {
                             sorted.sort_unstable();
                             sorted.join(",")
                         };
+                        if answer_guard_retry_count == 0 && !reads_this_turn.is_empty() {
+                            answer_guard_retry_count += 1;
+                            trace_runtime_decision(
+                                on_event,
+                                "answer_guard_rejected",
+                                &[
+                                    ("path", bad_path.clone()),
+                                    ("reads_count", reads_this_turn.len().to_string()),
+                                    ("reads", reads_list.clone()),
+                                    (
+                                        "evidence_ready",
+                                        investigation.evidence_ready().to_string(),
+                                    ),
+                                    ("retry_available", "true".to_string()),
+                                    ("action", "retry".to_string()),
+                                ],
+                            );
+                            self.conversation.discard_last_if_assistant();
+                            self.conversation.push_user(answer_guard_retry_constraint(
+                                bad_path,
+                                &reads_list,
+                            ));
+                            next_round_label = GenerationRoundLabel::PostEvidenceRetry;
+                            next_round_cause = GenerationRoundCause::AnswerGuardRetry;
+                            continue;
+                        }
                         trace_runtime_decision(
                             on_event,
                             "answer_guard_rejected",
@@ -2374,7 +2405,7 @@ mod tests {
         );
     }
 
-    // ── ContextPolicy tests ──────────────────────────────────────────────────
+    // ContextPolicy tests
 
     #[test]
     fn context_policy_none_uses_defaults() {
@@ -2416,7 +2447,7 @@ mod tests {
         assert_eq!(policy.tool_result_max_lines, 200);
     }
 
-    // ── cap_tool_result_blocks tests ─────────────────────────────────────────
+    // cap_tool_result_blocks tests
 
     #[test]
     fn cap_under_limit_is_noop() {

@@ -177,6 +177,15 @@ pub(crate) const READ_REQUEST_TOOL_REQUIRED: &str =
     "[runtime:correction] The user asked to read a specific file. \
      Call read_file for that exact path before answering.";
 
+/// Injected when answer_guard rejects a synthesis that cites an unread path and a retry
+/// is eligible (evidence exists). Directs the model to synthesize only from read files.
+pub(crate) fn answer_guard_retry_constraint(bad_path: &str, reads: &str) -> String {
+    format!(
+        "[runtime:correction] Your answer cited `{bad_path}`, which was not read this turn. \
+         Answer using only the file(s) already read: {reads}. Do not call any tools."
+    )
+}
+
 /// Injected when the model tries to read a file that was already read earlier in the same turn.
 /// The file's contents are already in the conversation context; re-reading adds no new evidence
 /// and only inflates the prompt.

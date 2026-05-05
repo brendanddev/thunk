@@ -25,7 +25,7 @@ fn build_root(dir: &TempDir) -> ProjectRoot {
     ProjectRoot::new(dir.path().to_path_buf()).unwrap()
 }
 
-// ─── project root detection ──────────────────────────────────────────────────
+// project root detection
 
 #[test]
 fn project_root_accepts_git_repo_root() {
@@ -68,7 +68,7 @@ fn project_root_accepts_plain_directory_without_git() {
     );
 }
 
-// ─── startup behavior ────────────────────────────────────────────────────────
+// startup behavior
 
 #[test]
 fn runtime_starts_in_git_initialized_repo_without_config_toml() {
@@ -119,7 +119,7 @@ fn runtime_starts_with_config_toml_present() {
     );
 }
 
-// ─── list_dir behavior ───────────────────────────────────────────────────────
+// list_dir behavior
 
 #[test]
 fn list_dir_skips_all_default_noisy_directories() {
@@ -238,7 +238,7 @@ fn list_dir_ordering_is_deterministic_in_mixed_repo() {
     );
 }
 
-// ─── search_code behavior ────────────────────────────────────────────────────
+// search_code behavior
 
 #[test]
 fn search_code_skips_all_noisy_directories_finds_only_source() {
@@ -282,7 +282,7 @@ fn search_code_skips_all_noisy_directories_finds_only_source() {
     );
 }
 
-// ─── project_snapshot behavior ───────────────────────────────────────────────
+// project_snapshot behavior
 
 #[test]
 fn project_snapshot_excludes_all_noisy_directories_in_realistic_fixture() {
@@ -352,7 +352,7 @@ fn project_snapshot_does_not_explode_on_large_noisy_tree() {
     }
 }
 
-// ─── path safety ─────────────────────────────────────────────────────────────
+// path safety
 
 #[test]
 fn path_cannot_escape_root_via_dotdot() {

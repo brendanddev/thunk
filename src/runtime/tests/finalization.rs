@@ -296,13 +296,15 @@ fn answer_citing_unread_path_triggers_insufficient_evidence() {
     )
     .unwrap();
 
-    // Model: search → read the candidate → final answer that cites the unread file.
+    // Model: search → read the candidate → answer citing the unread file (twice).
+    // 18.2: first guard rejection triggers a retry; second rejection is terminal.
     let hallucinated = "route_request is defined in src/handlers.rs.";
     let mut rt = make_runtime_in(
         vec![
             "[search_code: route_request]",
             "[read_file: src/router.rs]",
-            hallucinated,
+            hallucinated, // attempt 1 — guard rejects, retry issued
+            hallucinated, // attempt 2 — guard rejects, terminal
         ],
         tmp.path(),
     );
