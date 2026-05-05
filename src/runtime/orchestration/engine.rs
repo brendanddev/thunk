@@ -192,7 +192,6 @@ enum GenerationRoundCause {
     ReadRequestToolRequired,
     SearchBeforeAnsweringCorrection,
     ReadBeforeAnsweringCorrection,
-    AnswerGuardRetry,
 }
 
 impl GenerationRoundCause {
@@ -211,7 +210,6 @@ impl GenerationRoundCause {
             Self::ReadRequestToolRequired => "read_request_tool_required",
             Self::SearchBeforeAnsweringCorrection => "search_before_answering",
             Self::ReadBeforeAnsweringCorrection => "read_before_answering",
-            Self::AnswerGuardRetry => "answer_guard_retry",
         }
     }
 }
@@ -1114,9 +1112,10 @@ impl Runtime {
         // Holds the raw tool_result block from a seeded direct read so the runtime can serve
         // it as a deterministic fallback when model synthesis repeatedly fails in answer phase.
         let mut direct_read_result: Option<String> = None;
-        // Counts how many times answer_guard_retry has been entered this turn.
-        // Bounded to 1: a second guard rejection is always terminal.
-        let mut answer_guard_retry_count = 0u8;
+        // Tracks whether the answer_guard retry has been entered this turn.
+        // Set to true when the first guard rejection issues a retry; a second rejection
+        // is always terminal regardless of evidence state.
+        let mut answer_guard_retry_entered = false;
 
         macro_rules! finish_turn {
             () => {{
@@ -1806,8 +1805,8 @@ impl Runtime {
                             sorted.sort_unstable();
                             sorted.join(",")
                         };
-                        if answer_guard_retry_count == 0 && !reads_this_turn.is_empty() {
-                            answer_guard_retry_count += 1;
+                        if !answer_guard_retry_entered && !reads_this_turn.is_empty() {
+                            answer_guard_retry_entered = true;
                             trace_runtime_decision(
                                 on_event,
                                 "answer_guard_rejected",
@@ -1829,7 +1828,7 @@ impl Runtime {
                                 &reads_list,
                             ));
                             next_round_label = GenerationRoundLabel::PostEvidenceRetry;
-                            next_round_cause = GenerationRoundCause::AnswerGuardRetry;
+                            next_round_cause = GenerationRoundCause::Recovery;
                             continue;
                         }
                         trace_runtime_decision(
