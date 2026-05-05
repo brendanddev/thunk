@@ -24,7 +24,7 @@ use super::super::{resolve, ProjectRoot};
 /// context growth when the model reads speculatively or drifts into repeated reads.
 /// 3 is conservative: a correct investigation needs 1 (search → read → answer);
 /// 2-3 accommodates a reasonable follow-up read without runaway context expansion.
-const MAX_READS_PER_TURN: usize = 3;
+pub(super) const MAX_READS_PER_TURN: usize = 3;
 
 /// Maximum number of distinct search-candidate files that may be read in a single
 /// investigation turn.  After two candidate reads, if evidence is still not ready,

@@ -28,6 +28,7 @@ use super::super::types::{
 use super::generation::{emit_visible_assistant_message, run_generate_turn};
 use super::tool_round::{
     run_tool_round, SearchBudget, ToolRoundOutcome, MAX_CANDIDATE_READS_PER_INVESTIGATION,
+    MAX_READS_PER_TURN,
 };
 
 /// Maximum tool rounds per turn. Prevents runaway loops when the model keeps
@@ -1349,7 +1350,7 @@ impl Runtime {
                 };
 
             if let Some(phase) = answer_phase {
-                if !calls.is_empty() {
+                if !calls.is_empty() && response.is_some() {
                     post_answer_phase_tool_attempts += 1;
                     if matches!(phase, AnswerPhaseKind::InvestigationEvidenceReady) {
                         trace_runtime_decision(
@@ -1805,6 +1806,24 @@ impl Runtime {
                             sorted.sort_unstable();
                             sorted.join(",")
                         };
+                        let can_dispatch = !answer_guard_retry_entered
+                            && investigation.is_search_candidate_path(
+                                &normalize_evidence_path(bad_path),
+                            )
+                            && investigation.candidate_reads_count()
+                                < MAX_CANDIDATE_READS_PER_INVESTIGATION
+                            && reads_this_turn.len() < MAX_READS_PER_TURN;
+                        if can_dispatch {
+                            answer_guard_retry_entered = true;
+                            self.conversation.discard_last_if_assistant();
+                            pending_runtime_call = Some(PendingRuntimeCall {
+                                input: ToolInput::ReadFile { path: bad_path.clone() },
+                                seeded_pre_generation: false,
+                            });
+                            next_round_label = GenerationRoundLabel::PostTool;
+                            next_round_cause = GenerationRoundCause::Recovery;
+                            continue;
+                        }
                         if !answer_guard_retry_entered && !reads_this_turn.is_empty() {
                             answer_guard_retry_entered = true;
                             trace_runtime_decision(
@@ -3819,6 +3838,165 @@ mod tests {
         assert!(
             rt.anchors.last_search_query().is_none(),
             "anchor must not be updated on rejected query"
+        );
+    }
+
+    // ── 18.4 answer guard dispatch ────────────────────────────────────────────
+
+    /// Guard fires on an unread search candidate → dispatch reads it → clean synthesis.
+    /// Verifies Phase 18.4 happy path: no correction injected, two reads in conversation.
+    #[test]
+    fn answer_guard_dispatches_unread_candidate_and_allows_grounded_synthesis() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/a.rs"), "fn run_turns() {}\n").unwrap();
+        fs::write(
+            tmp.path().join("src/b.rs"),
+            "fn run_turns() {} // dispatch entry\n",
+        )
+        .unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: run_turns]",
+                "[read_file: src/a.rs]",
+                "run_turns is in src/b.rs.",
+                "run_turns is in src/a.rs and src/b.rs.",
+            ],
+            tmp.path(),
+        );
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is run_turns located?".into(),
+            },
+        );
+
+        let source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(s) = e {
+                Some(s.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(source, Some(AnswerSource::ToolAssisted { .. })),
+            "dispatch must allow grounded synthesis: {source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        let read_results = snapshot
+            .iter()
+            .filter(|m| m.content.contains("=== tool_result: read_file ==="))
+            .count();
+        assert_eq!(
+            read_results, 2,
+            "dispatch must produce a second read_file result: {snapshot:?}"
+        );
+        assert!(
+            !snapshot
+                .iter()
+                .any(|m| m.content.contains("which was not read this turn")),
+            "dispatch path must not inject answer_guard correction: {snapshot:?}"
+        );
+    }
+
+    /// Guard fires on a non-candidate path → can_dispatch is false → Phase 18.3 correction
+    /// fires → clean synthesis is admitted on retry. Verifies Phase 18.3 is fully preserved.
+    #[test]
+    fn answer_guard_correction_fires_when_bad_path_is_not_a_search_candidate() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/engine.rs"), "fn run_turns() {}\n").unwrap();
+        fs::write(tmp.path().join("src/unrelated.rs"), "fn unrelated() {}\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: run_turns]",
+                "[read_file: src/engine.rs]",
+                "run_turns is in src/unrelated.rs.",
+                "run_turns is in src/engine.rs.",
+            ],
+            tmp.path(),
+        );
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is run_turns located?".into(),
+            },
+        );
+
+        let source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(s) = e {
+                Some(s.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(source, Some(AnswerSource::ToolAssisted { .. })),
+            "Phase 18.3 correction must allow clean synthesis on retry: {source:?}"
+        );
+        let snapshot = rt.messages_snapshot();
+        assert!(
+            snapshot.iter().any(|m| {
+                m.content.contains("[runtime:correction]")
+                    && m.content.contains("src/unrelated.rs")
+            }),
+            "correction must name the cited non-candidate path: {snapshot:?}"
+        );
+    }
+
+    /// Guard fires once (dispatch), retry flag blocks a second dispatch on the next
+    /// violation — terminal fires instead. Verifies no double-dispatch is possible.
+    #[test]
+    fn answer_guard_terminal_fires_on_second_violation_after_dispatch() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/a.rs"), "fn run_turns() {}\n").unwrap();
+        fs::write(tmp.path().join("src/b.rs"), "fn run_turns() {} // b\n").unwrap();
+        fs::write(tmp.path().join("src/c.rs"), "fn run_turns() {} // c\n").unwrap();
+
+        let mut rt = make_runtime_in(
+            vec![
+                "[search_code: run_turns]",
+                "[read_file: src/a.rs]",
+                "run_turns is in src/b.rs.", // guard fires → dispatch reads b.rs
+                "run_turns is in src/c.rs.", // guard fires again → terminal
+            ],
+            tmp.path(),
+        );
+        let events = collect_events(
+            &mut rt,
+            RuntimeRequest::Submit {
+                text: "Where is run_turns located?".into(),
+            },
+        );
+
+        let source = events.iter().find_map(|e| {
+            if let RuntimeEvent::AnswerReady(s) = e {
+                Some(s.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            matches!(
+                source,
+                Some(AnswerSource::RuntimeTerminal {
+                    reason: RuntimeTerminalReason::InsufficientEvidence,
+                    ..
+                })
+            ),
+            "second guard violation after dispatch must terminate: {source:?}"
         );
     }
 }
