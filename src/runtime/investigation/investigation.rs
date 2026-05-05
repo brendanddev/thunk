@@ -374,6 +374,12 @@ impl RecoveryKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadClassification {
+    Direct,
+    Candidate,
+}
+
 /// Tracks per-turn search → read investigation state.
 /// Resets at the start of each call to run_turns, exactly like SearchBudget.
 pub(crate) struct InvestigationState {
@@ -420,6 +426,8 @@ pub(crate) struct InvestigationState {
     /// insufficient; after two candidate reads the runtime terminates cleanly if
     /// evidence_ready() is still false.
     candidate_reads_count: usize,
+    direct_reads_count: usize,
+    direct_read_paths: HashSet<String>,
     /// True when this turn is a broad UsageLookup prompt eligible for the
     /// multi-candidate evidence policy.
     broad_usage_lookup: bool,
@@ -532,6 +540,8 @@ impl InvestigationState {
             lockfile_candidates: HashSet::new(),
             lockfile_correction_issued: false,
             non_candidate_read_attempts: 0,
+            direct_reads_count: 0,
+            direct_read_paths: HashSet::new(),
         }
     }
 
@@ -846,6 +856,7 @@ impl InvestigationState {
         &mut self,
         output: &ToolOutput,
         mode: InvestigationMode,
+        classification: ReadClassification,
         on_event: &mut dyn FnMut(RuntimeEvent),
     ) -> Option<(String, RecoveryKind)> {
         let ToolOutput::FileContents(file) = output else {
@@ -854,6 +865,11 @@ impl InvestigationState {
 
         self.files_read_count += 1;
         let read_path = normalize_evidence_path(&file.path);
+
+        if classification == ReadClassification::Direct {
+            self.direct_reads_count += 1;
+            self.direct_read_paths.insert(read_path.clone());
+        }
 
         let is_search_candidate = self
             .search_candidate_paths
@@ -1266,7 +1282,14 @@ impl InvestigationState {
                 &[
                     ("path", read_path),
                     ("accepted", "false".into()),
-                    ("reason", "not_search_candidate".into()),
+                    (
+                        "reason",
+                        if classification == ReadClassification::Direct {
+                            "direct_read".into()
+                        } else {
+                            "not_search_candidate".into()
+                        },
+                    ),
                 ],
             );
         }
@@ -2425,5 +2448,46 @@ mod tests {
             state.definition_only_candidates.contains("models/enums.py"),
             "class TaskStatus must be definition-only for symbol 'TaskStatus'"
         );
+    }
+
+    fn make_file_contents_output(path: &str, contents: &str) -> crate::tools::ToolOutput {
+        use crate::tools::types::FileContentsOutput;
+        crate::tools::ToolOutput::FileContents(FileContentsOutput {
+            path: path.to_string(),
+            contents: contents.to_string(),
+            total_lines: contents.lines().count(),
+            truncated: false,
+        })
+    }
+
+    #[test]
+    fn direct_read_does_not_increment_candidate_counts() {
+        let mut state = InvestigationState::new();
+        let output = make_file_contents_output("src/foo.rs", "fn main() {}");
+        state.record_read_result(&output, InvestigationMode::General, ReadClassification::Direct, &mut |_| {});
+        assert_eq!(state.direct_reads_count, 1);
+        assert!(state.direct_read_paths.contains("src/foo.rs"));
+        assert_eq!(state.candidate_reads_count, 0);
+        assert_eq!(state.useful_accepted_candidate_reads, 0);
+    }
+
+    #[test]
+    fn direct_read_returns_no_recovery() {
+        let mut state = InvestigationState::new();
+        let output = make_file_contents_output("src/foo.rs", "fn main() {}");
+        let result = state.record_read_result(&output, InvestigationMode::General, ReadClassification::Direct, &mut |_| {});
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn candidate_read_path_unchanged() {
+        let mut state = InvestigationState::new();
+        let search_output = make_search_output_for_hint(vec![("src/foo.rs", "fn main()")]);
+        state.record_search_results(&search_output, None, &mut |_| {});
+        let output = make_file_contents_output("src/foo.rs", "fn main() {}");
+        state.record_read_result(&output, InvestigationMode::General, ReadClassification::Candidate, &mut |_| {});
+        assert_eq!(state.candidate_reads_count, 1);
+        assert_eq!(state.direct_reads_count, 0);
+        assert!(state.direct_read_paths.is_empty());
     }
 }

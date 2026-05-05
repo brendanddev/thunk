@@ -6,7 +6,7 @@ use crate::tools::{
 
 use super::super::investigation::anchors::AnchorState;
 use super::super::investigation::investigation::{
-    InvestigationMode, InvestigationState, RecoveryKind,
+    InvestigationMode, InvestigationState, ReadClassification, RecoveryKind,
 };
 use super::super::investigation::search_query::{simplify_search_input, weak_search_query_reason};
 use super::super::investigation::tool_surface::{
@@ -780,8 +780,13 @@ pub(super) fn run_tool_round(
                             &[("kind", "last_read_file".into()), ("path", path)],
                         );
                     }
+                    let classification = if requested_read_path.is_some() {
+                        ReadClassification::Direct
+                    } else {
+                        ReadClassification::Candidate
+                    };
                     let recovery =
-                        investigation.record_read_result(&output, investigation_mode, on_event);
+                        investigation.record_read_result(&output, investigation_mode, classification, on_event);
                     if let Some(requested) = requested_read_path {
                         if let Some(rp) = read_path.as_deref() {
                             if normalize_evidence_path(rp) == normalize_evidence_path(requested) {
