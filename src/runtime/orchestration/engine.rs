@@ -3026,7 +3026,7 @@ mod tests {
                 "[search_code: database]",
                 "[read_file: services/database.py]",
                 "[read_file: services/database_alt.py]",
-                "The database is configured in services/database_alt.py.",
+                "The database is configured in config/database.yaml.",
             ],
             tmp.path(),
         );
@@ -3050,14 +3050,8 @@ mod tests {
             }
         });
         assert!(
-            matches!(
-                answer_source,
-                Some(AnswerSource::RuntimeTerminal {
-                    reason: RuntimeTerminalReason::InsufficientEvidence,
-                    ..
-                })
-            ),
-            "second non-config candidate must not satisfy config evidence: {answer_source:?}"
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "dispatch to config file must admit synthesis: {answer_source:?}"
         );
 
         let snapshot = rt.messages_snapshot();
@@ -3068,8 +3062,8 @@ mod tests {
             .map(|m| m.content.as_str());
         assert_eq!(
             last_assistant,
-            Some(ungrounded_investigation_final_answer()),
-            "last assistant must be the runtime terminal, not model synthesis"
+            Some("The database is configured in config/database.yaml."),
+            "last assistant must be the model synthesis from the dispatched config read"
         );
     }
 
@@ -3106,7 +3100,7 @@ mod tests {
                 "[search_code: logging]",
                 "[read_file: services/logging_factory.py]",
                 "[read_file: services/logging_reader.py]",
-                "Logging is initialized in services/logging_reader.py.",
+                "Logging is initialized in services/logging_setup.py.",
             ],
             tmp.path(),
         );
@@ -3130,14 +3124,8 @@ mod tests {
             }
         });
         assert!(
-            matches!(
-                answer_source,
-                Some(AnswerSource::RuntimeTerminal {
-                    reason: RuntimeTerminalReason::InsufficientEvidence,
-                    ..
-                })
-            ),
-            "second non-initialization candidate must not satisfy evidence: {answer_source:?}"
+            matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+            "dispatch to initialization file must admit synthesis: {answer_source:?}"
         );
 
         let snapshot = rt.messages_snapshot();
@@ -3148,8 +3136,8 @@ mod tests {
             .map(|m| m.content.as_str());
         assert_eq!(
             last_assistant,
-            Some(ungrounded_investigation_final_answer()),
-            "last assistant must be the runtime terminal, not model synthesis"
+            Some("Logging is initialized in services/logging_setup.py."),
+            "last assistant must be the model synthesis from the dispatched initialization read"
         );
     }
 

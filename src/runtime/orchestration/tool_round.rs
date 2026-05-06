@@ -6,7 +6,7 @@ use crate::tools::{
 
 use super::super::investigation::anchors::AnchorState;
 use super::super::investigation::investigation::{
-    InvestigationMode, InvestigationState, ReadClassification, RecoveryKind,
+    InvestigationMode, InvestigationState, ReadClassification,
 };
 use super::super::investigation::search_query::{simplify_search_input, weak_search_query_reason};
 use super::super::investigation::tool_surface::{
@@ -859,26 +859,10 @@ pub(super) fn run_tool_round(
                         "recovery_issued",
                         &[("kind", kind.as_str().into()), ("path", path.clone())],
                     );
-                    let correction = match kind {
-                        RecoveryKind::DefinitionOnly | RecoveryKind::NonDefinitionSite => {
-                            return ToolRoundOutcome::RuntimeDispatch {
-                                accumulated,
-                                call: ToolInput::ReadFile { path },
-                            };
-                        }
-                        RecoveryKind::ImportOnly => import_read_recovery_correction(&path),
-                        RecoveryKind::ConfigFile => config_read_recovery_correction(&path),
-                        RecoveryKind::Initialization => {
-                            initialization_read_recovery_correction(&path)
-                        }
-                        RecoveryKind::Create => create_read_recovery_correction(&path),
-                        RecoveryKind::Register => register_read_recovery_correction(&path),
-                        RecoveryKind::Load => load_read_recovery_correction(&path),
-                        RecoveryKind::Save => save_read_recovery_correction(&path),
-                        RecoveryKind::Lockfile => lockfile_read_recovery_correction(&path),
+                    return ToolRoundOutcome::RuntimeDispatch {
+                        accumulated,
+                        call: ToolInput::ReadFile { path },
                     };
-                    accumulated.push_str(&correction);
-                    accumulated.push_str("\n\n");
                 }
                 if name == "read_file"
                     && !has_read_recovery

@@ -161,14 +161,11 @@ fn initialization_lookup_non_initialization_read_triggers_recovery() {
     );
 
     let snapshot = rt.messages_snapshot();
-    let expected_recovery_path = "services/logging_setup.py";
     assert!(
-        snapshot.iter().any(|m| {
-            m.content.contains("This is an initialization lookup")
-                && m.content
-                    .contains(&format!("[read_file: {expected_recovery_path}]"))
-        }),
-        "runtime must inject bounded initialization recovery"
+        snapshot
+            .iter()
+            .any(|m| m.content.contains("basicConfig")),
+        "runtime must dispatch recovery read of the initialization file (logging_setup.py content must appear in conversation)"
     );
     let last_assistant = snapshot
         .iter()

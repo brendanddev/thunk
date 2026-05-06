@@ -1,11 +1,10 @@
 use super::*;
-use crate::runtime::types::RuntimeTerminalReason;
 
 #[test]
-fn config_lookup_non_config_read_triggers_recovery_to_config_file() {
+fn config_lookup_non_config_read_dispatches_to_config_file() {
     // Config lookup: two candidates — a source file and a config file.
-    // Model reads the source file first → runtime injects config recovery pointing to YAML.
-    // Model follows recovery and reads the config file → evidence ready → ToolAssisted.
+    // Model reads the source file first → runtime dispatches directly to config.yaml.
+    // No text correction is injected. The dispatched read satisfies evidence → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -27,7 +26,6 @@ fn config_lookup_non_config_read_triggers_recovery_to_config_file() {
         vec![
             "[search_code: database]",
             "[read_file: services/database.py]",
-            "[read_file: config/database.yaml]",
             "The database is configured in config/database.yaml.",
         ],
         tmp.path(),
@@ -50,7 +48,7 @@ fn config_lookup_non_config_read_triggers_recovery_to_config_file() {
     });
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
-        "config recovery + config read must admit synthesis: {answer_source:?}"
+        "dispatch to config candidate must admit synthesis: {answer_source:?}"
     );
     let snapshot = rt.messages_snapshot();
     let last_assistant = snapshot
@@ -121,11 +119,11 @@ fn config_lookup_no_config_candidates_degrades_cleanly() {
 }
 
 #[test]
-fn create_lookup_non_create_read_triggers_recovery_to_create_file() {
+fn create_lookup_non_create_read_dispatches_to_create_file() {
     // File A: no create-term matches → non-create candidate.
     // File B: a create-term match → create candidate.
-    // Model reads A first → recovery fires pointing to B.
-    // Model reads B → evidence ready → ToolAssisted.
+    // Model reads A first → runtime dispatches directly to B. No text correction injected.
+    // Dispatched read satisfies evidence → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -147,7 +145,6 @@ fn create_lookup_non_create_read_triggers_recovery_to_create_file() {
         vec![
             "[search_code: task]",
             "[read_file: services/task_handler.py]",
-            "[read_file: storage/task_store.py]",
             "Tasks are created in storage/task_store.py.",
         ],
         tmp.path(),
@@ -162,15 +159,6 @@ fn create_lookup_non_create_read_triggers_recovery_to_create_file() {
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
 
-    let snapshot = rt.messages_snapshot();
-    assert!(
-        snapshot
-            .iter()
-            .any(|m| m.content.contains("creation lookup")
-                && m.content.contains("storage/task_store.py")),
-        "create recovery correction must point to the create candidate"
-    );
-
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -180,8 +168,9 @@ fn create_lookup_non_create_read_triggers_recovery_to_create_file() {
     });
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
-        "create lookup + recovery + create read must admit synthesis: {answer_source:?}"
+        "dispatch to create candidate must admit synthesis: {answer_source:?}"
     );
+    let snapshot = rt.messages_snapshot();
     let last_assistant = snapshot
         .iter()
         .rev()
@@ -249,11 +238,10 @@ fn create_lookup_no_create_candidates_degrades_cleanly() {
 }
 
 #[test]
-fn create_lookup_second_non_create_candidate_after_recovery_is_not_accepted() {
-    // After one recovery the correction flag is set.
-    // A second non-create read falls through the gate without accepting.
-    // With candidate_reads_count == 2 and evidence_ready false, the runtime
-    // terminates with InsufficientEvidence.
+fn create_lookup_non_create_read_dispatch_then_ignored_tool_call_succeeds() {
+    // Model reads non-create file → runtime dispatches to create candidate (task_store.py).
+    // Dispatched read makes evidence ready. Model then tries another tool call (rejected by
+    // answer_phase guard) and on the follow-up produces the answer → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -294,7 +282,7 @@ fn create_lookup_second_non_create_candidate_after_recovery_is_not_accepted() {
         },
     );
 
-    assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+    assert!(!has_failed(&events), "must complete cleanly: {events:?}");
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -303,14 +291,8 @@ fn create_lookup_second_non_create_candidate_after_recovery_is_not_accepted() {
         }
     });
     assert!(
-        matches!(
-            answer_source,
-            Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::InsufficientEvidence,
-                ..
-            })
-        ),
-        "two non-create reads must terminate with InsufficientEvidence: {answer_source:?}"
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "dispatch to create candidate must complete as ToolAssisted: {answer_source:?}"
     );
 }
 
@@ -374,11 +356,11 @@ fn create_lookup_noisy_create_term_in_comment_still_classifies_as_create() {
 }
 
 #[test]
-fn register_lookup_non_register_read_triggers_recovery_to_register_file() {
+fn register_lookup_non_register_read_dispatches_to_register_file() {
     // File A: no register-term matches → non-register candidate.
     // File B: a register-term match → register candidate.
-    // Model reads A first → recovery fires pointing to B.
-    // Model reads B → evidence ready → ToolAssisted.
+    // Model reads A first → runtime dispatches directly to B. No text correction injected.
+    // Dispatched read satisfies evidence → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -399,7 +381,6 @@ fn register_lookup_non_register_read_triggers_recovery_to_register_file() {
         vec![
             "[search_code: command]",
             "[read_file: cli/handlers.py]",
-            "[read_file: cli/registry.py]",
             "Commands are registered in cli/registry.py.",
         ],
         tmp.path(),
@@ -414,15 +395,6 @@ fn register_lookup_non_register_read_triggers_recovery_to_register_file() {
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
 
-    let snapshot = rt.messages_snapshot();
-    assert!(
-        snapshot
-            .iter()
-            .any(|m| m.content.contains("registration lookup")
-                && m.content.contains("cli/registry.py")),
-        "register recovery correction must point to the register candidate"
-    );
-
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -432,8 +404,9 @@ fn register_lookup_non_register_read_triggers_recovery_to_register_file() {
     });
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
-        "register lookup + recovery + register read must admit synthesis: {answer_source:?}"
+        "dispatch to register candidate must admit synthesis: {answer_source:?}"
     );
+    let snapshot = rt.messages_snapshot();
     let last_assistant = snapshot
         .iter()
         .rev()
@@ -501,11 +474,10 @@ fn register_lookup_no_register_candidates_degrades_cleanly() {
 }
 
 #[test]
-fn register_lookup_second_non_register_candidate_after_recovery_is_not_accepted() {
-    // After one recovery the correction flag is set.
-    // A second non-register read falls through the gate without accepting.
-    // With candidate_reads_count == 2 and evidence_ready false, the runtime
-    // terminates with InsufficientEvidence.
+fn register_lookup_non_register_read_dispatch_then_ignored_tool_call_succeeds() {
+    // Model reads non-register file → runtime dispatches to register candidate (registry.py).
+    // Dispatched read makes evidence ready. Model then tries another tool call (rejected by
+    // answer_phase guard) and on the follow-up produces the answer → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -545,7 +517,7 @@ fn register_lookup_second_non_register_candidate_after_recovery_is_not_accepted(
         },
     );
 
-    assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+    assert!(!has_failed(&events), "must complete cleanly: {events:?}");
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -554,14 +526,8 @@ fn register_lookup_second_non_register_candidate_after_recovery_is_not_accepted(
         }
     });
     assert!(
-        matches!(
-            answer_source,
-            Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::InsufficientEvidence,
-                ..
-            })
-        ),
-        "two non-register reads must terminate with InsufficientEvidence: {answer_source:?}"
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "dispatch to register candidate must complete as ToolAssisted: {answer_source:?}"
     );
 }
 
@@ -618,11 +584,11 @@ fn register_lookup_noisy_register_term_in_comment_still_classifies_as_register()
 }
 
 #[test]
-fn load_lookup_non_load_read_triggers_recovery_to_load_file() {
+fn load_lookup_non_load_read_dispatches_to_load_file() {
     // File A: no load-term matches → non-load candidate.
     // File B: a load-term match → load candidate.
-    // Model reads A first → recovery fires pointing to B.
-    // Model reads B → evidence ready → ToolAssisted.
+    // Model reads A first → runtime dispatches directly to B. No text correction injected.
+    // Dispatched read satisfies evidence → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -643,7 +609,6 @@ fn load_lookup_non_load_read_triggers_recovery_to_load_file() {
         vec![
             "[search_code: session]",
             "[read_file: services/session_handler.py]",
-            "[read_file: services/session_loader.py]",
             "Sessions are loaded in services/session_loader.py.",
         ],
         tmp.path(),
@@ -658,13 +623,6 @@ fn load_lookup_non_load_read_triggers_recovery_to_load_file() {
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
 
-    let snapshot = rt.messages_snapshot();
-    assert!(
-        snapshot.iter().any(|m| m.content.contains("load lookup")
-            && m.content.contains("services/session_loader.py")),
-        "load recovery correction must point to the load candidate"
-    );
-
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -674,8 +632,9 @@ fn load_lookup_non_load_read_triggers_recovery_to_load_file() {
     });
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
-        "load lookup + recovery + load read must admit synthesis: {answer_source:?}"
+        "dispatch to load candidate must admit synthesis: {answer_source:?}"
     );
+    let snapshot = rt.messages_snapshot();
     let last_assistant = snapshot
         .iter()
         .rev()
@@ -743,11 +702,10 @@ fn load_lookup_no_load_candidates_degrades_cleanly() {
 }
 
 #[test]
-fn load_lookup_second_non_load_candidate_after_recovery_is_not_accepted() {
-    // After one recovery the correction flag is set.
-    // A second non-load read falls through the gate without accepting.
-    // With candidate_reads_count == 2 and evidence_ready false, the runtime
-    // terminates with InsufficientEvidence.
+fn load_lookup_non_load_read_dispatch_then_ignored_tool_call_succeeds() {
+    // Model reads non-load file → runtime dispatches to load candidate (session_loader.py).
+    // Dispatched read makes evidence ready. Model then tries another tool call (rejected by
+    // answer_phase guard) and on the follow-up produces the answer → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -787,7 +745,7 @@ fn load_lookup_second_non_load_candidate_after_recovery_is_not_accepted() {
         },
     );
 
-    assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+    assert!(!has_failed(&events), "must complete cleanly: {events:?}");
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -796,14 +754,8 @@ fn load_lookup_second_non_load_candidate_after_recovery_is_not_accepted() {
         }
     });
     assert!(
-        matches!(
-            answer_source,
-            Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::InsufficientEvidence,
-                ..
-            })
-        ),
-        "two non-load reads must terminate with InsufficientEvidence: {answer_source:?}"
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "dispatch to load candidate must complete as ToolAssisted: {answer_source:?}"
     );
 }
 
@@ -858,11 +810,11 @@ fn load_lookup_noisy_load_term_in_comment_still_classifies_as_load() {
 }
 
 #[test]
-fn save_lookup_non_save_read_triggers_recovery_to_save_file() {
+fn save_lookup_non_save_read_dispatches_to_save_file() {
     // File A: no save-term matches → non-save candidate.
     // File B: a save-term match → save candidate.
-    // Model reads A first → recovery fires pointing to B.
-    // Model reads B → evidence ready → ToolAssisted.
+    // Model reads A first → runtime dispatches directly to B. No text correction injected.
+    // Dispatched read satisfies evidence → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -883,7 +835,6 @@ fn save_lookup_non_save_read_triggers_recovery_to_save_file() {
         vec![
             "[search_code: session]",
             "[read_file: services/session_handler.py]",
-            "[read_file: services/session_store.py]",
             "Sessions are saved in services/session_store.py.",
         ],
         tmp.path(),
@@ -898,13 +849,6 @@ fn save_lookup_non_save_read_triggers_recovery_to_save_file() {
 
     assert!(!has_failed(&events), "turn must not fail: {events:?}");
 
-    let snapshot = rt.messages_snapshot();
-    assert!(
-        snapshot.iter().any(|m| m.content.contains("save lookup")
-            && m.content.contains("services/session_store.py")),
-        "save recovery correction must point to the save candidate"
-    );
-
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -914,8 +858,9 @@ fn save_lookup_non_save_read_triggers_recovery_to_save_file() {
     });
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
-        "save lookup + recovery + save read must admit synthesis: {answer_source:?}"
+        "dispatch to save candidate must admit synthesis: {answer_source:?}"
     );
+    let snapshot = rt.messages_snapshot();
     let last_assistant = snapshot
         .iter()
         .rev()
@@ -983,11 +928,10 @@ fn save_lookup_no_save_candidates_degrades_cleanly() {
 }
 
 #[test]
-fn save_lookup_second_non_save_candidate_after_recovery_is_not_accepted() {
-    // After one recovery the correction flag is set.
-    // A second non-save read falls through the gate without accepting.
-    // With candidate_reads_count == 2 and evidence_ready false, the runtime
-    // terminates with InsufficientEvidence.
+fn save_lookup_non_save_read_dispatch_then_ignored_tool_call_succeeds() {
+    // Model reads non-save file → runtime dispatches to save candidate (session_store.py).
+    // Dispatched read makes evidence ready. Model then tries another tool call (rejected by
+    // answer_phase guard) and on the follow-up produces the answer → ToolAssisted.
     use std::fs;
     use tempfile::TempDir;
 
@@ -1027,7 +971,7 @@ fn save_lookup_second_non_save_candidate_after_recovery_is_not_accepted() {
         },
     );
 
-    assert!(!has_failed(&events), "must terminate cleanly: {events:?}");
+    assert!(!has_failed(&events), "must complete cleanly: {events:?}");
     let answer_source = events.iter().find_map(|e| {
         if let RuntimeEvent::AnswerReady(src) = e {
             Some(src.clone())
@@ -1036,14 +980,8 @@ fn save_lookup_second_non_save_candidate_after_recovery_is_not_accepted() {
         }
     });
     assert!(
-        matches!(
-            answer_source,
-            Some(AnswerSource::RuntimeTerminal {
-                reason: RuntimeTerminalReason::InsufficientEvidence,
-                ..
-            })
-        ),
-        "two non-save reads must terminate with InsufficientEvidence: {answer_source:?}"
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "dispatch to save candidate must complete as ToolAssisted: {answer_source:?}"
     );
 }
 
@@ -1094,5 +1032,85 @@ fn save_lookup_noisy_save_term_in_comment_still_classifies_as_save() {
     assert!(
         matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
         "save candidate read must admit synthesis: {answer_source:?}"
+    );
+}
+
+#[test]
+fn initialization_lookup_wrong_candidate_dispatches_to_init_candidate() {
+    // Regression: InitializationLookup — two search candidates, one with init terms,
+    // one without. Model reads the non-init candidate first.
+    //
+    // Old behavior: runtime injected a text correction; model ignored it and re-searched;
+    // search budget exhausted → RepeatedSearchBudgetViolation terminal.
+    //
+    // New behavior: runtime dispatches directly to the init candidate. The dispatched read
+    // satisfies evidence. No correction text is injected, no search is reopened → ToolAssisted.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("services")).unwrap();
+    fs::write(
+        tmp.path().join("services").join("app_handler.py"),
+        "def handle_request(req):\n    return req.process()\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("services").join("app_boot.py"),
+        "def initialize_app():\n    app.start()\n",
+    )
+    .unwrap();
+
+    let mut rt = make_runtime_in(
+        vec![
+            "[search_code: app]",
+            "[read_file: services/app_handler.py]",
+            "The app is initialized in services/app_boot.py.",
+        ],
+        tmp.path(),
+    );
+
+    let events = collect_events(
+        &mut rt,
+        RuntimeRequest::Submit {
+            text: "Where is the app initialized?".into(),
+        },
+    );
+
+    assert!(!has_failed(&events), "turn must not fail: {events:?}");
+
+    let snapshot = rt.messages_snapshot();
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("initialization lookup")),
+        "no text correction must be injected — dispatch replaces it: {snapshot:?}"
+    );
+    assert!(
+        !snapshot
+            .iter()
+            .any(|m| m.content.contains("search budget exceeded")),
+        "search must not be reopened after dispatch: {snapshot:?}"
+    );
+
+    let answer_source = events.iter().find_map(|e| {
+        if let RuntimeEvent::AnswerReady(src) = e {
+            Some(src.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        matches!(answer_source, Some(AnswerSource::ToolAssisted { .. })),
+        "dispatch to init candidate must complete as ToolAssisted: {answer_source:?}"
+    );
+    let last_assistant = snapshot
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::llm::backend::Role::Assistant)
+        .map(|m| m.content.as_str());
+    assert_eq!(
+        last_assistant,
+        Some("The app is initialized in services/app_boot.py.")
     );
 }

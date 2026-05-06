@@ -128,7 +128,6 @@ fn initialization_recovery_extra_tool_after_evidence_ready_enters_answer_only_mo
         vec![
             "[search_code: logging]",
             "[read_file: sandbox/services/logging_usage.py]",
-            "[read_file: sandbox/services/logging_init.py]",
             "[read_file: sandbox/services/logging_usage.py]",
             final_answer,
         ],
@@ -157,10 +156,6 @@ fn initialization_recovery_extra_tool_after_evidence_ready_enters_answer_only_mo
         all_user.matches("=== tool_result: read_file ===").count(),
         2,
         "only the wrong first read and accepted recovery read should dispatch"
-    );
-    assert!(
-        all_user.contains("This is an initialization lookup"),
-        "initialization recovery must still be issued before evidence is ready"
     );
     assert!(
         all_user.contains("Evidence is already ready"),

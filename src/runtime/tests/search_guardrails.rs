@@ -203,12 +203,8 @@ fn lockfile_read_rejected_when_matched_source_candidate_exists() {
         "lockfile read should execute, then recovery should read source evidence"
     );
     assert!(
-        snapshot.iter().any(|m| m
-            .content
-            .contains("[runtime:correction] The file just read is a lockfile")
-            && m.content.contains("[read_file: ")
-            && m.content.contains("src/git_status.rs")),
-        "runtime should issue one lockfile-specific recovery to the source candidate"
+        snapshot.iter().any(|m| m.content.contains("render_git_status")),
+        "runtime should dispatch to the source candidate after lockfile read"
     );
     let last_assistant = snapshot
         .iter()
@@ -313,11 +309,8 @@ fn lockfile_guard_preserves_config_lookup_recovery_priority() {
     );
     let snapshot = rt.messages_snapshot();
     assert!(
-        snapshot.iter().any(|m| m
-            .content
-            .contains("[runtime:correction] This is a config lookup")
-            && m.content.contains("sandbox/database.yaml")),
-        "config recovery should remain the active mode-specific gate"
+        snapshot.iter().any(|m| m.content.contains("database: postgres")),
+        "runtime should dispatch to the config candidate (sandbox/database.yaml) after lockfile read"
     );
     assert!(
         snapshot.iter().all(|m| !m
